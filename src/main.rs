@@ -1,3 +1,4 @@
+mod agent;
 mod protocol;
 mod state;
 mod task;
@@ -24,6 +25,11 @@ enum Command {
     ApplyResponse {
         /// Path to JSON response file produced by the engineering lead (use - for stdin)
         path: String,
+    },
+    /// Dispatch a worker to execute a single task using Copilot
+    Dispatch {
+        /// Task ID to dispatch (e.g., T-0001)
+        task_id: String,
     },
     Task {
         #[command(subcommand)]
@@ -88,6 +94,12 @@ fn main() -> Result<()> {
             apply_lead_response(&mut state, response);
             state.save()?;
             println!("Applied response and saved state.");
+        }
+        Command::Dispatch { task_id } => {
+            if let Err(e) = agent::dispatch(&task_id) {
+                eprintln!("Dispatch failed: {:#}", e);
+                return Err(e);
+            }
         }
         Command::Task { command } => match command {
             TaskCommand::List => match OrcState::load() {

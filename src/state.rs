@@ -67,3 +67,39 @@ impl OrcState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::LeadAction;
+
+    #[test]
+    fn create_task_increments_and_adds() {
+        let mut s = OrcState::new("proj");
+        assert_eq!(s.next_task_id, 1);
+
+        s.apply_action(LeadAction::CreateTask {
+            title: "Implement widget".into(),
+            objective: "Add widget to UI".into(),
+            role: "developer".into(),
+            priority: crate::task::TaskPriority::Normal,
+        });
+
+        assert_eq!(s.tasks.len(), 1);
+        assert_eq!(s.next_task_id, 2);
+        let t = &s.tasks[0];
+        assert_eq!(t.id, "T-0001");
+        assert_eq!(t.title, "Implement widget");
+        assert_eq!(t.status, TaskStatus::Backlog);
+    }
+
+    #[test]
+    fn require_cto_approval_appends_reason() {
+        let mut s = OrcState::new("proj");
+        s.apply_action(LeadAction::RequireCtoApproval {
+            reason: "security review".into(),
+        });
+        assert_eq!(s.pending_cto_approvals.len(), 1);
+        assert_eq!(s.pending_cto_approvals[0], "security review");
+    }
+}

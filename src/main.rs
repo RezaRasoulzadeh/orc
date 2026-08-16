@@ -21,6 +21,10 @@ enum Command {
     Ask {
         request: String,
     },
+    ApplyResponse {
+        /// Path to JSON response file produced by the engineering lead (use - for stdin)
+        path: String,
+    },
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -41,26 +45,61 @@ fn main() -> Result<()> {
             state.save()?;
             println!("Initialized Orc in .orc/state.json");
         }
-        Command::Status => {
-            let state = OrcState::load()?;
-            println!("Project: {}", state.project);
-            println!("Tasks: {}", state.tasks.len());
-            for task in state.tasks {
-                println!("{}  {:<10} {}", task.id, task.status, task.title);
-            }
-        }
-        Command::Ask { request } => {
-            let state = OrcState::load()?;
-            let lead_request = EngineeringLeadRequest::from_state(request, &state);
-            println!("{}", serde_json::to_string_pretty(&lead_request)?);
-        }
-        Command::Task { command } => match command {
-            TaskCommand::List => {
-                let state = OrcState::load()?;
+        Command::Status => match OrcState::load() {
+            Ok(state) => {
+                println!("Project: {}", state.project);
+                println!("Tasks: {}", state.tasks.len());
                 for task in state.tasks {
-                    println!("{}\t{}\t{}", task.id, task.status, task.title);
+                    println!("{}  {:<10} {}", task.id, task.status, task.title);
                 }
             }
+            Err(_) => {
+                eprintln!("No state found. Run `orc init` to initialize repository state.");
+            }
+        },
+        Command::Ask { request } => match OrcState::load() {
+            Ok(state) => {
+                let lead_request = EngineeringLeadRequest::from_state(request, &state);
+                println!("{}", serde_json::to_string_pretty(&lead_request)?);
+            }
+            Err(_) => {
+                eprintln!("No state found. Run `orc init` to initialize repository state.");
+            }
+        },
+        Command::ApplyResponse { path } => {
+            let mut state = match OrcState::load() {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("No state found. Run `orc init` to initialize repository state.");
+                    return Ok(());
+                }
+            };
+
+            let data = if path == "-" {
+                use std::io::{self, Read};
+                let mut buf = String::new();
+                io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)?
+            };
+
+            let response: EngineeringLeadResponse = serde_json::from_str(&data)?;
+            apply_lead_response(&mut state, response);
+            state.save()?;
+            println!("Applied response and saved state.");
+        }
+        Command::Task { command } => match command {
+            TaskCommand::List => match OrcState::load() {
+                Ok(state) => {
+                    for task in state.tasks {
+                        println!("{}\t{}\t{}", task.id, task.status, task.title);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("No state found. Run `orc init` to initialize repository state.");
+                }
+            },
         },
     }
 

@@ -2,6 +2,18 @@ use crate::task::{Task, TaskPriority, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
 
+#[derive(Debug, Clone)]
+pub struct AgentRun {
+    pub id: i64,
+    pub project_id: i64,
+    pub task_id: Option<String>,
+    pub agent: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DbError {
     #[error("database filesystem error: {0}")]
@@ -328,6 +340,63 @@ impl Database {
             .prepare("SELECT reason FROM approval_requests WHERE project_id = ?1 ORDER BY id")?;
         Ok(stmt
             .query_map(params![project_id], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
+        Ok(AgentRun {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            task_id: row.get(2)?,
+            agent: row.get(3)?,
+            status: row.get(4)?,
+            output: row.get(5)?,
+            started_at: row.get(6)?,
+            finished_at: row.get(7)?,
+        })
+    }
+
+    pub fn create_agent_run(
+        &self,
+        project_id: i64,
+        task_id: &str,
+        agent: &str,
+    ) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO agent_runs (project_id, task_id, agent, status, started_at) VALUES (?1, ?2, ?3, 'running', CURRENT_TIMESTAMP)",
+            params![project_id, task_id, agent],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_agent_run_status(
+        &self,
+        run_id: i64,
+        status: &str,
+        output: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            params![status, output, run_id],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, task_id, agent, status, output, started_at, finished_at FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, task_id, agent, status, output, started_at, finished_at FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+        )?;
+        Ok(stmt
+            .query_map(params![task_id], Self::agent_run_from_row)?
             .collect::<Result<Vec<_>, _>>()?)
     }
 }

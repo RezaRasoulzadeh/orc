@@ -33,11 +33,21 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Manage and view agent runs
+    Runs {
+        /// Optional task ID to filter runs for a specific task
+        task_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum TaskCommand {
     List,
+    /// Display task details
+    Show {
+        /// Task ID to display
+        task_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -130,6 +140,67 @@ fn main() -> Result<()> {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
+            TaskCommand::Show { task_id } => match Database::open(DB_PATH) {
+                Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {
+                    Some(task) => {
+                        println!("ID:        {}", task.id);
+                        println!("Title:     {}", task.title);
+                        println!("Objective: {}", task.objective);
+                        println!("Role:      {}", task.role);
+                        println!("Priority:  {:?}", task.priority);
+                        println!("Status:    {}", task.status);
+                    }
+                    None => {
+                        eprintln!("Task {} not found", task_id);
+                    }
+                },
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
+        },
+        Command::Runs { task_id } => match Database::open(DB_PATH) {
+            Ok(db) => {
+                let runs = if let Some(tid) = task_id {
+                    // Show runs for specific task
+                    db.list_agent_runs_for_task(&tid)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                } else {
+                    // Show recent runs for project
+                    let pid = db
+                        .get_project_id()
+                        .map_err(|e| anyhow::anyhow!(e))?
+                        .ok_or_else(|| anyhow::anyhow!("no project found in DB"))?;
+                    db.list_agent_runs(pid, 50)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                };
+
+                if runs.is_empty() {
+                    println!("No agent runs found");
+                } else {
+                    for run in runs {
+                        println!(
+                            "{} {} {} {}",
+                            run.id,
+                            run.task_id.as_deref().unwrap_or("-"),
+                            run.agent,
+                            run.status
+                        );
+                        if let Some(finished) = run.finished_at {
+                            println!("  Started:  {}", run.started_at);
+                            println!("  Finished: {}", finished);
+                        } else {
+                            println!("  Started: {}", run.started_at);
+                        }
+                        if let Some(output) = run.output {
+                            println!("  Output: {}", output);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("No DB found. Run `orc init` to initialize repository state.");
+            }
         },
     }
 

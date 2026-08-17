@@ -1,0 +1,54 @@
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::registry::AgentDefinition;
+use crate::worker::{CodexWorker, CopilotWorker, Worker};
+
+pub struct WorkerFactory;
+
+impl WorkerFactory {
+    pub fn build(agent: &AgentDefinition) -> Result<Box<dyn Worker>, String> {
+        match agent.backend.as_str() {
+            "copilot" => Ok(Box::new(CopilotWorker)),
+            "codex" => Ok(Box::new(CodexWorker::new(
+                agent.profile_path.as_deref().map(PathBuf::from),
+            ))),
+            backend => Err(format!(
+                "unsupported agent backend '{}'; supported backends: copilot, codex",
+                backend
+            )),
+        }
+    }
+}
+
+pub(crate) fn apply_profile_environment(command: &mut Command, profile_path: Option<&Path>) {
+    if let Some(profile_path) = profile_path {
+        // Credentials remain managed by the Codex CLI and are never copied into Orc's database.
+        command.env("CODEX_HOME", profile_path);
+    }
+}
+
+pub(crate) fn configure_noninteractive(command: &mut Command, cwd: &Path) {
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_environment_is_scoped_to_the_codex_command() {
+        let mut command = Command::new("codex");
+        apply_profile_environment(&mut command, Some(Path::new("/profiles/main")));
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == "CODEX_HOME")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(value, Some("/profiles/main"));
+    }
+}

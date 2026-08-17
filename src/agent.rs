@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use crate::backend::WorkerFactory;
 use crate::contract;
 use crate::git;
+use crate::registry::{self, AgentDefinition};
 use crate::storage::Database;
 use crate::task::{Task, TaskStatus};
-use crate::worker::{CopilotWorker, Worker, WorkerOutcome};
+use crate::worker::{Worker, WorkerOutcome};
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 
@@ -34,6 +36,16 @@ pub fn dispatch_with_worker_and_db(
     worker: &dyn Worker,
     db_path: &str,
     repo_path: impl AsRef<Path>,
+) -> Result<()> {
+    dispatch_with_worker_and_db_as(task_id, worker, db_path, repo_path, "copilot")
+}
+
+pub fn dispatch_with_worker_and_db_as(
+    task_id: &str,
+    worker: &dyn Worker,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
 ) -> Result<()> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
@@ -70,7 +82,7 @@ pub fn dispatch_with_worker_and_db(
 
     // Create an agent run
     let run_id = db
-        .create_agent_run(project_id, task_id, "copilot")
+        .create_agent_run(project_id, task_id, agent_id)
         .with_context(|| "failed to create agent run")?;
 
     // Create a worktree for the task
@@ -142,6 +154,44 @@ pub fn dispatch_with_worker(task_id: &str, worker: &dyn Worker) -> Result<()> {
 
 /// Public dispatch function using the Copilot worker and default DB path
 pub fn dispatch(task_id: &str) -> Result<()> {
-    let worker = CopilotWorker;
-    dispatch_with_worker(task_id, &worker)
+    dispatch_selected(task_id, None)
+}
+
+pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result<()> {
+    let db_path = ".orc/orc.db";
+    let db = Database::open(db_path)
+        .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
+    let _task = db
+        .get_task(task_id)?
+        .with_context(|| format!("task '{}' not found in DB", task_id))?;
+    let required_capabilities = vec!["code".to_owned(), "terminal".to_owned()];
+    let agent = if let Some(agent_id) = requested_agent {
+        registry::get_agent(&db, agent_id)?
+    } else {
+        registry::select_agent(&db.list_agents()?, &required_capabilities)?.clone()
+    };
+    validate_selected_agent(&agent, &required_capabilities)?;
+    let worker = WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
+    dispatch_with_worker_and_db_as(task_id, worker.as_ref(), db_path, ".", &agent.id)
+}
+
+fn validate_selected_agent(agent: &AgentDefinition, required: &[String]) -> Result<()> {
+    if !agent.enabled {
+        anyhow::bail!("agent '{}' is disabled", agent.id);
+    }
+    if agent.status != registry::AVAILABLE {
+        let reason = agent
+            .unavailable_reason
+            .as_deref()
+            .unwrap_or("no reason provided");
+        anyhow::bail!("agent '{}' is unavailable: {}", agent.id, reason);
+    }
+    if !agent.supports(required) {
+        anyhow::bail!(
+            "agent '{}' lacks required capabilities: {}",
+            agent.id,
+            required.join(", ")
+        );
+    }
+    registry::validate_backend(&agent.backend)
 }

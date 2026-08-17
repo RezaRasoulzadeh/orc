@@ -1,0 +1,125 @@
+use orc::backend::WorkerFactory;
+use orc::registry::{self, AgentDefinition};
+use orc::storage::Database;
+use orc::task::TaskPriority;
+use orc::worker::CodexWorker;
+use tempfile::tempdir;
+
+fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
+    AgentDefinition {
+        id: id.into(),
+        backend: "codex".into(),
+        display_name: id.into(),
+        enabled: true,
+        priority,
+        capabilities: vec!["code".into(), "terminal".into()],
+        status: status.into(),
+        unavailable_reason: None,
+        profile_path: Some(format!("/profiles/{id}")),
+        config_metadata: None,
+    }
+}
+
+#[test]
+fn registry_persists_multiple_profiles_and_reopens() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("codex-main", 100, registry::AVAILABLE))
+        .unwrap();
+    db.insert_agent(&agent("codex-secondary", 90, registry::AVAILABLE))
+        .unwrap();
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    let agents = reopened.list_agents().unwrap();
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0].backend, "codex");
+    assert_eq!(
+        agents[1].profile_path.as_deref(),
+        Some("/profiles/codex-secondary")
+    );
+}
+
+#[test]
+fn selection_filters_and_orders_deterministically() {
+    let agents = vec![
+        agent("codex-z", 100, registry::AVAILABLE),
+        agent("codex-a", 100, registry::AVAILABLE),
+        agent("disabled", 200, registry::AVAILABLE),
+        agent("unavailable", 300, registry::UNAVAILABLE),
+    ];
+    let mut agents = agents;
+    agents[2].enabled = false;
+    let required = vec!["code".into(), "terminal".into()];
+    assert_eq!(
+        registry::select_agent(&agents, &required).unwrap().id,
+        "codex-a"
+    );
+    agents[0].capabilities = vec!["code".into()];
+    assert_eq!(
+        registry::select_agent(&agents, &required).unwrap().id,
+        "codex-a"
+    );
+}
+
+#[test]
+fn enablement_and_availability_are_persisted() {
+    let dir = tempdir().unwrap();
+    let db = Database::init(dir.path().join("orc.db")).unwrap();
+    db.insert_agent(&agent("codex-main", 100, registry::AVAILABLE))
+        .unwrap();
+    assert!(db.set_agent_enabled("codex-main", false).unwrap());
+    assert!(
+        db.set_agent_availability("codex-main", registry::UNAVAILABLE, Some("quota"))
+            .unwrap()
+    );
+    let saved = db.get_agent("codex-main").unwrap().unwrap();
+    assert!(!saved.enabled);
+    assert_eq!(saved.status, registry::UNAVAILABLE);
+    assert_eq!(saved.unavailable_reason.as_deref(), Some("quota"));
+}
+
+#[test]
+fn codex_workers_and_factory_support_isolated_profiles() {
+    let first = agent("codex-main", 100, registry::AVAILABLE);
+    let second = agent("codex-secondary", 90, registry::AVAILABLE);
+    let first_worker = WorkerFactory::build(&first).unwrap();
+    let second_worker = WorkerFactory::build(&second).unwrap();
+    assert_eq!(
+        CodexWorker::command_args("inspect"),
+        vec!["exec", "--sandbox", "workspace-write", "inspect"]
+    );
+    assert_ne!(first.profile_path, second.profile_path);
+    drop((first_worker, second_worker));
+}
+
+#[test]
+fn agent_run_history_keeps_selected_ids_distinct() {
+    let dir = tempdir().unwrap();
+    let db = Database::init(dir.path().join("orc.db")).unwrap();
+    let project = db.create_project("project").unwrap();
+    db.insert_task(project, "First", "First task", "dev", TaskPriority::Normal)
+        .unwrap();
+    db.insert_task(
+        project,
+        "Second",
+        "Second task",
+        "dev",
+        TaskPriority::Normal,
+    )
+    .unwrap();
+    let first = db
+        .create_agent_run(project, "T-0001", "codex-main")
+        .unwrap();
+    let second = db
+        .create_agent_run(project, "T-0002", "codex-secondary")
+        .unwrap();
+    let runs = db.list_agent_runs(project, 10).unwrap();
+    let ids: Vec<_> = runs
+        .iter()
+        .filter(|run| run.id == first || run.id == second)
+        .map(|run| run.agent.as_str())
+        .collect();
+    assert!(ids.contains(&"codex-main"));
+    assert!(ids.contains(&"codex-secondary"));
+}

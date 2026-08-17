@@ -1,7 +1,9 @@
 //! Worker abstraction for executing tasks.
 //! Keeps provider-specific logic behind this interface so tests can inject fake workers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::backend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
@@ -25,21 +27,23 @@ pub struct CopilotWorker;
 
 impl Worker for CopilotWorker {
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
-        use std::process::{Command, Stdio};
+        use std::process::Command;
 
         let mut cmd = Command::new("copilot");
         cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
-        cmd.current_dir(cwd);
-        cmd.stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::inherit());
+        backend::configure_noninteractive(&mut cmd, cwd);
 
-        match cmd.status() {
+        match cmd.output() {
             Ok(status) => {
-                if status.success() {
-                    Ok((WorkerOutcome::Success, None))
+                if status.status.success() {
+                    let output = String::from_utf8_lossy(&status.stdout).to_string();
+                    Ok((
+                        WorkerOutcome::Success,
+                        (!output.is_empty()).then_some(output),
+                    ))
                 } else {
                     let code = status
+                        .status
                         .code()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "unknown".into());
@@ -49,6 +53,63 @@ impl Worker for CopilotWorker {
             Err(e) => Err(format!(
                 "failed to spawn 'copilot' executable; ensure it is installed and on PATH: {}",
                 e
+            )),
+        }
+    }
+}
+
+/// Codex CLI worker. The optional profile is isolated through CODEX_HOME.
+pub struct CodexWorker {
+    pub profile_path: Option<PathBuf>,
+}
+
+impl CodexWorker {
+    pub fn new(profile_path: Option<PathBuf>) -> Self {
+        Self { profile_path }
+    }
+
+    pub fn command_args(prompt: &str) -> Vec<String> {
+        vec![
+            "exec".into(),
+            "--sandbox".into(),
+            "workspace-write".into(),
+            prompt.into(),
+        ]
+    }
+}
+
+impl Worker for CodexWorker {
+    fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let mut command = std::process::Command::new("codex");
+        command.args(Self::command_args(prompt));
+        backend::apply_profile_environment(&mut command, self.profile_path.as_deref());
+        backend::configure_noninteractive(&mut command, cwd);
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let combined = if stderr.is_empty() {
+                    stdout
+                } else if stdout.is_empty() {
+                    stderr
+                } else {
+                    format!("{stdout}\n{stderr}")
+                };
+                Ok((
+                    WorkerOutcome::Success,
+                    (!combined.is_empty()).then_some(combined),
+                ))
+            }
+            Ok(output) => {
+                let code = output
+                    .status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                Err(format!("Codex exited with non-zero status: {code}"))
+            }
+            Err(error) => Err(format!(
+                "failed to spawn 'codex' executable; ensure it is installed and on PATH: {error}"
             )),
         }
     }

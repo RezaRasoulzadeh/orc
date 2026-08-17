@@ -4,6 +4,7 @@ use orc::adoption;
 use orc::agent;
 use orc::discovery;
 use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
+use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
 
 const DB_PATH: &str = ".orc/orc.db";
@@ -26,6 +27,8 @@ enum Command {
     ApplyDiscovery {
         path: String,
     },
+    /// List registered agents.
+    Agents,
     Status,
     Ask {
         request: String,
@@ -34,10 +37,17 @@ enum Command {
         /// Path to JSON response file produced by the engineering lead (use - for stdin)
         path: String,
     },
-    /// Dispatch a worker to execute a single task using Copilot
+    /// Dispatch a task using a selected registered agent
     Dispatch {
         /// Task ID to dispatch (e.g., T-0001)
         task_id: String,
+        /// Explicit agent override; selection validity checks still apply.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     Task {
         #[command(subcommand)]
@@ -47,6 +57,40 @@ enum Command {
     Runs {
         /// Optional task ID to filter runs for a specific task
         task_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    List,
+    Add {
+        id: String,
+        #[arg(long)]
+        backend: String,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        #[arg(long)]
+        capability: Vec<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Unavailable {
+        id: String,
+        reason: String,
+    },
+    Available {
+        id: String,
+    },
+    Show {
+        id: String,
     },
 }
 
@@ -103,6 +147,10 @@ fn main() -> Result<()> {
             let response = discovery::parse_response(&data)?;
             discovery::apply_response(".", &response)?;
             println!("Applied repository discovery.");
+        }
+        Command::Agents => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            print_agents(&db)?;
         }
         Command::Status => match Database::open(DB_PATH) {
             Ok(db) => {
@@ -163,10 +211,76 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("Applied response to DB.");
         }
-        Command::Dispatch { task_id } => {
-            if let Err(e) = agent::dispatch(&task_id) {
+        Command::Dispatch { task_id, agent } => {
+            if let Err(e) = agent::dispatch_selected(&task_id, agent.as_deref()) {
                 eprintln!("Dispatch failed: {:#}", e);
                 return Err(e);
+            }
+        }
+        Command::Agent { command } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            match command {
+                AgentCommand::List => {
+                    print_agents(&db)?;
+                }
+                AgentCommand::Add {
+                    id,
+                    backend,
+                    priority,
+                    capability,
+                    display_name,
+                    profile,
+                } => {
+                    registry::validate_backend(&backend)?;
+                    let agent = AgentDefinition {
+                        display_name: display_name.unwrap_or_else(|| id.clone()),
+                        id,
+                        backend,
+                        enabled: true,
+                        priority,
+                        capabilities: capability,
+                        status: registry::AVAILABLE.to_owned(),
+                        unavailable_reason: None,
+                        profile_path: profile,
+                        config_metadata: None,
+                    };
+                    db.insert_agent(&agent).map_err(|e| anyhow::anyhow!(e))?;
+                    println!("Added agent {}", agent.id);
+                }
+                AgentCommand::Enable { id } => update_agent_enabled(&db, &id, true)?,
+                AgentCommand::Disable { id } => update_agent_enabled(&db, &id, false)?,
+                AgentCommand::Unavailable { id, reason } => {
+                    ensure_agent_updated(
+                        db.set_agent_availability(&id, registry::UNAVAILABLE, Some(&reason))
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        &id,
+                    )?;
+                }
+                AgentCommand::Available { id } => {
+                    ensure_agent_updated(
+                        db.set_agent_availability(&id, registry::AVAILABLE, None)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        &id,
+                    )?;
+                }
+                AgentCommand::Show { id } => {
+                    let agent = registry::get_agent(&db, &id)?;
+                    println!("ID:                 {}", agent.id);
+                    println!("Backend:            {}", agent.backend);
+                    println!("Display name:       {}", agent.display_name);
+                    println!("Enabled:            {}", agent.enabled);
+                    println!("Availability:       {}", agent.status);
+                    println!(
+                        "Unavailable reason: {}",
+                        agent.unavailable_reason.as_deref().unwrap_or("-")
+                    );
+                    println!("Priority:            {}", agent.priority);
+                    println!("Capabilities:        {}", agent.capabilities.join(", "));
+                    println!(
+                        "Profile/config:      {}",
+                        agent.profile_path.as_deref().unwrap_or("-")
+                    );
+                }
             }
         }
         Command::Task { command } => match command {
@@ -292,5 +406,42 @@ fn main() -> Result<()> {
         },
     }
 
+    Ok(())
+}
+
+fn update_agent_enabled(db: &Database, id: &str, enabled: bool) -> Result<()> {
+    ensure_agent_updated(
+        db.set_agent_enabled(id, enabled)
+            .map_err(|e| anyhow::anyhow!(e))?,
+        id,
+    )
+}
+
+fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
+    if !changed {
+        anyhow::bail!("agent '{}' is not registered", id);
+    }
+    Ok(())
+}
+
+fn print_agents(db: &Database) -> Result<()> {
+    println!(
+        "{:<18} {:<9} {:<12} {:<10} PROFILE",
+        "ID", "BACKEND", "STATUS", "PRIORITY"
+    );
+    for agent in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
+        println!(
+            "{:<18} {:<9} {:<12} {:<10} {}",
+            agent.id,
+            agent.backend,
+            if agent.enabled {
+                agent.status.as_str()
+            } else {
+                "disabled"
+            },
+            agent.priority,
+            agent.profile_path.as_deref().unwrap_or("-")
+        );
+    }
     Ok(())
 }

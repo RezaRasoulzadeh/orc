@@ -1,3 +1,4 @@
+use crate::registry::AgentDefinition;
 use crate::task::{Task, TaskPriority, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
@@ -51,6 +52,18 @@ impl Database {
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (project_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                backend TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 0,
+                capabilities TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available',
+                unavailable_reason TEXT,
+                profile_path TEXT,
+                config_metadata TEXT
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -114,12 +127,20 @@ impl Database {
         }
         let conn = Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Self::configure(&conn)?;
+        Self::ensure_registry_schema(&conn)?;
         Ok(Self { conn })
     }
 
     fn configure(conn: &Connection) -> Result<(), DbError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        Ok(())
+    }
+
+    fn ensure_registry_schema(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
+        )?;
         Ok(())
     }
 
@@ -145,6 +166,83 @@ impl Database {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                agent.id,
+                agent.backend,
+                agent.display_name,
+                agent.enabled,
+                agent.priority,
+                serde_json::to_string(&agent.capabilities)?,
+                agent.status,
+                agent.unavailable_reason,
+                agent.profile_path,
+                agent.config_metadata,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<AgentDefinition> {
+        let capabilities_json: String = row.get(5)?;
+        let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
+            rusqlite::Error::InvalidParameterName(format!("invalid agent capabilities: {error}"))
+        })?;
+        Ok(AgentDefinition {
+            id: row.get(0)?,
+            backend: row.get(1)?,
+            display_name: row.get(2)?,
+            enabled: row.get::<_, i64>(3)? != 0,
+            priority: row.get(4)?,
+            capabilities,
+            status: row.get(6)?,
+            unavailable_reason: row.get(7)?,
+            profile_path: row.get(8)?,
+            config_metadata: row.get(9)?,
+        })
+    }
+
+    pub fn get_agent(&self, id: &str) -> Result<Option<AgentDefinition>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata FROM agents WHERE id = ?1",
+                params![id],
+                Self::agent_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata FROM agents ORDER BY id",
+        )?;
+        Ok(statement
+            .query_map([], Self::agent_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET enabled = ?1 WHERE id = ?2",
+            params![enabled, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_availability(
+        &self,
+        id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET status = ?1, unavailable_reason = ?2 WHERE id = ?3",
+            params![status, reason, id],
+        )? != 0)
     }
 
     pub fn store_discovery_facts(

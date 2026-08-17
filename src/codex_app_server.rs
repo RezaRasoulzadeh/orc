@@ -37,7 +37,7 @@ pub struct CreditsSnapshot {
 }
 
 pub trait RateLimitProvider {
-    fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String>;
+    fn read(&self, profile_path: &Path) -> Result<QuotaSnapshot, String>;
 }
 
 pub type AgentSyncResult = (String, Result<QuotaSnapshot, String>);
@@ -45,7 +45,7 @@ pub type AgentSyncResult = (String, Result<QuotaSnapshot, String>);
 pub struct CodexAppServer;
 
 impl RateLimitProvider for CodexAppServer {
-    fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String> {
+    fn read(&self, profile_path: &Path) -> Result<QuotaSnapshot, String> {
         let mut client = StdioClient::start(profile_path)?;
         client.initialize()?;
         client.read_rate_limits()
@@ -154,7 +154,13 @@ pub fn sync_agent(
             agent.id, agent.backend
         ));
     }
-    let snapshot = provider.read(agent.profile_path.as_deref().map(Path::new))?;
+    let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
+        format!(
+            "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
+            agent.id, agent.id
+        )
+    })?;
+    let snapshot = provider.read(Path::new(profile_path))?;
     db.set_agent_synced_quota(
         &agent.id,
         snapshot.remaining_percent,
@@ -268,7 +274,7 @@ struct StdioClient {
 }
 
 impl StdioClient {
-    fn start(profile_path: Option<&Path>) -> Result<Self, String> {
+    fn start(profile_path: &Path) -> Result<Self, String> {
         let mut command = Command::new("codex");
         command
             .args(["app-server", "--stdio"])
@@ -371,15 +377,15 @@ mod tests {
 
     struct FakeProvider {
         results: HashMap<String, Result<QuotaSnapshot, String>>,
-        profiles: Mutex<Vec<Option<String>>>,
+        profiles: Mutex<Vec<String>>,
     }
 
     impl RateLimitProvider for FakeProvider {
-        fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String> {
-            let profile = profile_path.map(|path| path.display().to_string());
+        fn read(&self, profile_path: &Path) -> Result<QuotaSnapshot, String> {
+            let profile = profile_path.display().to_string();
             self.profiles.lock().unwrap().push(profile.clone());
             self.results
-                .get(profile.as_deref().unwrap_or(""))
+                .get(&profile)
                 .cloned()
                 .unwrap_or_else(|| Err("fixture missing".into()))
         }
@@ -588,8 +594,26 @@ mod tests {
         assert_eq!(work.quota_reset_at.as_deref(), Some("1787500000"));
         assert_eq!(
             provider.profiles.into_inner().unwrap(),
-            vec![Some("/profiles/main".into()), Some("/profiles/work".into())]
+            vec!["/profiles/main", "/profiles/work"]
         );
+    }
+
+    #[test]
+    fn sync_rejects_codex_agent_without_profile_before_provider_call() {
+        let directory = tempdir().unwrap();
+        let db = Database::init(directory.path().join("orc.db")).unwrap();
+        let mut missing = agent("codex-missing", "codex", "/profiles/unused");
+        missing.profile_path = None;
+        db.insert_agent(&missing).unwrap();
+        let provider = FakeProvider {
+            results: HashMap::new(),
+            profiles: Mutex::new(vec![]),
+        };
+
+        let error = sync_agent(&db, &missing, &provider).unwrap_err();
+        assert!(error.contains("codex-missing"));
+        assert!(error.contains("profile path"));
+        assert!(provider.profiles.into_inner().unwrap().is_empty());
     }
 
     #[test]

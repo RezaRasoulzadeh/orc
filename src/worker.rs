@@ -16,6 +16,11 @@ pub enum WorkerOutcome {
 /// Trait for task execution backends.
 /// Implementations are responsible for executing a task and returning the outcome.
 pub trait Worker: Send + Sync {
+    /// Provider environment required to execute this worker, if any.
+    fn configured_environment(&self) -> Option<(&'static str, &Path)> {
+        None
+    }
+
     /// Execute a task with the given prompt and return the outcome.
     /// output may contain captured stdout/stderr or other useful diagnostic information.
     /// cwd is the working directory in which the task should execute.
@@ -58,13 +63,13 @@ impl Worker for CopilotWorker {
     }
 }
 
-/// Codex CLI worker. The optional profile is isolated through CODEX_HOME.
+/// Codex CLI worker. Its required profile is isolated through CODEX_HOME.
 pub struct CodexWorker {
-    pub profile_path: Option<PathBuf>,
+    pub profile_path: PathBuf,
 }
 
 impl CodexWorker {
-    pub fn new(profile_path: Option<PathBuf>) -> Self {
+    pub fn new(profile_path: PathBuf) -> Self {
         Self { profile_path }
     }
 
@@ -76,15 +81,23 @@ impl CodexWorker {
             prompt.into(),
         ]
     }
+
+    fn command(&self, prompt: &str, cwd: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("codex");
+        command.args(Self::command_args(prompt));
+        backend::apply_profile_environment(&mut command, &self.profile_path);
+        backend::configure_noninteractive(&mut command, cwd);
+        command
+    }
 }
 
 impl Worker for CodexWorker {
+    fn configured_environment(&self) -> Option<(&'static str, &Path)> {
+        Some(("CODEX_HOME", &self.profile_path))
+    }
+
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
-        let mut command = std::process::Command::new("codex");
-        command.args(Self::command_args(prompt));
-        backend::apply_profile_environment(&mut command, self.profile_path.as_deref());
-        backend::configure_noninteractive(&mut command, cwd);
-        match command.output() {
+        match self.command(prompt, cwd).output() {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -167,6 +180,29 @@ impl Worker for AntigravityWorker {
                 "failed to spawn 'agy' executable; ensure it is installed and on PATH: {error}"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_commands_receive_the_registered_profile_environment() {
+        let main = CodexWorker::new(PathBuf::from("/profiles/main"));
+        let third = CodexWorker::new(PathBuf::from("/profiles/third"));
+        let profile = |worker: &CodexWorker| {
+            worker
+                .command("inspect", Path::new("."))
+                .get_envs()
+                .find(|(key, _)| *key == "CODEX_HOME")
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(profile(&main).as_deref(), Some("/profiles/main"));
+        assert_eq!(profile(&third).as_deref(), Some("/profiles/third"));
     }
 }
 

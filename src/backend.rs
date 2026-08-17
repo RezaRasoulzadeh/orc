@@ -25,20 +25,26 @@ pub fn check_health(
     }
     match agent.backend.as_str() {
         "codex" => {
+            let profile = agent.profile_path.as_deref().map(Path::new).ok_or_else(|| {
+                format!(
+                    "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
+                    agent.id, agent.id
+                )
+            })?;
             if !runner.executable_exists("codex") {
                 return Err("provider CLI 'codex' not found".into());
             }
-            let profile = agent.profile_path.as_deref().map(Path::new);
-            if let Some(path) = profile
-                && !path.is_dir()
-            {
-                return Err(format!("profile path does not exist: {}", path.display()));
+            if !profile.is_dir() {
+                return Err(format!(
+                    "profile path does not exist: {}",
+                    profile.display()
+                ));
             }
             runner.run(
                 "codex",
                 &["login", "status"],
                 cwd,
-                profile.map(|path| ("CODEX_HOME", path)),
+                Some(("CODEX_HOME", profile)),
             )
         }
         "copilot" => {
@@ -63,9 +69,15 @@ impl WorkerFactory {
     pub fn build(agent: &AgentDefinition) -> Result<Box<dyn Worker>, String> {
         match agent.backend.as_str() {
             "copilot" => Ok(Box::new(CopilotWorker)),
-            "codex" => Ok(Box::new(CodexWorker::new(
-                agent.profile_path.as_deref().map(PathBuf::from),
-            ))),
+            "codex" => {
+                let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
+                    format!(
+                        "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
+                        agent.id, agent.id
+                    )
+                })?;
+                Ok(Box::new(CodexWorker::new(PathBuf::from(profile_path))))
+            }
             "antigravity" => Ok(Box::new(AntigravityWorker)),
             backend => Err(format!(
                 "unsupported agent backend '{}'; supported backends: copilot, codex, antigravity",
@@ -75,11 +87,9 @@ impl WorkerFactory {
     }
 }
 
-pub(crate) fn apply_profile_environment(command: &mut Command, profile_path: Option<&Path>) {
-    if let Some(profile_path) = profile_path {
-        // Credentials remain managed by the Codex CLI and are never copied into Orc's database.
-        command.env("CODEX_HOME", profile_path);
-    }
+pub(crate) fn apply_profile_environment(command: &mut Command, profile_path: &Path) {
+    // Credentials remain managed by the Codex CLI and are never copied into Orc's database.
+    command.env("CODEX_HOME", profile_path);
 }
 
 pub(crate) fn configure_noninteractive(command: &mut Command, cwd: &Path) {
@@ -97,7 +107,7 @@ mod tests {
     #[test]
     fn profile_environment_is_scoped_to_the_codex_command() {
         let mut command = Command::new("codex");
-        apply_profile_environment(&mut command, Some(Path::new("/profiles/main")));
+        apply_profile_environment(&mut command, Path::new("/profiles/main"));
         let value = command
             .get_envs()
             .find(|(key, _)| *key == "CODEX_HOME")

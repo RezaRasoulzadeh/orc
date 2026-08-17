@@ -327,6 +327,13 @@ impl Database {
         )? != 0)
     }
 
+    pub fn set_agent_profile_path(&self, id: &str, profile_path: &str) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET profile_path = ?1 WHERE id = ?2",
+            params![profile_path, id],
+        )? != 0)
+    }
+
     pub fn set_agent_execution_mode(
         &self,
         id: &str,

@@ -137,6 +137,11 @@ enum AgentCommand {
         id: String,
         priority: i64,
     },
+    /// Set the configuration profile directory for an existing agent.
+    Profile {
+        id: String,
+        path: String,
+    },
     Quota {
         id: String,
         #[arg(long, value_parser = clap::value_parser!(i64).range(0..=100))]
@@ -439,6 +444,11 @@ fn main() -> Result<()> {
                 }
                 AgentCommand::Priority { id, priority } => ensure_agent_updated(
                     db.set_agent_priority(&id, priority)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    &id,
+                )?,
+                AgentCommand::Profile { id, path } => ensure_agent_updated(
+                    db.set_agent_profile_path(&id, &path)
                         .map_err(|e| anyhow::anyhow!(e))?,
                     &id,
                 )?,

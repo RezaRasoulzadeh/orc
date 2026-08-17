@@ -103,16 +103,72 @@ fn enablement_and_availability_are_persisted() {
 
 #[test]
 fn codex_workers_and_factory_support_isolated_profiles() {
-    let first = agent("codex-main", 100, registry::AVAILABLE);
-    let second = agent("codex-secondary", 90, registry::AVAILABLE);
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("codex-main", 100, registry::AVAILABLE))
+        .unwrap();
+    db.insert_agent(&agent("codex-secondary", 90, registry::AVAILABLE))
+        .unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    let first = db.get_agent("codex-main").unwrap().unwrap();
+    let second = db.get_agent("codex-secondary").unwrap().unwrap();
     let first_worker = WorkerFactory::build(&first).unwrap();
     let second_worker = WorkerFactory::build(&second).unwrap();
     assert_eq!(
         CodexWorker::command_args("inspect"),
         vec!["exec", "--sandbox", "workspace-write", "inspect"]
     );
-    assert_ne!(first.profile_path, second.profile_path);
-    drop((first_worker, second_worker));
+    assert_eq!(
+        first_worker.configured_environment().map(|(_, path)| path),
+        Some(std::path::Path::new("/profiles/codex-main"))
+    );
+    assert_eq!(
+        second_worker.configured_environment().map(|(_, path)| path),
+        Some(std::path::Path::new("/profiles/codex-secondary"))
+    );
+}
+
+#[test]
+fn codex_worker_factory_rejects_missing_profile() {
+    let mut definition = agent("codex-missing", 100, registry::AVAILABLE);
+    definition.profile_path = None;
+    let error = match WorkerFactory::build(&definition) {
+        Ok(_) => panic!("missing Codex profile unexpectedly built a worker"),
+        Err(error) => error,
+    };
+    assert!(error.contains("codex-missing"));
+    assert!(error.contains("profile path"));
+}
+
+#[test]
+fn profile_update_persists_across_reopen_and_rejects_missing_agent() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("codex-third", 100, registry::AVAILABLE))
+        .unwrap();
+    assert!(
+        db.set_agent_profile_path("codex-third", "/profiles/third")
+            .unwrap()
+    );
+    assert!(
+        !db.set_agent_profile_path("missing-agent", "/profiles/missing")
+            .unwrap()
+    );
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_agent("codex-third")
+            .unwrap()
+            .unwrap()
+            .profile_path
+            .as_deref(),
+        Some("/profiles/third")
+    );
 }
 
 #[test]

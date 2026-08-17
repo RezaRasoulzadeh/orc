@@ -26,12 +26,15 @@ impl HealthCommandRunner for FakeRunner {
         executable: &str,
         args: &[&str],
         _cwd: &Path,
-        _env: Option<(&str, &Path)>,
+        env: Option<(&str, &Path)>,
     ) -> Result<(), String> {
-        self.commands.borrow_mut().push((
-            executable.into(),
-            args.iter().map(|arg| (*arg).into()).collect(),
-        ));
+        let mut recorded = args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>();
+        if let Some((key, value)) = env {
+            recorded.push(format!("{key}={}", value.display()));
+        }
+        self.commands
+            .borrow_mut()
+            .push((executable.into(), recorded));
         Ok(())
     }
 }
@@ -86,11 +89,13 @@ fn healthy_project_checks_auth_without_an_ai_request() {
     let report = doctor::inspect(&root, &runner);
     assert_eq!(report.overall(), "OK");
     let commands = runner.commands.borrow();
-    assert!(
-        commands
-            .iter()
-            .any(|(program, args)| program == "codex" && args == &["login", "status"])
-    );
+    assert!(commands.iter().any(|(program, args)| program == "codex"
+        && args
+            == &[
+                "login",
+                "status",
+                &format!("CODEX_HOME={}", profile.display())
+            ]));
     assert!(
         !commands
             .iter()
@@ -157,6 +162,31 @@ fn missing_provider_cli_is_reported_through_lookup_abstraction() {
         report.agents[0].status,
         CheckStatus::Unavailable(_)
     ));
+}
+
+#[test]
+fn missing_codex_profile_is_reported_without_running_login_status() {
+    let (_dir, root) = project();
+    Database::open(root.join(".orc/orc.db"))
+        .unwrap()
+        .insert_agent(&agent("codex", None))
+        .unwrap();
+    let runner = FakeRunner {
+        commands: RefCell::new(vec![]),
+        codex_exists: true,
+        agy_exists: true,
+    };
+    let report = doctor::inspect(&root, &runner);
+    assert!(
+        matches!(report.agents[0].status, CheckStatus::Unavailable(ref error) if error.contains("agent") && error.contains("profile path"))
+    );
+    assert!(
+        !runner
+            .commands
+            .borrow()
+            .iter()
+            .any(|(program, _)| program == "codex")
+    );
 }
 
 #[test]

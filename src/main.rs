@@ -497,7 +497,12 @@ fn main() -> Result<()> {
                         println!("Effective limit:    {}", limits.effective);
                         print_quota_limit("Primary limit:", limits.primary.as_ref());
                         print_quota_limit("Secondary limit:", limits.secondary.as_ref());
-                        print_quota_limit("Monthly limit:", limits.monthly.as_ref());
+                        if let Some(limit) = &limits.individual_limit {
+                            println!(
+                                "Individual limit:   {}% remaining, reset {}",
+                                limit.remaining_percent, limit.reset_at
+                            );
+                        }
                     }
                     println!("Capabilities:        {}", agent.capabilities.join(", "));
                     println!(

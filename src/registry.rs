@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::collections::BTreeMap;
 
 use crate::storage::Database;
 
@@ -10,11 +11,28 @@ pub struct QuotaLimit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndividualQuotaLimit {
+    pub limit: String,
+    pub used: String,
+    pub remaining_percent: i64,
+    pub reset_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaLimitBucket {
+    pub primary: Option<QuotaLimit>,
+    pub secondary: Option<QuotaLimit>,
+    pub individual_limit: Option<IndividualQuotaLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaLimits {
     pub primary: Option<QuotaLimit>,
     pub secondary: Option<QuotaLimit>,
     #[serde(default)]
-    pub monthly: Option<QuotaLimit>,
+    pub individual_limit: Option<IndividualQuotaLimit>,
+    #[serde(default)]
+    pub by_limit_id: BTreeMap<String, QuotaLimitBucket>,
     pub effective: String,
 }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -8,7 +9,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::apply_profile_environment;
-use crate::registry::{AgentDefinition, QuotaLimit, QuotaLimits};
+use crate::registry::{
+    AgentDefinition, IndividualQuotaLimit, QuotaLimit, QuotaLimitBucket, QuotaLimits,
+};
 use crate::storage::Database;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,22 +87,42 @@ pub fn parse_rate_limits_response(value: Value) -> Result<QuotaSnapshot, String>
         .map_err(|error| format!("malformed rate-limit response: {error}"))?;
     let primary = result.rate_limits.primary.map(QuotaLimit::from);
     let secondary = result.rate_limits.secondary.map(QuotaLimit::from);
-    let monthly = result.rate_limits.monthly.map(QuotaLimit::from);
-    let (effective, effective_name) = if let Some(limit) = monthly.as_ref() {
-        (limit, "monthly")
-    } else if let Some(limit) = secondary.as_ref() {
-        (limit, "secondary")
-    } else if let Some(limit) = primary.as_ref() {
-        (limit, "primary")
-    } else {
-        return Err(
-            "Codex rate-limit response has no primary, secondary, or monthly limit".to_owned(),
-        );
-    };
+    let individual_limit = result
+        .rate_limits
+        .individual_limit
+        .map(IndividualQuotaLimit::from);
+    let (remaining_percent, reset_at, window_duration_mins, effective_name) =
+        if let Some(limit) = individual_limit.as_ref() {
+            (
+                limit.remaining_percent,
+                Some(limit.reset_at),
+                None,
+                "individualLimit",
+            )
+        } else if let Some(limit) = secondary.as_ref() {
+            (
+                limit.remaining_percent,
+                limit.reset_at,
+                limit.window_duration_mins,
+                "secondary",
+            )
+        } else if let Some(limit) = primary.as_ref() {
+            (
+                limit.remaining_percent,
+                limit.reset_at,
+                limit.window_duration_mins,
+                "primary",
+            )
+        } else {
+            return Err(
+                "Codex rate-limit response has no individualLimit, secondary, or primary limit"
+                    .to_owned(),
+            );
+        };
     Ok(QuotaSnapshot {
-        remaining_percent: effective.remaining_percent,
-        reset_at: effective.reset_at,
-        window_duration_mins: effective.window_duration_mins,
+        remaining_percent,
+        reset_at,
+        window_duration_mins,
         rate_limit_reached_type: result.rate_limits.rate_limit_reached_type,
         credits: result.rate_limits.credits,
         reset_credits_available: result
@@ -108,7 +131,13 @@ pub fn parse_rate_limits_response(value: Value) -> Result<QuotaSnapshot, String>
         limits: QuotaLimits {
             primary,
             secondary,
-            monthly,
+            individual_limit,
+            by_limit_id: result
+                .rate_limits_by_limit_id
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, snapshot)| (id, QuotaLimitBucket::from(snapshot)))
+                .collect(),
             effective: effective_name.to_owned(),
         },
     })
@@ -164,6 +193,7 @@ struct RpcResponse {
 #[serde(rename_all = "camelCase")]
 struct RateLimitsResponse {
     rate_limits: RateLimitSnapshot,
+    rate_limits_by_limit_id: Option<BTreeMap<String, RateLimitSnapshot>>,
     rate_limit_reset_credits: Option<ResetCreditsSummary>,
 }
 
@@ -172,9 +202,39 @@ struct RateLimitsResponse {
 struct RateLimitSnapshot {
     primary: Option<RateLimitWindow>,
     secondary: Option<RateLimitWindow>,
-    monthly: Option<RateLimitWindow>,
+    individual_limit: Option<SpendControlLimitSnapshot>,
     rate_limit_reached_type: Option<String>,
     credits: Option<CreditsSnapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpendControlLimitSnapshot {
+    limit: String,
+    used: String,
+    remaining_percent: i64,
+    resets_at: i64,
+}
+
+impl From<SpendControlLimitSnapshot> for IndividualQuotaLimit {
+    fn from(value: SpendControlLimitSnapshot) -> Self {
+        Self {
+            limit: value.limit,
+            used: value.used,
+            remaining_percent: value.remaining_percent.clamp(0, 100),
+            reset_at: value.resets_at,
+        }
+    }
+}
+
+impl From<RateLimitSnapshot> for QuotaLimitBucket {
+    fn from(value: RateLimitSnapshot) -> Self {
+        Self {
+            primary: value.primary.map(QuotaLimit::from),
+            secondary: value.secondary.map(QuotaLimit::from),
+            individual_limit: value.individual_limit.map(IndividualQuotaLimit::from),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -361,7 +421,8 @@ mod tests {
                     window_duration_mins: Some(10080),
                 }),
                 secondary: None,
-                monthly: None,
+                individual_limit: None,
+                by_limit_id: BTreeMap::new(),
                 effective: "primary".into(),
             },
         }
@@ -405,24 +466,39 @@ mod tests {
     }
 
     #[test]
-    fn free_account_uses_monthly_limit() {
+    fn individual_limit_overrides_primary_and_preserves_limit_buckets() {
         let result = parse_rate_limits_response(json!({
             "id": 2,
             "result": {"rateLimits": {
                 "primary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1787000000},
-                "monthly": {"usedPercent": 1, "windowDurationMins": 43200, "resetsAt": 1789000000}
+                "individualLimit": {"limit": "1000", "used": "10", "remainingPercent": 99, "resetsAt": 1789000000}
+            }, "rateLimitsByLimitId": {
+                "codex": {"primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1787100000}}
             }}
         }))
         .unwrap();
 
         assert_eq!(result.remaining_percent, 99);
         assert_eq!(result.reset_at, Some(1789000000));
-        assert_eq!(result.window_duration_mins, Some(43200));
-        assert_eq!(result.limits.effective, "monthly");
+        assert_eq!(result.window_duration_mins, None);
+        assert_eq!(result.limits.effective, "individualLimit");
         assert_eq!(result.limits.primary.as_ref().unwrap().remaining_percent, 1);
         assert_eq!(
-            result.limits.monthly.as_ref().unwrap().remaining_percent,
+            result
+                .limits
+                .individual_limit
+                .as_ref()
+                .unwrap()
+                .remaining_percent,
             99
+        );
+        assert_eq!(
+            result.limits.by_limit_id["codex"]
+                .primary
+                .as_ref()
+                .unwrap()
+                .remaining_percent,
+            75
         );
     }
 
@@ -455,7 +531,7 @@ mod tests {
                 "id": 2, "result": {"rateLimits": {"primary": null}}
             }))
             .unwrap_err()
-            .contains("no primary")
+            .contains("no individualLimit")
         );
         assert!(parse_rate_limits_response(json!({"id": 2, "result": []})).is_err());
     }
@@ -514,6 +590,64 @@ mod tests {
             provider.profiles.into_inner().unwrap(),
             vec![Some("/profiles/main".into()), Some("/profiles/work".into())]
         );
+    }
+
+    #[test]
+    fn structured_individual_quota_survives_reopen_and_scheduler_uses_flattened_value() {
+        use crate::scheduler;
+        use crate::task::{Task, TaskPriority, TaskStatus};
+
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("orc.db");
+        let db = Database::init(&database_path).unwrap();
+        let mut registered = agent("codex-main", "codex", "/profiles/main");
+        registered.capabilities = vec!["code".into(), "terminal".into()];
+        db.insert_agent(&registered).unwrap();
+        let parsed = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1787000000},
+                "individualLimit": {"limit": "1000", "used": "10", "remainingPercent": 99, "resetsAt": 1789000000}
+            }}
+        }))
+        .unwrap();
+        let provider = FakeProvider {
+            results: HashMap::from([("/profiles/main".into(), Ok(parsed))]),
+            profiles: Mutex::new(vec![]),
+        };
+        sync_agent(&db, &registered, &provider).unwrap();
+        drop(db);
+
+        let reopened = Database::open(&database_path).unwrap();
+        let stored = reopened.get_agent("codex-main").unwrap().unwrap();
+        assert_eq!(stored.quota_remaining_percent, Some(99));
+        assert_eq!(
+            stored.quota_limits.as_ref().unwrap().effective,
+            "individualLimit"
+        );
+        assert_eq!(
+            stored
+                .quota_limits
+                .as_ref()
+                .unwrap()
+                .individual_limit
+                .as_ref()
+                .unwrap()
+                .reset_at,
+            1789000000
+        );
+
+        let task = Task {
+            id: "T-quota".into(),
+            title: "quota regression".into(),
+            objective: "verify scheduling".into(),
+            role: "developer".into(),
+            priority: TaskPriority::Normal,
+            status: TaskStatus::Ready,
+            required_capabilities: vec![],
+        };
+        let decision = scheduler::schedule(&task, &[stored], None).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("codex-main"));
     }
 
     #[test]

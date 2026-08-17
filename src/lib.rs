@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod git;
 pub mod protocol;
 pub mod registry;
+pub mod scheduler;
 pub mod state;
 pub mod storage;
 pub mod task;
@@ -16,6 +17,10 @@ pub mod worker;
 
 // Re-export useful types for tests
 pub use protocol::*;
+pub use scheduler::{
+    CandidateEvaluation, CandidateStatus, RejectionReason, ScheduleDecision, SelectionReason,
+    evaluate_candidate, is_backend_mode_supported, schedule, validate_override,
+};
 pub use state::*;
 pub use storage::Database;
 pub use task::*;

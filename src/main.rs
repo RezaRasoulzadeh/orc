@@ -53,6 +53,17 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Schedule an agent for a task using deterministic selection rules
+    Schedule {
+        /// Task ID to schedule (e.g., T-0001)
+        task_id: String,
+        /// Explain candidate evaluations and selection reasoning
+        #[arg(long)]
+        explain: bool,
+        /// Restrict selection to a specific execution mode
+        #[arg(long, value_parser = ["automated", "manual"])]
+        mode: Option<String>,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -152,6 +163,14 @@ enum TaskCommand {
     Show {
         /// Task ID to display
         task_id: String,
+    },
+    /// Set required capabilities for a task
+    Require {
+        /// Task ID to configure
+        task_id: String,
+        /// Required capabilities (e.g. code terminal architecture review)
+        #[arg(required = true, num_args = 1..)]
+        capabilities: Vec<String>,
     },
     /// Show the diff for a task worktree
     Diff {
@@ -270,6 +289,31 @@ fn main() -> Result<()> {
             if let Err(e) = agent::dispatch_selected(&task_id, agent.as_deref()) {
                 eprintln!("Dispatch failed: {:#}", e);
                 return Err(e);
+            }
+        }
+        Command::Schedule {
+            task_id,
+            explain,
+            mode,
+        } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let task = db
+                .get_task(&task_id)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .ok_or_else(|| anyhow::anyhow!("task '{}' not found in DB", task_id))?;
+            let agents = db.list_agents().map_err(|e| anyhow::anyhow!(e))?;
+            let decision = orc::scheduler::schedule(&task, &agents, mode.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if explain {
+                println!("{}", decision.format_explanation());
+            } else {
+                match &decision.selected_agent_id {
+                    Some(id) => println!("Selected: {}", id),
+                    None => {
+                        eprintln!("No eligible agent found for task {}", task_id);
+                        anyhow::bail!("no eligible agent found for task '{}'", task_id);
+                    }
+                }
             }
         }
         Command::Run { command } => {
@@ -471,17 +515,40 @@ fn main() -> Result<()> {
             TaskCommand::Show { task_id } => match Database::open(DB_PATH) {
                 Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {
                     Some(task) => {
-                        println!("ID:        {}", task.id);
-                        println!("Title:     {}", task.title);
-                        println!("Objective: {}", task.objective);
-                        println!("Role:      {}", task.role);
-                        println!("Priority:  {:?}", task.priority);
-                        println!("Status:    {}", task.status);
+                        println!("ID:           {}", task.id);
+                        println!("Title:        {}", task.title);
+                        println!("Objective:    {}", task.objective);
+                        println!("Role:         {}", task.role);
+                        println!("Priority:     {:?}", task.priority);
+                        println!("Status:       {}", task.status);
+                        println!("Capabilities: {}", task.required_capabilities().join(", "));
                     }
                     None => {
                         eprintln!("Task {} not found", task_id);
                     }
                 },
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
+            TaskCommand::Require {
+                task_id,
+                capabilities,
+            } => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    let changed = db
+                        .set_task_required_capabilities(&task_id, &capabilities)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    if !changed {
+                        eprintln!("Task {} not found", task_id);
+                        anyhow::bail!("task '{}' not found in DB", task_id);
+                    }
+                    println!(
+                        "Updated capabilities for task {}: {}",
+                        task_id,
+                        capabilities.join(", ")
+                    );
+                }
                 Err(_) => {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }

@@ -34,6 +34,7 @@ fn build_worker_prompt_contains_engineering_contract() {
         role: "backend-engineer".to_string(),
         priority: TaskPriority::Normal,
         status: TaskStatus::Ready,
+        required_capabilities: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "testproj", &task);
@@ -58,6 +59,7 @@ fn generated_worker_prompt_still_contains_task_information() {
         role: "lead-engineer".to_string(),
         priority: TaskPriority::High,
         status: TaskStatus::Active,
+        required_capabilities: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "myproject", &task);

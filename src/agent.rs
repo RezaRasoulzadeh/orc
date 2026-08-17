@@ -174,21 +174,30 @@ pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result
     let db_path = ".orc/orc.db";
     let db = Database::open(db_path)
         .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
-    let _task = db
+    let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
-    let required_capabilities = vec!["code".to_owned(), "terminal".to_owned()];
     let agent = if let Some(agent_id) = requested_agent {
-        registry::get_agent(&db, agent_id)?
+        let agent = registry::get_agent(&db, agent_id)?;
+        crate::scheduler::validate_override(&agent, &task)?;
+        agent
     } else {
-        registry::select_agent(&db.list_agents()?, &required_capabilities)?.clone()
+        let agents = db.list_agents()?;
+        let decision = crate::scheduler::schedule(&task, &agents, None)?;
+        let selected_id = decision.selected_agent_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no eligible agent found for task '{}': {}",
+                task_id,
+                decision.explanation
+            )
+        })?;
+        agents
+            .into_iter()
+            .find(|a| a.id == selected_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("selected agent '{}' not found in registry", selected_id)
+            })?
     };
-    let capabilities = if agent.execution_mode == registry::MANUAL {
-        Vec::new()
-    } else {
-        required_capabilities.clone()
-    };
-    validate_selected_agent(&agent, &capabilities)?;
     if agent.execution_mode == registry::MANUAL {
         return dispatch_manual(task_id, &agent, &db, ".");
     }
@@ -396,27 +405,6 @@ pub fn submit_patch_with_runner(
         branch_name,
         validation_report: report,
     })
-}
-
-fn validate_selected_agent(agent: &AgentDefinition, required: &[String]) -> Result<()> {
-    if !agent.enabled {
-        anyhow::bail!("agent '{}' is disabled", agent.id);
-    }
-    if agent.status != registry::AVAILABLE {
-        let reason = agent
-            .unavailable_reason
-            .as_deref()
-            .unwrap_or("no reason provided");
-        anyhow::bail!("agent '{}' is unavailable: {}", agent.id, reason);
-    }
-    if !agent.supports(required) {
-        anyhow::bail!(
-            "agent '{}' lacks required capabilities: {}",
-            agent.id,
-            required.join(", ")
-        );
-    }
-    registry::validate_backend(&agent.backend)
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ impl Database {
                 role TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 status TEXT NOT NULL,
+                required_capabilities TEXT,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
@@ -128,6 +129,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
+        Self::ensure_task_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -156,6 +158,21 @@ impl Database {
         )?;
         Self::ensure_agent_columns(conn)?;
         Self::ensure_agent_run_columns(conn)?;
+        Self::ensure_task_columns(conn)?;
+        Ok(())
+    }
+
+    fn ensure_task_columns(conn: &Connection) -> Result<(), DbError> {
+        let mut statement = conn.prepare("PRAGMA table_info(tasks)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns
+            .iter()
+            .any(|column| column == "required_capabilities")
+        {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN required_capabilities TEXT")?;
+        }
         Ok(())
     }
 
@@ -416,6 +433,16 @@ impl Database {
                 )));
             }
         };
+        let required_capabilities_json: Option<String> = row.get(6)?;
+        let required_capabilities = match required_capabilities_json {
+            Some(json_str) if !json_str.trim().is_empty() => serde_json::from_str(&json_str)
+                .map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "invalid task capabilities: {error}"
+                    ))
+                })?,
+            _ => Vec::new(),
+        };
         Ok(Task {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -423,12 +450,13 @@ impl Database {
             role: row.get(3)?,
             priority: priority_value,
             status: status_value,
+            required_capabilities,
         })
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities FROM tasks ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -575,11 +603,24 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, title, objective, role, priority, status FROM tasks WHERE id = ?1",
+                "SELECT id, title, objective, role, priority, status, required_capabilities FROM tasks WHERE id = ?1",
                 params![id],
                 Self::task_from_row,
             )
             .optional()?)
+    }
+
+    pub fn set_task_required_capabilities(
+        &self,
+        id: &str,
+        capabilities: &[String],
+    ) -> Result<bool, DbError> {
+        let json = serde_json::to_string(capabilities)?;
+        let changed = self.conn.execute(
+            "UPDATE tasks SET required_capabilities = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![json, id],
+        )?;
+        Ok(changed != 0)
     }
 
     #[allow(dead_code)]

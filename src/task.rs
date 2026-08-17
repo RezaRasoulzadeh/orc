@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -10,6 +10,26 @@ pub struct Task {
     pub role: String,
     pub priority: TaskPriority,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+}
+
+impl Task {
+    pub const DEFAULT_REQUIRED_CAPABILITIES: [&'static str; 2] = ["code", "terminal"];
+
+    pub fn required_capabilities(&self) -> Vec<String> {
+        if !self.required_capabilities.is_empty() {
+            return self.required_capabilities.clone();
+        }
+
+        match self.role.as_str() {
+            "developer" => vec!["code".into(), "terminal".into()],
+            "reviewer" => vec!["review".into()],
+            "architect" => vec!["architecture".into()],
+            "researcher" => vec!["research".into()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,5 +69,62 @@ impl fmt::Display for TaskStatus {
             Self::Done => "done",
         };
         f.write_str(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(role: &str, required_capabilities: Vec<&str>) -> Task {
+        Task {
+            id: "T-0001".into(),
+            title: "Test".into(),
+            objective: "Test capability requirements".into(),
+            role: role.into(),
+            priority: TaskPriority::Normal,
+            status: TaskStatus::Backlog,
+            required_capabilities: required_capabilities
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn developer_defaults_to_code_and_terminal() {
+        assert_eq!(
+            task("developer", vec![]).required_capabilities(),
+            vec!["code", "terminal"]
+        );
+    }
+
+    #[test]
+    fn non_coding_roles_get_role_specific_defaults() {
+        assert_eq!(
+            task("architect", vec![]).required_capabilities(),
+            vec!["architecture"]
+        );
+        assert_eq!(
+            task("reviewer", vec![]).required_capabilities(),
+            vec!["review"]
+        );
+        assert_eq!(
+            task("researcher", vec![]).required_capabilities(),
+            vec!["research"]
+        );
+    }
+
+    #[test]
+    fn explicit_capabilities_override_role_defaults() {
+        assert_eq!(
+            task("developer", vec!["review", "architecture"]).required_capabilities(),
+            vec!["review", "architecture"]
+        );
+    }
+
+    #[test]
+    fn unknown_role_without_explicit_requirements_has_no_defaults() {
+        assert!(task("custom", vec![]).required_capabilities().is_empty());
     }
 }

@@ -59,6 +59,7 @@ impl OrcState {
                     role,
                     priority,
                     status: TaskStatus::Backlog,
+                    required_capabilities: Vec::new(),
                 });
             }
             LeadAction::RequireCtoApproval { reason } => {

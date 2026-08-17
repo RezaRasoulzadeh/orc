@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use orc::adoption;
 use orc::agent;
 use orc::discovery;
+use orc::doctor::{self, CheckStatus};
 use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
 use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
@@ -29,6 +30,8 @@ enum Command {
     },
     /// List registered agents.
     Agents,
+    /// Diagnose project and configured agent health without consuming model quota.
+    Doctor,
     Status,
     Ask {
         request: String,
@@ -87,6 +90,20 @@ enum AgentCommand {
         reason: String,
     },
     Available {
+        id: String,
+    },
+    Priority {
+        id: String,
+        priority: i64,
+    },
+    Quota {
+        id: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..=100))]
+        remaining: i64,
+        #[arg(long)]
+        reset: Option<String>,
+    },
+    QuotaClear {
         id: String,
     },
     Show {
@@ -152,6 +169,7 @@ fn main() -> Result<()> {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             print_agents(&db)?;
         }
+        Command::Doctor => print_doctor(&doctor::inspect(".", &doctor::SystemHealthRunner)),
         Command::Status => match Database::open(DB_PATH) {
             Ok(db) => {
                 let project = db.get_project_name().map_err(|e| anyhow::anyhow!(e))?;
@@ -243,6 +261,10 @@ fn main() -> Result<()> {
                         unavailable_reason: None,
                         profile_path: profile,
                         config_metadata: None,
+                        quota_remaining_percent: None,
+                        quota_reset_at: None,
+                        quota_checked_at: None,
+                        quota_source: None,
                     };
                     db.insert_agent(&agent).map_err(|e| anyhow::anyhow!(e))?;
                     println!("Added agent {}", agent.id);
@@ -263,6 +285,24 @@ fn main() -> Result<()> {
                         &id,
                     )?;
                 }
+                AgentCommand::Priority { id, priority } => ensure_agent_updated(
+                    db.set_agent_priority(&id, priority)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    &id,
+                )?,
+                AgentCommand::Quota {
+                    id,
+                    remaining,
+                    reset,
+                } => ensure_agent_updated(
+                    db.set_agent_quota(&id, remaining, reset.as_deref())
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    &id,
+                )?,
+                AgentCommand::QuotaClear { id } => ensure_agent_updated(
+                    db.clear_agent_quota(&id).map_err(|e| anyhow::anyhow!(e))?,
+                    &id,
+                )?,
                 AgentCommand::Show { id } => {
                     let agent = registry::get_agent(&db, &id)?;
                     println!("ID:                 {}", agent.id);
@@ -275,6 +315,25 @@ fn main() -> Result<()> {
                         agent.unavailable_reason.as_deref().unwrap_or("-")
                     );
                     println!("Priority:            {}", agent.priority);
+                    println!(
+                        "Quota:               {}",
+                        agent
+                            .quota_remaining_percent
+                            .map(|value| format!("{value}%"))
+                            .unwrap_or_else(|| "unknown".into())
+                    );
+                    println!(
+                        "Quota reset:         {}",
+                        agent.quota_reset_at.as_deref().unwrap_or("-")
+                    );
+                    println!(
+                        "Quota checked:       {}",
+                        agent.quota_checked_at.as_deref().unwrap_or("-")
+                    );
+                    println!(
+                        "Quota source:        {}",
+                        agent.quota_source.as_deref().unwrap_or("-")
+                    );
                     println!("Capabilities:        {}", agent.capabilities.join(", "));
                     println!(
                         "Profile/config:      {}",
@@ -426,12 +485,12 @@ fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
 
 fn print_agents(db: &Database) -> Result<()> {
     println!(
-        "{:<18} {:<9} {:<12} {:<10} PROFILE",
-        "ID", "BACKEND", "STATUS", "PRIORITY"
+        "{:<18} {:<9} {:<12} {:<10} {:<7} RESET",
+        "ID", "BACKEND", "STATUS", "PRIORITY", "QUOTA"
     );
     for agent in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
         println!(
-            "{:<18} {:<9} {:<12} {:<10} {}",
+            "{:<18} {:<9} {:<12} {:<10} {:<7} {}",
             agent.id,
             agent.backend,
             if agent.enabled {
@@ -440,8 +499,43 @@ fn print_agents(db: &Database) -> Result<()> {
                 "disabled"
             },
             agent.priority,
-            agent.profile_path.as_deref().unwrap_or("-")
+            agent
+                .quota_remaining_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "?".into()),
+            agent.quota_reset_at.as_deref().unwrap_or("-")
         );
     }
     Ok(())
+}
+
+fn print_doctor(report: &doctor::DoctorReport) {
+    println!("ORC DOCTOR\n\nProject");
+    for check in &report.project {
+        print_check(check);
+    }
+    println!("\nAgents");
+    if report.agents.is_empty() {
+        println!("  (none enabled)");
+    } else {
+        for check in &report.agents {
+            print_check(check);
+        }
+    }
+    println!("\nOverall: {}", report.overall());
+}
+
+fn print_check(check: &doctor::Check) {
+    let detail = check
+        .detail
+        .as_deref()
+        .map(|detail| format!(" ({detail})"))
+        .unwrap_or_default();
+    match &check.status {
+        CheckStatus::Ok => println!("  {:<20} OK{detail}", check.name),
+        CheckStatus::Unavailable(reason) => {
+            println!("  {:<20} UNAVAILABLE: {reason}{detail}", check.name)
+        }
+        CheckStatus::Failed(reason) => println!("  {:<20} FAILED: {reason}{detail}", check.name),
+    }
 }

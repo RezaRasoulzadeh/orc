@@ -17,6 +17,10 @@ pub struct AgentDefinition {
     pub unavailable_reason: Option<String>,
     pub profile_path: Option<String>,
     pub config_metadata: Option<String>,
+    pub quota_remaining_percent: Option<i64>,
+    pub quota_reset_at: Option<String>,
+    pub quota_checked_at: Option<String>,
+    pub quota_source: Option<String>,
 }
 
 impl AgentDefinition {

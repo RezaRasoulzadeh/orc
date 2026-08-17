@@ -4,6 +4,50 @@ use std::process::{Command, Stdio};
 use crate::registry::AgentDefinition;
 use crate::worker::{CodexWorker, CopilotWorker, Worker};
 
+pub trait HealthCommandRunner {
+    fn executable_exists(&self, executable: &str) -> bool;
+    fn run(
+        &self,
+        executable: &str,
+        args: &[&str],
+        cwd: &Path,
+        environment: Option<(&str, &Path)>,
+    ) -> Result<(), String>;
+}
+
+pub fn check_health(
+    agent: &AgentDefinition,
+    cwd: &Path,
+    runner: &dyn HealthCommandRunner,
+) -> Result<(), String> {
+    match agent.backend.as_str() {
+        "codex" => {
+            if !runner.executable_exists("codex") {
+                return Err("provider CLI 'codex' not found".into());
+            }
+            let profile = agent.profile_path.as_deref().map(Path::new);
+            if let Some(path) = profile
+                && !path.is_dir()
+            {
+                return Err(format!("profile path does not exist: {}", path.display()));
+            }
+            runner.run(
+                "codex",
+                &["login", "status"],
+                cwd,
+                profile.map(|path| ("CODEX_HOME", path)),
+            )
+        }
+        "copilot" => {
+            if !runner.executable_exists("copilot") {
+                return Err("provider CLI 'copilot' not found".into());
+            }
+            runner.run("copilot", &["--version"], cwd, None)
+        }
+        backend => Err(format!("unsupported backend '{backend}'")),
+    }
+}
+
 pub struct WorkerFactory;
 
 impl WorkerFactory {

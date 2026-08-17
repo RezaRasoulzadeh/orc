@@ -3,6 +3,7 @@ pub mod agent;
 pub mod backend;
 pub mod contract;
 pub mod discovery;
+pub mod doctor;
 pub mod git;
 pub mod protocol;
 pub mod registry;

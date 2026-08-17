@@ -17,6 +17,10 @@ fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
         unavailable_reason: None,
         profile_path: Some(format!("/profiles/{id}")),
         config_metadata: None,
+        quota_remaining_percent: None,
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
     }
 }
 
@@ -122,4 +126,79 @@ fn agent_run_history_keeps_selected_ids_distinct() {
         .collect();
     assert!(ids.contains(&"codex-main"));
     assert!(ids.contains(&"codex-secondary"));
+}
+
+#[test]
+fn priority_update_persists_and_changes_selection() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("first", 100, registry::AVAILABLE))
+        .unwrap();
+    db.insert_agent(&agent("second", 90, registry::AVAILABLE))
+        .unwrap();
+    let required = vec!["code".into()];
+    assert_eq!(
+        registry::select_agent(&db.list_agents().unwrap(), &required)
+            .unwrap()
+            .id,
+        "first"
+    );
+    assert!(db.set_agent_priority("second", 110).unwrap());
+    assert!(!db.set_agent_priority("missing", 200).unwrap());
+    assert_eq!(
+        registry::select_agent(&db.list_agents().unwrap(), &required)
+            .unwrap()
+            .id,
+        "second"
+    );
+    drop(db);
+    assert_eq!(
+        Database::open(&path)
+            .unwrap()
+            .get_agent("second")
+            .unwrap()
+            .unwrap()
+            .priority,
+        110
+    );
+}
+
+#[test]
+fn quota_metadata_persists_accepts_boundaries_and_clears() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("codex-main", 100, registry::AVAILABLE))
+        .unwrap();
+    assert!(db.set_agent_quota("codex-main", -1, None).is_err());
+    assert!(db.set_agent_quota("codex-main", 101, None).is_err());
+    assert!(
+        db.set_agent_quota("codex-main", 0, Some("2026-08-22T20:09:00+03:30"))
+            .unwrap()
+    );
+    let saved = db.get_agent("codex-main").unwrap().unwrap();
+    assert_eq!(saved.quota_remaining_percent, Some(0));
+    assert_eq!(
+        saved.quota_reset_at.as_deref(),
+        Some("2026-08-22T20:09:00+03:30")
+    );
+    assert!(saved.quota_checked_at.is_some());
+    assert_eq!(saved.quota_source.as_deref(), Some("manual"));
+    assert_eq!(saved.status, registry::AVAILABLE);
+    assert!(db.set_agent_quota("codex-main", 100, None).unwrap());
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_agent("codex-main")
+            .unwrap()
+            .unwrap()
+            .quota_remaining_percent,
+        Some(100)
+    );
+    assert!(reopened.clear_agent_quota("codex-main").unwrap());
+    let cleared = reopened.get_agent("codex-main").unwrap().unwrap();
+    assert_eq!(cleared.quota_remaining_percent, None);
+    assert_eq!(cleared.quota_checked_at, None);
 }

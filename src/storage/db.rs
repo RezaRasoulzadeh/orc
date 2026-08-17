@@ -25,6 +25,8 @@ pub enum DbError {
     Serde(#[from] serde_json::Error),
     #[error("invalid next task id in database: {0}")]
     InvalidSequence(String),
+    #[error("quota remaining percent must be between 0 and 100, got {0}")]
+    InvalidQuota(i64),
 }
 
 pub struct Database {
@@ -63,7 +65,11 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'available',
                 unavailable_reason TEXT,
                 profile_path TEXT,
-                config_metadata TEXT
+                config_metadata TEXT,
+                quota_remaining_percent INTEGER,
+                quota_reset_at TEXT,
+                quota_checked_at TEXT,
+                quota_source TEXT
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -115,6 +121,7 @@ impl Database {
             COMMIT;
             "#,
         )?;
+        Self::ensure_agent_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -141,6 +148,27 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
         )?;
+        Self::ensure_agent_columns(conn)?;
+        Ok(())
+    }
+
+    fn ensure_agent_columns(conn: &Connection) -> Result<(), DbError> {
+        let mut statement = conn.prepare("PRAGMA table_info(agents)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (name, definition) in [
+            ("quota_remaining_percent", "INTEGER"),
+            ("quota_reset_at", "TEXT"),
+            ("quota_checked_at", "TEXT"),
+            ("quota_source", "TEXT"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE agents ADD COLUMN {name} {definition}"
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -170,7 +198,7 @@ impl Database {
 
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 agent.id,
                 agent.backend,
@@ -182,6 +210,10 @@ impl Database {
                 agent.unavailable_reason,
                 agent.profile_path,
                 agent.config_metadata,
+                agent.quota_remaining_percent,
+                agent.quota_reset_at,
+                agent.quota_checked_at,
+                agent.quota_source,
             ],
         )?;
         Ok(())
@@ -203,6 +235,10 @@ impl Database {
             unavailable_reason: row.get(7)?,
             profile_path: row.get(8)?,
             config_metadata: row.get(9)?,
+            quota_remaining_percent: row.get(10)?,
+            quota_reset_at: row.get(11)?,
+            quota_checked_at: row.get(12)?,
+            quota_source: row.get(13)?,
         })
     }
 
@@ -210,7 +246,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata FROM agents WHERE id = ?1",
+                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents WHERE id = ?1",
                 params![id],
                 Self::agent_from_row,
             )
@@ -219,7 +255,7 @@ impl Database {
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata FROM agents ORDER BY id",
+            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents ORDER BY id",
         )?;
         Ok(statement
             .query_map([], Self::agent_from_row)?
@@ -230,6 +266,35 @@ impl Database {
         Ok(self.conn.execute(
             "UPDATE agents SET enabled = ?1 WHERE id = ?2",
             params![enabled, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET priority = ?1 WHERE id = ?2",
+            params![priority, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_quota(
+        &self,
+        id: &str,
+        remaining_percent: i64,
+        reset_at: Option<&str>,
+    ) -> Result<bool, DbError> {
+        if !(0..=100).contains(&remaining_percent) {
+            return Err(DbError::InvalidQuota(remaining_percent));
+        }
+        Ok(self.conn.execute(
+            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = 'manual' WHERE id = ?3",
+            params![remaining_percent, reset_at, id],
+        )? != 0)
+    }
+
+    pub fn clear_agent_quota(&self, id: &str) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET quota_remaining_percent = NULL, quota_reset_at = NULL, quota_checked_at = NULL, quota_source = NULL WHERE id = ?1",
+            params![id],
         )? != 0)
     }
 

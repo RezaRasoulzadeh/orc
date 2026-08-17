@@ -5,6 +5,69 @@ use crate::task::{Task, TaskPriority};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectDiscoveryRequest {
+    pub protocol_version: u32,
+    pub project_name: String,
+    pub repository_path: String,
+    pub engineering_contract: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectDiscoveryResponse {
+    pub protocol_version: u32,
+    pub project: DiscoveryProject,
+    pub architecture: DiscoveryArchitecture,
+    pub engineering: DiscoveryEngineering,
+    pub state: DiscoveryState,
+    pub unknowns: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoveryProject {
+    pub name: String,
+    pub purpose: String,
+    pub languages: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoveryArchitecture {
+    pub entry_points: Vec<String>,
+    pub modules: Vec<String>,
+    pub boundaries: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoveryEngineering {
+    pub build_commands: Vec<String>,
+    pub test_commands: Vec<String>,
+    pub observed_patterns: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoveryState {
+    pub implemented: Vec<String>,
+    pub in_progress: Vec<String>,
+    pub risks: Vec<String>,
+}
+
+impl ProjectDiscoveryResponse {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            anyhow::bail!(
+                "unsupported discovery protocol version {}; expected {}",
+                self.protocol_version,
+                PROTOCOL_VERSION
+            );
+        }
+        if self.project.name.trim().is_empty() {
+            anyhow::bail!("discovery response project name must not be empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EngineeringLeadRequest {
     pub protocol_version: u32,
     pub project: String,

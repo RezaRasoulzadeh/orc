@@ -1,5 +1,7 @@
+pub mod adoption;
 pub mod agent;
 pub mod contract;
+pub mod discovery;
 pub mod git;
 pub mod protocol;
 pub mod state;

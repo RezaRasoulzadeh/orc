@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use orc::adoption;
 use orc::agent;
+use orc::discovery;
 use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
 use orc::storage::Database;
 
@@ -16,6 +18,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
+    /// Adopt the existing Git repository in the current directory.
+    Adopt,
+    /// Emit a read-only repository discovery request as JSON.
+    DiscoveryRequest,
+    /// Apply a structured repository discovery response from a JSON file (or - for stdin).
+    ApplyDiscovery {
+        path: String,
+    },
     Status,
     Ask {
         request: String,
@@ -72,6 +82,27 @@ fn main() -> Result<()> {
                 None => db.create_project("orc").map_err(|e| anyhow::anyhow!(e))?,
             };
             println!("Initialized Orc DB in {} (project id={})", DB_PATH, pid);
+        }
+        Command::Adopt => {
+            let root = adoption::adopt(".")?;
+            println!("Adopted repository {}", root.display());
+        }
+        Command::DiscoveryRequest => {
+            let request = discovery::build_request(".")?;
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
+        Command::ApplyDiscovery { path } => {
+            let data = if path == "-" {
+                use std::io::{self, Read};
+                let mut buf = String::new();
+                io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)?
+            };
+            let response = discovery::parse_response(&data)?;
+            discovery::apply_response(".", &response)?;
+            println!("Applied repository discovery.");
         }
         Command::Status => match Database::open(DB_PATH) {
             Ok(db) => {

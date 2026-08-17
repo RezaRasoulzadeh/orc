@@ -20,6 +20,8 @@ pub enum DbError {
     Io(#[from] io::Error),
     #[error("sqlite error: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
     #[error("invalid next task id in database: {0}")]
     InvalidSequence(String),
 }
@@ -43,6 +45,12 @@ impl Database {
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
+            CREATE TABLE IF NOT EXISTS project_facts (
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (project_id, key)
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -137,6 +145,35 @@ impl Database {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    pub fn store_discovery_facts(
+        &self,
+        project_id: i64,
+        response: &crate::protocol::ProjectDiscoveryResponse,
+    ) -> Result<(), DbError> {
+        let facts = [
+            ("purpose", response.project.purpose.clone()),
+            (
+                "languages",
+                serde_json::to_string(&response.project.languages)?,
+            ),
+            (
+                "build_commands",
+                serde_json::to_string(&response.engineering.build_commands)?,
+            ),
+            (
+                "test_commands",
+                serde_json::to_string(&response.engineering.test_commands)?,
+            ),
+        ];
+        for (key, value) in facts {
+            self.conn.execute(
+                "INSERT INTO project_facts (project_id, key, value) VALUES (?1, ?2, ?3) ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
+                params![project_id, key, value],
+            )?;
+        }
+        Ok(())
     }
 
     fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {

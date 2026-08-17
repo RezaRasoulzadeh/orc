@@ -30,6 +30,18 @@ pub enum DbError {
     InvalidQuota(i64),
     #[error("invalid or already completed agent run: {0}")]
     InvalidRunStatus(i64),
+    #[error("task '{0}' cannot depend on itself")]
+    SelfDependency(String),
+    #[error("task '{0}' not found")]
+    TaskNotFound(String),
+    #[error("task '{0}' already depends on '{1}'")]
+    DuplicateDependency(String, String),
+    #[error("dependency cycle detected: adding '{0}' -> '{1}' would create a cycle")]
+    DependencyCycle(String, String),
+    #[error("dependency '{0}' -> '{1}' not found")]
+    DependencyNotFound(String, String),
+    #[error("scheduler error: {0}")]
+    Scheduler(String),
 }
 
 pub struct Database {
@@ -827,5 +839,112 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn add_task_dependency(&self, task_id: &str, depends_on: &str) -> Result<(), DbError> {
+        if task_id == depends_on {
+            return Err(DbError::SelfDependency(task_id.to_string()));
+        }
+
+        let task_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE id = ?1",
+                params![task_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !task_exists {
+            return Err(DbError::TaskNotFound(task_id.to_string()));
+        }
+
+        let depends_on_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE id = ?1",
+                params![depends_on],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !depends_on_exists {
+            return Err(DbError::TaskNotFound(depends_on.to_string()));
+        }
+
+        let already_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM task_dependencies WHERE task_id = ?1 AND depends_on = ?2",
+                params![task_id, depends_on],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if already_exists {
+            return Err(DbError::DuplicateDependency(
+                task_id.to_string(),
+                depends_on.to_string(),
+            ));
+        }
+
+        // Cycle check: can `depends_on` reach `task_id` via existing dependencies?
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(depends_on.to_string());
+        visited.insert(depends_on.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            let deps = self.list_task_dependencies(&current)?;
+            for dep in deps {
+                if dep == task_id {
+                    return Err(DbError::DependencyCycle(
+                        task_id.to_string(),
+                        depends_on.to_string(),
+                    ));
+                }
+                if visited.insert(dep.clone()) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        self.conn.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+            params![task_id, depends_on],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_task_dependency(&self, task_id: &str, depends_on: &str) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on = ?2",
+            params![task_id, depends_on],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn list_task_dependencies(&self, task_id: &str) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on FROM task_dependencies WHERE task_id = ?1 ORDER BY depends_on",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_task_dependents(&self, task_id: &str) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id FROM task_dependencies WHERE depends_on = ?1 ORDER BY task_id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_all_dependencies(&self) -> Result<Vec<(String, String)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, depends_on FROM task_dependencies ORDER BY task_id, depends_on",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }

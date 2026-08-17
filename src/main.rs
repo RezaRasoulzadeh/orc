@@ -38,6 +38,12 @@ enum Command {
     /// Diagnose project and configured agent health without consuming model quota.
     Doctor,
     Status,
+    /// Show the deterministic queue of tasks
+    Queue {
+        /// Explain task readiness, dependency state, and scheduler eligibility
+        #[arg(long)]
+        explain: bool,
+    },
     Ask {
         request: String,
     },
@@ -200,6 +206,20 @@ enum TaskCommand {
         task_id: String,
         reason: Option<String>,
     },
+    /// Add a dependency to a task
+    Depend {
+        /// Task ID that depends on another task
+        task_id: String,
+        /// Task ID that must be completed first
+        dependency_id: String,
+    },
+    /// Remove a dependency from a task
+    Undepend {
+        /// Task ID that depends on another task
+        task_id: String,
+        /// Dependency task ID to remove
+        dependency_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -258,6 +278,19 @@ fn main() -> Result<()> {
                     eprintln!(
                         "No project found in DB. Run `orc init` to initialize repository state."
                     );
+                }
+            }
+            Err(_) => {
+                eprintln!("No DB found. Run `orc init` to initialize repository state.");
+            }
+        },
+        Command::Queue { explain } => match Database::open(DB_PATH) {
+            Ok(db) => {
+                let report = orc::queue::compute_queue(&db).map_err(|e| anyhow::anyhow!(e))?;
+                if explain {
+                    print!("{}", report.format_explain());
+                } else {
+                    print!("{}", report.format_concise());
                 }
             }
             Err(_) => {
@@ -562,6 +595,14 @@ fn main() -> Result<()> {
                         println!("Priority:     {:?}", task.priority);
                         println!("Status:       {}", task.status);
                         println!("Capabilities: {}", task.required_capabilities().join(", "));
+                        let deps = db
+                            .list_task_dependencies(&task_id)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        if deps.is_empty() {
+                            println!("Dependencies: none");
+                        } else {
+                            println!("Dependencies: {}", deps.join(", "));
+                        }
                     }
                     None => {
                         eprintln!("Task {} not found", task_id);
@@ -656,6 +697,39 @@ fn main() -> Result<()> {
                     task_id
                 );
             }
+            TaskCommand::Depend {
+                task_id,
+                dependency_id,
+            } => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    db.add_task_dependency(&task_id, &dependency_id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    println!("Added dependency: {} depends on {}", task_id, dependency_id);
+                }
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
+            TaskCommand::Undepend {
+                task_id,
+                dependency_id,
+            } => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    let changed = db
+                        .remove_task_dependency(&task_id, &dependency_id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    if !changed {
+                        anyhow::bail!("dependency '{}' -> '{}' not found", task_id, dependency_id);
+                    }
+                    println!(
+                        "Removed dependency: {} no longer depends on {}",
+                        task_id, dependency_id
+                    );
+                }
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
         },
         Command::Runs { task_id } => match Database::open(DB_PATH) {
             Ok(db) => {

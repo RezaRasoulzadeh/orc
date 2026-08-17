@@ -1,0 +1,478 @@
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::backend::apply_profile_environment;
+use crate::registry::AgentDefinition;
+use crate::storage::Database;
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const QUOTA_SOURCE: &str = "codex_app_server";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    pub remaining_percent: i64,
+    pub reset_at: Option<i64>,
+    pub window_duration_mins: Option<i64>,
+    pub rate_limit_reached_type: Option<String>,
+    pub credits: Option<CreditsSnapshot>,
+    pub reset_credits_available: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
+
+pub trait RateLimitProvider {
+    fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String>;
+}
+
+pub type AgentSyncResult = (String, Result<QuotaSnapshot, String>);
+
+pub struct CodexAppServer;
+
+impl RateLimitProvider for CodexAppServer {
+    fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String> {
+        let mut client = StdioClient::start(profile_path)?;
+        client.initialize()?;
+        client.read_rate_limits()
+    }
+}
+
+pub fn initialization_request() -> Value {
+    json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": { "name": "orc", "version": env!("CARGO_PKG_VERSION") },
+            "capabilities": {}
+        }
+    })
+}
+
+pub fn initialized_notification() -> Value {
+    json!({ "method": "initialized" })
+}
+
+pub fn rate_limits_request() -> Value {
+    json!({ "id": 2, "method": "account/rateLimits/read", "params": null })
+}
+
+pub fn parse_rate_limits_response(value: Value) -> Result<QuotaSnapshot, String> {
+    if let Some(error) = value.get("error") {
+        return Err(format!("app-server rate-limit request failed: {error}"));
+    }
+    let response: RpcResponse = serde_json::from_value(value)
+        .map_err(|error| format!("malformed app-server response: {error}"))?;
+    if response.id != 2 {
+        return Err(format!(
+            "unexpected app-server response id: {}",
+            response.id
+        ));
+    }
+    let result: RateLimitsResponse = serde_json::from_value(response.result)
+        .map_err(|error| format!("malformed rate-limit response: {error}"))?;
+    let primary = result
+        .rate_limits
+        .primary
+        .ok_or_else(|| "Codex rate-limit response has no primary limit".to_owned())?;
+    let remaining_percent = (100_i64 - primary.used_percent).clamp(0, 100);
+    Ok(QuotaSnapshot {
+        remaining_percent,
+        reset_at: primary.resets_at,
+        window_duration_mins: primary.window_duration_mins,
+        rate_limit_reached_type: result.rate_limits.rate_limit_reached_type,
+        credits: result.rate_limits.credits,
+        reset_credits_available: result
+            .rate_limit_reset_credits
+            .map(|summary| summary.available_count),
+    })
+}
+
+pub fn sync_agent(
+    db: &Database,
+    agent: &AgentDefinition,
+    provider: &dyn RateLimitProvider,
+) -> Result<QuotaSnapshot, String> {
+    if agent.backend != "codex" {
+        return Err(format!(
+            "agent '{}' uses unsupported backend '{}' for quota sync",
+            agent.id, agent.backend
+        ));
+    }
+    let snapshot = provider.read(agent.profile_path.as_deref().map(Path::new))?;
+    db.set_agent_synced_quota(
+        &agent.id,
+        snapshot.remaining_percent,
+        snapshot.reset_at.map(|value| value.to_string()).as_deref(),
+        QUOTA_SOURCE,
+    )
+    .map_err(|error| format!("failed to store quota for '{}': {error}", agent.id))?
+    .then_some(())
+    .ok_or_else(|| format!("agent '{}' is not registered", agent.id))?;
+    Ok(snapshot)
+}
+
+pub fn sync_enabled_agents(
+    db: &Database,
+    provider: &dyn RateLimitProvider,
+) -> Result<Vec<AgentSyncResult>, String> {
+    let agents = db.list_agents().map_err(|error| error.to_string())?;
+    Ok(agents
+        .into_iter()
+        .filter(|agent| agent.enabled && agent.backend == "codex")
+        .map(|agent| {
+            let result = sync_agent(db, &agent, provider);
+            (agent.id, result)
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct RpcResponse {
+    id: i64,
+    result: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitsResponse {
+    rate_limits: RateLimitSnapshot,
+    rate_limit_reset_credits: Option<ResetCreditsSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitSnapshot {
+    primary: Option<RateLimitWindow>,
+    rate_limit_reached_type: Option<String>,
+    credits: Option<CreditsSnapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitWindow {
+    used_percent: i64,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCreditsSummary {
+    available_count: i64,
+}
+
+struct StdioClient {
+    child: Child,
+    stdin: ChildStdin,
+    messages: Receiver<Result<Value, String>>,
+}
+
+impl StdioClient {
+    fn start(profile_path: Option<&Path>) -> Result<Self, String> {
+        let mut command = Command::new("codex");
+        command
+            .args(["app-server", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_profile_environment(&mut command, profile_path);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to start `codex app-server --stdio`: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open stdin for `codex app-server --stdio`".to_owned())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to open stdout for `codex app-server --stdio`".to_owned())?;
+        let (sender, messages) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let parsed = line
+                    .map_err(|error| format!("failed reading app-server output: {error}"))
+                    .and_then(|line| {
+                        serde_json::from_str(&line)
+                            .map_err(|error| format!("invalid JSON from app-server: {error}"))
+                    });
+                if sender.send(parsed).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            messages,
+        })
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        self.send(&initialization_request())?;
+        let response = self.response_for(1)?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("app-server initialization failed: {error}"));
+        }
+        if response.get("result").is_none() {
+            return Err("malformed app-server initialization response: missing result".into());
+        }
+        self.send(&initialized_notification())
+    }
+
+    fn read_rate_limits(&mut self) -> Result<QuotaSnapshot, String> {
+        self.send(&rate_limits_request())?;
+        parse_rate_limits_response(self.response_for(2)?)
+    }
+
+    fn send(&mut self, message: &Value) -> Result<(), String> {
+        serde_json::to_writer(&mut self.stdin, message)
+            .map_err(|error| format!("failed to encode app-server request: {error}"))?;
+        self.stdin
+            .write_all(b"\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("failed to write app-server request: {error}"))
+    }
+
+    fn response_for(&self, expected_id: i64) -> Result<Value, String> {
+        loop {
+            let message =
+                self.messages
+                    .recv_timeout(RESPONSE_TIMEOUT)
+                    .map_err(|error| match error {
+                        mpsc::RecvTimeoutError::Timeout => {
+                            format!("app-server timed out waiting for response {expected_id}")
+                        }
+                        mpsc::RecvTimeoutError::Disconnected => {
+                            "app-server closed stdout before responding".to_owned()
+                        }
+                    })??;
+            if message.get("id").and_then(Value::as_i64) == Some(expected_id) {
+                return Ok(message);
+            }
+        }
+    }
+}
+
+impl Drop for StdioClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::AVAILABLE;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    struct FakeProvider {
+        results: HashMap<String, Result<QuotaSnapshot, String>>,
+        profiles: Mutex<Vec<Option<String>>>,
+    }
+
+    impl RateLimitProvider for FakeProvider {
+        fn read(&self, profile_path: Option<&Path>) -> Result<QuotaSnapshot, String> {
+            let profile = profile_path.map(|path| path.display().to_string());
+            self.profiles.lock().unwrap().push(profile.clone());
+            self.results
+                .get(profile.as_deref().unwrap_or(""))
+                .cloned()
+                .unwrap_or_else(|| Err("fixture missing".into()))
+        }
+    }
+
+    fn agent(id: &str, backend: &str, profile: &str) -> AgentDefinition {
+        AgentDefinition {
+            id: id.into(),
+            backend: backend.into(),
+            display_name: id.into(),
+            enabled: true,
+            priority: 0,
+            capabilities: vec![],
+            status: AVAILABLE.into(),
+            unavailable_reason: None,
+            profile_path: Some(profile.into()),
+            config_metadata: None,
+            quota_remaining_percent: None,
+            quota_reset_at: None,
+            quota_checked_at: None,
+            quota_source: None,
+        }
+    }
+
+    fn snapshot(remaining_percent: i64, reset_at: i64) -> QuotaSnapshot {
+        QuotaSnapshot {
+            remaining_percent,
+            reset_at: Some(reset_at),
+            window_duration_mins: Some(10080),
+            rate_limit_reached_type: None,
+            credits: None,
+            reset_credits_available: None,
+        }
+    }
+
+    #[test]
+    fn request_shapes_match_protocol() {
+        assert_eq!(initialization_request()["method"], "initialize");
+        assert_eq!(
+            initialization_request()["params"]["clientInfo"]["name"],
+            "orc"
+        );
+        assert_eq!(initialized_notification(), json!({"method": "initialized"}));
+        assert_eq!(
+            rate_limits_request(),
+            json!({"id": 2, "method": "account/rateLimits/read", "params": null})
+        );
+    }
+
+    #[test]
+    fn parses_primary_limit_and_optional_account_fields() {
+        let result = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {
+                "rateLimits": {
+                    "primary": {"usedPercent": 97, "windowDurationMins": 10080, "resetsAt": 1787416740},
+                    "rateLimitReachedType": "rate_limit_reached",
+                    "credits": {"hasCredits": false, "unlimited": false, "balance": "0"}
+                },
+                "rateLimitResetCredits": {"availableCount": 2, "credits": null}
+            }
+        })).unwrap();
+        assert_eq!(result.remaining_percent, 3);
+        assert_eq!(result.reset_at, Some(1787416740));
+        assert_eq!(result.window_duration_mins, Some(10080));
+        assert_eq!(
+            result.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(result.reset_credits_available, Some(2));
+    }
+
+    #[test]
+    fn clamps_usage_and_rejects_missing_or_malformed_primary() {
+        let over = parse_rate_limits_response(json!({
+            "id": 2, "result": {"rateLimits": {"primary": {"usedPercent": 120}}}
+        }))
+        .unwrap();
+        assert_eq!(over.remaining_percent, 0);
+        assert!(
+            parse_rate_limits_response(json!({
+                "id": 2, "result": {"rateLimits": {"primary": null}}
+            }))
+            .unwrap_err()
+            .contains("no primary")
+        );
+        assert!(parse_rate_limits_response(json!({"id": 2, "result": []})).is_err());
+    }
+
+    #[test]
+    fn reached_limit_maps_to_zero_remaining() {
+        let result = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 100, "resetsAt": null},
+                "rateLimitReachedType": "rate_limit_reached"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(result.remaining_percent, 0);
+        assert_eq!(result.reset_at, None);
+        assert_eq!(
+            result.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+    }
+
+    #[test]
+    fn sync_isolates_profiles_and_updates_agents_independently() {
+        let directory = tempdir().unwrap();
+        let db = Database::init(directory.path().join("orc.db")).unwrap();
+        let first = agent("codex-main", "codex", "/profiles/main");
+        let second = agent("codex-work", "codex", "/profiles/work");
+        db.insert_agent(&first).unwrap();
+        db.insert_agent(&second).unwrap();
+        let provider = FakeProvider {
+            results: HashMap::from([
+                ("/profiles/main".into(), Ok(snapshot(3, 1787416740))),
+                ("/profiles/work".into(), Ok(snapshot(72, 1787500000))),
+            ]),
+            profiles: Mutex::new(vec![]),
+        };
+
+        let results = sync_enabled_agents(&db, &provider).unwrap();
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        let main = db.get_agent("codex-main").unwrap().unwrap();
+        let work = db.get_agent("codex-work").unwrap().unwrap();
+        assert_eq!(main.quota_remaining_percent, Some(3));
+        assert_eq!(main.quota_reset_at.as_deref(), Some("1787416740"));
+        assert_eq!(main.quota_source.as_deref(), Some(QUOTA_SOURCE));
+        assert!(main.quota_checked_at.is_some());
+        assert_eq!(work.quota_remaining_percent, Some(72));
+        assert_eq!(work.quota_reset_at.as_deref(), Some("1787500000"));
+        assert_eq!(
+            provider.profiles.into_inner().unwrap(),
+            vec![Some("/profiles/main".into()), Some("/profiles/work".into())]
+        );
+    }
+
+    #[test]
+    fn unsupported_backend_rejects_sync() {
+        let directory = tempdir().unwrap();
+        let db = Database::init(directory.path().join("orc.db")).unwrap();
+        let unsupported = agent("copilot", "copilot", "/profiles/copilot");
+        db.insert_agent(&unsupported).unwrap();
+        let provider = FakeProvider {
+            results: HashMap::new(),
+            profiles: Mutex::new(vec![]),
+        };
+        assert!(
+            sync_agent(&db, &unsupported, &provider)
+                .unwrap_err()
+                .contains("unsupported backend")
+        );
+        assert!(provider.profiles.into_inner().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_failed_agent_does_not_stop_enabled_sync() {
+        let directory = tempdir().unwrap();
+        let db = Database::init(directory.path().join("orc.db")).unwrap();
+        db.insert_agent(&agent("codex-bad", "codex", "/profiles/bad"))
+            .unwrap();
+        db.insert_agent(&agent("codex-good", "codex", "/profiles/good"))
+            .unwrap();
+        let provider = FakeProvider {
+            results: HashMap::from([
+                ("/profiles/bad".into(), Err("protocol failed".into())),
+                ("/profiles/good".into(), Ok(snapshot(55, 1787500000))),
+            ]),
+            profiles: Mutex::new(vec![]),
+        };
+        let results = sync_enabled_agents(&db, &provider).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_err());
+        assert!(results[1].1.is_ok());
+        assert_eq!(
+            db.get_agent("codex-good")
+                .unwrap()
+                .unwrap()
+                .quota_remaining_percent,
+            Some(55)
+        );
+    }
+}

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orc::adoption;
 use orc::agent;
+use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
 use orc::discovery;
 use orc::doctor::{self, CheckStatus};
 use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
@@ -29,7 +30,11 @@ enum Command {
         path: String,
     },
     /// List registered agents.
-    Agents,
+    Agents {
+        /// Synchronize quota for enabled supported agents before listing.
+        #[arg(long)]
+        sync: bool,
+    },
     /// Diagnose project and configured agent health without consuming model quota.
     Doctor,
     Status,
@@ -106,6 +111,10 @@ enum AgentCommand {
     QuotaClear {
         id: String,
     },
+    /// Synchronize quota through the provider's machine-readable protocol.
+    Sync {
+        id: String,
+    },
     Show {
         id: String,
     },
@@ -165,8 +174,11 @@ fn main() -> Result<()> {
             discovery::apply_response(".", &response)?;
             println!("Applied repository discovery.");
         }
-        Command::Agents => {
+        Command::Agents { sync } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            if sync {
+                sync_enabled_agents(&db);
+            }
             print_agents(&db)?;
         }
         Command::Doctor => print_doctor(&doctor::inspect(".", &doctor::SystemHealthRunner)),
@@ -303,6 +315,12 @@ fn main() -> Result<()> {
                     db.clear_agent_quota(&id).map_err(|e| anyhow::anyhow!(e))?,
                     &id,
                 )?,
+                AgentCommand::Sync { id } => {
+                    let agent = registry::get_agent(&db, &id)?;
+                    let snapshot = codex_app_server::sync_agent(&db, &agent, &CodexAppServer)
+                        .map_err(anyhow::Error::msg)?;
+                    print_synced_quota(&id, &snapshot);
+                }
                 AgentCommand::Show { id } => {
                     let agent = registry::get_agent(&db, &id)?;
                     println!("ID:                 {}", agent.id);
@@ -481,6 +499,32 @@ fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
         anyhow::bail!("agent '{}' is not registered", id);
     }
     Ok(())
+}
+
+fn sync_enabled_agents(db: &Database) {
+    match codex_app_server::sync_enabled_agents(db, &CodexAppServer) {
+        Ok(results) => {
+            for (id, result) in results {
+                match result {
+                    Ok(snapshot) => print_synced_quota(&id, &snapshot),
+                    Err(error) => eprintln!("{id}: quota sync failed: {error}"),
+                }
+            }
+        }
+        Err(error) => eprintln!("quota sync failed: {error}"),
+    }
+}
+
+fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
+    println!("{id}:");
+    println!("  remaining: {}%", snapshot.remaining_percent);
+    println!(
+        "  reset: {}",
+        snapshot
+            .reset_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    );
 }
 
 fn print_agents(db: &Database) -> Result<()> {

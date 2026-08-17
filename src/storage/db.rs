@@ -291,6 +291,22 @@ impl Database {
         )? != 0)
     }
 
+    pub fn set_agent_synced_quota(
+        &self,
+        id: &str,
+        remaining_percent: i64,
+        reset_at: Option<&str>,
+        source: &str,
+    ) -> Result<bool, DbError> {
+        if !(0..=100).contains(&remaining_percent) {
+            return Err(DbError::InvalidQuota(remaining_percent));
+        }
+        Ok(self.conn.execute(
+            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = ?3 WHERE id = ?4",
+            params![remaining_percent, reset_at, source, id],
+        )? != 0)
+    }
+
     pub fn clear_agent_quota(&self, id: &str) -> Result<bool, DbError> {
         Ok(self.conn.execute(
             "UPDATE agents SET quota_remaining_percent = NULL, quota_reset_at = NULL, quota_checked_at = NULL, quota_source = NULL WHERE id = ?1",

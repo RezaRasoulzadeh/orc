@@ -1,12 +1,8 @@
-mod agent;
-mod protocol;
-mod storage;
-mod task;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
-use storage::Database;
+use orc::agent;
+use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
+use orc::storage::Database;
 
 const DB_PATH: &str = ".orc/orc.db";
 

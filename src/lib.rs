@@ -1,3 +1,5 @@
+pub mod agent;
+pub mod contract;
 pub mod protocol;
 pub mod state;
 pub mod storage;

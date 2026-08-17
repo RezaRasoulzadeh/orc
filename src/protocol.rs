@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{state::OrcState, task::TaskPriority};
+use crate::task::{Task, TaskPriority};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -13,13 +13,12 @@ pub struct EngineeringLeadRequest {
 }
 
 impl EngineeringLeadRequest {
-    pub fn from_state(cto_request: String, state: &OrcState) -> Self {
+    pub fn from_tasks(cto_request: String, project: String, tasks: &[Task]) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            project: state.project.clone(),
+            project,
             cto_request,
-            active_tasks: state
-                .tasks
+            active_tasks: tasks
                 .iter()
                 .filter(|task| !task.status.is_terminal())
                 .map(|task| TaskSummary {
@@ -46,7 +45,7 @@ pub struct EngineeringLeadResponse {
     pub actions: Vec<LeadAction>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LeadAction {
     CreateTask {

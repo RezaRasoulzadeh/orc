@@ -1,12 +1,14 @@
 mod agent;
 mod protocol;
-mod state;
+mod storage;
 mod task;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
-use state::OrcState;
+use storage::Database;
+
+const DB_PATH: &str = ".orc/orc.db";
 
 #[derive(Parser)]
 #[command(name = "orc", version, about = "Local AI engineering orchestrator")]
@@ -47,40 +49,49 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Init => {
-            let state = OrcState::new("orc");
-            state.save()?;
-            println!("Initialized Orc in .orc/state.json");
-        }
-        Command::Status => match OrcState::load() {
-            Ok(state) => {
-                println!("Project: {}", state.project);
-                println!("Tasks: {}", state.tasks.len());
-                for task in state.tasks {
-                    println!("{}  {:<10} {}", task.id, task.status, task.title);
-                }
-            }
-            Err(_) => {
-                eprintln!("No state found. Run `orc init` to initialize repository state.");
-            }
-        },
-        Command::Ask { request } => match OrcState::load() {
-            Ok(state) => {
-                let lead_request = EngineeringLeadRequest::from_state(request, &state);
-                println!("{}", serde_json::to_string_pretty(&lead_request)?);
-            }
-            Err(_) => {
-                eprintln!("No state found. Run `orc init` to initialize repository state.");
-            }
-        },
-        Command::ApplyResponse { path } => {
-            let mut state = match OrcState::load() {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("No state found. Run `orc init` to initialize repository state.");
-                    return Ok(());
-                }
+            // initialize sqlite DB
+            let db = Database::init(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let pid = match db.get_project_id().map_err(|e| anyhow::anyhow!(e))? {
+                Some(id) => id,
+                None => db.create_project("orc").map_err(|e| anyhow::anyhow!(e))?,
             };
-
+            println!("Initialized Orc DB in {} (project id={})", DB_PATH, pid);
+        }
+        Command::Status => match Database::open(DB_PATH) {
+            Ok(db) => {
+                let project = db.get_project_name().map_err(|e| anyhow::anyhow!(e))?;
+                if let Some(name) = project {
+                    println!("Project: {}", name);
+                    let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+                    println!("Tasks: {}", tasks.len());
+                    for task in tasks {
+                        println!("{}  {:<10} {}", task.id, task.status, task.title);
+                    }
+                } else {
+                    eprintln!(
+                        "No project found in DB. Run `orc init` to initialize repository state."
+                    );
+                }
+            }
+            Err(_) => {
+                eprintln!("No DB found. Run `orc init` to initialize repository state.");
+            }
+        },
+        Command::Ask { request } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project = db
+                .get_project_name()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No project found in DB. Run `orc init` to initialize repository state."
+                    )
+                })?;
+            let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+            let lead_request = EngineeringLeadRequest::from_tasks(request, project, &tasks);
+            println!("{}", serde_json::to_string_pretty(&lead_request)?);
+        }
+        Command::ApplyResponse { path } => {
             let data = if path == "-" {
                 use std::io::{self, Read};
                 let mut buf = String::new();
@@ -91,9 +102,19 @@ fn main() -> Result<()> {
             };
 
             let response: EngineeringLeadResponse = serde_json::from_str(&data)?;
-            apply_lead_response(&mut state, response);
-            state.save()?;
-            println!("Applied response and saved state.");
+
+            // persist to sqlite
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+
+            let project_id = match db.get_project_id().map_err(|e| anyhow::anyhow!(e))? {
+                Some(id) => id,
+                None => db.create_project("orc").map_err(|e| anyhow::anyhow!(e))?,
+            };
+
+            // Apply the response atomically via the storage layer.
+            db.apply_engineering_lead_response(project_id, &response)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Applied response to DB.");
         }
         Command::Dispatch { task_id } => {
             if let Err(e) = agent::dispatch(&task_id) {
@@ -102,25 +123,19 @@ fn main() -> Result<()> {
             }
         }
         Command::Task { command } => match command {
-            TaskCommand::List => match OrcState::load() {
-                Ok(state) => {
-                    for task in state.tasks {
+            TaskCommand::List => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+                    for task in tasks {
                         println!("{}\t{}\t{}", task.id, task.status, task.title);
                     }
                 }
                 Err(_) => {
-                    eprintln!("No state found. Run `orc init` to initialize repository state.");
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
         },
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-fn apply_lead_response(state: &mut OrcState, response: EngineeringLeadResponse) {
-    for action in response.actions {
-        state.apply_action(action);
-    }
 }

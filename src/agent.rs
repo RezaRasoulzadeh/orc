@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 
-use crate::{state::OrcState, task::Task};
+use crate::storage::Database;
+use crate::task::Task;
 
 fn build_worker_prompt(project: &str, task: &Task) -> String {
     // concise prompt with required fields
@@ -16,15 +17,20 @@ fn build_worker_prompt(project: &str, task: &Task) -> String {
 }
 
 pub fn dispatch(task_id: &str) -> Result<()> {
-    let state = OrcState::load().with_context(|| "failed to load Orc state (.orc/state.json)")?;
+    // use sqlite-backed storage
+    let db = Database::open(".orc/orc.db")
+        .with_context(|| "failed to open orc DB (.orc/orc.db); run `orc init` first")?;
+    let project = db
+        .get_project_name()
+        .with_context(|| "failed to read project name from DB")?;
+    let project_name = project.unwrap_or_else(|| "orc".into());
 
-    let task = state
-        .tasks
-        .into_iter()
-        .find(|t| t.id == task_id)
-        .with_context(|| format!("task '{}' not found in state", task_id))?;
+    let task = db
+        .get_task(task_id)
+        .with_context(|| format!("failed to fetch task '{}' from DB", task_id))?
+        .with_context(|| format!("task '{}' not found in DB", task_id))?;
 
-    let prompt = build_worker_prompt(&state.project, &task);
+    let prompt = build_worker_prompt(&project_name, &task);
 
     // Spawn copilot with inherited stdio so the user sees progress
     let mut cmd = Command::new("copilot");

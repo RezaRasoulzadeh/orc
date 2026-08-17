@@ -50,6 +50,7 @@ fn agent(backend: &str, profile: Option<String>) -> AgentDefinition {
     AgentDefinition {
         id: "agent".into(),
         backend: backend.into(),
+        execution_mode: "automated".into(),
         display_name: "Agent".into(),
         enabled: true,
         priority: 1,

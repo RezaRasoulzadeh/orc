@@ -4,11 +4,14 @@ use crate::storage::Database;
 
 pub const AVAILABLE: &str = "available";
 pub const UNAVAILABLE: &str = "unavailable";
+pub const AUTOMATED: &str = "automated";
+pub const MANUAL: &str = "manual";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentDefinition {
     pub id: String,
     pub backend: String,
+    pub execution_mode: String,
     pub display_name: String,
     pub enabled: bool,
     pub priority: i64,
@@ -62,7 +65,7 @@ pub fn get_agent(db: &Database, id: &str) -> Result<AgentDefinition> {
 
 pub fn validate_backend(backend: &str) -> Result<()> {
     match backend {
-        "copilot" | "codex" => Ok(()),
+        "copilot" | "codex" | "chatgpt" | "claude" | "generic_manual" => Ok(()),
         _ => bail!(
             "unsupported agent backend '{}'; supported backends: copilot, codex",
             backend

@@ -23,6 +23,16 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
     )
 }
 
+pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id: &str) -> String {
+    format!(
+        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}\n\n## Constraints\n\nStay strictly inside this task's scope. Do not modify unrelated project work or assume access to credentials, private memory, or external systems.\n\n## Required validation\n\nDescribe the checks and tests you performed. If you could not run a check, say why.\n\n## Required response / handoff format\n\nSummarize changes or recommendations, list files affected (if any), report validation results, and identify follow-up risks or questions.\n",
+        id = task.id,
+        title = task.title,
+        objective = task.objective,
+        role = task.role
+    )
+}
+
 /// Build a worker prompt with engineering contract and task information.
 pub fn build_worker_prompt_for_testing(contract: &str, project: &str, task: &Task) -> String {
     build_worker_prompt(contract, project, task)
@@ -82,7 +92,7 @@ pub fn dispatch_with_worker_and_db_as(
 
     // Create an agent run
     let run_id = db
-        .create_agent_run(project_id, task_id, agent_id)
+        .create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)
         .with_context(|| "failed to create agent run")?;
 
     // Create a worktree for the task
@@ -170,9 +180,72 @@ pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result
     } else {
         registry::select_agent(&db.list_agents()?, &required_capabilities)?.clone()
     };
-    validate_selected_agent(&agent, &required_capabilities)?;
+    let capabilities = if agent.execution_mode == registry::MANUAL {
+        Vec::new()
+    } else {
+        required_capabilities.clone()
+    };
+    validate_selected_agent(&agent, &capabilities)?;
+    if agent.execution_mode == registry::MANUAL {
+        return dispatch_manual(task_id, &agent, &db, ".");
+    }
     let worker = WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
     dispatch_with_worker_and_db_as(task_id, worker.as_ref(), db_path, ".", &agent.id)
+}
+
+pub fn dispatch_manual(
+    task_id: &str,
+    agent: &AgentDefinition,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+) -> Result<()> {
+    let repo_path = repo_path.as_ref();
+    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
+    let project_id = db.get_project_id()?.context("no project found in DB")?;
+    let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
+    let task = db.get_task(task_id)?.context("task not found in DB")?;
+    if task.status == TaskStatus::Active || task.status == TaskStatus::Done {
+        anyhow::bail!(
+            "Task {} cannot be manually dispatched from status {}",
+            task_id,
+            task.status
+        );
+    }
+    db.update_task_status(task_id, TaskStatus::Active)?;
+    let run_id =
+        db.create_agent_run_with_mode(project_id, task_id, &agent.id, &agent.execution_mode)?;
+    if !db.set_agent_run_waiting_external(run_id)? {
+        anyhow::bail!("failed to put run {} into waiting_external", run_id);
+    }
+    println!(
+        "Run {} (agent={}, mode=manual, status=waiting_external)",
+        run_id, agent.id
+    );
+    println!(
+        "\n{}",
+        build_manual_packet(&contract, &project, &task, &agent.id)
+    );
+    Ok(())
+}
+
+pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
+    let run = db.get_agent_run(run_id)?.context("run not found")?;
+    if run.execution_mode != registry::MANUAL || run.status != "waiting_external" {
+        anyhow::bail!("run {} is not a waiting manual run", run_id);
+    }
+    let task_id = db.complete_manual_run(run_id, output)?;
+    db.update_task_status(&task_id, TaskStatus::Review)?;
+    Ok(task_id)
+}
+
+pub fn fail_run(db: &Database, run_id: i64, reason: &str) -> Result<String> {
+    let run = db.get_agent_run(run_id)?.context("run not found")?;
+    if run.execution_mode != registry::MANUAL || run.status != "waiting_external" {
+        anyhow::bail!("run {} is not a waiting manual run", run_id);
+    }
+    let task_id = db.fail_run(run_id, reason)?;
+    db.update_task_status(&task_id, TaskStatus::Blocked)?;
+    Ok(task_id)
 }
 
 fn validate_selected_agent(agent: &AgentDefinition, required: &[String]) -> Result<()> {
@@ -194,4 +267,125 @@ fn validate_selected_agent(agent: &AgentDefinition, required: &[String]) -> Resu
         );
     }
     registry::validate_backend(&agent.backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{AVAILABLE, MANUAL};
+    use crate::storage::Database;
+    use crate::task::TaskPriority;
+    use tempfile::tempdir;
+
+    fn manual_agent() -> AgentDefinition {
+        AgentDefinition {
+            id: "chatgpt-lead".into(),
+            backend: "chatgpt".into(),
+            execution_mode: MANUAL.into(),
+            display_name: "ChatGPT Lead".into(),
+            enabled: true,
+            priority: 100,
+            capabilities: vec!["planning".into(), "review".into()],
+            status: AVAILABLE.into(),
+            unavailable_reason: None,
+            profile_path: None,
+            config_metadata: None,
+            quota_remaining_percent: None,
+            quota_reset_at: None,
+            quota_checked_at: None,
+            quota_source: None,
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, Database, String) {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".orc")).unwrap();
+        std::fs::write(dir.path().join(".orc/engineering.md"), "Do focused work.").unwrap();
+        let db = Database::init(dir.path().join(".orc/orc.db")).unwrap();
+        let project = db.create_project("demo").unwrap();
+        db.insert_task(
+            project,
+            "Review API",
+            "Review the API design",
+            "review",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+        db.insert_agent(&manual_agent()).unwrap();
+        (dir, db, "T-0001".into())
+    }
+
+    #[test]
+    fn manual_dispatch_creates_waiting_run_without_worker_and_packet() {
+        let (dir, db, task_id) = setup();
+        let agent = manual_agent();
+        let packet = build_manual_packet(
+            "contract text",
+            "demo",
+            &db.get_task(&task_id).unwrap().unwrap(),
+            &agent.id,
+        );
+        assert!(packet.contains("contract text"));
+        assert!(packet.contains("T-0001"));
+        dispatch_manual(&task_id, &agent, &db, dir.path()).unwrap();
+        let task = db.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Active);
+        let run = db
+            .list_agent_runs_for_task(&task_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(run.execution_mode, MANUAL);
+        assert_eq!(run.status, "waiting_external");
+        db.set_agent_execution_mode(&agent.id, registry::AUTOMATED)
+            .unwrap();
+        drop(db);
+        let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+        let run = reopened
+            .list_agent_runs_for_task(&task_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(run.execution_mode, MANUAL);
+    }
+
+    #[test]
+    fn submit_and_fail_manual_runs_transition_tasks_and_preserve_output() {
+        let (dir, db, task_id) = setup();
+        dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+        let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+        assert_eq!(
+            submit_run(&db, run_id, "review completed").unwrap(),
+            task_id
+        );
+        let run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.output.as_deref(), Some("review completed"));
+        assert_eq!(
+            db.get_task(&task_id).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
+        assert!(submit_run(&db, run_id, "again").is_err());
+
+        let second_task = db
+            .insert_task(
+                db.get_project_id().unwrap().unwrap(),
+                "Second",
+                "Second",
+                "review",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        dispatch_manual(&second_task, &manual_agent(), &db, dir.path()).unwrap();
+        let second_run = db.list_agent_runs_for_task(&second_task).unwrap()[0].id;
+        assert_eq!(
+            fail_run(&db, second_run, "needs more detail").unwrap(),
+            second_task
+        );
+        assert_eq!(
+            db.get_task(&second_task).unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert!(fail_run(&db, second_run, "again").is_err());
+    }
 }

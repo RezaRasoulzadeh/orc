@@ -9,6 +9,7 @@ pub struct AgentRun {
     pub project_id: i64,
     pub task_id: Option<String>,
     pub agent: String,
+    pub execution_mode: String,
     pub status: String,
     pub output: Option<String>,
     pub started_at: String,
@@ -27,6 +28,8 @@ pub enum DbError {
     InvalidSequence(String),
     #[error("quota remaining percent must be between 0 and 100, got {0}")]
     InvalidQuota(i64),
+    #[error("invalid or already completed agent run: {0}")]
+    InvalidRunStatus(i64),
 }
 
 pub struct Database {
@@ -66,6 +69,7 @@ impl Database {
                 unavailable_reason TEXT,
                 profile_path TEXT,
                 config_metadata TEXT,
+                execution_mode TEXT NOT NULL DEFAULT 'automated',
                 quota_remaining_percent INTEGER,
                 quota_reset_at TEXT,
                 quota_checked_at TEXT,
@@ -105,6 +109,7 @@ impl Database {
                 project_id INTEGER NOT NULL REFERENCES projects(id),
                 task_id TEXT REFERENCES tasks(id),
                 agent TEXT NOT NULL,
+                execution_mode TEXT NOT NULL DEFAULT 'automated',
                 status TEXT NOT NULL,
                 output TEXT,
                 started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -122,6 +127,7 @@ impl Database {
             "#,
         )?;
         Self::ensure_agent_columns(&conn)?;
+        Self::ensure_agent_run_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -149,6 +155,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
         )?;
         Self::ensure_agent_columns(conn)?;
+        Self::ensure_agent_run_columns(conn)?;
         Ok(())
     }
 
@@ -162,12 +169,26 @@ impl Database {
             ("quota_reset_at", "TEXT"),
             ("quota_checked_at", "TEXT"),
             ("quota_source", "TEXT"),
+            ("execution_mode", "TEXT NOT NULL DEFAULT 'automated'"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE agents ADD COLUMN {name} {definition}"
                 ))?;
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_agent_run_columns(conn: &Connection) -> Result<(), DbError> {
+        let mut statement = conn.prepare("PRAGMA table_info(agent_runs)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "execution_mode") {
+            conn.execute_batch(
+                "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
+            )?;
         }
         Ok(())
     }
@@ -198,7 +219,7 @@ impl Database {
 
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 agent.id,
                 agent.backend,
@@ -210,6 +231,7 @@ impl Database {
                 agent.unavailable_reason,
                 agent.profile_path,
                 agent.config_metadata,
+                agent.execution_mode,
                 agent.quota_remaining_percent,
                 agent.quota_reset_at,
                 agent.quota_checked_at,
@@ -227,6 +249,7 @@ impl Database {
         Ok(AgentDefinition {
             id: row.get(0)?,
             backend: row.get(1)?,
+            execution_mode: row.get(10)?,
             display_name: row.get(2)?,
             enabled: row.get::<_, i64>(3)? != 0,
             priority: row.get(4)?,
@@ -235,10 +258,10 @@ impl Database {
             unavailable_reason: row.get(7)?,
             profile_path: row.get(8)?,
             config_metadata: row.get(9)?,
-            quota_remaining_percent: row.get(10)?,
-            quota_reset_at: row.get(11)?,
-            quota_checked_at: row.get(12)?,
-            quota_source: row.get(13)?,
+            quota_remaining_percent: row.get(11)?,
+            quota_reset_at: row.get(12)?,
+            quota_checked_at: row.get(13)?,
+            quota_source: row.get(14)?,
         })
     }
 
@@ -246,7 +269,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents WHERE id = ?1",
+                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents WHERE id = ?1",
                 params![id],
                 Self::agent_from_row,
             )
@@ -255,7 +278,7 @@ impl Database {
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents ORDER BY id",
+            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents ORDER BY id",
         )?;
         Ok(statement
             .query_map([], Self::agent_from_row)?
@@ -273,6 +296,17 @@ impl Database {
         Ok(self.conn.execute(
             "UPDATE agents SET priority = ?1 WHERE id = ?2",
             params![priority, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_execution_mode(
+        &self,
+        id: &str,
+        execution_mode: &str,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET execution_mode = ?1 WHERE id = ?2",
+            params![execution_mode, id],
         )? != 0)
     }
 
@@ -596,10 +630,11 @@ impl Database {
             project_id: row.get(1)?,
             task_id: row.get(2)?,
             agent: row.get(3)?,
-            status: row.get(4)?,
-            output: row.get(5)?,
-            started_at: row.get(6)?,
-            finished_at: row.get(7)?,
+            execution_mode: row.get(4)?,
+            status: row.get(5)?,
+            output: row.get(6)?,
+            started_at: row.get(7)?,
+            finished_at: row.get(8)?,
         })
     }
 
@@ -609,9 +644,19 @@ impl Database {
         task_id: &str,
         agent: &str,
     ) -> Result<i64, DbError> {
+        self.create_agent_run_with_mode(project_id, task_id, agent, "automated")
+    }
+
+    pub fn create_agent_run_with_mode(
+        &self,
+        project_id: i64,
+        task_id: &str,
+        agent: &str,
+        execution_mode: &str,
+    ) -> Result<i64, DbError> {
         self.conn.execute(
-            "INSERT INTO agent_runs (project_id, task_id, agent, status, started_at) VALUES (?1, ?2, ?3, 'running', CURRENT_TIMESTAMP)",
-            params![project_id, task_id, agent],
+            "INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, status, started_at) VALUES (?1, ?2, ?3, ?4, 'running', CURRENT_TIMESTAMP)",
+            params![project_id, task_id, agent, execution_mode],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -629,9 +674,50 @@ impl Database {
         Ok(changed != 0)
     }
 
+    pub fn set_agent_run_waiting_external(&self, run_id: i64) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agent_runs SET status = 'waiting_external' WHERE id = ?1 AND status = 'running'",
+            params![run_id],
+        )? != 0)
+    }
+
+    pub fn get_agent_run(&self, run_id: i64) -> Result<Option<AgentRun>, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE id = ?1",
+            params![run_id], Self::agent_run_from_row).optional()?)
+    }
+
+    pub fn complete_manual_run(&self, run_id: i64, output: &str) -> Result<String, DbError> {
+        let task_id: String = self.conn.query_row(
+            "SELECT task_id FROM agent_runs WHERE id = ?1 AND status = 'waiting_external'",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        let changed = self.conn.execute(
+            "UPDATE agent_runs SET status = 'completed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status = 'waiting_external'",
+            params![output, run_id])?;
+        if changed == 0 {
+            return Err(DbError::InvalidRunStatus(run_id));
+        }
+        Ok(task_id)
+    }
+
+    pub fn fail_run(&self, run_id: i64, reason: &str) -> Result<String, DbError> {
+        let task_id: String = self.conn.query_row(
+            "SELECT task_id FROM agent_runs WHERE id = ?1 AND status IN ('running', 'waiting_external')",
+            params![run_id], |row| row.get(0))?;
+        let changed = self.conn.execute(
+            "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+            params![reason, run_id])?;
+        if changed == 0 {
+            return Err(DbError::InvalidRunStatus(run_id));
+        }
+        Ok(task_id)
+    }
+
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, status, output, started_at, finished_at FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -640,7 +726,7 @@ impl Database {
 
     pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, status, output, started_at, finished_at FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
         )?;
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?

@@ -66,6 +66,23 @@ enum Command {
         /// Optional task ID to filter runs for a specific task
         task_id: Option<String>,
     },
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommand {
+    Submit {
+        run_id: i64,
+        #[arg(long)]
+        file: Option<String>,
+    },
+    Fail {
+        run_id: i64,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -83,6 +100,8 @@ enum AgentCommand {
         display_name: Option<String>,
         #[arg(long)]
         profile: Option<String>,
+        #[arg(long, value_parser = ["automated", "manual"], default_value = "automated")]
+        mode: String,
     },
     Enable {
         id: String,
@@ -247,6 +266,35 @@ fn main() -> Result<()> {
                 return Err(e);
             }
         }
+        Command::Run { command } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            match command {
+                RunCommand::Submit { run_id, file } => {
+                    let output = match file.as_deref() {
+                        Some(path) => std::fs::read_to_string(path)?,
+                        None => {
+                            use std::io::Read;
+                            let mut output = String::new();
+                            std::io::stdin().read_to_string(&mut output)?;
+                            output
+                        }
+                    };
+                    let task_id = agent::submit_run(&db, run_id, &output)?;
+                    println!(
+                        "Run {} completed; task {} moved to review.",
+                        run_id, task_id
+                    );
+                }
+                RunCommand::Fail { run_id, reason } => {
+                    let task_id = agent::fail_run(
+                        &db,
+                        run_id,
+                        reason.as_deref().unwrap_or("manual run failed"),
+                    )?;
+                    println!("Run {} failed; task {} moved to blocked.", run_id, task_id);
+                }
+            }
+        }
         Command::Agent { command } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             match command {
@@ -260,12 +308,17 @@ fn main() -> Result<()> {
                     capability,
                     display_name,
                     profile,
+                    mode,
                 } => {
                     registry::validate_backend(&backend)?;
+                    if mode == registry::AUTOMATED && backend != "codex" && backend != "copilot" {
+                        anyhow::bail!("backend '{}' requires --mode manual", backend);
+                    }
                     let agent = AgentDefinition {
                         display_name: display_name.unwrap_or_else(|| id.clone()),
                         id,
                         backend,
+                        execution_mode: mode,
                         enabled: true,
                         priority,
                         capabilities: capability,
@@ -325,6 +378,7 @@ fn main() -> Result<()> {
                     let agent = registry::get_agent(&db, &id)?;
                     println!("ID:                 {}", agent.id);
                     println!("Backend:            {}", agent.backend);
+                    println!("Execution mode:     {}", agent.execution_mode);
                     println!("Display name:       {}", agent.display_name);
                     println!("Enabled:            {}", agent.enabled);
                     println!("Availability:       {}", agent.status);
@@ -459,10 +513,11 @@ fn main() -> Result<()> {
                 } else {
                     for run in runs {
                         println!(
-                            "{} {} {} {}",
+                            "{} {} {} {} {}",
                             run.id,
                             run.task_id.as_deref().unwrap_or("-"),
                             run.agent,
+                            run.execution_mode,
                             run.status
                         );
                         if let Some(finished) = run.finished_at {
@@ -529,14 +584,15 @@ fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
 
 fn print_agents(db: &Database) -> Result<()> {
     println!(
-        "{:<18} {:<9} {:<12} {:<10} {:<7} RESET",
-        "ID", "BACKEND", "STATUS", "PRIORITY", "QUOTA"
+        "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} RESET",
+        "ID", "BACKEND", "MODE", "STATUS", "PRIORITY", "QUOTA"
     );
     for agent in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
         println!(
-            "{:<18} {:<9} {:<12} {:<10} {:<7} {}",
+            "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} {}",
             agent.id,
             agent.backend,
+            agent.execution_mode,
             if agent.enabled {
                 agent.status.as_str()
             } else {

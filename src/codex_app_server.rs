@@ -300,6 +300,7 @@ mod tests {
         AgentDefinition {
             id: id.into(),
             backend: backend.into(),
+            execution_mode: "automated".into(),
             display_name: id.into(),
             enabled: true,
             priority: 0,

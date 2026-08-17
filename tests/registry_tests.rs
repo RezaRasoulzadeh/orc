@@ -9,6 +9,7 @@ fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
     AgentDefinition {
         id: id.into(),
         backend: "codex".into(),
+        execution_mode: "automated".into(),
         display_name: id.into(),
         enabled: true,
         priority,
@@ -38,9 +39,25 @@ fn registry_persists_multiple_profiles_and_reopens() {
     let agents = reopened.list_agents().unwrap();
     assert_eq!(agents.len(), 2);
     assert_eq!(agents[0].backend, "codex");
+    assert_eq!(agents[0].execution_mode, "automated");
     assert_eq!(
         agents[1].profile_path.as_deref(),
         Some("/profiles/codex-secondary")
+    );
+}
+
+#[test]
+fn manual_execution_mode_persists() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let mut manual = agent("chatgpt", 100, registry::AVAILABLE);
+    manual.backend = "chatgpt".into();
+    manual.execution_mode = registry::MANUAL.into();
+    db.insert_agent(&manual).unwrap();
+    assert_eq!(
+        db.get_agent("chatgpt").unwrap().unwrap().execution_mode,
+        registry::MANUAL
     );
 }
 
@@ -119,6 +136,10 @@ fn agent_run_history_keeps_selected_ids_distinct() {
         .create_agent_run(project, "T-0002", "codex-secondary")
         .unwrap();
     let runs = db.list_agent_runs(project, 10).unwrap();
+    assert!(
+        runs.iter()
+            .all(|run| run.execution_mode == registry::AUTOMATED)
+    );
     let ids: Vec<_> = runs
         .iter()
         .filter(|run| run.id == first || run.id == second)

@@ -20,6 +20,9 @@ pub fn check_health(
     cwd: &Path,
     runner: &dyn HealthCommandRunner,
 ) -> Result<(), String> {
+    if agent.execution_mode == crate::registry::MANUAL {
+        return Ok(());
+    }
     match agent.backend.as_str() {
         "codex" => {
             if !runner.executable_exists("codex") {

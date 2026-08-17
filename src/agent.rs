@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::WorkerFactory;
 use crate::contract;
@@ -7,6 +7,9 @@ use crate::git;
 use crate::registry::{self, AgentDefinition};
 use crate::storage::Database;
 use crate::task::{Task, TaskStatus};
+use crate::validation::{
+    self, SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
+};
 use crate::worker::{Worker, WorkerOutcome};
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
@@ -248,6 +251,153 @@ pub fn fail_run(db: &Database, run_id: i64, reason: &str) -> Result<String> {
     Ok(task_id)
 }
 
+#[derive(Debug, Clone)]
+pub struct PatchSubmissionOutcome {
+    pub run_id: i64,
+    pub task_id: String,
+    pub worktree_path: PathBuf,
+    pub branch_name: String,
+    pub validation_report: ValidationReport,
+}
+
+pub fn submit_patch(
+    db: &Database,
+    run_id: i64,
+    patch_content: &str,
+    repo_path: impl AsRef<Path>,
+) -> Result<PatchSubmissionOutcome> {
+    submit_patch_with_runner(
+        db,
+        run_id,
+        patch_content,
+        repo_path,
+        &SystemValidationRunner,
+    )
+}
+
+pub fn submit_patch_with_runner(
+    db: &Database,
+    run_id: i64,
+    patch_content: &str,
+    repo_path: impl AsRef<Path>,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<PatchSubmissionOutcome> {
+    let repo_path = repo_path.as_ref();
+    let run = db
+        .get_agent_run(run_id)?
+        .with_context(|| format!("run {} not found", run_id))?;
+
+    if run.execution_mode != registry::MANUAL {
+        anyhow::bail!(
+            "run {} has execution_mode '{}'; only manual runs accept submit-patch",
+            run_id,
+            run.execution_mode
+        );
+    }
+    if run.status != "waiting_external" {
+        anyhow::bail!(
+            "run {} is in status '{}'; only waiting_external manual runs accept submit-patch",
+            run_id,
+            run.status
+        );
+    }
+    let task_id = run
+        .task_id
+        .clone()
+        .with_context(|| format!("run {} has no associated task", run_id))?;
+
+    let task = db
+        .get_task(&task_id)?
+        .with_context(|| format!("task '{}' not found in DB", task_id))?;
+
+    if task.status == TaskStatus::Done {
+        anyhow::bail!("task {} is already done; cannot submit patch", task_id);
+    }
+
+    if patch_content.trim().is_empty() {
+        let err_msg = "malformed patch: patch content is empty";
+        let _ = db.update_agent_run_output(run_id, err_msg);
+        anyhow::bail!("{}", err_msg);
+    }
+
+    // Ensure task worktree exists
+    let (branch_name, worktree_path) = match db.get_worktree_metadata(&task_id)? {
+        Some((branch, path_str)) if repo_path.join(&path_str).exists() => {
+            (branch, PathBuf::from(path_str))
+        }
+        _ => {
+            let (branch, path) = git::ensure_worktree(&task_id, repo_path)?;
+            (branch, path)
+        }
+    };
+
+    // Record worktree metadata for this run
+    let _ = db.store_worktree_metadata(
+        run_id,
+        &task_id,
+        &branch_name,
+        &worktree_path.to_string_lossy(),
+    );
+
+    let absolute_worktree = repo_path.join(&worktree_path);
+
+    // 1. Validate patch against worktree (git apply --check)
+    if let Err(e) = git::validate_patch(&absolute_worktree, patch_content) {
+        let err_msg = format!("patch validation failed: {:#}", e);
+        let _ = db.update_agent_run_output(run_id, &err_msg);
+        anyhow::bail!("{}", err_msg);
+    }
+
+    // 2. Apply patch to worktree (git apply)
+    if let Err(e) = git::apply_patch(&absolute_worktree, patch_content) {
+        let err_msg = format!("patch apply failed: {:#}", e);
+        let _ = db.fail_run(run_id, &err_msg);
+        let _ = db.update_task_status(&task_id, TaskStatus::Blocked);
+        anyhow::bail!("{}", err_msg);
+    }
+
+    // 3. Run project validation pipeline
+    let validation_config = ValidationConfig::load(repo_path)?;
+    let report = validation::run_validation_pipeline(
+        validation_runner,
+        &validation_config.commands,
+        &absolute_worktree,
+    )?;
+
+    if !report.is_success() {
+        let failure_summary = format!(
+            "Worktree: {}\nApplied: yes\n\nValidation:\n{}\nFailure: project validation",
+            worktree_path.display(),
+            report.summary()
+        );
+        let _ = db.fail_run(run_id, &failure_summary);
+        let _ = db.update_task_status(&task_id, TaskStatus::Blocked);
+        anyhow::bail!(
+            "Validation failed after applying patch to {}:\n{}",
+            worktree_path.display(),
+            report.summary()
+        );
+    }
+
+    // 4. Success: persist output and transition lifecycle
+    let success_output = format!(
+        "Worktree: {}\nApplied: yes\n\nValidation:\n{}\nPatch:\n{}",
+        worktree_path.display(),
+        report.summary(),
+        patch_content
+    );
+    db.complete_manual_run(run_id, &success_output)?;
+    db.update_task_status(&task_id, TaskStatus::Review)?;
+
+    Ok(PatchSubmissionOutcome {
+        run_id,
+        task_id,
+        worktree_path,
+        branch_name,
+        validation_report: report,
+    })
+}
+
 fn validate_selected_agent(agent: &AgentDefinition, required: &[String]) -> Result<()> {
     if !agent.enabled {
         anyhow::bail!("agent '{}' is disabled", agent.id);
@@ -275,6 +425,8 @@ mod tests {
     use crate::registry::{AVAILABLE, MANUAL};
     use crate::storage::Database;
     use crate::task::TaskPriority;
+    use crate::validation::test_helpers::FakeValidationRunner;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn manual_agent() -> AgentDefinition {
@@ -297,8 +449,46 @@ mod tests {
         }
     }
 
+    fn init_git_repo(repo_path: &Path) {
+        Command::new("git")
+            .current_dir(repo_path)
+            .arg("init")
+            .arg(".")
+            .output()
+            .expect("init git");
+        Command::new("git")
+            .current_dir(repo_path)
+            .arg("config")
+            .arg("user.email")
+            .arg("test@example.com")
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .current_dir(repo_path)
+            .arg("config")
+            .arg("user.name")
+            .arg("Test User")
+            .output()
+            .expect("git config name");
+        std::fs::write(repo_path.join("README.md"), "initial content\n").unwrap();
+        Command::new("git")
+            .current_dir(repo_path)
+            .arg("add")
+            .arg(".")
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .current_dir(repo_path)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial commit")
+            .output()
+            .expect("git commit");
+    }
+
     fn setup() -> (tempfile::TempDir, Database, String) {
         let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
         std::fs::create_dir_all(dir.path().join(".orc")).unwrap();
         std::fs::write(dir.path().join(".orc/engineering.md"), "Do focused work.").unwrap();
         let db = Database::init(dir.path().join(".orc/orc.db")).unwrap();
@@ -387,5 +577,81 @@ mod tests {
             TaskStatus::Blocked
         );
         assert!(fail_run(&db, second_run, "again").is_err());
+    }
+
+    #[test]
+    fn submit_patch_success_flow() {
+        let (dir, db, task_id) = setup();
+        dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+        let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+
+        let patch = "diff --git a/new_file.txt b/new_file.txt
+new file mode 100644
+--- /dev/null
++++ b/new_file.txt
+@@ -0,0 +1 @@
++hello manual patch
+";
+        let runner = FakeValidationRunner::success();
+        let outcome = submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner)
+            .expect("submit patch");
+
+        assert_eq!(outcome.run_id, run_id);
+        assert_eq!(outcome.task_id, task_id);
+        assert!(outcome.validation_report.is_success());
+
+        // Check task status moved to review
+        let task = db.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Review);
+
+        // Check run marked completed with output
+        let run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(run.status, "completed");
+        assert!(run.output.as_ref().unwrap().contains("hello manual patch"));
+
+        // Check applied in worktree, not main
+        let worktree_file = dir.path().join(&outcome.worktree_path).join("new_file.txt");
+        assert!(worktree_file.exists());
+        assert_eq!(
+            std::fs::read_to_string(worktree_file).unwrap(),
+            "hello manual patch\n"
+        );
+        assert!(!dir.path().join("new_file.txt").exists());
+    }
+
+    #[test]
+    fn submit_patch_validation_failure_leaves_run_actionable() {
+        let (dir, db, task_id) = setup();
+        dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+        let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+
+        // Invalid patch
+        let bad_patch = "not a valid diff";
+        let runner = FakeValidationRunner::success();
+        let err =
+            submit_patch_with_runner(&db, run_id, bad_patch, dir.path(), &runner).unwrap_err();
+        assert!(err.to_string().contains("patch validation failed"));
+
+        // Run is still waiting_external and task is still active
+        let run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(run.status, "waiting_external");
+        let task = db.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Active);
+
+        // Can resubmit with a valid patch
+        let good_patch = "diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-initial content
++updated content
+";
+        let outcome = submit_patch_with_runner(&db, run_id, good_patch, dir.path(), &runner)
+            .expect("resubmission should succeed");
+        assert_eq!(outcome.task_id, task_id);
+        assert_eq!(
+            db.get_task(&task_id).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
     }
 }

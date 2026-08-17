@@ -733,6 +733,14 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn update_agent_run_output(&self, run_id: i64, output: &str) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE agent_runs SET output = ?1 WHERE id = ?2",
+            params![output, run_id],
+        )?;
+        Ok(changed != 0)
+    }
+
     pub fn store_worktree_metadata(
         &self,
         agent_run_id: i64,
@@ -741,7 +749,7 @@ impl Database {
         worktree_path: &str,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO worktree_metadata (agent_run_id, task_id, branch_name, worktree_path) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO worktree_metadata (agent_run_id, task_id, branch_name, worktree_path) VALUES (?1, ?2, ?3, ?4)",
             params![agent_run_id, task_id, branch_name, worktree_path],
         )?;
         Ok(())

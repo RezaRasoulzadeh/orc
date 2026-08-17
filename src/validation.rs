@@ -1,0 +1,367 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationStepResult {
+    pub command: String,
+    pub passed: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub steps: Vec<ValidationStepResult>,
+}
+
+impl ValidationReport {
+    pub fn is_success(&self) -> bool {
+        self.steps.iter().all(|s| s.passed)
+    }
+
+    pub fn summary(&self) -> String {
+        let mut out = String::new();
+        for step in &self.steps {
+            let status = if step.passed { "PASS" } else { "FAIL" };
+            out.push_str(&format!("  {:<40} {}\n", step.command, status));
+            if !step.passed && !step.output.is_empty() {
+                out.push_str("    Output:\n");
+                for line in step.output.lines() {
+                    out.push_str(&format!("      {}\n", line));
+                }
+            }
+        }
+        out
+    }
+}
+
+pub trait ValidationRunner: Send + Sync {
+    fn run(&self, command: &str, working_dir: &Path) -> Result<ValidationStepResult>;
+}
+
+pub struct SystemValidationRunner;
+
+impl ValidationRunner for SystemValidationRunner {
+    fn run(&self, command: &str, working_dir: &Path) -> Result<ValidationStepResult> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .output()
+            .with_context(|| format!("failed to spawn validation command: {command}"))?;
+
+        let passed = output.status.success();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut combined = String::new();
+        if !stdout.trim().is_empty() {
+            combined.push_str(stdout.trim());
+        }
+        if !stderr.trim().is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(stderr.trim());
+        }
+
+        Ok(ValidationStepResult {
+            command: command.to_string(),
+            passed,
+            output: combined,
+        })
+    }
+}
+
+pub fn run_validation_pipeline(
+    runner: &dyn ValidationRunner,
+    commands: &[String],
+    working_dir: &Path,
+) -> Result<ValidationReport> {
+    let mut steps = Vec::new();
+    for cmd in commands {
+        let step = runner.run(cmd, working_dir)?;
+        let passed = step.passed;
+        steps.push(step);
+        if !passed {
+            break;
+        }
+    }
+    Ok(ValidationReport { steps })
+}
+
+impl ValidationConfig {
+    pub fn default_commands() -> Vec<String> {
+        vec![
+            "cargo fmt --check".to_string(),
+            "cargo clippy --all-targets -- -D warnings".to_string(),
+            "cargo test".to_string(),
+        ]
+    }
+
+    pub fn load(repo_path: impl AsRef<Path>) -> Result<Self> {
+        let repo_path = repo_path.as_ref();
+
+        // 1. Try .orc/validation.toml
+        let toml_path = repo_path.join(".orc/validation.toml");
+        if toml_path.exists() {
+            let content = std::fs::read_to_string(&toml_path)
+                .with_context(|| format!("failed to read {}", toml_path.display()))?;
+            if let Some(commands) = parse_commands_from_toml(&content) {
+                return Ok(Self { commands });
+            }
+        }
+
+        // 2. Try .orc/validation.json
+        let json_path = repo_path.join(".orc/validation.json");
+        if json_path.exists() {
+            let content = std::fs::read_to_string(&json_path)
+                .with_context(|| format!("failed to read {}", json_path.display()))?;
+            if let Ok(cfg) = serde_json::from_str::<ValidationConfig>(&content) {
+                return Ok(cfg);
+            }
+        }
+
+        // 3. Try .orc/engineering.md extraction
+        let contract_path = repo_path.join(".orc/engineering.md");
+        if let Some(commands) = std::fs::read_to_string(&contract_path)
+            .ok()
+            .and_then(|content| extract_commands_from_engineering_contract(&content))
+        {
+            return Ok(Self { commands });
+        }
+
+        // 4. Default fallback
+        Ok(Self {
+            commands: Self::default_commands(),
+        })
+    }
+}
+
+fn parse_commands_from_toml(content: &str) -> Option<Vec<String>> {
+    let mut in_commands = false;
+    let mut commands = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if (trimmed.starts_with("commands") || trimmed.starts_with("commands "))
+            && trimmed.contains('=')
+        {
+            let after_eq = trimmed.split_once('=')?.1.trim();
+            if after_eq.starts_with('[') && after_eq.ends_with(']') {
+                let inner = &after_eq[1..after_eq.len() - 1];
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        commands.push(s.to_string());
+                    }
+                }
+                return Some(commands);
+            }
+            if let Some(inner) = after_eq.strip_prefix('[') {
+                in_commands = true;
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() && s != "]" {
+                        commands.push(s.to_string());
+                    }
+                }
+                if after_eq.contains(']') {
+                    return Some(commands);
+                }
+                continue;
+            }
+        }
+        if in_commands {
+            if trimmed.ends_with(']') || trimmed == "]" {
+                let inner = trimmed.trim_end_matches(']');
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        commands.push(s.to_string());
+                    }
+                }
+                return Some(commands);
+            }
+            for item in trimmed.split(',') {
+                let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                if !s.is_empty() {
+                    commands.push(s.to_string());
+                }
+            }
+        }
+    }
+    if in_commands || !commands.is_empty() {
+        Some(commands)
+    } else {
+        None
+    }
+}
+
+fn extract_commands_from_engineering_contract(content: &str) -> Option<Vec<String>> {
+    let mut capturing = false;
+    let mut commands = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed
+            .to_lowercase()
+            .contains("every implementation must pass:")
+            || trimmed
+                .to_lowercase()
+                .starts_with("## tests and validation")
+        {
+            capturing = true;
+            continue;
+        }
+        if capturing {
+            if trimmed.starts_with('#') {
+                break;
+            }
+            if trimmed.starts_with("cargo ")
+                || trimmed.starts_with("npm ")
+                || trimmed.starts_with("pytest ")
+                || trimmed.starts_with("make ")
+            {
+                commands.push(trimmed.to_string());
+            } else if !commands.is_empty() && trimmed.is_empty() {
+                break;
+            }
+        }
+    }
+    if !commands.is_empty() {
+        Some(commands)
+    } else {
+        None
+    }
+}
+
+pub mod test_helpers {
+    use super::*;
+    use std::sync::Mutex;
+
+    pub struct FakeValidationRunner {
+        pub fail_commands: Vec<String>,
+        pub executed: Mutex<Vec<String>>,
+    }
+
+    impl FakeValidationRunner {
+        pub fn success() -> Self {
+            Self {
+                fail_commands: Vec::new(),
+                executed: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn failing_on(command: &str) -> Self {
+            Self {
+                fail_commands: vec![command.to_string()],
+                executed: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn executed_commands(&self) -> Vec<String> {
+            self.executed.lock().unwrap().clone()
+        }
+    }
+
+    impl ValidationRunner for FakeValidationRunner {
+        fn run(&self, command: &str, _working_dir: &Path) -> Result<ValidationStepResult> {
+            self.executed.lock().unwrap().push(command.to_string());
+            let passed = !self.fail_commands.iter().any(|c| c == command);
+            let output = if passed {
+                String::new()
+            } else {
+                format!("command failed: {}", command)
+            };
+            Ok(ValidationStepResult {
+                command: command.to_string(),
+                passed,
+                output,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::FakeValidationRunner;
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_toml_single_line_and_multiline() {
+        let toml_single = r#"commands = ["cargo fmt --check", "cargo test"]"#;
+        let cmds = parse_commands_from_toml(toml_single).unwrap();
+        assert_eq!(cmds, vec!["cargo fmt --check", "cargo test"]);
+
+        let toml_multi = r#"
+commands = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+]
+"#;
+        let cmds2 = parse_commands_from_toml(toml_multi).unwrap();
+        assert_eq!(
+            cmds2,
+            vec![
+                "cargo fmt --check",
+                "cargo clippy --all-targets -- -D warnings",
+                "cargo test"
+            ]
+        );
+    }
+
+    #[test]
+    fn load_from_toml_and_json_and_contract() {
+        let dir = tempdir().unwrap();
+        let orc_dir = dir.path().join(".orc");
+        std::fs::create_dir_all(&orc_dir).unwrap();
+
+        // 1. Engineering contract
+        std::fs::write(
+            orc_dir.join("engineering.md"),
+            "# Contract\n\n## Tests and validation\nEvery implementation must pass:\n\ncargo test\n",
+        )
+        .unwrap();
+        let cfg = ValidationConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.commands, vec!["cargo test"]);
+
+        // 2. validation.json overrides contract
+        std::fs::write(
+            orc_dir.join("validation.json"),
+            r#"{"commands": ["cargo check"]}"#,
+        )
+        .unwrap();
+        let cfg = ValidationConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.commands, vec!["cargo check"]);
+
+        // 3. validation.toml overrides json
+        std::fs::write(
+            orc_dir.join("validation.toml"),
+            r#"commands = ["cargo test --lib"]"#,
+        )
+        .unwrap();
+        let cfg = ValidationConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.commands, vec!["cargo test --lib"]);
+    }
+
+    #[test]
+    fn fake_runner_execution_and_pipeline() {
+        let runner = FakeValidationRunner::failing_on("cargo test");
+        let commands = vec!["cargo fmt --check".to_string(), "cargo test".to_string()];
+        let report = run_validation_pipeline(&runner, &commands, Path::new(".")).unwrap();
+        assert!(!report.is_success());
+        assert_eq!(report.steps.len(), 2);
+        assert!(report.steps[0].passed);
+        assert!(!report.steps[1].passed);
+        assert_eq!(runner.executed_commands(), commands);
+    }
+}

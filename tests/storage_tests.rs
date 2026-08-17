@@ -9,7 +9,6 @@ fn opening_missing_db_fails_without_creating_file() {
     assert!(Database::open(&db_path).is_err());
     assert!(!db_path.exists());
 }
-
 #[test]
 fn db_init_and_task_insert_read() {
     let dir = tempdir().unwrap();
@@ -153,4 +152,72 @@ fn apply_response_is_atomic() {
 
     // pre-existing T-0006 should still be present
     assert!(db2.get_task("T-0006").unwrap().is_some());
+}
+
+#[test]
+fn task_dependency_crud_and_validation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).expect("init");
+    let pid = db.create_project("testproj").expect("project");
+
+    let t1 = db
+        .insert_task(pid, "T1", "First task", "dev", TaskPriority::Normal)
+        .unwrap();
+    let t2 = db
+        .insert_task(pid, "T2", "Second task", "dev", TaskPriority::Normal)
+        .unwrap();
+    let t3 = db
+        .insert_task(pid, "T3", "Third task", "dev", TaskPriority::Normal)
+        .unwrap();
+
+    // self-dependency is rejected
+    assert!(db.add_task_dependency(&t1, &t1).is_err());
+
+    // missing task is rejected
+    assert!(db.add_task_dependency(&t1, "T-9999").is_err());
+    assert!(db.add_task_dependency("T-9999", &t1).is_err());
+
+    // valid dependency
+    db.add_task_dependency(&t2, &t1).expect("add t2 -> t1");
+    assert_eq!(db.list_task_dependencies(&t2).unwrap(), vec![t1.clone()]);
+    assert_eq!(db.list_task_dependents(&t1).unwrap(), vec![t2.clone()]);
+
+    // duplicate dependency is rejected
+    assert!(db.add_task_dependency(&t2, &t1).is_err());
+
+    // cycle: t1 -> t2 when t2 -> t1
+    assert!(db.add_task_dependency(&t1, &t2).is_err());
+
+    // multi-step cycle: t3 -> t2 -> t1; trying to add t1 -> t3
+    db.add_task_dependency(&t3, &t2).expect("add t3 -> t2");
+    assert!(db.add_task_dependency(&t1, &t3).is_err());
+
+    // remove dependency
+    assert!(db.remove_task_dependency(&t2, &t1).unwrap());
+    assert!(!db.remove_task_dependency(&t2, &t1).unwrap());
+    assert!(db.list_task_dependencies(&t2).unwrap().is_empty());
+}
+
+#[test]
+fn task_dependency_persistence_survives_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+
+    let (t1, t2) = {
+        let db = Database::init(&path).expect("init");
+        let pid = db.create_project("testproj").expect("project");
+        let t1 = db
+            .insert_task(pid, "T1", "First", "dev", TaskPriority::Normal)
+            .unwrap();
+        let t2 = db
+            .insert_task(pid, "T2", "Second", "dev", TaskPriority::Normal)
+            .unwrap();
+        db.add_task_dependency(&t2, &t1).unwrap();
+        (t1, t2)
+    };
+
+    let db2 = Database::open(&path).expect("open");
+    assert_eq!(db2.list_task_dependencies(&t2).unwrap(), vec![t1.clone()]);
+    assert_eq!(db2.list_task_dependents(&t1).unwrap(), vec![t2]);
 }

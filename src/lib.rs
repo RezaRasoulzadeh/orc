@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod git;
 pub mod protocol;
+pub mod queue;
 pub mod registry;
 pub mod review;
 pub mod scheduler;
@@ -18,6 +19,10 @@ pub mod worker;
 
 // Re-export useful types for tests
 pub use protocol::*;
+pub use queue::{
+    BlockingReason, DependencyInfo, QueueCategory, QueueEntry, QueueItem, QueueReport,
+    compute_queue,
+};
 pub use scheduler::{
     CandidateEvaluation, CandidateStatus, RejectionReason, ScheduleDecision, SelectionReason,
     evaluate_candidate, is_backend_mode_supported, schedule, validate_override,

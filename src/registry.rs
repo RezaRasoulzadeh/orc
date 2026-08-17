@@ -41,6 +41,37 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const AUTOMATED: &str = "automated";
 pub const MANUAL: &str = "manual";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => bail!(
+                "invalid reasoning effort '{value}'; expected one of: none, low, medium, high"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentDefinition {
     pub id: String,
@@ -53,6 +84,8 @@ pub struct AgentDefinition {
     pub status: String,
     pub unavailable_reason: Option<String>,
     pub profile_path: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub config_metadata: Option<String>,
     pub quota_remaining_percent: Option<i64>,
     pub quota_reset_at: Option<String>,

@@ -1,4 +1,4 @@
-use crate::registry::{AgentDefinition, QuotaLimits};
+use crate::registry::{AgentDefinition, QuotaLimits, ReasoningEffort};
 use crate::task::{Task, TaskPriority, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
@@ -80,6 +80,8 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'available',
                 unavailable_reason TEXT,
                 profile_path TEXT,
+                model TEXT,
+                reasoning_effort TEXT,
                 config_metadata TEXT,
                 execution_mode TEXT NOT NULL DEFAULT 'automated',
                 quota_remaining_percent INTEGER,
@@ -201,6 +203,8 @@ impl Database {
             ("quota_source", "TEXT"),
             ("quota_limits", "TEXT"),
             ("execution_mode", "TEXT NOT NULL DEFAULT 'automated'"),
+            ("model", "TEXT"),
+            ("reasoning_effort", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
@@ -250,7 +254,7 @@ impl Database {
 
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 agent.id,
                 agent.backend,
@@ -261,6 +265,8 @@ impl Database {
                 agent.status,
                 agent.unavailable_reason,
                 agent.profile_path,
+                agent.model,
+                agent.reasoning_effort.map(ReasoningEffort::as_str),
                 agent.config_metadata,
                 agent.execution_mode,
                 agent.quota_remaining_percent,
@@ -278,7 +284,7 @@ impl Database {
         let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
             rusqlite::Error::InvalidParameterName(format!("invalid agent capabilities: {error}"))
         })?;
-        let quota_limits_json: Option<String> = row.get(15)?;
+        let quota_limits_json: Option<String> = row.get(17)?;
         let quota_limits = quota_limits_json
             .map(|value| serde_json::from_str(&value))
             .transpose()
@@ -288,7 +294,7 @@ impl Database {
         Ok(AgentDefinition {
             id: row.get(0)?,
             backend: row.get(1)?,
-            execution_mode: row.get(10)?,
+            execution_mode: row.get(12)?,
             display_name: row.get(2)?,
             enabled: row.get::<_, i64>(3)? != 0,
             priority: row.get(4)?,
@@ -296,11 +302,17 @@ impl Database {
             status: row.get(6)?,
             unavailable_reason: row.get(7)?,
             profile_path: row.get(8)?,
-            config_metadata: row.get(9)?,
-            quota_remaining_percent: row.get(11)?,
-            quota_reset_at: row.get(12)?,
-            quota_checked_at: row.get(13)?,
-            quota_source: row.get(14)?,
+            model: row.get(9)?,
+            reasoning_effort: row
+                .get::<_, Option<String>>(10)?
+                .map(|value| ReasoningEffort::parse(&value))
+                .transpose()
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+            config_metadata: row.get(11)?,
+            quota_remaining_percent: row.get(13)?,
+            quota_reset_at: row.get(14)?,
+            quota_checked_at: row.get(15)?,
+            quota_source: row.get(16)?,
             quota_limits,
         })
     }
@@ -309,7 +321,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents WHERE id = ?1",
+                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents WHERE id = ?1",
                 params![id],
                 Self::agent_from_row,
             )
@@ -318,7 +330,7 @@ impl Database {
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents ORDER BY id",
+            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents ORDER BY id",
         )?;
         Ok(statement
             .query_map([], Self::agent_from_row)?
@@ -343,6 +355,24 @@ impl Database {
         Ok(self.conn.execute(
             "UPDATE agents SET profile_path = ?1 WHERE id = ?2",
             params![profile_path, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_model(&self, id: &str, model: &str) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET model = ?1 WHERE id = ?2",
+            params![model, id],
+        )? != 0)
+    }
+
+    pub fn set_agent_reasoning_effort(
+        &self,
+        id: &str,
+        effort: ReasoningEffort,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET reasoning_effort = ?1 WHERE id = ?2",
+            params![effort.as_str(), id],
         )? != 0)
     }
 

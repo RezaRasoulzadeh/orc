@@ -11,6 +11,8 @@ pub struct DispatchSummary {
     pub agent: String,
     pub backend: String,
     pub profile: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<crate::registry::ReasoningEffort>,
     pub worktree_path: String,
     pub run_id: i64,
     pub run_status: String,
@@ -25,6 +27,12 @@ pub fn format_dispatch(summary: &DispatchSummary) -> String {
     );
     if let Some(profile) = &summary.profile {
         out.push_str(&format!("Profile    {profile}\n"));
+    }
+    if let Some(model) = &summary.model {
+        out.push_str(&format!("Model      {model}\n"));
+    }
+    if let Some(effort) = summary.reasoning_effort {
+        out.push_str(&format!("Effort     {}\n", effort.as_str()));
     }
     out.push_str(&format!(
         "Worktree   {}\n\nPreparing worktree       OK\nStarting worker          OK\nWorker finished          {}\nValidation               {}\n\nChanges\n{}\nRun        {} {}\nTask       {}\n\nNext: orc review {}",

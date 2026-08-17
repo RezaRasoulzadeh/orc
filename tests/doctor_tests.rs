@@ -64,6 +64,8 @@ fn agent(backend: &str, profile: Option<String>) -> AgentDefinition {
         status: AVAILABLE.into(),
         unavailable_reason: None,
         profile_path: profile,
+        model: None,
+        reasoning_effort: None,
         config_metadata: None,
         quota_remaining_percent: None,
         quota_reset_at: None,

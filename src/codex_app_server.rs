@@ -403,6 +403,8 @@ mod tests {
             status: AVAILABLE.into(),
             unavailable_reason: None,
             profile_path: Some(profile.into()),
+            model: None,
+            reasoning_effort: None,
             config_metadata: None,
             quota_remaining_percent: None,
             quota_reset_at: None,

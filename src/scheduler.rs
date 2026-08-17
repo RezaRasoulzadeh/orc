@@ -328,6 +328,8 @@ mod tests {
             status: registry::AVAILABLE.to_string(),
             unavailable_reason: None,
             profile_path: None,
+            model: None,
+            reasoning_effort: None,
             config_metadata: None,
             quota_remaining_percent: None,
             quota_reset_at: None,

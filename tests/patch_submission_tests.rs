@@ -19,6 +19,8 @@ fn manual_agent() -> AgentDefinition {
         status: AVAILABLE.into(),
         unavailable_reason: None,
         profile_path: None,
+        model: None,
+        reasoning_effort: None,
         config_metadata: None,
         quota_remaining_percent: None,
         quota_reset_at: None,

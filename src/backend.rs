@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::registry::AgentDefinition;
+use crate::registry::ReasoningEffort;
 use crate::worker::{AntigravityWorker, CodexWorker, CopilotWorker, Worker};
 
 pub trait HealthCommandRunner {
@@ -76,13 +77,44 @@ impl WorkerFactory {
                         agent.id, agent.id
                     )
                 })?;
-                Ok(Box::new(CodexWorker::new(PathBuf::from(profile_path))))
+                Ok(Box::new(CodexWorker::with_execution(
+                    PathBuf::from(profile_path),
+                    agent.model.clone(),
+                    agent.reasoning_effort,
+                )))
             }
             "antigravity" => Ok(Box::new(AntigravityWorker)),
             backend => Err(format!(
                 "unsupported agent backend '{}'; supported backends: copilot, codex, antigravity",
                 backend
             )),
+        }
+    }
+
+    pub fn build_with_codex_overrides(
+        agent: &AgentDefinition,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String> {
+        match agent.backend.as_str() {
+            "codex" => {
+                let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
+                    format!(
+                        "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
+                        agent.id, agent.id
+                    )
+                })?;
+                Ok(Box::new(CodexWorker::with_execution(
+                    PathBuf::from(profile_path),
+                    model.or_else(|| agent.model.clone()),
+                    reasoning_effort.or(agent.reasoning_effort),
+                )))
+            }
+            _ if model.is_some() || reasoning_effort.is_some() => Err(format!(
+                "backend '{}' does not support Codex model or reasoning-effort overrides",
+                agent.backend
+            )),
+            _ => Self::build(agent),
         }
     }
 }

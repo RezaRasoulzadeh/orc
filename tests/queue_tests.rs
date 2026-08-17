@@ -30,6 +30,8 @@ fn add_agent(
         status: registry::AVAILABLE.to_string(),
         unavailable_reason: None,
         profile_path: None,
+        model: None,
+        reasoning_effort: None,
         config_metadata: None,
         execution_mode: mode.to_string(),
         quota_remaining_percent: None,

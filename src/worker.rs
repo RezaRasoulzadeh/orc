@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backend;
+use crate::registry::ReasoningEffort;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
@@ -66,25 +67,60 @@ impl Worker for CopilotWorker {
 /// Codex CLI worker. Its required profile is isolated through CODEX_HOME.
 pub struct CodexWorker {
     pub profile_path: PathBuf,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl CodexWorker {
     pub fn new(profile_path: PathBuf) -> Self {
-        Self { profile_path }
+        Self::with_execution(profile_path, None, None)
+    }
+
+    pub fn with_execution(
+        profile_path: PathBuf,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        Self {
+            profile_path,
+            model,
+            reasoning_effort,
+        }
     }
 
     pub fn command_args(prompt: &str) -> Vec<String> {
-        vec![
-            "exec".into(),
-            "--sandbox".into(),
-            "workspace-write".into(),
-            prompt.into(),
-        ]
+        Self::command_args_with_execution(prompt, None, None)
+    }
+
+    pub fn command_args_with_execution(
+        prompt: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Vec<String> {
+        vec!["exec".into(), "--sandbox".into(), "workspace-write".into()]
+            .into_iter()
+            .chain(
+                model
+                    .into_iter()
+                    .flat_map(|model| ["--model".into(), model.into()]),
+            )
+            .chain(reasoning_effort.into_iter().flat_map(|effort| {
+                [
+                    "--config".into(),
+                    format!("model_reasoning_effort=\"{}\"", effort.as_str()),
+                ]
+            }))
+            .chain(std::iter::once(prompt.into()))
+            .collect()
     }
 
     fn command(&self, prompt: &str, cwd: &Path) -> std::process::Command {
         let mut command = std::process::Command::new("codex");
-        command.args(Self::command_args(prompt));
+        command.args(Self::command_args_with_execution(
+            prompt,
+            self.model.as_deref(),
+            self.reasoning_effort,
+        ));
         backend::apply_profile_environment(&mut command, &self.profile_path);
         backend::configure_noninteractive(&mut command, cwd);
         command

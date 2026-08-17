@@ -1,5 +1,5 @@
 use orc::backend::WorkerFactory;
-use orc::registry::{self, AgentDefinition};
+use orc::registry::{self, AgentDefinition, ReasoningEffort};
 use orc::storage::Database;
 use orc::task::TaskPriority;
 use orc::worker::{AntigravityWorker, CodexWorker};
@@ -17,6 +17,8 @@ fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
         status: status.into(),
         unavailable_reason: None,
         profile_path: Some(format!("/profiles/{id}")),
+        model: None,
+        reasoning_effort: None,
         config_metadata: None,
         quota_remaining_percent: None,
         quota_reset_at: None,
@@ -45,6 +47,30 @@ fn registry_persists_multiple_profiles_and_reopens() {
         agents[1].profile_path.as_deref(),
         Some("/profiles/codex-secondary")
     );
+}
+
+#[test]
+fn codex_execution_defaults_persist_and_are_independent_per_agent() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let mut first = agent("codex-main", 100, registry::AVAILABLE);
+    first.model = Some("gpt-5.6-luna".into());
+    first.reasoning_effort = Some(ReasoningEffort::Low);
+    let mut second = agent("codex-secondary", 90, registry::AVAILABLE);
+    second.model = Some("gpt-5.6-terra".into());
+    second.reasoning_effort = Some(ReasoningEffort::High);
+    db.insert_agent(&first).unwrap();
+    db.insert_agent(&second).unwrap();
+    drop(db);
+
+    let db = Database::open(&path).unwrap();
+    let first = db.get_agent("codex-main").unwrap().unwrap();
+    let second = db.get_agent("codex-secondary").unwrap().unwrap();
+    assert_eq!(first.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(first.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(second.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(second.reasoning_effort, Some(ReasoningEffort::High));
 }
 
 #[test]
@@ -128,6 +154,65 @@ fn codex_workers_and_factory_support_isolated_profiles() {
         second_worker.configured_environment().map(|(_, path)| path),
         Some(std::path::Path::new("/profiles/codex-secondary"))
     );
+}
+
+#[test]
+fn codex_worker_uses_optional_model_and_reasoning_effort_configuration() {
+    assert_eq!(
+        CodexWorker::command_args_with_execution(
+            "inspect",
+            Some("gpt-5.6-luna"),
+            Some(ReasoningEffort::Low),
+        ),
+        vec![
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--model",
+            "gpt-5.6-luna",
+            "--config",
+            "model_reasoning_effort=\"low\"",
+            "inspect",
+        ]
+    );
+    assert_eq!(
+        CodexWorker::command_args_with_execution("inspect", None, None),
+        CodexWorker::command_args("inspect")
+    );
+}
+
+#[test]
+fn codex_dispatch_overrides_resolve_before_agent_defaults() {
+    let mut definition = agent("codex-main", 100, registry::AVAILABLE);
+    definition.model = Some("gpt-5.6-terra".into());
+    definition.reasoning_effort = Some(ReasoningEffort::High);
+    let worker = WorkerFactory::build_with_codex_overrides(
+        &definition,
+        Some("gpt-5.6-luna".into()),
+        Some(ReasoningEffort::Low),
+    )
+    .unwrap();
+    assert_eq!(
+        worker.configured_environment().map(|(_, path)| path),
+        Some(std::path::Path::new("/profiles/codex-main"))
+    );
+    assert_eq!(definition.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(definition.reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[test]
+fn non_codex_workers_reject_execution_overrides() {
+    let mut definition = agent("copilot", 100, registry::AVAILABLE);
+    definition.backend = "copilot".into();
+    let error = match WorkerFactory::build_with_codex_overrides(
+        &definition,
+        Some("gpt-5.6-luna".into()),
+        None,
+    ) {
+        Ok(_) => panic!("non-Codex worker unexpectedly accepted overrides"),
+        Err(error) => error,
+    };
+    assert!(error.contains("does not support"));
 }
 
 #[test]

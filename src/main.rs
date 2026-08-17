@@ -11,6 +11,20 @@ use orc::storage::Database;
 
 const DB_PATH: &str = ".orc/orc.db";
 
+fn parse_reasoning_effort(value: &str) -> Result<registry::ReasoningEffort, String> {
+    registry::ReasoningEffort::parse(value).map_err(|error| error.to_string())
+}
+
+fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
+    let agent = registry::get_agent(db, id)?;
+    if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
+        anyhow::bail!(
+            "only automated Codex agents support model and reasoning-effort configuration"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "orc", version, about = "Local AI engineering orchestrator")]
 struct Cli {
@@ -58,6 +72,10 @@ enum Command {
         /// Explicit agent override; selection validity checks still apply.
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
     },
     /// Review the latest task run and its worktree changes.
     Review {
@@ -127,6 +145,10 @@ enum AgentCommand {
         display_name: Option<String>,
         #[arg(long)]
         profile: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
         #[arg(long, value_parser = ["automated", "manual"], default_value = "automated")]
         mode: String,
     },
@@ -151,6 +173,15 @@ enum AgentCommand {
     Profile {
         id: String,
         path: String,
+    },
+    Model {
+        id: String,
+        model: String,
+    },
+    Effort {
+        id: String,
+        #[arg(value_parser = parse_reasoning_effort)]
+        effort: registry::ReasoningEffort,
     },
     Quota {
         id: String,
@@ -336,8 +367,15 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("Applied response to DB.");
         }
-        Command::Dispatch { task_id, agent } => {
-            if let Err(e) = agent::dispatch_selected(&task_id, agent.as_deref()) {
+        Command::Dispatch {
+            task_id,
+            agent,
+            model,
+            effort,
+        } => {
+            if let Err(e) =
+                agent::dispatch_selected_with_options(&task_id, agent.as_deref(), model, effort)
+            {
                 eprintln!("Dispatch failed: {:#}", e);
                 return Err(e);
             }
@@ -446,9 +484,18 @@ fn main() -> Result<()> {
                     capability,
                     display_name,
                     profile,
+                    model,
+                    effort,
                     mode,
                 } => {
                     registry::validate_backend(&backend)?;
+                    if (model.is_some() || effort.is_some())
+                        && (backend != "codex" || mode == registry::MANUAL)
+                    {
+                        anyhow::bail!(
+                            "only automated Codex agents support model and reasoning-effort configuration"
+                        );
+                    }
                     if mode == registry::AUTOMATED
                         && backend != "codex"
                         && backend != "copilot"
@@ -467,6 +514,8 @@ fn main() -> Result<()> {
                         status: registry::AVAILABLE.to_owned(),
                         unavailable_reason: None,
                         profile_path: profile,
+                        model,
+                        reasoning_effort: effort,
                         config_metadata: None,
                         quota_remaining_percent: None,
                         quota_reset_at: None,
@@ -503,6 +552,22 @@ fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!(e))?,
                     &id,
                 )?,
+                AgentCommand::Model { id, model } => {
+                    ensure_codex_automated_agent(&db, &id)?;
+                    ensure_agent_updated(
+                        db.set_agent_model(&id, &model)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        &id,
+                    )?;
+                }
+                AgentCommand::Effort { id, effort } => {
+                    ensure_codex_automated_agent(&db, &id)?;
+                    ensure_agent_updated(
+                        db.set_agent_reasoning_effort(&id, effort)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        &id,
+                    )?;
+                }
                 AgentCommand::Quota {
                     id,
                     remaining,
@@ -527,6 +592,17 @@ fn main() -> Result<()> {
                     println!("ID:                 {}", agent.id);
                     println!("Backend:            {}", agent.backend);
                     println!("Execution mode:     {}", agent.execution_mode);
+                    println!(
+                        "Model:              {}",
+                        agent.model.as_deref().unwrap_or("-")
+                    );
+                    println!(
+                        "Reasoning effort:   {}",
+                        agent
+                            .reasoning_effort
+                            .map(|value| value.as_str())
+                            .unwrap_or("-")
+                    );
                     println!("Display name:       {}", agent.display_name);
                     println!("Enabled:            {}", agent.enabled);
                     println!("Availability:       {}", agent.status);

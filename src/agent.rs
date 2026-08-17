@@ -232,6 +232,8 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                         agent: agent_id.to_owned(),
                         backend: "unknown".to_owned(),
                         profile: None,
+                        model: None,
+                        reasoning_effort: None,
                         worktree_path: worktree_path.display().to_string(),
                         run_id,
                         run_status: "completed".to_owned(),
@@ -273,7 +275,7 @@ pub fn dispatch(task_id: &str) -> Result<()> {
 }
 
 pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result<()> {
-    dispatch_selected_with_summary(task_id, requested_agent).map(|summary| {
+    dispatch_selected_with_options(task_id, requested_agent, None, None).map(|summary| {
         println!("{}", crate::review::format_dispatch(&summary));
     })
 }
@@ -281,6 +283,15 @@ pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result
 pub fn dispatch_selected_with_summary(
     task_id: &str,
     requested_agent: Option<&str>,
+) -> Result<DispatchSummary> {
+    dispatch_selected_with_options(task_id, requested_agent, None, None)
+}
+
+pub fn dispatch_selected_with_options(
+    task_id: &str,
+    requested_agent: Option<&str>,
+    model_override: Option<String>,
+    effort_override: Option<crate::registry::ReasoningEffort>,
 ) -> Result<DispatchSummary> {
     let db_path = ".orc/orc.db";
     let db = Database::open(db_path)
@@ -310,6 +321,12 @@ pub fn dispatch_selected_with_summary(
             })?
     };
     if agent.execution_mode == registry::MANUAL {
+        if model_override.is_some() || effort_override.is_some() {
+            anyhow::bail!(
+                "manual agent '{}' does not support Codex model or reasoning-effort overrides",
+                agent.id
+            );
+        }
         dispatch_manual(task_id, &agent, &db, ".")?;
         let task = db
             .get_task(task_id)?
@@ -324,6 +341,8 @@ pub fn dispatch_selected_with_summary(
             agent: agent.id,
             backend: agent.backend,
             profile: agent.profile_path,
+            model: None,
+            reasoning_effort: None,
             worktree_path: "(created when patch is submitted)".into(),
             run_id: run.id,
             run_status: run.status,
@@ -331,7 +350,10 @@ pub fn dispatch_selected_with_summary(
             changes: Default::default(),
         });
     }
-    let worker = WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
+    let model = model_override.or_else(|| agent.model.clone());
+    let reasoning_effort = effort_override.or(agent.reasoning_effort);
+    let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
+        .map_err(anyhow::Error::msg)?;
     let mut summary = dispatch_with_worker_and_db_as_with_runner(
         task_id,
         worker.as_ref(),
@@ -342,6 +364,8 @@ pub fn dispatch_selected_with_summary(
     )?;
     summary.backend = agent.backend;
     summary.profile = agent.profile_path;
+    summary.model = model;
+    summary.reasoning_effort = reasoning_effort;
     Ok(summary)
 }
 
@@ -623,6 +647,8 @@ mod tests {
             status: AVAILABLE.into(),
             unavailable_reason: None,
             profile_path: None,
+            model: None,
+            reasoning_effort: None,
             config_metadata: None,
             quota_remaining_percent: None,
             quota_reset_at: None,

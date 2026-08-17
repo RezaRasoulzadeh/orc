@@ -2,24 +2,90 @@ use orc::agent;
 use orc::storage::Database;
 use orc::task::TaskStatus;
 use orc::worker::test_helpers::{FailingSpawnWorker, FakeWorker};
-use tempfile::tempdir;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tempfile::TempDir;
+
+static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn get_unique_task_id() -> String {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("T-{:04}", id)
+}
+
+fn init_temp_git_repo(dir: &std::path::Path) {
+    // Create .orc directory with engineering.md
+    let orc_dir = dir.join(".orc");
+    std::fs::create_dir_all(&orc_dir).expect("create .orc dir");
+    std::fs::write(
+        orc_dir.join("engineering.md"),
+        "# Test Engineering Contract\n",
+    )
+    .expect("write engineering.md");
+
+    // Initialize a git repo in the temporary directory
+    Command::new("git")
+        .current_dir(dir)
+        .arg("init")
+        .arg(".")
+        .output()
+        .expect("init repo");
+
+    // Configure git user for commit operations
+    Command::new("git")
+        .current_dir(dir)
+        .arg("config")
+        .arg("user.email")
+        .arg("test@example.com")
+        .output()
+        .expect("config email");
+
+    Command::new("git")
+        .current_dir(dir)
+        .arg("config")
+        .arg("user.name")
+        .arg("Test User")
+        .output()
+        .expect("config name");
+
+    // Create initial commit
+    let file_path = dir.join("README.md");
+    std::fs::write(&file_path, "test").expect("write file");
+    Command::new("git")
+        .current_dir(dir)
+        .arg("add")
+        .arg(".")
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .current_dir(dir)
+        .arg("commit")
+        .arg("-m")
+        .arg("initial")
+        .output()
+        .expect("git commit");
+}
 
 #[test]
 fn active_task_cannot_be_dispatched_again() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Set task to active
     db.update_task_status(&tid, TaskStatus::Active)
@@ -27,27 +93,33 @@ fn active_task_cannot_be_dispatched_again() {
 
     // Try to dispatch active task
     let worker = FakeWorker::new_success(None);
-    let result = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("already active"));
 }
 
 #[test]
 fn done_task_cannot_be_dispatched() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Set task to done
     db.update_task_status(&tid, TaskStatus::Done)
@@ -55,35 +127,43 @@ fn done_task_cannot_be_dispatched() {
 
     // Try to dispatch done task
     let worker = FakeWorker::new_success(None);
-    let result = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("already done"));
 }
 
 #[test]
 fn successful_worker_transitions_active_to_review() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Initial status should be backlog
     let task = db.get_task(&tid).expect("get task").unwrap();
     assert_eq!(task.status, TaskStatus::Backlog);
 
-    // Dispatch with successful worker
+    // Dispatch with worker in repo context
     let worker = FakeWorker::new_success(None);
-    let result = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
     assert!(
         result.is_ok(),
         "dispatch should succeed: {:#?}",
@@ -102,24 +182,30 @@ fn successful_worker_transitions_active_to_review() {
 
 #[test]
 fn failed_worker_transitions_active_to_blocked() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Dispatch with failing worker
     let worker = FakeWorker::new_failure("something went wrong".to_string());
-    let result = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
     assert!(result.is_err());
 
     // Verify task transitioned to blocked
@@ -135,24 +221,30 @@ fn failed_worker_transitions_active_to_blocked() {
 
 #[test]
 fn failed_spawn_does_not_leave_task_active() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Dispatch with worker that fails at spawn
     let worker = FailingSpawnWorker;
-    let result = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
     assert!(result.is_err());
 
     // Verify task is NOT active (should be blocked)
@@ -167,26 +259,32 @@ fn failed_spawn_does_not_leave_task_active() {
 
 #[test]
 fn agent_run_status_output_timestamps_persist() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
-    // Dispatch with successful worker
+    // Dispatch with output text
     let output_text = "Deployment successful".to_string();
     let worker = FakeWorker::new_success(Some(output_text.clone()));
-    agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap())
-        .expect("dispatch should succeed");
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
+    assert!(result.is_ok(), "dispatch should succeed");
 
     // Verify agent run has all expected fields
     let runs = db.list_agent_runs_for_task(&tid).expect("list runs");
@@ -203,27 +301,32 @@ fn agent_run_status_output_timestamps_persist() {
 
 #[test]
 fn reopening_db_preserves_run_history() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
+
+    let db_path = repo_dir.join("orc.db");
 
     let tid = {
         let db = Database::init(&db_path).expect("init");
         let pid = db.create_project("test").expect("create project");
-        let tid = db
-            .insert_task(
-                pid,
-                "Test Task",
-                "Do something",
-                "dev",
-                orc::task::TaskPriority::Normal,
-            )
-            .expect("insert task");
+        let tid = get_unique_task_id();
+        db.insert_task_with_id(
+            pid,
+            &tid,
+            "Test Task",
+            "Do something",
+            "dev",
+            orc::task::TaskPriority::Normal,
+        )
+        .expect("insert task");
 
-        // Dispatch with successful worker
         let worker = FakeWorker::new_success(Some("output".to_string()));
-        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap())
-            .expect("dispatch should succeed");
+        let result =
+            agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
 
+        assert!(result.is_ok(), "dispatch should succeed");
         tid
     };
 
@@ -237,20 +340,24 @@ fn reopening_db_preserves_run_history() {
 
 #[test]
 fn task_transitions_through_lifecycle() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // Initial: backlog
     let task = db.get_task(&tid).expect("get task").unwrap();
@@ -258,8 +365,10 @@ fn task_transitions_through_lifecycle() {
 
     // After successful dispatch: review
     let worker = FakeWorker::new_success(None);
-    agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap())
-        .expect("dispatch should succeed");
+    let result =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+
+    assert!(result.is_ok(), "dispatch should succeed");
 
     let task = db.get_task(&tid).expect("get task").unwrap();
     assert_eq!(task.status, TaskStatus::Review);
@@ -267,25 +376,30 @@ fn task_transitions_through_lifecycle() {
 
 #[test]
 fn multiple_runs_per_task_are_tracked() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("orc.db");
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
 
+    let db_path = repo_dir.join("orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
-    let tid = db
-        .insert_task(
-            pid,
-            "Test Task",
-            "Do something",
-            "dev",
-            orc::task::TaskPriority::Normal,
-        )
-        .expect("insert task");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
 
     // First successful run
     let worker = FakeWorker::new_success(None);
-    agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap())
-        .expect("first dispatch");
+    let result1 =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+    assert!(result1.is_ok(), "first dispatch should succeed");
 
     // Reset task to backlog for another run
     db.update_task_status(&tid, TaskStatus::Backlog)
@@ -293,7 +407,9 @@ fn multiple_runs_per_task_are_tracked() {
 
     // Second run that fails
     let worker = FakeWorker::new_failure("failed".to_string());
-    let _ = agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap());
+    let result2 =
+        agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir);
+    assert!(result2.is_err(), "second dispatch should fail");
 
     // Verify both runs are tracked
     let runs = db.list_agent_runs_for_task(&tid).expect("list runs");

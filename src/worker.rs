@@ -1,5 +1,7 @@
-/// Worker abstraction for executing tasks.
-/// Keeps provider-specific logic behind this interface so tests can inject fake workers.
+//! Worker abstraction for executing tasks.
+//! Keeps provider-specific logic behind this interface so tests can inject fake workers.
+
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
@@ -14,18 +16,20 @@ pub enum WorkerOutcome {
 pub trait Worker: Send + Sync {
     /// Execute a task with the given prompt and return the outcome.
     /// output may contain captured stdout/stderr or other useful diagnostic information.
-    fn execute(&self, prompt: &str) -> Result<(WorkerOutcome, Option<String>), String>;
+    /// cwd is the working directory in which the task should execute.
+    fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String>;
 }
 
 /// Copilot worker implementation
 pub struct CopilotWorker;
 
 impl Worker for CopilotWorker {
-    fn execute(&self, prompt: &str) -> Result<(WorkerOutcome, Option<String>), String> {
+    fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         use std::process::{Command, Stdio};
 
         let mut cmd = Command::new("copilot");
         cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
+        cmd.current_dir(cwd);
         cmd.stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .stdin(Stdio::inherit());
@@ -76,7 +80,11 @@ pub mod test_helpers {
     }
 
     impl Worker for FakeWorker {
-        fn execute(&self, _prompt: &str) -> Result<(WorkerOutcome, Option<String>), String> {
+        fn execute(
+            &self,
+            _prompt: &str,
+            _cwd: &Path,
+        ) -> Result<(WorkerOutcome, Option<String>), String> {
             Ok((self.outcome.clone(), self.output.clone()))
         }
     }
@@ -85,7 +93,11 @@ pub mod test_helpers {
     pub struct FailingSpawnWorker;
 
     impl Worker for FailingSpawnWorker {
-        fn execute(&self, _prompt: &str) -> Result<(WorkerOutcome, Option<String>), String> {
+        fn execute(
+            &self,
+            _prompt: &str,
+            _cwd: &Path,
+        ) -> Result<(WorkerOutcome, Option<String>), String> {
             Err("simulated spawn failure".to_string())
         }
     }

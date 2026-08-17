@@ -48,6 +48,16 @@ enum TaskCommand {
         /// Task ID to display
         task_id: String,
     },
+    /// Show the diff for a task worktree
+    Diff {
+        /// Task ID
+        task_id: String,
+    },
+    /// Show worktree information for a task
+    Worktree {
+        /// Task ID
+        task_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -154,6 +164,53 @@ fn main() -> Result<()> {
                         eprintln!("Task {} not found", task_id);
                     }
                 },
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
+            TaskCommand::Diff { task_id } => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    match db
+                        .get_worktree_metadata(&task_id)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                    {
+                        Some((_branch, _path)) => match orc::git::show_diff(&task_id, ".") {
+                            Ok(diff) => {
+                                if diff.is_empty() {
+                                    println!("No changes in worktree for task {}", task_id);
+                                } else {
+                                    println!("{}", diff);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to show diff: {}", e);
+                            }
+                        },
+                        None => {
+                            eprintln!("No worktree found for task {}", task_id);
+                        }
+                    }
+                }
+                Err(_) => {
+                    eprintln!("No DB found. Run `orc init` to initialize repository state.");
+                }
+            },
+            TaskCommand::Worktree { task_id } => match Database::open(DB_PATH) {
+                Ok(db) => {
+                    match db
+                        .get_worktree_metadata(&task_id)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                    {
+                        Some((branch, path)) => {
+                            println!("Task:     {}", task_id);
+                            println!("Branch:   {}", branch);
+                            println!("Worktree: {}", path);
+                        }
+                        None => {
+                            eprintln!("No worktree found for task {}", task_id);
+                        }
+                    }
+                }
                 Err(_) => {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }

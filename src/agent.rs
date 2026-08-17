@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 
 use crate::contract;
+use crate::git;
 use crate::storage::Database;
 use crate::task::{Task, TaskStatus};
 use crate::worker::{CopilotWorker, Worker, WorkerOutcome};
@@ -31,8 +33,10 @@ pub fn dispatch_with_worker_and_db(
     task_id: &str,
     worker: &dyn Worker,
     db_path: &str,
+    repo_path: impl AsRef<Path>,
 ) -> Result<()> {
-    let contract = contract::load_contract(ENGINEERING_CONTRACT_PATH)?;
+    let repo_path = repo_path.as_ref();
+    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
     let db = Database::open(db_path)
         .with_context(|| format!("failed to open orc DB ({}); run `orc init` first", db_path))?;
@@ -69,10 +73,35 @@ pub fn dispatch_with_worker_and_db(
         .create_agent_run(project_id, task_id, "copilot")
         .with_context(|| "failed to create agent run")?;
 
+    // Create a worktree for the task
+    let (branch_name, worktree_path) = match git::create_worktree(task_id, repo_path) {
+        Ok((branch, path)) => (branch, path),
+        Err(e) => {
+            let error_msg = format!("Failed to create worktree: {}", e);
+            let _ = db.update_agent_run_status(run_id, "failed", Some(&error_msg));
+            let _ = db.update_task_status(task_id, TaskStatus::Blocked);
+            anyhow::bail!("{}", error_msg);
+        }
+    };
+
+    // Store worktree metadata
+    if let Err(e) = db.store_worktree_metadata(
+        run_id,
+        task_id,
+        &branch_name,
+        &worktree_path.to_string_lossy(),
+    ) {
+        let error_msg = format!("Failed to store worktree metadata: {}", e);
+        let _ = db.update_agent_run_status(run_id, "failed", Some(&error_msg));
+        let _ = db.update_task_status(task_id, TaskStatus::Blocked);
+        anyhow::bail!("{}", error_msg);
+    }
+
     let prompt = build_worker_prompt(&contract, &project_name, &task);
 
-    // Execute the worker
-    match worker.execute(&prompt) {
+    // Execute the worker in the worktree directory
+    let worktree_dir = repo_path.join(&worktree_path);
+    match worker.execute(&prompt, &worktree_dir) {
         Ok((outcome, output)) => {
             match outcome {
                 WorkerOutcome::Success => {
@@ -108,7 +137,7 @@ pub fn dispatch_with_worker_and_db(
 /// Dispatch a task for execution using the provided worker.
 /// Uses the default DB path (.orc/orc.db).
 pub fn dispatch_with_worker(task_id: &str, worker: &dyn Worker) -> Result<()> {
-    dispatch_with_worker_and_db(task_id, worker, ".orc/orc.db")
+    dispatch_with_worker_and_db(task_id, worker, ".orc/orc.db", ".")
 }
 
 /// Public dispatch function using the Copilot worker and default DB path

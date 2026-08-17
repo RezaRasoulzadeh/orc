@@ -83,6 +83,13 @@ impl Database {
                 started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 finished_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS worktree_metadata (
+                agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                branch_name TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
             INSERT OR IGNORE INTO meta (key, value) VALUES ('next_task_id', '1');
             COMMIT;
             "#,
@@ -221,6 +228,30 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    /// Insert a task with a specific ID (mainly for testing).
+    #[allow(dead_code)]
+    pub fn insert_task_with_id(
+        &self,
+        project_id: i64,
+        id: &str,
+        title: &str,
+        objective: &str,
+        role: &str,
+        priority: TaskPriority,
+    ) -> Result<String, DbError> {
+        let priority_str = match priority {
+            TaskPriority::Low => "low",
+            TaskPriority::Normal => "normal",
+            TaskPriority::High => "high",
+            TaskPriority::Critical => "critical",
+        };
+        self.conn.execute(
+            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog')",
+            params![id, project_id, title, objective, role, priority_str],
+        )?;
+        Ok(id.to_string())
     }
 
     /// Apply an Engineering Lead response atomically.
@@ -398,5 +429,33 @@ impl Database {
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn store_worktree_metadata(
+        &self,
+        agent_run_id: i64,
+        task_id: &str,
+        branch_name: &str,
+        worktree_path: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO worktree_metadata (agent_run_id, task_id, branch_name, worktree_path) VALUES (?1, ?2, ?3, ?4)",
+            params![agent_run_id, task_id, branch_name, worktree_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_worktree_metadata(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, String)>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT branch_name, worktree_path FROM worktree_metadata WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 }

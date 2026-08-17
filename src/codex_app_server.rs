@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::apply_profile_environment;
-use crate::registry::AgentDefinition;
+use crate::registry::{AgentDefinition, QuotaLimit, QuotaLimits};
 use crate::storage::Database;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,6 +22,7 @@ pub struct QuotaSnapshot {
     pub rate_limit_reached_type: Option<String>,
     pub credits: Option<CreditsSnapshot>,
     pub reset_credits_available: Option<i64>,
+    pub limits: QuotaLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -81,20 +82,35 @@ pub fn parse_rate_limits_response(value: Value) -> Result<QuotaSnapshot, String>
     }
     let result: RateLimitsResponse = serde_json::from_value(response.result)
         .map_err(|error| format!("malformed rate-limit response: {error}"))?;
-    let primary = result
-        .rate_limits
-        .primary
-        .ok_or_else(|| "Codex rate-limit response has no primary limit".to_owned())?;
-    let remaining_percent = (100_i64 - primary.used_percent).clamp(0, 100);
+    let primary = result.rate_limits.primary.map(QuotaLimit::from);
+    let secondary = result.rate_limits.secondary.map(QuotaLimit::from);
+    let monthly = result.rate_limits.monthly.map(QuotaLimit::from);
+    let (effective, effective_name) = if let Some(limit) = monthly.as_ref() {
+        (limit, "monthly")
+    } else if let Some(limit) = secondary.as_ref() {
+        (limit, "secondary")
+    } else if let Some(limit) = primary.as_ref() {
+        (limit, "primary")
+    } else {
+        return Err(
+            "Codex rate-limit response has no primary, secondary, or monthly limit".to_owned(),
+        );
+    };
     Ok(QuotaSnapshot {
-        remaining_percent,
-        reset_at: primary.resets_at,
-        window_duration_mins: primary.window_duration_mins,
+        remaining_percent: effective.remaining_percent,
+        reset_at: effective.reset_at,
+        window_duration_mins: effective.window_duration_mins,
         rate_limit_reached_type: result.rate_limits.rate_limit_reached_type,
         credits: result.rate_limits.credits,
         reset_credits_available: result
             .rate_limit_reset_credits
             .map(|summary| summary.available_count),
+        limits: QuotaLimits {
+            primary,
+            secondary,
+            monthly,
+            effective: effective_name.to_owned(),
+        },
     })
 }
 
@@ -115,6 +131,7 @@ pub fn sync_agent(
         snapshot.remaining_percent,
         snapshot.reset_at.map(|value| value.to_string()).as_deref(),
         QUOTA_SOURCE,
+        &snapshot.limits,
     )
     .map_err(|error| format!("failed to store quota for '{}': {error}", agent.id))?
     .then_some(())
@@ -154,6 +171,8 @@ struct RateLimitsResponse {
 #[serde(rename_all = "camelCase")]
 struct RateLimitSnapshot {
     primary: Option<RateLimitWindow>,
+    secondary: Option<RateLimitWindow>,
+    monthly: Option<RateLimitWindow>,
     rate_limit_reached_type: Option<String>,
     credits: Option<CreditsSnapshot>,
 }
@@ -164,6 +183,16 @@ struct RateLimitWindow {
     used_percent: i64,
     window_duration_mins: Option<i64>,
     resets_at: Option<i64>,
+}
+
+impl From<RateLimitWindow> for QuotaLimit {
+    fn from(value: RateLimitWindow) -> Self {
+        Self {
+            remaining_percent: (100_i64 - value.used_percent).clamp(0, 100),
+            reset_at: value.resets_at,
+            window_duration_mins: value.window_duration_mins,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -313,6 +342,7 @@ mod tests {
             quota_reset_at: None,
             quota_checked_at: None,
             quota_source: None,
+            quota_limits: None,
         }
     }
 
@@ -324,6 +354,16 @@ mod tests {
             rate_limit_reached_type: None,
             credits: None,
             reset_credits_available: None,
+            limits: QuotaLimits {
+                primary: Some(QuotaLimit {
+                    remaining_percent,
+                    reset_at: Some(reset_at),
+                    window_duration_mins: Some(10080),
+                }),
+                secondary: None,
+                monthly: None,
+                effective: "primary".into(),
+            },
         }
     }
 
@@ -362,6 +402,45 @@ mod tests {
             Some("rate_limit_reached")
         );
         assert_eq!(result.reset_credits_available, Some(2));
+    }
+
+    #[test]
+    fn free_account_uses_monthly_limit() {
+        let result = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1787000000},
+                "monthly": {"usedPercent": 1, "windowDurationMins": 43200, "resetsAt": 1789000000}
+            }}
+        }))
+        .unwrap();
+
+        assert_eq!(result.remaining_percent, 99);
+        assert_eq!(result.reset_at, Some(1789000000));
+        assert_eq!(result.window_duration_mins, Some(43200));
+        assert_eq!(result.limits.effective, "monthly");
+        assert_eq!(result.limits.primary.as_ref().unwrap().remaining_percent, 1);
+        assert_eq!(
+            result.limits.monthly.as_ref().unwrap().remaining_percent,
+            99
+        );
+    }
+
+    #[test]
+    fn paid_account_uses_weekly_secondary_limit() {
+        let result = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 8, "windowDurationMins": 300, "resetsAt": 1787000000},
+                "secondary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1787600000}
+            }}
+        }))
+        .unwrap();
+
+        assert_eq!(result.remaining_percent, 58);
+        assert_eq!(result.reset_at, Some(1787600000));
+        assert_eq!(result.window_duration_mins, Some(10080));
+        assert_eq!(result.limits.effective, "secondary");
     }
 
     #[test]
@@ -422,6 +501,12 @@ mod tests {
         assert_eq!(main.quota_remaining_percent, Some(3));
         assert_eq!(main.quota_reset_at.as_deref(), Some("1787416740"));
         assert_eq!(main.quota_source.as_deref(), Some(QUOTA_SOURCE));
+        assert_eq!(
+            main.quota_limits
+                .as_ref()
+                .map(|limits| limits.effective.as_str()),
+            Some("primary")
+        );
         assert!(main.quota_checked_at.is_some());
         assert_eq!(work.quota_remaining_percent, Some(72));
         assert_eq!(work.quota_reset_at.as_deref(), Some("1787500000"));

@@ -1,4 +1,4 @@
-use crate::registry::AgentDefinition;
+use crate::registry::{AgentDefinition, QuotaLimits};
 use crate::task::{Task, TaskPriority, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
@@ -74,6 +74,7 @@ impl Database {
                 quota_reset_at TEXT,
                 quota_checked_at TEXT,
                 quota_source TEXT
+                , quota_limits TEXT
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -186,6 +187,7 @@ impl Database {
             ("quota_reset_at", "TEXT"),
             ("quota_checked_at", "TEXT"),
             ("quota_source", "TEXT"),
+            ("quota_limits", "TEXT"),
             ("execution_mode", "TEXT NOT NULL DEFAULT 'automated'"),
         ] {
             if !columns.iter().any(|column| column == name) {
@@ -236,7 +238,7 @@ impl Database {
 
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 agent.id,
                 agent.backend,
@@ -253,6 +255,7 @@ impl Database {
                 agent.quota_reset_at,
                 agent.quota_checked_at,
                 agent.quota_source,
+                agent.quota_limits.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -263,6 +266,13 @@ impl Database {
         let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
             rusqlite::Error::InvalidParameterName(format!("invalid agent capabilities: {error}"))
         })?;
+        let quota_limits_json: Option<String> = row.get(15)?;
+        let quota_limits = quota_limits_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!("invalid quota limits: {error}"))
+            })?;
         Ok(AgentDefinition {
             id: row.get(0)?,
             backend: row.get(1)?,
@@ -279,6 +289,7 @@ impl Database {
             quota_reset_at: row.get(12)?,
             quota_checked_at: row.get(13)?,
             quota_source: row.get(14)?,
+            quota_limits,
         })
     }
 
@@ -286,7 +297,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents WHERE id = ?1",
+                "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents WHERE id = ?1",
                 params![id],
                 Self::agent_from_row,
             )
@@ -295,7 +306,7 @@ impl Database {
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source FROM agents ORDER BY id",
+            "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents ORDER BY id",
         )?;
         Ok(statement
             .query_map([], Self::agent_from_row)?
@@ -337,7 +348,7 @@ impl Database {
             return Err(DbError::InvalidQuota(remaining_percent));
         }
         Ok(self.conn.execute(
-            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = 'manual' WHERE id = ?3",
+            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = 'manual', quota_limits = NULL WHERE id = ?3",
             params![remaining_percent, reset_at, id],
         )? != 0)
     }
@@ -348,19 +359,20 @@ impl Database {
         remaining_percent: i64,
         reset_at: Option<&str>,
         source: &str,
+        limits: &QuotaLimits,
     ) -> Result<bool, DbError> {
         if !(0..=100).contains(&remaining_percent) {
             return Err(DbError::InvalidQuota(remaining_percent));
         }
         Ok(self.conn.execute(
-            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = ?3 WHERE id = ?4",
-            params![remaining_percent, reset_at, source, id],
+            "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = ?3, quota_limits = ?4 WHERE id = ?5",
+            params![remaining_percent, reset_at, source, serde_json::to_string(limits)?, id],
         )? != 0)
     }
 
     pub fn clear_agent_quota(&self, id: &str) -> Result<bool, DbError> {
         Ok(self.conn.execute(
-            "UPDATE agents SET quota_remaining_percent = NULL, quota_reset_at = NULL, quota_checked_at = NULL, quota_source = NULL WHERE id = ?1",
+            "UPDATE agents SET quota_remaining_percent = NULL, quota_reset_at = NULL, quota_checked_at = NULL, quota_source = NULL, quota_limits = NULL WHERE id = ?1",
             params![id],
         )? != 0)
     }

@@ -66,6 +66,7 @@ fn agent(backend: &str, profile: Option<String>) -> AgentDefinition {
         quota_reset_at: None,
         quota_checked_at: None,
         quota_source: None,
+        quota_limits: None,
     }
 }
 

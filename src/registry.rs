@@ -2,6 +2,22 @@ use anyhow::{Result, bail};
 
 use crate::storage::Database;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaLimit {
+    pub remaining_percent: i64,
+    pub reset_at: Option<i64>,
+    pub window_duration_mins: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaLimits {
+    pub primary: Option<QuotaLimit>,
+    pub secondary: Option<QuotaLimit>,
+    #[serde(default)]
+    pub monthly: Option<QuotaLimit>,
+    pub effective: String,
+}
+
 pub const AVAILABLE: &str = "available";
 pub const UNAVAILABLE: &str = "unavailable";
 pub const AUTOMATED: &str = "automated";
@@ -24,6 +40,7 @@ pub struct AgentDefinition {
     pub quota_reset_at: Option<String>,
     pub quota_checked_at: Option<String>,
     pub quota_source: Option<String>,
+    pub quota_limits: Option<QuotaLimits>,
 }
 
 impl AgentDefinition {

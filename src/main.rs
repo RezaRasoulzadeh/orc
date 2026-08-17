@@ -416,6 +416,7 @@ fn main() -> Result<()> {
                         quota_reset_at: None,
                         quota_checked_at: None,
                         quota_source: None,
+                        quota_limits: None,
                     };
                     db.insert_agent(&agent).map_err(|e| anyhow::anyhow!(e))?;
                     println!("Added agent {}", agent.id);
@@ -492,6 +493,12 @@ fn main() -> Result<()> {
                         "Quota source:        {}",
                         agent.quota_source.as_deref().unwrap_or("-")
                     );
+                    if let Some(limits) = &agent.quota_limits {
+                        println!("Effective limit:    {}", limits.effective);
+                        print_quota_limit("Primary limit:", limits.primary.as_ref());
+                        print_quota_limit("Secondary limit:", limits.secondary.as_ref());
+                        print_quota_limit("Monthly limit:", limits.monthly.as_ref());
+                    }
                     println!("Capabilities:        {}", agent.capabilities.join(", "));
                     println!(
                         "Profile/config:      {}",
@@ -689,6 +696,25 @@ fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned())
     );
+    println!("  effective limit: {}", snapshot.limits.effective);
+}
+
+fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
+    match limit {
+        Some(limit) => println!(
+            "{label:<20} {}% ({} min), reset {}",
+            limit.remaining_percent,
+            limit
+                .window_duration_mins
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            limit
+                .reset_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+        None => println!("{label:<20} -"),
+    }
 }
 
 fn print_agents(db: &Database) -> Result<()> {

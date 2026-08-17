@@ -13,6 +13,7 @@
 - AI/provider-specific logic belongs behind worker/backend abstractions.
 - Project state must come from SQLite.
 - No raw SQL outside storage.
+- No comments inside code, except file name in first row and TODO.
 - No hidden global mutable state.
 
 ## Error handling

@@ -65,9 +65,9 @@ pub fn get_agent(db: &Database, id: &str) -> Result<AgentDefinition> {
 
 pub fn validate_backend(backend: &str) -> Result<()> {
     match backend {
-        "copilot" | "codex" | "chatgpt" | "claude" | "generic_manual" => Ok(()),
+        "copilot" | "codex" | "antigravity" | "chatgpt" | "claude" | "generic_manual" => Ok(()),
         _ => bail!(
-            "unsupported agent backend '{}'; supported backends: copilot, codex",
+            "unsupported agent backend '{}'; supported backends: copilot, codex, antigravity",
             backend
         ),
     }

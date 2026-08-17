@@ -2,7 +2,7 @@ use orc::backend::WorkerFactory;
 use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
 use orc::task::TaskPriority;
-use orc::worker::CodexWorker;
+use orc::worker::{AntigravityWorker, CodexWorker};
 use tempfile::tempdir;
 
 fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
@@ -112,6 +112,35 @@ fn codex_workers_and_factory_support_isolated_profiles() {
     );
     assert_ne!(first.profile_path, second.profile_path);
     drop((first_worker, second_worker));
+}
+
+#[test]
+fn antigravity_worker_is_built_in_print_json_accept_edits_mode() {
+    let mut definition = agent("antigravity-main", 100, registry::AVAILABLE);
+    definition.backend = "antigravity".into();
+    let worker = WorkerFactory::build(&definition).unwrap();
+    assert_eq!(
+        AntigravityWorker::command_args("inspect"),
+        vec![
+            "-p",
+            "inspect",
+            "--output-format",
+            "json",
+            "--mode",
+            "accept-edits",
+            "--sandbox",
+        ]
+    );
+    drop(worker);
+}
+
+#[test]
+fn unsupported_backend_is_rejected_by_validation_and_factory() {
+    assert!(registry::validate_backend("antigravity").is_ok());
+    assert!(registry::validate_backend("nonexistent").is_err());
+    let mut definition = agent("bad", 100, registry::AVAILABLE);
+    definition.backend = "nonexistent".into();
+    assert!(WorkerFactory::build(&definition).is_err());
 }
 
 #[test]

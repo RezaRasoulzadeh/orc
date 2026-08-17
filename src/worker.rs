@@ -115,6 +115,61 @@ impl Worker for CodexWorker {
     }
 }
 
+/// Antigravity CLI worker. Runs `agy` in headless print mode with JSON output
+/// and accept-edits so file operations proceed without an interactive prompt,
+/// while leaving shell-command permissions on the CLI's default (safe) policy.
+pub struct AntigravityWorker;
+
+impl AntigravityWorker {
+    pub fn command_args(prompt: &str) -> Vec<String> {
+        vec![
+            "-p".into(),
+            prompt.into(),
+            "--output-format".into(),
+            "json".into(),
+            "--mode".into(),
+            "accept-edits".into(),
+            "--sandbox".into(),
+        ]
+    }
+}
+
+impl Worker for AntigravityWorker {
+    fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let mut command = std::process::Command::new("agy");
+        command.args(Self::command_args(prompt));
+        backend::configure_noninteractive(&mut command, cwd);
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let combined = if stderr.is_empty() {
+                    stdout
+                } else if stdout.is_empty() {
+                    stderr
+                } else {
+                    format!("{stdout}\n{stderr}")
+                };
+                Ok((
+                    WorkerOutcome::Success,
+                    (!combined.is_empty()).then_some(combined),
+                ))
+            }
+            Ok(output) => {
+                let code = output
+                    .status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                Err(format!("Antigravity exited with non-zero status: {code}"))
+            }
+            Err(error) => Err(format!(
+                "failed to spawn 'agy' executable; ensure it is installed and on PATH: {error}"
+            )),
+        }
+    }
+}
+
 pub mod test_helpers {
     use super::*;
 

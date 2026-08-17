@@ -311,7 +311,11 @@ fn main() -> Result<()> {
                     mode,
                 } => {
                     registry::validate_backend(&backend)?;
-                    if mode == registry::AUTOMATED && backend != "codex" && backend != "copilot" {
+                    if mode == registry::AUTOMATED
+                        && backend != "codex"
+                        && backend != "copilot"
+                        && backend != "antigravity"
+                    {
                         anyhow::bail!("backend '{}' requires --mode manual", backend);
                     }
                     let agent = AgentDefinition {

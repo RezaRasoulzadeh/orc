@@ -11,11 +11,14 @@ use tempfile::TempDir;
 struct FakeRunner {
     commands: RefCell<Vec<(String, Vec<String>)>>,
     codex_exists: bool,
+    agy_exists: bool,
 }
 
 impl HealthCommandRunner for FakeRunner {
     fn executable_exists(&self, executable: &str) -> bool {
-        executable == "git" || (executable == "codex" && self.codex_exists)
+        executable == "git"
+            || (executable == "codex" && self.codex_exists)
+            || (executable == "agy" && self.agy_exists)
     }
 
     fn run(
@@ -77,6 +80,7 @@ fn healthy_project_checks_auth_without_an_ai_request() {
     let runner = FakeRunner {
         commands: RefCell::new(vec![]),
         codex_exists: true,
+        agy_exists: true,
     };
     let report = doctor::inspect(&root, &runner);
     assert_eq!(report.overall(), "OK");
@@ -102,6 +106,7 @@ fn reports_missing_contract_database_unsupported_backend_and_profile() {
     let runner = FakeRunner {
         commands: RefCell::new(vec![]),
         codex_exists: true,
+        agy_exists: true,
     };
     let report = doctor::inspect(&root, &runner);
     assert!(
@@ -144,6 +149,51 @@ fn missing_provider_cli_is_reported_through_lookup_abstraction() {
     let runner = FakeRunner {
         commands: RefCell::new(vec![]),
         codex_exists: false,
+        agy_exists: false,
+    };
+    let report = doctor::inspect(&root, &runner);
+    assert!(matches!(
+        report.agents[0].status,
+        CheckStatus::Unavailable(_)
+    ));
+}
+
+#[test]
+fn antigravity_health_check_uses_version_flag_without_an_ai_request() {
+    let (_dir, root) = project();
+    let db = Database::open(root.join(".orc/orc.db")).unwrap();
+    db.insert_agent(&agent("antigravity", None)).unwrap();
+    let runner = FakeRunner {
+        commands: RefCell::new(vec![]),
+        codex_exists: false,
+        agy_exists: true,
+    };
+    let report = doctor::inspect(&root, &runner);
+    assert_eq!(report.overall(), "OK");
+    let commands = runner.commands.borrow();
+    assert!(
+        commands
+            .iter()
+            .any(|(program, args)| program == "agy" && args == &["--version"])
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|(_, args)| args.iter().any(|arg| arg == "-p"))
+    );
+}
+
+#[test]
+fn missing_agy_executable_is_reported_as_unavailable() {
+    let (_dir, root) = project();
+    Database::open(root.join(".orc/orc.db"))
+        .unwrap()
+        .insert_agent(&agent("antigravity", None))
+        .unwrap();
+    let runner = FakeRunner {
+        commands: RefCell::new(vec![]),
+        codex_exists: true,
+        agy_exists: false,
     };
     let report = doctor::inspect(&root, &runner);
     assert!(matches!(

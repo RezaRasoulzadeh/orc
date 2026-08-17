@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::registry::AgentDefinition;
-use crate::worker::{CodexWorker, CopilotWorker, Worker};
+use crate::worker::{AntigravityWorker, CodexWorker, CopilotWorker, Worker};
 
 pub trait HealthCommandRunner {
     fn executable_exists(&self, executable: &str) -> bool;
@@ -47,6 +47,12 @@ pub fn check_health(
             }
             runner.run("copilot", &["--version"], cwd, None)
         }
+        "antigravity" => {
+            if !runner.executable_exists("agy") {
+                return Err("provider CLI 'agy' not found".into());
+            }
+            runner.run("agy", &["--version"], cwd, None)
+        }
         backend => Err(format!("unsupported backend '{backend}'")),
     }
 }
@@ -60,8 +66,9 @@ impl WorkerFactory {
             "codex" => Ok(Box::new(CodexWorker::new(
                 agent.profile_path.as_deref().map(PathBuf::from),
             ))),
+            "antigravity" => Ok(Box::new(AntigravityWorker)),
             backend => Err(format!(
-                "unsupported agent backend '{}'; supported backends: copilot, codex",
+                "unsupported agent backend '{}'; supported backends: copilot, codex, antigravity",
                 backend
             )),
         }

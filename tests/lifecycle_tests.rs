@@ -22,6 +22,8 @@ fn init_temp_git_repo(dir: &std::path::Path) {
         "# Test Engineering Contract\n",
     )
     .expect("write engineering.md");
+    std::fs::write(orc_dir.join("validation.toml"), "commands = []\n")
+        .expect("write validation config");
 
     // Initialize a git repo in the temporary directory
     Command::new("git")

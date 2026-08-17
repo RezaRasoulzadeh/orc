@@ -53,6 +53,10 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Review the latest task run and its worktree changes.
+    Review {
+        task_id: String,
+    },
     /// Schedule an agent for a task using deterministic selection rules
     Schedule {
         /// Task ID to schedule (e.g., T-0001)
@@ -187,6 +191,15 @@ enum TaskCommand {
         /// Task ID
         task_id: String,
     },
+    /// Accept a reviewed task and integrate its branch.
+    Accept {
+        task_id: String,
+    },
+    /// Reject a reviewed task while preserving its worktree.
+    Reject {
+        task_id: String,
+        reason: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -295,6 +308,11 @@ fn main() -> Result<()> {
                 eprintln!("Dispatch failed: {:#}", e);
                 return Err(e);
             }
+        }
+        Command::Review { task_id } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let review = orc::review::build_review(&db, &task_id, std::path::Path::new("."))?;
+            println!("{}", orc::review::format_review(&review));
         }
         Command::Schedule {
             task_id,
@@ -581,12 +599,12 @@ fn main() -> Result<()> {
                         .get_worktree_metadata(&task_id)
                         .map_err(|e| anyhow::anyhow!(e))?
                     {
-                        Some((_branch, _path)) => match orc::git::show_diff(&task_id, ".") {
-                            Ok(diff) => {
-                                if diff.is_empty() {
+                        Some((_branch, path)) => match orc::git::inspect_worktree(path, ".") {
+                            Ok(changes) => {
+                                if changes.diff.is_empty() {
                                     println!("No changes in worktree for task {}", task_id);
                                 } else {
-                                    println!("{}", diff);
+                                    println!("{}", changes.diff);
                                 }
                             }
                             Err(e) => {
@@ -622,6 +640,22 @@ fn main() -> Result<()> {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
+            TaskCommand::Accept { task_id } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                orc::agent::accept_task(&db, &task_id, ".")?;
+                println!(
+                    "Accepted task {}; changes integrated and task marked done.",
+                    task_id
+                );
+            }
+            TaskCommand::Reject { task_id, reason } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                orc::agent::reject_task(&db, &task_id, reason.as_deref())?;
+                println!(
+                    "Rejected task {}; worktree preserved and task moved to ready.",
+                    task_id
+                );
+            }
         },
         Command::Runs { task_id } => match Database::open(DB_PATH) {
             Ok(db) => {

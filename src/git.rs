@@ -2,6 +2,182 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const RUNTIME_ARTIFACTS: [&str; 3] = [".orc/orc.db", ".orc/orc.db-wal", ".orc/orc.db-shm"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub status: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeChanges {
+    pub files: Vec<ChangedFile>,
+    pub stat: String,
+    pub diff: String,
+}
+
+pub fn is_runtime_artifact(path: &str) -> bool {
+    RUNTIME_ARTIFACTS.contains(&path)
+        || path == ".orc/worktrees"
+        || path.starts_with(".orc/worktrees/")
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_output_owned(dir: &Path, args: &[String]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub fn changed_files(worktree: impl AsRef<Path>) -> Result<Vec<ChangedFile>> {
+    let worktree = worktree.as_ref();
+    let output = git_output(worktree, &["status", "--porcelain=v1", "-z"])?;
+    let mut files = Vec::new();
+    let mut entries = output.split('\0');
+    while let Some(entry) = entries.next() {
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = entry[..2].trim().to_string();
+        let path = entry[3..].to_string();
+        if status.contains('R') || status.contains('C') {
+            let _ = entries.next();
+        }
+        if !is_runtime_artifact(&path) {
+            files.push(ChangedFile { status, path });
+        }
+    }
+    Ok(files)
+}
+
+pub fn inspect_worktree(
+    worktree: impl AsRef<Path>,
+    main_checkout: impl AsRef<Path>,
+) -> Result<WorktreeChanges> {
+    let worktree = worktree.as_ref();
+    let main_head = git_output(main_checkout.as_ref(), &["rev-parse", "HEAD"])?;
+    let base = git_output_owned(
+        worktree,
+        &[
+            "merge-base".to_owned(),
+            main_head.trim().to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )?;
+    let base = base.trim();
+    let diff_args = [
+        "diff".to_owned(),
+        base.to_owned(),
+        "--".to_owned(),
+        ".".to_owned(),
+        ":(exclude).orc/orc.db".to_owned(),
+        ":(exclude).orc/orc.db-wal".to_owned(),
+        ":(exclude).orc/orc.db-shm".to_owned(),
+        ":(exclude).orc/worktrees/**".to_owned(),
+    ];
+    let mut diff = git_output_owned(worktree, &diff_args)?;
+    let status_files = changed_files(worktree)?;
+    let names_args = [
+        "diff".to_owned(),
+        "--name-status".to_owned(),
+        "-z".to_owned(),
+        base.to_owned(),
+        "--".to_owned(),
+        ".".to_owned(),
+        ":(exclude).orc/orc.db".to_owned(),
+        ":(exclude).orc/orc.db-wal".to_owned(),
+        ":(exclude).orc/orc.db-shm".to_owned(),
+        ":(exclude).orc/worktrees/**".to_owned(),
+    ];
+    let mut files = parse_name_status(&git_output_owned(worktree, &names_args)?);
+    for file in status_files.iter().filter(|file| file.status == "??") {
+        let output = Command::new("git")
+            .current_dir(worktree)
+            .args(["diff", "--no-index", "--", "/dev/null", &file.path])
+            .output()
+            .context("failed to diff untracked file")?;
+        if output.status.code() == Some(1) {
+            diff.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        files.push(file.clone());
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
+    let stat = if files.is_empty() {
+        String::new()
+    } else {
+        let stat_args = [
+            "diff".to_owned(),
+            "--stat".to_owned(),
+            base.to_owned(),
+            "--".to_owned(),
+            ".".to_owned(),
+            ":(exclude).orc/orc.db".to_owned(),
+            ":(exclude).orc/orc.db-wal".to_owned(),
+            ":(exclude).orc/orc.db-shm".to_owned(),
+            ":(exclude).orc/worktrees/**".to_owned(),
+        ];
+        let mut text = git_output_owned(worktree, &stat_args)?;
+        if files.iter().any(|file| file.status == "??") {
+            text.push_str(&format!(
+                "{} file(s) untracked\n",
+                files.iter().filter(|file| file.status == "??").count()
+            ));
+        }
+        text.trim().to_owned()
+    };
+    Ok(WorktreeChanges { files, stat, diff })
+}
+
+fn parse_name_status(output: &str) -> Vec<ChangedFile> {
+    let mut entries = output.split('\0');
+    let mut files = Vec::new();
+    while let (Some(status), Some(first_path)) = (entries.next(), entries.next()) {
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            entries.next().unwrap_or(first_path)
+        } else {
+            first_path
+        };
+        if status.is_empty() || is_runtime_artifact(path) {
+            continue;
+        }
+        files.push(ChangedFile {
+            status: status.to_owned(),
+            path: path.to_owned(),
+        });
+    }
+    files
+}
+
 /// Generates a Git branch name for a task.
 /// Format: orc/task/<task-id>
 pub fn branch_name_for_task(task_id: &str) -> String {
@@ -244,8 +420,6 @@ pub fn get_worktree_path(task_id: &str) -> PathBuf {
     worktree_path_for_task(task_id)
 }
 
-/// Show the diff for a task worktree/branch.
-/// Returns the diff output as a string.
 pub fn show_diff(task_id: &str, git_dir: impl AsRef<Path>) -> Result<String> {
     let git_dir = git_dir.as_ref();
     let worktree_path = worktree_path_for_task(task_id);
@@ -259,20 +433,104 @@ pub fn show_diff(task_id: &str, git_dir: impl AsRef<Path>) -> Result<String> {
         );
     }
 
-    // Get the base branch (usually main/master)
-    let output = Command::new("git")
-        .current_dir(&absolute_worktree_path)
-        .arg("diff")
-        .arg("HEAD^..HEAD")
-        .output()
-        .context("failed to get diff")?;
+    Ok(inspect_worktree(&absolute_worktree_path, git_dir)?.diff)
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Ok(stderr.to_string());
+pub fn worktree_has_meaningful_changes(worktree: impl AsRef<Path>) -> Result<bool> {
+    Ok(!changed_files(worktree)?.is_empty())
+}
+
+pub fn commit_worktree_changes(
+    worktree: impl AsRef<Path>,
+    task_id: &str,
+    title: &str,
+) -> Result<bool> {
+    let worktree = worktree.as_ref();
+    if !worktree_has_meaningful_changes(worktree)? {
+        return Ok(false);
     }
+    git_output(
+        worktree,
+        &[
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude).orc/orc.db",
+            ":(exclude).orc/orc.db-wal",
+            ":(exclude).orc/orc.db-shm",
+            ":(exclude).orc/worktrees/**",
+        ],
+    )?;
+    let staged = git_output(worktree, &["diff", "--cached", "--name-only"])?;
+    if staged.trim().is_empty() {
+        return Ok(false);
+    }
+    let message = format!("Orc task {task_id}: {title}");
+    let output = Command::new("git")
+        .current_dir(worktree)
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .output()
+        .context("failed to commit task changes")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(true)
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+pub fn main_checkout_is_clean(repo: impl AsRef<Path>) -> Result<bool> {
+    Ok(changed_files(repo)?.is_empty())
+}
+
+pub fn merge_task_branch(repo: impl AsRef<Path>, branch: &str, task_id: &str) -> Result<()> {
+    let repo = repo.as_ref();
+    if !main_checkout_is_clean(repo)? {
+        anyhow::bail!(
+            "current project checkout has meaningful uncommitted changes; commit or stash them before accepting"
+        );
+    }
+    let message = format!("Merge Orc task {task_id}");
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge", "--no-ff", branch, "-m", &message])
+        .output()
+        .context("failed to merge task branch")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = Command::new("git")
+            .current_dir(repo)
+            .args(["merge", "--abort"])
+            .output();
+        anyhow::bail!(
+            "task branch conflicts with the current project checkout; merge was aborted: {detail}"
+        );
+    }
+    Ok(())
+}
+
+pub fn remove_worktree(repo: impl AsRef<Path>, path: impl AsRef<Path>) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo.as_ref())
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            path.as_ref().to_string_lossy().as_ref(),
+        ])
+        .output()
+        .context("failed to remove task worktree")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

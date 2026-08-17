@@ -235,8 +235,12 @@ pub mod test_helpers {
         fn execute(
             &self,
             _prompt: &str,
-            _cwd: &Path,
+            cwd: &Path,
         ) -> Result<(WorkerOutcome, Option<String>), String> {
+            if matches!(self.outcome, WorkerOutcome::Success) {
+                std::fs::write(cwd.join("fake-worker-change.txt"), "fake worker change\n")
+                    .map_err(|error| error.to_string())?;
+            }
             Ok((self.outcome.clone(), self.output.clone()))
         }
     }

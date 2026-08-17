@@ -5,6 +5,7 @@ use crate::backend::WorkerFactory;
 use crate::contract;
 use crate::git;
 use crate::registry::{self, AgentDefinition};
+use crate::review::DispatchSummary;
 use crate::storage::Database;
 use crate::task::{Task, TaskStatus};
 use crate::validation::{
@@ -13,6 +14,14 @@ use crate::validation::{
 use crate::worker::{Worker, WorkerOutcome};
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
+
+fn block_automated_run(db: &Database, run_id: i64, task_id: &str, output: &str) -> Result<()> {
+    db.update_agent_run_status(run_id, "failed", Some(output))
+        .context("failed to update agent run status to failed")?;
+    db.update_task_status(task_id, TaskStatus::Blocked)
+        .context("failed to set task status to blocked")?;
+    Ok(())
+}
 
 fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
     format!(
@@ -50,7 +59,7 @@ pub fn dispatch_with_worker_and_db(
     db_path: &str,
     repo_path: impl AsRef<Path>,
 ) -> Result<()> {
-    dispatch_with_worker_and_db_as(task_id, worker, db_path, repo_path, "copilot")
+    dispatch_with_worker_and_db_as(task_id, worker, db_path, repo_path, "copilot").map(|_| ())
 }
 
 pub fn dispatch_with_worker_and_db_as(
@@ -60,6 +69,25 @@ pub fn dispatch_with_worker_and_db_as(
     repo_path: impl AsRef<Path>,
     agent_id: &str,
 ) -> Result<()> {
+    dispatch_with_worker_and_db_as_with_runner(
+        task_id,
+        worker,
+        db_path,
+        repo_path,
+        agent_id,
+        &SystemValidationRunner,
+    )
+    .map(|_| ())
+}
+
+pub fn dispatch_with_worker_and_db_as_with_runner(
+    task_id: &str,
+    worker: &dyn Worker,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
@@ -99,7 +127,7 @@ pub fn dispatch_with_worker_and_db_as(
         .with_context(|| "failed to create agent run")?;
 
     // Create a worktree for the task
-    let (branch_name, worktree_path) = match git::create_worktree(task_id, repo_path) {
+    let (branch_name, worktree_path) = match git::ensure_worktree(task_id, repo_path) {
         Ok((branch, path)) => (branch, path),
         Err(e) => {
             let error_msg = format!("Failed to create worktree: {}", e);
@@ -130,12 +158,86 @@ pub fn dispatch_with_worker_and_db_as(
         Ok((outcome, output)) => {
             match outcome {
                 WorkerOutcome::Success => {
-                    // Mark agent run as completed and task as review
-                    db.update_agent_run_status(run_id, "completed", output.as_deref())
+                    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+                        Ok(changes) => changes,
+                        Err(error) => {
+                            let output = format!(
+                                "{}\n\nPost-worker inspection failed: {error:#}",
+                                output.as_deref().unwrap_or_default()
+                            );
+                            block_automated_run(&db, run_id, task_id, &output)?;
+                            anyhow::bail!("could not inspect task worktree after worker completion")
+                        }
+                    };
+                    if changes.files.is_empty() {
+                        let output = format!(
+                            "{}\n\nDispatch result: no meaningful project changes.",
+                            output.as_deref().unwrap_or_default()
+                        );
+                        db.update_agent_run_status(run_id, "no_changes", Some(&output))?;
+                        db.update_task_status(task_id, TaskStatus::Blocked)?;
+                        anyhow::bail!(
+                            "worker completed without meaningful project changes; task remains blocked"
+                        );
+                    }
+                    let validation_config = match ValidationConfig::load(&worktree_dir) {
+                        Ok(config) => config,
+                        Err(error) => {
+                            let output = format!(
+                                "{}\n\nValidation setup failed: {error:#}",
+                                output.as_deref().unwrap_or_default()
+                            );
+                            block_automated_run(&db, run_id, task_id, &output)?;
+                            anyhow::bail!("validation setup failed for task {task_id}")
+                        }
+                    };
+                    let report = match validation::run_validation_pipeline(
+                        validation_runner,
+                        &validation_config.commands,
+                        &worktree_dir,
+                    ) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            let output = format!(
+                                "{}\n\nValidation execution failed: {error:#}",
+                                output.as_deref().unwrap_or_default()
+                            );
+                            block_automated_run(&db, run_id, task_id, &output)?;
+                            anyhow::bail!("validation execution failed for task {task_id}")
+                        }
+                    };
+                    let validation_summary = report.summary();
+                    let combined_output = if validation_summary.is_empty() {
+                        output.unwrap_or_default()
+                    } else {
+                        format!(
+                            "{}\n\nValidation:\n{}",
+                            output.unwrap_or_default(),
+                            validation_summary
+                        )
+                    };
+                    if !report.is_success() {
+                        block_automated_run(&db, run_id, task_id, &combined_output)?;
+                        anyhow::bail!("validation failed for task {task_id}; task remains blocked");
+                    }
+                    db.update_agent_run_status(run_id, "completed", Some(&combined_output))
                         .with_context(|| "failed to update agent run status to completed")?;
                     db.update_task_status(task_id, TaskStatus::Review)
                         .with_context(|| "failed to set task status to review")?;
-                    Ok(())
+                    let task = db
+                        .get_task(task_id)?
+                        .context("task disappeared after dispatch")?;
+                    Ok(DispatchSummary {
+                        task,
+                        agent: agent_id.to_owned(),
+                        backend: "unknown".to_owned(),
+                        profile: None,
+                        worktree_path: worktree_path.display().to_string(),
+                        run_id,
+                        run_status: "completed".to_owned(),
+                        validation: "PASS".to_owned(),
+                        changes,
+                    })
                 }
                 WorkerOutcome::Failure(error) => {
                     // Mark agent run as failed and task as blocked
@@ -171,6 +273,15 @@ pub fn dispatch(task_id: &str) -> Result<()> {
 }
 
 pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result<()> {
+    dispatch_selected_with_summary(task_id, requested_agent).map(|summary| {
+        println!("{}", crate::review::format_dispatch(&summary));
+    })
+}
+
+pub fn dispatch_selected_with_summary(
+    task_id: &str,
+    requested_agent: Option<&str>,
+) -> Result<DispatchSummary> {
     let db_path = ".orc/orc.db";
     let db = Database::open(db_path)
         .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
@@ -199,10 +310,93 @@ pub fn dispatch_selected(task_id: &str, requested_agent: Option<&str>) -> Result
             })?
     };
     if agent.execution_mode == registry::MANUAL {
-        return dispatch_manual(task_id, &agent, &db, ".");
+        dispatch_manual(task_id, &agent, &db, ".")?;
+        let task = db
+            .get_task(task_id)?
+            .context("task disappeared after manual dispatch")?;
+        let run = db
+            .list_agent_runs_for_task(task_id)?
+            .into_iter()
+            .next()
+            .context("manual run missing")?;
+        return Ok(DispatchSummary {
+            task,
+            agent: agent.id,
+            backend: agent.backend,
+            profile: agent.profile_path,
+            worktree_path: "(created when patch is submitted)".into(),
+            run_id: run.id,
+            run_status: run.status,
+            validation: "PENDING".into(),
+            changes: Default::default(),
+        });
     }
     let worker = WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
-    dispatch_with_worker_and_db_as(task_id, worker.as_ref(), db_path, ".", &agent.id)
+    let mut summary = dispatch_with_worker_and_db_as_with_runner(
+        task_id,
+        worker.as_ref(),
+        db_path,
+        ".",
+        &agent.id,
+        &SystemValidationRunner,
+    )?;
+    summary.backend = agent.backend;
+    summary.profile = agent.profile_path;
+    Ok(summary)
+}
+
+pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) -> Result<()> {
+    let repo_path = repo_path.as_ref();
+    let task = db.get_task(task_id)?.context("task not found")?;
+    if task.status != TaskStatus::Review {
+        anyhow::bail!(
+            "task {} can only be accepted from review (currently {})",
+            task_id,
+            task.status
+        );
+    }
+    let (branch, path) = db
+        .get_worktree_metadata(task_id)?
+        .context("task has no worktree")?;
+    let worktree = repo_path.join(&path);
+    if !worktree.exists() {
+        anyhow::bail!("task worktree does not exist: {}", worktree.display());
+    }
+    if git::inspect_worktree(&worktree, repo_path)?
+        .files
+        .is_empty()
+    {
+        anyhow::bail!("task {task_id} has no meaningful changes to accept");
+    }
+    git::commit_worktree_changes(&worktree, task_id, &task.title)?;
+    git::merge_task_branch(repo_path, &branch, task_id)?;
+    git::remove_worktree(repo_path, &path)?;
+    db.update_task_status(task_id, TaskStatus::Done)?;
+    Ok(())
+}
+
+pub fn reject_task(db: &Database, task_id: &str, reason: Option<&str>) -> Result<()> {
+    let task = db.get_task(task_id)?.context("task not found")?;
+    if task.status != TaskStatus::Review {
+        anyhow::bail!(
+            "task {} can only be rejected from review (currently {})",
+            task_id,
+            task.status
+        );
+    }
+    if let (Some(reason), Some(run)) = (
+        reason,
+        db.list_agent_runs_for_task(task_id)?.into_iter().next(),
+    ) {
+        let output = format!(
+            "{}\n\nReview rejected: {}",
+            run.output.unwrap_or_default(),
+            reason
+        );
+        db.update_agent_run_output(run.id, &output)?;
+    }
+    db.update_task_status(task_id, TaskStatus::Ready)?;
+    Ok(())
 }
 
 pub fn dispatch_manual(

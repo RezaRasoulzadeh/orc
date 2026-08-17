@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod git;
 pub mod protocol;
 pub mod registry;
+pub mod review;
 pub mod scheduler;
 pub mod state;
 pub mod storage;

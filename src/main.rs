@@ -9,6 +9,8 @@ use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
 use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
 use orc::task::TaskScopeMode;
+use std::process::Command as ProcessCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DB_PATH: &str = ".orc/orc.db";
 
@@ -24,6 +26,45 @@ fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn format_timestamp(value: &str) -> String {
+    let Ok(timestamp) = value.parse::<i64>() else {
+        return value.to_owned();
+    };
+    let date = ProcessCommand::new("date")
+        .args(["-d", &format!("@{timestamp}"), "+%Y-%m-%d %H:%M:%S %Z"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|date| !date.is_empty())
+        .unwrap_or_else(|| value.to_owned());
+    format!("{date} ({})", format_relative_duration(timestamp))
+}
+
+fn format_relative_duration(timestamp: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let difference = timestamp.saturating_sub(now);
+    let future = difference >= 0;
+    let seconds = difference.unsigned_abs();
+    let (amount, unit) = if seconds < 60 {
+        (seconds, "s")
+    } else if seconds < 3_600 {
+        (seconds / 60, "m")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "h")
+    } else {
+        (seconds / 86_400, "d")
+    };
+    if future {
+        format!("in {amount}{unit}")
+    } else {
+        format!("{amount}{unit} ago")
+    }
 }
 
 #[derive(Parser)]
@@ -738,11 +779,19 @@ fn main() -> Result<()> {
                     );
                     println!(
                         "Quota reset:         {}",
-                        agent.quota_reset_at.as_deref().unwrap_or("-")
+                        agent
+                            .quota_reset_at
+                            .as_deref()
+                            .map(format_timestamp)
+                            .unwrap_or_else(|| "-".into())
                     );
                     println!(
                         "Quota checked:       {}",
-                        agent.quota_checked_at.as_deref().unwrap_or("-")
+                        agent
+                            .quota_checked_at
+                            .as_deref()
+                            .map(format_timestamp)
+                            .unwrap_or_else(|| "-".into())
                     );
                     println!(
                         "Quota source:        {}",
@@ -755,7 +804,8 @@ fn main() -> Result<()> {
                         if let Some(limit) = &limits.individual_limit {
                             println!(
                                 "Individual limit:   {}% remaining, reset {}",
-                                limit.remaining_percent, limit.reset_at
+                                limit.remaining_percent,
+                                format_timestamp(&limit.reset_at.to_string())
                             );
                         }
                     }
@@ -1110,7 +1160,7 @@ fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
         "  reset: {}",
         snapshot
             .reset_at
-            .map(|value| value.to_string())
+            .map(|value| format_timestamp(&value.to_string()))
             .unwrap_or_else(|| "unknown".to_owned())
     );
     println!("  effective limit: {}", snapshot.limits.effective);
@@ -1127,7 +1177,7 @@ fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
                 .unwrap_or_else(|| "unknown".into()),
             limit
                 .reset_at
-                .map(|value| value.to_string())
+                .map(|value| format_timestamp(&value.to_string()))
                 .unwrap_or_else(|| "unknown".into())
         ),
         None => println!("{label:<20} -"),
@@ -1155,7 +1205,11 @@ fn print_agents(db: &Database) -> Result<()> {
                 .quota_remaining_percent
                 .map(|value| format!("{value}%"))
                 .unwrap_or_else(|| "?".into()),
-            agent.quota_reset_at.as_deref().unwrap_or("-")
+            agent
+                .quota_reset_at
+                .as_deref()
+                .map(format_timestamp)
+                .unwrap_or_else(|| "-".into())
         );
     }
     Ok(())

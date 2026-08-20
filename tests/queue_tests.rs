@@ -79,6 +79,36 @@ fn task_with_no_dependencies_can_become_ready() {
 }
 
 #[test]
+fn cancelled_task_is_explicit_and_not_ready() {
+    let (_dir, db, pid) = create_test_db();
+    add_agent(
+        &db,
+        "codex-main",
+        "codex",
+        "automated",
+        100,
+        vec!["code", "terminal"],
+    );
+    let task_id = db
+        .insert_task(
+            pid,
+            "Abandoned",
+            "No longer needed",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    assert!(db.cancel_task(&task_id, Some("superseded")).unwrap());
+
+    let task = db.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert_eq!(task.cancellation_reason.as_deref(), Some("superseded"));
+    let report = compute_queue(&db).unwrap();
+    assert_eq!(report.cancelled[0].task.id, task_id);
+    assert!(report.ready.is_empty());
+}
+
+#[test]
 fn dependency_on_unfinished_task_blocks_it() {
     let (_dir, db, pid) = create_test_db();
     add_agent(

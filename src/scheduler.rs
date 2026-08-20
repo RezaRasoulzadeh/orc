@@ -443,6 +443,7 @@ mod tests {
             role: "dev".to_string(),
             priority: TaskPriority::Normal,
             status: crate::task::TaskStatus::Ready,
+            cancellation_reason: None,
             required_capabilities: capabilities.into_iter().map(String::from).collect(),
             scope_mode: None,
             context_files: Vec::new(),

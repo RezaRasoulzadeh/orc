@@ -148,6 +148,9 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
     if task.status == TaskStatus::Done {
         anyhow::bail!("Task {} is already done; cannot dispatch", task_id);
     }
+    if task.status == TaskStatus::Cancelled {
+        anyhow::bail!("Task {} is cancelled; cannot dispatch", task_id);
+    }
 
     // Set task status to active
     db.update_task_status(task_id, TaskStatus::Active)
@@ -639,7 +642,10 @@ pub fn dispatch_manual(
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if task.status == TaskStatus::Active || task.status == TaskStatus::Done {
+    if matches!(
+        task.status,
+        TaskStatus::Active | TaskStatus::Done | TaskStatus::Cancelled
+    ) {
         anyhow::bail!(
             "Task {} cannot be manually dispatched from status {}",
             task_id,

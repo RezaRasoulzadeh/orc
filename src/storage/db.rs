@@ -102,6 +102,7 @@ impl Database {
                 scope_mode TEXT,
                 context_files TEXT,
                 expected_changes TEXT,
+                cancellation_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
@@ -195,6 +196,7 @@ impl Database {
             ("scope_mode", "TEXT"),
             ("context_files", "TEXT"),
             ("expected_changes", "TEXT"),
+            ("cancellation_reason", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {definition}"))?;
@@ -531,6 +533,7 @@ impl Database {
             "review" => TaskStatus::Review,
             "blocked" => TaskStatus::Blocked,
             "done" => TaskStatus::Done,
+            "cancelled" => TaskStatus::Cancelled,
             _ => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "invalid status: {status}"
@@ -568,6 +571,7 @@ impl Database {
             role: row.get(3)?,
             priority: priority_value,
             status: status_value,
+            cancellation_reason: row.get(10)?,
             required_capabilities,
             scope_mode,
             context_files: list(8)?,
@@ -577,7 +581,7 @@ impl Database {
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -727,7 +731,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes FROM tasks WHERE id = ?1",
+                "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks WHERE id = ?1",
                 params![id],
                 Self::task_from_row,
             )
@@ -775,6 +779,14 @@ impl Database {
         let changed = self.conn.execute(
             "UPDATE tasks SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![status.to_string(), id],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn cancel_task(&self, id: &str, reason: Option<&str>) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', cancellation_reason = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status != 'done' AND status != 'cancelled'",
+            params![reason, id],
         )?;
         Ok(changed != 0)
     }

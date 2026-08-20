@@ -16,6 +16,7 @@ pub enum QueueCategory {
     Active,
     Review,
     Done,
+    Cancelled,
     Backlog,
 }
 
@@ -27,6 +28,7 @@ impl fmt::Display for QueueCategory {
             Self::Active => "ACTIVE",
             Self::Review => "REVIEW",
             Self::Done => "DONE",
+            Self::Cancelled => "CANCELLED",
             Self::Backlog => "BACKLOG",
         };
         f.write_str(name)
@@ -102,6 +104,7 @@ pub struct QueueReport {
     pub active: Vec<QueueEntry>,
     pub review: Vec<QueueEntry>,
     pub done: Vec<QueueEntry>,
+    pub cancelled: Vec<QueueEntry>,
     pub backlog: Vec<QueueEntry>,
 }
 
@@ -112,6 +115,7 @@ impl QueueReport {
             && self.active.is_empty()
             && self.review.is_empty()
             && self.done.is_empty()
+            && self.cancelled.is_empty()
             && self.backlog.is_empty()
     }
 
@@ -123,6 +127,7 @@ impl QueueReport {
         items.extend(&self.review);
         items.extend(&self.backlog);
         items.extend(&self.done);
+        items.extend(&self.cancelled);
         items
     }
 
@@ -196,6 +201,13 @@ impl QueueReport {
             }
             sections.push(s);
         }
+        if !self.cancelled.is_empty() {
+            let mut s = String::from("CANCELLED\n");
+            for item in &self.cancelled {
+                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
+            }
+            sections.push(s);
+        }
 
         if sections.is_empty() {
             "No tasks in queue.\n".to_string()
@@ -213,6 +225,7 @@ impl QueueReport {
             (QueueCategory::Review, &self.review),
             (QueueCategory::Backlog, &self.backlog),
             (QueueCategory::Done, &self.done),
+            (QueueCategory::Cancelled, &self.cancelled),
         ];
 
         let mut first_cat = true;
@@ -377,6 +390,18 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                 report.done.push(QueueItem {
                     task,
                     category: QueueCategory::Done,
+                    dependencies,
+                    waiting_on,
+                    blocking_reasons: Vec::new(),
+                    active_agent: None,
+                    recommended_agent: None,
+                    schedule_decision: None,
+                });
+            }
+            TaskStatus::Cancelled => {
+                report.cancelled.push(QueueItem {
+                    task,
+                    category: QueueCategory::Cancelled,
                     dependencies,
                     waiting_on,
                     blocking_reasons: Vec::new(),

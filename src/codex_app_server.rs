@@ -685,6 +685,7 @@ mod tests {
             role: "developer".into(),
             priority: TaskPriority::Normal,
             status: TaskStatus::Ready,
+            cancellation_reason: None,
             required_capabilities: vec![],
             scope_mode: None,
             context_files: vec![],

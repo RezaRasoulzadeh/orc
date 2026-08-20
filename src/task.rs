@@ -11,6 +11,8 @@ pub struct Task {
     pub priority: TaskPriority,
     pub status: TaskStatus,
     #[serde(default)]
+    pub cancellation_reason: Option<String>,
+    #[serde(default)]
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub scope_mode: Option<TaskScopeMode>,
@@ -85,11 +87,12 @@ pub enum TaskStatus {
     Review,
     Blocked,
     Done,
+    Cancelled,
 }
 
 impl TaskStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done)
+        matches!(self, Self::Done | Self::Cancelled)
     }
 }
 
@@ -102,6 +105,7 @@ impl fmt::Display for TaskStatus {
             Self::Review => "review",
             Self::Blocked => "blocked",
             Self::Done => "done",
+            Self::Cancelled => "cancelled",
         };
         f.write_str(value)
     }
@@ -119,6 +123,7 @@ mod tests {
             role: role.into(),
             priority: TaskPriority::Normal,
             status: TaskStatus::Backlog,
+            cancellation_reason: None,
             required_capabilities: required_capabilities
                 .into_iter()
                 .map(str::to_owned)

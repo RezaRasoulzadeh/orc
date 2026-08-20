@@ -279,6 +279,11 @@ enum TaskCommand {
         task_id: String,
         reason: Option<String>,
     },
+    /// Cancel a task while preserving its worktree.
+    Cancel {
+        task_id: String,
+        reason: Option<String>,
+    },
     /// Add a dependency to a task
     Depend {
         /// Task ID that depends on another task
@@ -783,6 +788,9 @@ fn main() -> Result<()> {
                         println!("Role:         {}", task.role);
                         println!("Priority:     {:?}", task.priority);
                         println!("Status:       {}", task.status);
+                        if let Some(reason) = &task.cancellation_reason {
+                            println!("Cancellation: {}", reason);
+                        }
                         println!("Capabilities: {}", task.required_capabilities().join(", "));
                         println!(
                             "Scope: {}",
@@ -837,6 +845,20 @@ fn main() -> Result<()> {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
+            TaskCommand::Cancel { task_id, reason } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                if !db.cancel_task(&task_id, reason.as_deref())? {
+                    let task = db.get_task(&task_id)?;
+                    match task {
+                        None => anyhow::bail!("task '{}' not found", task_id),
+                        Some(task) if task.status == orc::task::TaskStatus::Done => {
+                            anyhow::bail!("task '{}' is done and cannot be cancelled", task_id)
+                        }
+                        Some(_) => anyhow::bail!("task '{}' is already cancelled", task_id),
+                    }
+                }
+                println!("Cancelled task {}", task_id);
+            }
             TaskCommand::Scope { task_id, mode } => {
                 let scope = TaskScopeMode::parse(&mode)
                     .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {mode}"))?;

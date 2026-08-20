@@ -60,6 +60,7 @@ impl OrcState {
                     role,
                     priority,
                     status: TaskStatus::Backlog,
+                    cancellation_reason: None,
                     required_capabilities: Vec::new(),
                     scope_mode: None,
                     context_files: Vec::new(),

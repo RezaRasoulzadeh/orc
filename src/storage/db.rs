@@ -414,6 +414,37 @@ impl Database {
         )? != 0)
     }
 
+    pub fn quota_reserve(&self) -> Result<i64, DbError> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'quota_reserve'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(0))
+            .map_err(DbError::from)
+    }
+
+    pub fn set_quota_reserve(&self, reserve: i64) -> Result<(), DbError> {
+        if !(0..=100).contains(&reserve) {
+            return Err(DbError::InvalidQuota(reserve));
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('quota_reserve', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![reserve.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_agent_synced_quota(
         &self,
         id: &str,

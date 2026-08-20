@@ -14,6 +14,7 @@ pub enum RejectionReason {
     UnsupportedMode { mode: String },
     MissingCapability { capability: String },
     QuotaExhausted,
+    QuotaReserve { remaining: i64, reserve: i64 },
     Busy,
     ModeMismatch { requested: String, actual: String },
 }
@@ -28,6 +29,11 @@ impl RejectionReason {
             Self::UnsupportedMode { mode } => format!("unsupported execution mode: {mode}"),
             Self::MissingCapability { capability } => format!("missing capability: {capability}"),
             Self::QuotaExhausted => "quota exhausted".to_string(),
+            Self::QuotaReserve { remaining, reserve } => {
+                format!(
+                    "quota below automatic reserve ({remaining}% remaining, {reserve}% required)"
+                )
+            }
             Self::Busy => "busy".to_string(),
             Self::ModeMismatch { requested, actual } => {
                 format!("mode mismatch (requested: {requested}, actual: {actual})")
@@ -121,6 +127,15 @@ pub fn evaluate_candidate(
     task: &Task,
     requested_mode: Option<&str>,
 ) -> CandidateEvaluation {
+    evaluate_candidate_with_quota_reserve(agent, task, requested_mode, 0)
+}
+
+pub fn evaluate_candidate_with_quota_reserve(
+    agent: &AgentDefinition,
+    task: &Task,
+    requested_mode: Option<&str>,
+    quota_reserve: i64,
+) -> CandidateEvaluation {
     let make_eval = |status: CandidateStatus| CandidateEvaluation {
         agent_id: agent.id.clone(),
         backend: agent.backend.clone(),
@@ -177,6 +192,16 @@ pub fn evaluate_candidate(
     if agent.quota_remaining_percent == Some(0) {
         return make_eval(CandidateStatus::Rejected(RejectionReason::QuotaExhausted));
     }
+    if quota_reserve > 0
+        && agent
+            .quota_remaining_percent
+            .is_some_and(|remaining| remaining < quota_reserve)
+    {
+        return make_eval(CandidateStatus::Rejected(RejectionReason::QuotaReserve {
+            remaining: agent.quota_remaining_percent.unwrap(),
+            reserve: quota_reserve,
+        }));
+    }
 
     // 6. optional requested execution mode must match
     if let Some(req_mode) = requested_mode
@@ -197,7 +222,18 @@ pub fn evaluate_candidate_with_busy(
     requested_mode: Option<&str>,
     busy_agents: &HashSet<String>,
 ) -> CandidateEvaluation {
-    let evaluation = evaluate_candidate(agent, task, requested_mode);
+    evaluate_candidate_with_busy_and_quota_reserve(agent, task, requested_mode, busy_agents, 0)
+}
+
+pub fn evaluate_candidate_with_busy_and_quota_reserve(
+    agent: &AgentDefinition,
+    task: &Task,
+    requested_mode: Option<&str>,
+    busy_agents: &HashSet<String>,
+    quota_reserve: i64,
+) -> CandidateEvaluation {
+    let evaluation =
+        evaluate_candidate_with_quota_reserve(agent, task, requested_mode, quota_reserve);
     if matches!(evaluation.status, CandidateStatus::Eligible) && busy_agents.contains(&agent.id) {
         CandidateEvaluation {
             status: CandidateStatus::Rejected(RejectionReason::Busy),
@@ -213,11 +249,21 @@ pub fn schedule(
     agents: &[AgentDefinition],
     requested_mode: Option<&str>,
 ) -> Result<ScheduleDecision> {
+    schedule_with_quota_reserve(task, agents, requested_mode, 0)
+}
+
+pub fn schedule_with_quota_reserve(
+    task: &Task,
+    agents: &[AgentDefinition],
+    requested_mode: Option<&str>,
+    quota_reserve: i64,
+) -> Result<ScheduleDecision> {
     let mut eligible = Vec::new();
     let mut rejected = Vec::new();
 
     for agent in agents {
-        let eval = evaluate_candidate(agent, task, requested_mode);
+        let eval =
+            evaluate_candidate_with_quota_reserve(agent, task, requested_mode, quota_reserve);
         match eval.status {
             CandidateStatus::Eligible => eligible.push(eval),
             CandidateStatus::Rejected(_) => rejected.push(eval),
@@ -280,10 +326,26 @@ pub fn schedule_with_busy(
     requested_mode: Option<&str>,
     busy_agents: &HashSet<String>,
 ) -> Result<ScheduleDecision> {
+    schedule_with_busy_and_quota_reserve(task, agents, requested_mode, busy_agents, 0)
+}
+
+pub fn schedule_with_busy_and_quota_reserve(
+    task: &Task,
+    agents: &[AgentDefinition],
+    requested_mode: Option<&str>,
+    busy_agents: &HashSet<String>,
+    quota_reserve: i64,
+) -> Result<ScheduleDecision> {
     let mut eligible = Vec::new();
     let mut rejected = Vec::new();
     for agent in agents {
-        let evaluation = evaluate_candidate_with_busy(agent, task, requested_mode, busy_agents);
+        let evaluation = evaluate_candidate_with_busy_and_quota_reserve(
+            agent,
+            task,
+            requested_mode,
+            busy_agents,
+            quota_reserve,
+        );
         match evaluation.status {
             CandidateStatus::Eligible => eligible.push(evaluation),
             CandidateStatus::Rejected(_) => rejected.push(evaluation),
@@ -495,6 +557,30 @@ mod tests {
         a2.quota_remaining_percent = Some(4);
         let decision = schedule(&task, &[a1, a2], None).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("agent-high"));
+    }
+
+    #[test]
+    fn test_quota_reserve_rejects_known_low_quota() {
+        let task = test_task(vec!["code", "terminal"]);
+        let mut agent = test_agent("agent-1", 100, vec!["code", "terminal"]);
+        agent.quota_remaining_percent = Some(10);
+        let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
+        assert_eq!(decision.selected_agent_id, None);
+        assert_eq!(
+            decision.candidates[0].status,
+            CandidateStatus::Rejected(RejectionReason::QuotaReserve {
+                remaining: 10,
+                reserve: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn test_quota_reserve_keeps_unknown_quota_eligible() {
+        let task = test_task(vec!["code", "terminal"]);
+        let agent = test_agent("agent-1", 100, vec!["code", "terminal"]);
+        let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("agent-1"));
     }
 
     #[test]

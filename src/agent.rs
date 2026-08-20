@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::backend::WorkerFactory;
 use crate::contract;
@@ -525,6 +527,49 @@ pub fn dispatch_selected_with_options(
     summary.model = model;
     summary.reasoning_effort = reasoning_effort;
     Ok(summary)
+}
+
+pub fn dispatch_queue(concurrency: usize) -> Result<Vec<DispatchSummary>> {
+    if concurrency == 0 {
+        anyhow::bail!("concurrency must be greater than zero");
+    }
+    let db = Database::open(".orc/orc.db")?;
+    let report = crate::queue::compute_queue(&db)?;
+    let agents = db.list_agents()?;
+    let mut reserved = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    let mut assignments = Vec::new();
+    for entry in report.ready {
+        if assignments.len() == concurrency {
+            break;
+        }
+        let decision = crate::scheduler::schedule_with_busy(
+            &entry.task,
+            &agents,
+            Some(registry::AUTOMATED),
+            &reserved,
+        )?;
+        if let Some(agent_id) = decision.selected_agent_id {
+            reserved.insert(agent_id.clone());
+            assignments.push((entry.task.id, agent_id));
+        }
+    }
+    let mut summaries = Vec::new();
+    let handles = assignments
+        .iter()
+        .map(|(task_id, agent_id)| {
+            let task_id = task_id.clone();
+            let agent_id = agent_id.clone();
+            thread::spawn(move || {
+                dispatch_selected_with_options(&task_id, Some(&agent_id), None, None)
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        if let Ok(Ok(summary)) = handle.join() {
+            summaries.push(summary);
+        }
+    }
+    Ok(summaries)
 }
 
 pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) -> Result<()> {

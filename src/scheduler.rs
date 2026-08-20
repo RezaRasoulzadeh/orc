@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::registry::{self, AgentDefinition};
 use crate::task::Task;
@@ -13,6 +14,7 @@ pub enum RejectionReason {
     UnsupportedMode { mode: String },
     MissingCapability { capability: String },
     QuotaExhausted,
+    Busy,
     ModeMismatch { requested: String, actual: String },
 }
 
@@ -26,6 +28,7 @@ impl RejectionReason {
             Self::UnsupportedMode { mode } => format!("unsupported execution mode: {mode}"),
             Self::MissingCapability { capability } => format!("missing capability: {capability}"),
             Self::QuotaExhausted => "quota exhausted".to_string(),
+            Self::Busy => "busy".to_string(),
             Self::ModeMismatch { requested, actual } => {
                 format!("mode mismatch (requested: {requested}, actual: {actual})")
             }
@@ -188,6 +191,23 @@ pub fn evaluate_candidate(
     make_eval(CandidateStatus::Eligible)
 }
 
+pub fn evaluate_candidate_with_busy(
+    agent: &AgentDefinition,
+    task: &Task,
+    requested_mode: Option<&str>,
+    busy_agents: &HashSet<String>,
+) -> CandidateEvaluation {
+    let evaluation = evaluate_candidate(agent, task, requested_mode);
+    if matches!(evaluation.status, CandidateStatus::Eligible) && busy_agents.contains(&agent.id) {
+        CandidateEvaluation {
+            status: CandidateStatus::Rejected(RejectionReason::Busy),
+            ..evaluation
+        }
+    } else {
+        evaluation
+    }
+}
+
 pub fn schedule(
     task: &Task,
     agents: &[AgentDefinition],
@@ -249,6 +269,55 @@ pub fn schedule(
         task_id: task.id.clone(),
         selected_agent_id,
         candidates: all_candidates,
+        selection_reason,
+        explanation,
+    })
+}
+
+pub fn schedule_with_busy(
+    task: &Task,
+    agents: &[AgentDefinition],
+    requested_mode: Option<&str>,
+    busy_agents: &HashSet<String>,
+) -> Result<ScheduleDecision> {
+    let mut eligible = Vec::new();
+    let mut rejected = Vec::new();
+    for agent in agents {
+        let evaluation = evaluate_candidate_with_busy(agent, task, requested_mode, busy_agents);
+        match evaluation.status {
+            CandidateStatus::Eligible => eligible.push(evaluation),
+            CandidateStatus::Rejected(_) => rejected.push(evaluation),
+        }
+    }
+    eligible.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+    rejected.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    let selected_agent_id = eligible.first().map(|candidate| candidate.agent_id.clone());
+    let explanation = selected_agent_id.as_ref().map_or_else(
+        || {
+            format!(
+                "No eligible agent satisfies requirements for task '{}'.",
+                task.id
+            )
+        },
+        |id| format!("{id} selected by deterministic priority and lexicographic order."),
+    );
+    let selection_reason = match selected_agent_id {
+        None => SelectionReason::NoEligibleCandidates,
+        Some(_) if eligible.len() == 1 => SelectionReason::SingleEligibleCandidate,
+        Some(_) if eligible[0].priority > eligible[1].priority => SelectionReason::HighestPriority,
+        Some(_) => SelectionReason::LexicographicTieBreak,
+    };
+    let selected = selected_agent_id.clone();
+    let mut candidates = eligible;
+    candidates.extend(rejected);
+    Ok(ScheduleDecision {
+        task_id: task.id.clone(),
+        selected_agent_id: selected,
+        candidates,
         selection_reason,
         explanation,
     })

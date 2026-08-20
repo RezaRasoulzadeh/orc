@@ -1,7 +1,9 @@
 use orc::queue::{BlockingReason, QueueCategory, compute_queue};
 use orc::registry::{self, AgentDefinition};
+use orc::scheduler::{CandidateStatus, RejectionReason, schedule_with_busy};
 use orc::storage::{Database, DbError};
 use orc::task::{TaskPriority, TaskStatus};
+use std::collections::HashSet;
 use tempfile::tempdir;
 
 fn create_test_db() -> (tempfile::TempDir, Database, i64) {
@@ -530,6 +532,123 @@ fn queue_does_not_invoke_real_providers() {
     let report = compute_queue(&db).unwrap();
     assert_eq!(report.ready.len(), 1);
     assert_eq!(report.ready[0].task.id, t1);
+}
+
+#[test]
+fn schedule_with_busy_rejects_busy_agent() {
+    let (_dir, db, pid) = create_test_db();
+    add_agent(
+        &db,
+        "busy",
+        "codex",
+        "automated",
+        100,
+        vec!["code", "terminal"],
+    );
+    add_agent(
+        &db,
+        "free",
+        "codex",
+        "automated",
+        90,
+        vec!["code", "terminal"],
+    );
+    let task = db
+        .insert_task(pid, "Task", "obj", "developer", TaskPriority::Normal)
+        .unwrap();
+    let busy = HashSet::from(["busy".to_string()]);
+    let decision = schedule_with_busy(
+        &db.get_task(&task).unwrap().unwrap(),
+        &db.list_agents().unwrap(),
+        Some(registry::AUTOMATED),
+        &busy,
+    )
+    .unwrap();
+    assert_eq!(decision.selected_agent_id.as_deref(), Some("free"));
+    let busy_candidate = decision
+        .candidates
+        .iter()
+        .find(|candidate| candidate.agent_id == "busy")
+        .unwrap();
+    assert_eq!(
+        busy_candidate.status,
+        CandidateStatus::Rejected(RejectionReason::Busy)
+    );
+}
+
+#[test]
+fn dispatch_batch_reservation_is_deterministic_and_capacity_limited() {
+    let (_dir, db, pid) = create_test_db();
+    add_agent(
+        &db,
+        "agent-a",
+        "codex",
+        "automated",
+        100,
+        vec!["code", "terminal"],
+    );
+    add_agent(
+        &db,
+        "agent-b",
+        "codex",
+        "automated",
+        100,
+        vec!["code", "terminal"],
+    );
+    add_agent(
+        &db,
+        "manual",
+        "human",
+        "manual",
+        100,
+        vec!["code", "terminal"],
+    );
+    let first = db
+        .insert_task(pid, "First", "obj", "developer", TaskPriority::Normal)
+        .unwrap();
+    let second = db
+        .insert_task(pid, "Second", "obj", "developer", TaskPriority::Normal)
+        .unwrap();
+    let agents = db.list_agents().unwrap();
+    let mut reserved = HashSet::new();
+    let mut assignments = Vec::new();
+    for task_id in [first.clone(), second.clone()] {
+        let decision = schedule_with_busy(
+            &db.get_task(&task_id).unwrap().unwrap(),
+            &agents,
+            Some(registry::AUTOMATED),
+            &reserved,
+        )
+        .unwrap();
+        let agent = decision.selected_agent_id.unwrap();
+        reserved.insert(agent.clone());
+        assignments.push((task_id, agent));
+    }
+    assert_eq!(
+        assignments,
+        vec![(first, "agent-a".into()), (second, "agent-b".into())]
+    );
+    assert_eq!(reserved.len(), 2);
+    assert!(!reserved.contains("manual"));
+}
+
+#[test]
+fn queue_excludes_active_agent_and_reports_only_available_tasks() {
+    let (_dir, db, pid) = create_test_db();
+    add_agent(&db, "active", "codex", "automated", 100, vec!["code"]);
+    let task = db
+        .insert_task(pid, "Task", "obj", "developer", TaskPriority::Normal)
+        .unwrap();
+    db.create_agent_run(pid, &task, "active").unwrap();
+    let report = compute_queue(&db).unwrap();
+    assert!(report.ready.is_empty());
+    assert!(report.backlog.iter().any(|item| {
+        item.task.id == task
+            && item
+                .blocking_reasons
+                .iter()
+                .any(|reason| matches!(reason, BlockingReason::NoEligibleAgent { .. }))
+    }));
 }
 
 #[test]

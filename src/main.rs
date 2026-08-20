@@ -78,6 +78,12 @@ enum Command {
         #[arg(long, value_parser = parse_reasoning_effort)]
         effort: Option<registry::ReasoningEffort>,
     },
+    /// Dispatch ready automated tasks concurrently.
+    DispatchQueue {
+        /// Maximum number of tasks to execute at once.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+    },
     /// Review the latest task run and its worktree changes.
     Review {
         task_id: String,
@@ -412,6 +418,16 @@ fn main() -> Result<()> {
                 return Err(e);
             }
             sync_enabled_agents_after_automated_run(&task_id);
+        }
+        Command::DispatchQueue { concurrency } => {
+            let summaries = agent::dispatch_queue(concurrency)?;
+            for summary in &summaries {
+                println!("{}", orc::review::format_dispatch(summary));
+                if summary.run_status == "completed" {
+                    sync_enabled_agents_after_automated_run(&summary.task.id);
+                }
+            }
+            println!("Dispatched {} task(s).", summaries.len());
         }
         Command::Review {
             task_id,

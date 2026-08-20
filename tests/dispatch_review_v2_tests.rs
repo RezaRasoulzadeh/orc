@@ -306,3 +306,32 @@ fn accept_merges_diverged_non_conflicting_main_and_aborts_conflicts_safely() {
         TaskStatus::Review
     );
 }
+
+#[test]
+fn stale_task_branch_is_not_reused_after_worktree_disappears() {
+    let (dir, _db, task) = setup();
+    let old_worktree = git::ensure_worktree(&task, dir.path()).unwrap();
+    let old_commit = git_output(dir.path(), &["rev-parse", &old_worktree.0]);
+
+    std::fs::write(dir.path().join("main.txt"), "advanced\n").unwrap();
+    cmd(dir.path(), &["add", "main.txt"]);
+    cmd(dir.path(), &["commit", "-m", "advance main"]);
+    let new_commit = git_output(dir.path(), &["rev-parse", "HEAD"]);
+    git::remove_worktree(dir.path(), &old_worktree.1).unwrap();
+
+    let (_, new_path) = git::ensure_worktree(&task, dir.path()).unwrap();
+    let prepared_commit = git_output(dir.path().join(new_path).as_path(), &["rev-parse", "HEAD"]);
+
+    assert_eq!(prepared_commit, new_commit);
+    assert_ne!(prepared_commit, old_commit);
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {:?}", args);
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}

@@ -35,6 +35,9 @@ fn build_worker_prompt_contains_engineering_contract() {
         priority: TaskPriority::Normal,
         status: TaskStatus::Ready,
         required_capabilities: Vec::new(),
+        scope_mode: None,
+        context_files: Vec::new(),
+        expected_changes: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "testproj", &task);
@@ -60,6 +63,9 @@ fn generated_worker_prompt_still_contains_task_information() {
         priority: TaskPriority::High,
         status: TaskStatus::Active,
         required_capabilities: Vec::new(),
+        scope_mode: None,
+        context_files: Vec::new(),
+        expected_changes: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "myproject", &task);
@@ -74,4 +80,27 @@ fn generated_worker_prompt_still_contains_task_information() {
     // Verify instructions are still there
     assert!(prompt.contains("Inspect the repository"));
     assert!(prompt.contains("implement ONLY the changes required"));
+}
+
+#[test]
+fn targeted_prompt_guidance_is_scoped_and_optional() {
+    let mut task = Task {
+        id: "T-0002".into(),
+        title: "Targeted".into(),
+        objective: "Implement it".into(),
+        role: "developer".into(),
+        priority: TaskPriority::Normal,
+        status: TaskStatus::Ready,
+        required_capabilities: Vec::new(),
+        scope_mode: Some(orc::task::TaskScopeMode::Focused),
+        context_files: vec!["src/review.rs".into(), "src/agent.rs".into()],
+        expected_changes: vec!["src/review.rs".into()],
+    };
+    let prompt = orc::agent::build_worker_prompt_for_testing("# Contract", "p", &task);
+    assert!(prompt.contains("Read these files first:"));
+    assert!(prompt.contains("- src/review.rs"));
+    assert!(prompt.contains("Expected changes:"));
+    task.scope_mode = Some(orc::task::TaskScopeMode::Project);
+    let project_prompt = orc::agent::build_worker_prompt_for_testing("# Contract", "p", &task);
+    assert!(project_prompt.contains("broader repository inspection is allowed"));
 }

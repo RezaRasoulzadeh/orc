@@ -278,7 +278,18 @@ pub fn ensure_worktree(task_id: &str, git_dir: impl AsRef<Path>) -> Result<(Stri
             .map(|out| out.status.success())
             .unwrap_or(false);
         if is_worktree {
-            return Ok((branch, worktree_path));
+            let current_branch = git_output(
+                &absolute_worktree_path,
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )?;
+            if current_branch.trim() == branch {
+                return Ok((branch, worktree_path));
+            }
+            anyhow::bail!(
+                "task worktree {} is checked out at unexpected branch {}",
+                absolute_worktree_path.display(),
+                current_branch.trim()
+            );
         }
     }
 
@@ -301,20 +312,34 @@ pub fn ensure_worktree(task_id: &str, git_dir: impl AsRef<Path>) -> Result<(Stri
         .unwrap_or(false);
 
     if branch_exists {
-        let output = Command::new("git")
+        git_output(git_dir, &["worktree", "prune"])?;
+        let mut stale_branch = format!("{}.stale", branch);
+        let mut suffix = 1;
+        while Command::new("git")
             .current_dir(git_dir)
-            .arg("worktree")
-            .arg("add")
-            .arg(&worktree_path)
-            .arg(&branch)
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{stale_branch}"),
+            ])
             .output()
-            .context("failed to execute git worktree add with existing branch")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("git worktree add failed for task {}: {}", task_id, stderr);
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            stale_branch = format!("{}.stale-{}", branch, suffix);
+            suffix += 1;
         }
-        Ok((branch, worktree_path))
+        git_output_owned(
+            git_dir,
+            &[
+                "branch".into(),
+                "-m".into(),
+                branch.clone(),
+                stale_branch.clone(),
+            ],
+        )
+        .with_context(|| format!("failed to preserve stale task branch {branch}"))?;
+        create_worktree(task_id, git_dir)
     } else {
         create_worktree(task_id, git_dir)
     }

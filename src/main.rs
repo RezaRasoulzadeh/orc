@@ -405,12 +405,13 @@ fn main() -> Result<()> {
             model,
             effort,
         } => {
-            if let Err(e) =
-                agent::dispatch_selected_with_options(&task_id, agent.as_deref(), model, effort)
-            {
+            let selected =
+                agent::dispatch_selected_with_options(&task_id, agent.as_deref(), model, effort);
+            if let Err(e) = selected {
                 eprintln!("Dispatch failed: {:#}", e);
                 return Err(e);
             }
+            sync_enabled_agents_after_automated_run(&task_id);
         }
         Command::Review {
             task_id,
@@ -462,6 +463,7 @@ fn main() -> Result<()> {
                     &orc::SystemValidationRunner,
                 )?;
                 println!("{}", orc::review::format_dispatch(&summary));
+                sync_enabled_agents_after_automated_run(&task_id);
             }
             let _ = task;
         }
@@ -1014,6 +1016,22 @@ fn sync_enabled_agents(db: &Database) {
                     Ok(snapshot) => print_synced_quota(&id, &snapshot),
                     Err(error) => eprintln!("{id}: quota sync failed: {error}"),
                 }
+            }
+        }
+        Err(error) => eprintln!("quota sync failed: {error}"),
+    }
+}
+
+fn sync_enabled_agents_after_automated_run(task_id: &str) {
+    match Database::open(DB_PATH) {
+        Ok(db) => {
+            let automated = db
+                .list_agent_runs_for_task(task_id)
+                .ok()
+                .and_then(|runs| runs.into_iter().next())
+                .is_some_and(|run| run.execution_mode == registry::AUTOMATED);
+            if automated {
+                sync_enabled_agents(&db);
             }
         }
         Err(error) => eprintln!("quota sync failed: {error}"),

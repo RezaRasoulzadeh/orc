@@ -12,6 +12,41 @@ pub struct Task {
     pub status: TaskStatus,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub scope_mode: Option<TaskScopeMode>,
+    #[serde(default)]
+    pub context_files: Vec<String>,
+    #[serde(default)]
+    pub expected_changes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskScopeMode {
+    Focused,
+    Module,
+    Project,
+}
+
+impl TaskScopeMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "focused" => Some(Self::Focused),
+            "module" => Some(Self::Module),
+            "project" => Some(Self::Project),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TaskScopeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Focused => "focused",
+            Self::Module => "module",
+            Self::Project => "project",
+        })
+    }
 }
 
 impl Task {
@@ -88,6 +123,9 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            scope_mode: None,
+            context_files: Vec::new(),
+            expected_changes: Vec::new(),
         }
     }
 

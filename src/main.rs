@@ -8,6 +8,7 @@ use orc::doctor::{self, CheckStatus};
 use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
 use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
+use orc::task::TaskScopeMode;
 
 const DB_PATH: &str = ".orc/orc.db";
 
@@ -217,6 +218,24 @@ enum TaskCommand {
         /// Required capabilities (e.g. code terminal architecture review)
         #[arg(required = true, num_args = 1..)]
         capabilities: Vec<String>,
+    },
+    Scope {
+        task_id: String,
+        mode: String,
+    },
+    ContextAdd {
+        task_id: String,
+        paths: Vec<String>,
+    },
+    ContextClear {
+        task_id: String,
+    },
+    ExpectChange {
+        task_id: String,
+        paths: Vec<String>,
+    },
+    ExpectClear {
+        task_id: String,
     },
     /// Show the diff for a task worktree
     Diff {
@@ -671,6 +690,20 @@ fn main() -> Result<()> {
                         println!("Priority:     {:?}", task.priority);
                         println!("Status:       {}", task.status);
                         println!("Capabilities: {}", task.required_capabilities().join(", "));
+                        println!(
+                            "Scope: {}",
+                            task.scope_mode
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "none".into())
+                        );
+                        println!("Context files:");
+                        for path in &task.context_files {
+                            println!("  {path}");
+                        }
+                        println!("Expected changes:");
+                        for path in &task.expected_changes {
+                            println!("  {path}");
+                        }
                         let deps = db
                             .list_task_dependencies(&task_id)
                             .map_err(|e| anyhow::anyhow!(e))?;
@@ -710,6 +743,47 @@ fn main() -> Result<()> {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
+            TaskCommand::Scope { task_id, mode } => {
+                let scope = TaskScopeMode::parse(&mode)
+                    .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {mode}"))?;
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                if !db
+                    .set_task_scope(&task_id, scope)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                {
+                    anyhow::bail!("task '{task_id}' not found");
+                }
+            }
+            TaskCommand::ContextAdd { task_id, paths } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                let task = db
+                    .get_task(&task_id)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .ok_or_else(|| anyhow::anyhow!("task '{task_id}' not found"))?;
+                let mut values = task.context_files;
+                values.extend(paths);
+                db.set_task_context(&task_id, &values)?;
+            }
+            TaskCommand::ExpectChange { task_id, paths } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                let task = db
+                    .get_task(&task_id)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .ok_or_else(|| anyhow::anyhow!("task '{task_id}' not found"))?;
+                let mut values = task.expected_changes;
+                values.extend(paths);
+                db.set_task_expected_changes(&task_id, &values)?;
+            }
+            TaskCommand::ContextClear { task_id } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                let empty = Vec::new();
+                db.set_task_context(&task_id, &empty)?;
+            }
+            TaskCommand::ExpectClear { task_id } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                let empty = Vec::new();
+                db.set_task_expected_changes(&task_id, &empty)?;
+            }
             TaskCommand::Diff { task_id } => match Database::open(DB_PATH) {
                 Ok(db) => {
                     match db

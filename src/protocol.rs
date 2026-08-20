@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::task::{Task, TaskPriority};
+use crate::task::{Task, TaskPriority, TaskScopeMode};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -116,6 +116,12 @@ pub enum LeadAction {
         objective: String,
         role: String,
         priority: TaskPriority,
+        #[serde(default)]
+        scope_mode: Option<TaskScopeMode>,
+        #[serde(default)]
+        context_files: Vec<String>,
+        #[serde(default)]
+        expected_changes: Vec<String>,
     },
     RequireCtoApproval {
         reason: String,

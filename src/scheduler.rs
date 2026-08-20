@@ -313,6 +313,9 @@ mod tests {
             priority: TaskPriority::Normal,
             status: crate::task::TaskStatus::Ready,
             required_capabilities: capabilities.into_iter().map(String::from).collect(),
+            scope_mode: None,
+            context_files: Vec::new(),
+            expected_changes: Vec::new(),
         }
     }
 

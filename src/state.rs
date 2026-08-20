@@ -49,6 +49,7 @@ impl OrcState {
                 objective,
                 role,
                 priority,
+                ..
             } => {
                 let id = format!("T-{:04}", self.next_task_id);
                 self.next_task_id += 1;
@@ -60,6 +61,9 @@ impl OrcState {
                     priority,
                     status: TaskStatus::Backlog,
                     required_capabilities: Vec::new(),
+                    scope_mode: None,
+                    context_files: Vec::new(),
+                    expected_changes: Vec::new(),
                 });
             }
             LeadAction::RequireCtoApproval { reason } => {
@@ -84,6 +88,9 @@ mod tests {
             objective: "Add widget to UI".into(),
             role: "developer".into(),
             priority: crate::task::TaskPriority::Normal,
+            scope_mode: None,
+            context_files: Vec::new(),
+            expected_changes: Vec::new(),
         });
 
         assert_eq!(s.tasks.len(), 1);

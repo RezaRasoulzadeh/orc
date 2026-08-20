@@ -25,6 +25,12 @@ pub fn format_dispatch(summary: &DispatchSummary) -> String {
         "Task       {}  {}\nAgent      {}\nBackend    {}\n",
         summary.task.id, summary.task.title, summary.agent, summary.backend
     );
+    if let Some(scope) = summary.task.scope_mode {
+        out.push_str(&format!(
+            "Scope      {scope}\nContext    {} files\n",
+            summary.task.context_files.len()
+        ));
+    }
     if let Some(profile) = &summary.profile {
         out.push_str(&format!("Profile    {profile}\n"));
     }

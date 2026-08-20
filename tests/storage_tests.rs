@@ -129,12 +129,18 @@ fn apply_response_is_atomic() {
         message_to_cto: None,
         actions: vec![
             LeadAction::CreateTask {
+                scope_mode: None,
+                context_files: Vec::new(),
+                expected_changes: Vec::new(),
                 title: "First".into(),
                 objective: "obj1".into(),
                 role: "dev".into(),
                 priority: orc::task::TaskPriority::Normal,
             },
             LeadAction::CreateTask {
+                scope_mode: None,
+                context_files: Vec::new(),
+                expected_changes: Vec::new(),
                 title: "Second".into(),
                 objective: "obj2".into(),
                 role: "dev".into(),

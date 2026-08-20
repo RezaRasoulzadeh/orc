@@ -7,7 +7,7 @@ use crate::git;
 use crate::registry::{self, AgentDefinition};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
-use crate::task::{Task, TaskStatus};
+use crate::task::{Task, TaskScopeMode, TaskStatus};
 use crate::validation::{
     self, SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
 };
@@ -24,23 +24,53 @@ fn block_automated_run(db: &Database, run_id: i64, task_id: &str, output: &str) 
 }
 
 fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
+    let guidance = match task.scope_mode {
+        Some(TaskScopeMode::Focused) => format!("\n\n## Targeted Context\n\nRelevant implementation context has already been identified.\n\nRead these files first:\n{}\n\nExpected changes:\n{}\n\nDo not perform broad repository discovery unless this scope proves insufficient. If additional files are necessary, inspect only the minimum required and report which ones were needed.", task.context_files.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"), task.expected_changes.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")),
+        Some(TaskScopeMode::Module) => format!("\n\n## Targeted Context\n\nSupplied modules/directories:\n{}\nConstrain discovery to these areas where practical.\n\nExpected changes:\n{}", task.context_files.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"), task.expected_changes.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")),
+        Some(TaskScopeMode::Project) => "\n\n## Targeted Context\n\nProject scope is configured; broader repository inspection is allowed.".into(),
+        None => String::new(),
+    };
+    let objective = format!("{}{}", task.objective, guidance);
     format!(
         "# Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run any relevant checks and tests (e.g., cargo test) and fix failures you encounter. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
         contract = contract,
         project = project,
         id = task.id,
         title = task.title,
-        objective = task.objective,
-        role = task.role
+        objective = objective,
+        role = task.role,
     )
 }
 
 pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id: &str) -> String {
+    let guidance = match task.scope_mode {
+        Some(TaskScopeMode::Focused) => format!(
+            "\n\nRelevant implementation context has already been identified. Read these files first:\n{}\nExpected changes:\n{}\nDo not perform broad repository discovery unless this scope proves insufficient.",
+            task.context_files
+                .iter()
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            task.expected_changes
+                .iter()
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        Some(TaskScopeMode::Module) => {
+            "\n\nConstrain discovery to the supplied modules/directories where practical.".into()
+        }
+        Some(TaskScopeMode::Project) => {
+            "\n\nProject scope allows broader repository inspection.".into()
+        }
+        None => String::new(),
+    };
+    let objective = format!("{}{}", task.objective, guidance);
     format!(
         "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}\n\n## Constraints\n\nStay strictly inside this task's scope. Do not modify unrelated project work or assume access to credentials, private memory, or external systems.\n\n## Required validation\n\nDescribe the checks and tests you performed. If you could not run a check, say why.\n\n## Required response / handoff format\n\nSummarize changes or recommendations, list files affected (if any), report validation results, and identify follow-up risks or questions.\n",
         id = task.id,
         title = task.title,
-        objective = task.objective,
+        objective = objective,
         role = task.role
     )
 }

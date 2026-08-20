@@ -1,5 +1,5 @@
 use crate::registry::{AgentDefinition, QuotaLimits, ReasoningEffort};
-use crate::task::{Task, TaskPriority, TaskStatus};
+use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
 
@@ -99,6 +99,9 @@ impl Database {
                 priority TEXT NOT NULL,
                 status TEXT NOT NULL,
                 required_capabilities TEXT,
+                scope_mode TEXT,
+                context_files TEXT,
+                expected_changes TEXT,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
@@ -187,6 +190,15 @@ impl Database {
             .any(|column| column == "required_capabilities")
         {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN required_capabilities TEXT")?;
+        }
+        for (name, definition) in [
+            ("scope_mode", "TEXT"),
+            ("context_files", "TEXT"),
+            ("expected_changes", "TEXT"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {definition}"))?;
+            }
         }
         Ok(())
     }
@@ -504,6 +516,20 @@ impl Database {
                 })?,
             _ => Vec::new(),
         };
+        let scope_mode = match row.get::<_, Option<String>>(7)? {
+            Some(value) => Some(TaskScopeMode::parse(&value).ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(format!("invalid task scope mode: {value}"))
+            })?),
+            None => None,
+        };
+        let list = |index| -> Result<Vec<String>, rusqlite::Error> {
+            match row.get::<_, Option<String>>(index)? {
+                Some(value) => serde_json::from_str(&value).map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!("invalid task metadata: {error}"))
+                }),
+                None => Ok(Vec::new()),
+            }
+        };
         Ok(Task {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -512,12 +538,15 @@ impl Database {
             priority: priority_value,
             status: status_value,
             required_capabilities,
+            scope_mode,
+            context_files: list(8)?,
+            expected_changes: list(9)?,
         })
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes FROM tasks ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -611,6 +640,9 @@ impl Database {
                         objective,
                         role,
                         priority,
+                        scope_mode,
+                        context_files,
+                        expected_changes,
                     } => {
                         // get seq
                         let value: String = self.conn.query_row(
@@ -629,8 +661,8 @@ impl Database {
                             TaskPriority::Critical => "critical",
                         };
                         self.conn.execute(
-                            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog')",
-                            params![id, project_id, title, objective, role, priority_str],
+                            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9)",
+                            params![id, project_id, title, objective, role, priority_str, scope_mode.map(|v| v.to_string()), serde_json::to_string(context_files)?, serde_json::to_string(expected_changes)?],
                         )?;
                         self.conn.execute(
                             "UPDATE meta SET value = ?1 WHERE key = 'next_task_id'",
@@ -664,7 +696,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, title, objective, role, priority, status, required_capabilities FROM tasks WHERE id = ?1",
+                "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes FROM tasks WHERE id = ?1",
                 params![id],
                 Self::task_from_row,
             )
@@ -682,6 +714,29 @@ impl Database {
             params![json, id],
         )?;
         Ok(changed != 0)
+    }
+
+    pub fn set_task_scope(&self, id: &str, scope: TaskScopeMode) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE tasks SET scope_mode = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![scope.to_string(), id],
+        )? != 0)
+    }
+
+    pub fn set_task_context(&self, id: &str, files: &[String]) -> Result<bool, DbError> {
+        self.set_task_metadata(id, "context_files", files)
+    }
+    pub fn set_task_expected_changes(&self, id: &str, files: &[String]) -> Result<bool, DbError> {
+        self.set_task_metadata(id, "expected_changes", files)
+    }
+    fn set_task_metadata(&self, id: &str, column: &str, files: &[String]) -> Result<bool, DbError> {
+        let json = serde_json::to_string(files)?;
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE tasks SET {column} = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2"
+            ),
+            params![json, id],
+        )? != 0)
     }
 
     #[allow(dead_code)]

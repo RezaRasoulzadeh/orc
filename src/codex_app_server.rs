@@ -671,6 +671,9 @@ mod tests {
             priority: TaskPriority::Normal,
             status: TaskStatus::Ready,
             required_capabilities: vec![],
+            scope_mode: None,
+            context_files: vec![],
+            expected_changes: vec![],
         };
         let decision = scheduler::schedule(&task, &[stored], None).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("codex-main"));

@@ -1062,7 +1062,19 @@ fn sync_enabled_agents_after_automated_run(task_id: &str) {
                 .and_then(|runs| runs.into_iter().next())
                 .is_some_and(|run| run.execution_mode == registry::AUTOMATED);
             if automated {
-                sync_enabled_agents(&db);
+                match codex_app_server::sync_enabled_agents_after_automated_run(
+                    &db,
+                    &CodexAppServer,
+                ) {
+                    Ok(results) => {
+                        for (id, result) in results {
+                            if let Err(error) = result {
+                                eprintln!("{id}: quota sync failed: {error}");
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("quota sync failed: {error}"),
+                }
             }
         }
         Err(error) => eprintln!("quota sync failed: {error}"),

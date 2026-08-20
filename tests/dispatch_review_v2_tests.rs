@@ -108,6 +108,13 @@ fn dispatch_summary_and_review_show_real_task_worktree_changes() {
     let view = review::build_review(&db, &task, dir.path()).unwrap();
     assert!(!review::format_review(&view).contains("full worker output"));
     assert!(review::format_review(&view).contains("feature.txt"));
+    assert!(!review::format_review(&view).contains("\nDiff\n"));
+    assert!(review::format_review_with_diff(&view, Some(&view.changes.diff)).contains("\nDiff\n"));
+    assert!(
+        review::format_review_file(&view, "feature.txt")
+            .unwrap()
+            .contains("feature.txt")
+    );
 }
 
 #[test]

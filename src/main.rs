@@ -81,6 +81,12 @@ enum Command {
     /// Review the latest task run and its worktree changes.
     Review {
         task_id: String,
+        /// Show the complete unified diff.
+        #[arg(long, conflicts_with = "file")]
+        diff: bool,
+        /// Show the unified diff for one changed file.
+        #[arg(long, conflicts_with = "diff")]
+        file: Option<String>,
     },
     /// Schedule an agent for a task using deterministic selection rules
     Schedule {
@@ -399,10 +405,21 @@ fn main() -> Result<()> {
                 return Err(e);
             }
         }
-        Command::Review { task_id } => {
+        Command::Review {
+            task_id,
+            diff,
+            file,
+        } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let review = orc::review::build_review(&db, &task_id, std::path::Path::new("."))?;
-            println!("{}", orc::review::format_review(&review));
+            let output = match file {
+                Some(path) => orc::review::format_review_file(&review, &path)?,
+                None => orc::review::format_review_with_diff(
+                    &review,
+                    diff.then_some(review.changes.diff.as_str()),
+                ),
+            };
+            println!("{output}");
         }
         Command::Schedule {
             task_id,

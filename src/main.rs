@@ -213,6 +213,10 @@ enum AgentCommand {
     QuotaClear {
         id: String,
     },
+    QuotaReserve {
+        #[arg(value_parser = clap::value_parser!(i64).range(0..=100))]
+        remaining: i64,
+    },
     /// Synchronize quota through the provider's machine-readable protocol.
     Sync {
         id: String,
@@ -494,8 +498,14 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))?
                 .ok_or_else(|| anyhow::anyhow!("task '{}' not found in DB", task_id))?;
             let agents = db.list_agents().map_err(|e| anyhow::anyhow!(e))?;
-            let decision = orc::scheduler::schedule(&task, &agents, mode.as_deref())
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let reserve = db.quota_reserve().map_err(|e| anyhow::anyhow!(e))?;
+            let decision = orc::scheduler::schedule_with_quota_reserve(
+                &task,
+                &agents,
+                mode.as_deref(),
+                reserve,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
             if explain {
                 println!("{}", decision.format_explanation());
             } else {
@@ -679,6 +689,11 @@ fn main() -> Result<()> {
                     db.clear_agent_quota(&id).map_err(|e| anyhow::anyhow!(e))?,
                     &id,
                 )?,
+                AgentCommand::QuotaReserve { remaining } => {
+                    db.set_quota_reserve(remaining)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    println!("Automatic dispatch quota reserve set to {remaining}%.");
+                }
                 AgentCommand::Sync { id } => {
                     let agent = registry::get_agent(&db, &id)?;
                     let snapshot = codex_app_server::sync_agent(&db, &agent, &CodexAppServer)

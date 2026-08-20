@@ -536,17 +536,19 @@ pub fn dispatch_queue(concurrency: usize) -> Result<Vec<DispatchSummary>> {
     let db = Database::open(".orc/orc.db")?;
     let report = crate::queue::compute_queue(&db)?;
     let agents = db.list_agents()?;
+    let quota_reserve = db.quota_reserve()?;
     let mut reserved = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
     let mut assignments = Vec::new();
     for entry in report.ready {
         if assignments.len() == concurrency {
             break;
         }
-        let decision = crate::scheduler::schedule_with_busy(
+        let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
             &entry.task,
             &agents,
             Some(registry::AUTOMATED),
             &reserved,
+            quota_reserve,
         )?;
         if let Some(agent_id) = decision.selected_agent_id {
             reserved.insert(agent_id.clone());

@@ -890,6 +890,13 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn list_busy_agents(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT agent FROM agent_runs WHERE status IN ('running', 'waiting_external') ORDER BY agent")?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn update_agent_run_output(&self, run_id: i64, output: &str) -> Result<bool, DbError> {
         let changed = self.conn.execute(
             "UPDATE agent_runs SET output = ?1 WHERE id = ?2",

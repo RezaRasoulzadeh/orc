@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -319,6 +320,7 @@ impl QueueReport {
 pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
     let tasks = db.list_tasks()?;
     let agents = db.list_agents()?;
+    let busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
     let all_deps = db.list_all_dependencies()?;
 
     let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -440,8 +442,9 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         schedule_decision: None,
                     });
                 } else {
-                    let decision = scheduler::schedule(&task, &agents, None)
-                        .map_err(|e| DbError::Scheduler(e.to_string()))?;
+                    let decision =
+                        scheduler::schedule_with_busy(&task, &agents, None, &busy_agents)
+                            .map_err(|e| DbError::Scheduler(e.to_string()))?;
 
                     if let Some(ref selected) = decision.selected_agent_id {
                         report.ready.push(QueueItem {

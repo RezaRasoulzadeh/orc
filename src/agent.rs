@@ -373,15 +373,22 @@ pub fn revise_with_worker_and_db_as_with_runner(
     }
     db.update_agent_run_status(run_id, "completed", Some(&combined))?;
     db.update_task_status(task_id, TaskStatus::Review)?;
+    let agent = db
+        .list_agents()?
+        .into_iter()
+        .find(|agent| agent.id == agent_id);
     Ok(DispatchSummary {
         task: db
             .get_task(task_id)?
             .context("task disappeared after revision")?,
         agent: agent_id.into(),
-        backend: "unknown".into(),
-        profile: None,
-        model: None,
-        reasoning_effort: None,
+        backend: agent
+            .as_ref()
+            .map(|agent| agent.backend.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        profile: agent.as_ref().and_then(|agent| agent.profile_path.clone()),
+        model: agent.as_ref().and_then(|agent| agent.model.clone()),
+        reasoning_effort: agent.as_ref().and_then(|agent| agent.reasoning_effort),
         worktree_path,
         run_id,
         run_status: "completed".into(),

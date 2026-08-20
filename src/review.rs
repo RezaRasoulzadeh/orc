@@ -85,6 +85,20 @@ pub fn build_review(
 }
 
 pub fn format_review(summary: &ReviewSummary) -> String {
+    format_review_with_diff(summary, None)
+}
+
+pub fn format_review_with_diff(summary: &ReviewSummary, diff: Option<&str>) -> String {
+    format_review_with_diff_text(summary, diff.unwrap_or_default())
+}
+
+pub fn format_review_file(summary: &ReviewSummary, path: &str) -> Result<String> {
+    let diff = file_diff(&summary.changes.diff, path)
+        .with_context(|| format!("changed file '{path}' not found"))?;
+    Ok(format_review_with_diff_text(summary, &diff))
+}
+
+fn format_review_with_diff_text(summary: &ReviewSummary, diff: &str) -> String {
     let mut out = format!(
         "Task       {}  {}\nStatus     {}\n",
         summary.task.id, summary.task.title, summary.task.status
@@ -110,10 +124,22 @@ pub fn format_review(summary: &ReviewSummary) -> String {
         "\nChanges\n{}\n",
         format_changes(&summary.changes)
     ));
-    if !summary.changes.diff.is_empty() {
-        out.push_str(&format!("\nDiff\n{}", summary.changes.diff));
+    if !diff.is_empty() {
+        out.push_str(&format!("\nDiff\n{diff}"));
     }
     out
+}
+
+fn file_diff(diff: &str, path: &str) -> Option<String> {
+    let mut selected = None;
+    for section in diff.split_inclusive("diff --git ").skip(1) {
+        let header = section.lines().next()?;
+        if header.ends_with(&format!(" b/{path}")) || header.contains(&format!(" b/{path} ")) {
+            selected = Some(section.to_owned());
+            break;
+        }
+    }
+    selected
 }
 
 pub fn format_changes(changes: &WorktreeChanges) -> String {

@@ -299,6 +299,127 @@ pub fn dispatch_with_worker(task_id: &str, worker: &dyn Worker) -> Result<()> {
     dispatch_with_worker_and_db(task_id, worker, ".orc/orc.db", ".")
 }
 
+pub fn revise_with_worker_and_db_as_with_runner(
+    task_id: &str,
+    feedback: &str,
+    worker: &dyn Worker,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<DispatchSummary> {
+    let repo_path = repo_path.as_ref();
+    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
+    let db = Database::open(db_path)?;
+    let project_id = db.get_project_id()?.context("no project found in DB")?;
+    let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
+    let task = db.get_task(task_id)?.context("task not found in DB")?;
+    if task.status != TaskStatus::Review {
+        anyhow::bail!(
+            "task {} can only be revised from review (currently {})",
+            task_id,
+            task.status
+        );
+    }
+    let (_, worktree_path) = db
+        .get_worktree_metadata(task_id)?
+        .context("task has no worktree")?;
+    let worktree_dir = repo_path.join(&worktree_path);
+    if !worktree_dir.exists() {
+        anyhow::bail!("task worktree does not exist: {}", worktree_dir.display());
+    }
+    db.update_task_status(task_id, TaskStatus::Active)?;
+    let run_id =
+        db.create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)?;
+    let prompt = format!(
+        "{}\n\n## Review feedback\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
+        build_worker_prompt(&contract, &project_name, &task),
+        feedback
+    );
+    let fail = |message: String| -> Result<DispatchSummary> {
+        block_automated_run(&db, run_id, task_id, &message)?;
+        anyhow::bail!("{message}")
+    };
+    let (outcome, output) = match worker.execute(&prompt, &worktree_dir) {
+        Ok(result) => result,
+        Err(error) => return fail(error),
+    };
+    if let WorkerOutcome::Failure(error) = outcome {
+        return fail(format!("Worker failed: {error}"));
+    }
+    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+        Ok(changes) => changes,
+        Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
+    };
+    if changes.files.is_empty() {
+        return fail("Revision completed without meaningful project changes.".into());
+    }
+    let config = match ValidationConfig::load(&worktree_dir) {
+        Ok(config) => config,
+        Err(error) => return fail(format!("Validation setup failed: {error:#}")),
+    };
+    let report = match validation::run_validation_pipeline(
+        validation_runner,
+        &config.commands,
+        &worktree_dir,
+    ) {
+        Ok(report) => report,
+        Err(error) => return fail(format!("Validation execution failed: {error:#}")),
+    };
+    let summary = report.summary();
+    let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
+    if !report.is_success() {
+        return fail(combined);
+    }
+    db.update_agent_run_status(run_id, "completed", Some(&combined))?;
+    db.update_task_status(task_id, TaskStatus::Review)?;
+    Ok(DispatchSummary {
+        task: db
+            .get_task(task_id)?
+            .context("task disappeared after revision")?,
+        agent: agent_id.into(),
+        backend: "unknown".into(),
+        profile: None,
+        model: None,
+        reasoning_effort: None,
+        worktree_path,
+        run_id,
+        run_status: "completed".into(),
+        validation: "PASS".into(),
+        changes,
+    })
+}
+
+pub fn revise_manual(
+    task_id: &str,
+    feedback: &str,
+    agent: &AgentDefinition,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+) -> Result<()> {
+    let repo_path = repo_path.as_ref();
+    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
+    let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
+    let task = db.get_task(task_id)?.context("task not found in DB")?;
+    if task.status != TaskStatus::Review {
+        anyhow::bail!(
+            "task {} can only be revised from review (currently {})",
+            task_id,
+            task.status
+        );
+    }
+    let project_id = db.get_project_id()?.context("no project found in DB")?;
+    db.update_task_status(task_id, TaskStatus::Active)?;
+    let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
+    db.set_agent_run_waiting_external(run_id)?;
+    println!(
+        "\n{}\n\n## Review feedback\n\n{}",
+        build_manual_packet(&contract, &project, &task, &agent.id),
+        feedback
+    );
+    Ok(())
+}
+
 /// Public dispatch function using the Copilot worker and default DB path
 pub fn dispatch(task_id: &str) -> Result<()> {
     dispatch_selected(task_id, None)

@@ -88,6 +88,13 @@ enum Command {
         #[arg(long, conflicts_with = "diff")]
         file: Option<String>,
     },
+    /// Revise a reviewed task using review feedback.
+    Revise {
+        task_id: String,
+        #[arg(long)]
+        agent: Option<String>,
+        feedback: String,
+    },
     /// Schedule an agent for a task using deterministic selection rules
     Schedule {
         /// Task ID to schedule (e.g., T-0001)
@@ -420,6 +427,43 @@ fn main() -> Result<()> {
                 ),
             };
             println!("{output}");
+        }
+        Command::Revise {
+            task_id,
+            agent,
+            feedback,
+        } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let task = db
+                .get_task(&task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            let selected = if let Some(id) = agent {
+                registry::get_agent(&db, &id)?
+            } else {
+                let run = db
+                    .list_agent_runs_for_task(&task_id)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("task has no agent run"))?;
+                registry::get_agent(&db, &run.agent)?
+            };
+            if selected.execution_mode == registry::MANUAL {
+                orc::agent::revise_manual(&task_id, &feedback, &selected, &db, ".")?;
+            } else {
+                let worker =
+                    orc::backend::WorkerFactory::build(&selected).map_err(anyhow::Error::msg)?;
+                let summary = orc::agent::revise_with_worker_and_db_as_with_runner(
+                    &task_id,
+                    &feedback,
+                    worker.as_ref(),
+                    DB_PATH,
+                    ".",
+                    &selected.id,
+                    &orc::SystemValidationRunner,
+                )?;
+                println!("{}", orc::review::format_dispatch(&summary));
+            }
+            let _ = task;
         }
         Command::Schedule {
             task_id,

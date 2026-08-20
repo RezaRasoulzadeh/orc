@@ -189,6 +189,21 @@ pub fn sync_enabled_agents(
         .collect())
 }
 
+pub fn sync_enabled_agents_after_automated_run(
+    db: &Database,
+    provider: &dyn RateLimitProvider,
+) -> Result<Vec<AgentSyncResult>, String> {
+    let agents = db.list_agents().map_err(|error| error.to_string())?;
+    Ok(agents
+        .into_iter()
+        .filter(|agent| agent.enabled && agent.backend == "codex" && agent.profile_path.is_some())
+        .map(|agent| {
+            let result = sync_agent(db, &agent, provider);
+            (agent.id, result)
+        })
+        .collect())
+}
+
 #[derive(Deserialize)]
 struct RpcResponse {
     id: i64,

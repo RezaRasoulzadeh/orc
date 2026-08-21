@@ -460,7 +460,7 @@ impl Database {
         }
         for (name, definition) in [
             ("phase", "TEXT"),
-            ("last_activity", "TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)"),
+            ("last_activity", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
@@ -468,6 +468,14 @@ impl Database {
                 ))?;
             }
         }
+
+        conn.execute(
+            "UPDATE agent_runs
+             SET last_activity = COALESCE(finished_at, started_at, CURRENT_TIMESTAMP)
+             WHERE last_activity IS NULL",
+            [],
+        )?;
+
         Ok(())
     }
 

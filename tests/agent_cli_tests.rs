@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 
 use orc::storage::Database;
@@ -127,4 +128,38 @@ fn codex_model_and_effort_commands_persist_and_validate() {
             .as_deref(),
         Some("gpt-5.6-terra")
     );
+}
+
+#[test]
+fn apply_plan_warns_for_missing_context_files_without_aborting() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+    fs::write(directory.path().join("existing.rs"), "fn existing() {}\n").unwrap();
+    let plan_path = directory.path().join("plan.json");
+    let plan = serde_json::json!({
+        "protocol_version": 1,
+        "objective": "test plan",
+        "assumptions": [],
+        "risks": [],
+        "questions": [],
+        "tasks": [{
+            "local_id": "T-0001",
+            "title": "Test task",
+            "objective": "Verify context warnings",
+            "role": "developer",
+            "priority": "normal",
+            "context_files": ["existing.rs", "missing.rs"],
+            "expected_changes": ["new.rs"]
+        }]
+    });
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    let output = orc_command(directory.path(), &["apply-plan", "plan.json"]);
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("T-0001"));
+    assert!(stderr.contains("missing.rs"));
+    assert!(!stderr.contains("existing.rs"));
+    assert!(!stderr.contains("new.rs"));
 }

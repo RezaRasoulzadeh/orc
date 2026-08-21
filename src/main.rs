@@ -562,6 +562,16 @@ fn main() -> Result<()> {
             };
             let response: PlanResponse = serde_json::from_str(&data)?;
             response.validate()?;
+            for task in &response.tasks {
+                for context_file in &task.context_files {
+                    if !std::path::Path::new(context_file).exists() {
+                        eprintln!(
+                            "Warning: task '{}' declares non-existent context file '{}'",
+                            task.local_id, context_file
+                        );
+                    }
+                }
+            }
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project_id = db
                 .get_project_id()?

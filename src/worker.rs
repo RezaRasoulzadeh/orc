@@ -6,6 +6,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::backend;
@@ -30,7 +31,15 @@ pub fn configured_timeout(name: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
-pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+pub fn run_command_with_timeout(command: Command, timeout: Duration) -> Result<Output, String> {
+    run_command_with_timeout_progress(command, timeout, |_| {})
+}
+
+pub fn run_command_with_timeout_progress(
+    mut command: Command,
+    timeout: Duration,
+    progress: impl Fn(&str),
+) -> Result<Output, String> {
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -56,18 +65,39 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
         let _ = child.wait();
         return Err("spawned command did not provide stderr pipe".to_string());
     };
-    let stdout_reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut stdout = stdout;
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut stderr = stderr;
-        stderr.read_to_end(&mut output).map(|_| output)
-    });
+    let (sender, receiver) = mpsc::channel();
+    let _stdout_reader = spawn_reader(stdout, 0, sender.clone());
+    let _stderr_reader = spawn_reader(stderr, 1, sender);
+    let mut stdout_output = Vec::new();
+    let mut stderr_output = Vec::new();
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
+    let mut readers = 2;
+    let mut receive = |stream: usize, bytes: Vec<u8>| {
+        let (output, pending) = if stream == 0 {
+            (&mut stdout_output, &mut stdout_pending)
+        } else {
+            (&mut stderr_output, &mut stderr_pending)
+        };
+        output.extend_from_slice(&bytes);
+        pending.extend_from_slice(&bytes);
+        while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&pending[..index]).trim().to_owned();
+            pending.drain(..=index);
+            if !line.is_empty() {
+                progress(&line);
+            }
+        }
+    };
     let started = Instant::now();
     loop {
+        while let Ok((stream, bytes)) = receiver.try_recv() {
+            let done = bytes.is_empty();
+            receive(stream, bytes);
+            if done {
+                readers -= 1;
+            }
+        }
         if child
             .try_wait()
             .map_err(|error| format!("failed waiting for command: {error}"))?
@@ -76,7 +106,22 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
             let status = child
                 .wait()
                 .map_err(|error| format!("failed reaping command: {error}"))?;
-            return collect_output(status, stdout_reader, stderr_reader);
+            while readers > 0 {
+                if let Ok((stream, bytes)) = receiver.recv() {
+                    let done = bytes.is_empty();
+                    receive(stream, bytes);
+                    if done {
+                        readers -= 1;
+                    }
+                }
+            }
+            flush_progress(&mut stdout_pending, &progress);
+            flush_progress(&mut stderr_pending, &progress);
+            return Ok(Output {
+                status,
+                stdout: stdout_output,
+                stderr: stderr_output,
+            });
         }
         if started.elapsed() >= timeout {
             #[cfg(unix)]
@@ -105,37 +150,69 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
             child
                 .kill()
                 .map_err(|error| format!("failed terminating timed-out command: {error}"))?;
-            let status = child
+            let _status = child
                 .wait()
                 .map_err(|error| format!("failed reaping timed-out command: {error}"))?;
-            let _ = collect_output(status, stdout_reader, stderr_reader);
+            while readers > 0 {
+                if let Ok((stream, bytes)) = receiver.recv() {
+                    let done = bytes.is_empty();
+                    receive(stream, bytes);
+                    if done {
+                        readers -= 1;
+                    }
+                }
+            }
+            flush_progress(&mut stdout_pending, &progress);
+            flush_progress(&mut stderr_pending, &progress);
             return Err(format!(
                 "external process timed out after {} seconds",
                 timeout.as_secs()
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok((stream, bytes)) => {
+                let done = bytes.is_empty();
+                receive(stream, bytes);
+                if done {
+                    readers -= 1;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => readers = 0,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
-fn collect_output(
-    status: std::process::ExitStatus,
-    stdout_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Output, String> {
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "stdout reader thread panicked".to_string())?
-        .map_err(|error| format!("failed reading stdout: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "stderr reader thread panicked".to_string())?
-        .map_err(|error| format!("failed reading stderr: {error}"))?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
+fn spawn_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    stream: usize,
+    sender: mpsc::Sender<(usize, Vec<u8>)>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = sender.send((stream, Vec::new()));
+                    break;
+                }
+                Ok(size) => {
+                    if sender.send((stream, buffer[..size].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     })
+}
+
+fn flush_progress(pending: &mut Vec<u8>, progress: &impl Fn(&str)) {
+    let line = String::from_utf8_lossy(pending).trim().to_owned();
+    if !line.is_empty() {
+        progress(&line);
+    }
+    pending.clear();
 }
 
 #[cfg(unix)]
@@ -161,6 +238,15 @@ pub trait Worker: Send + Sync {
     /// output may contain captured stdout/stderr or other useful diagnostic information.
     /// cwd is the working directory in which the task should execute.
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String>;
+
+    fn execute_with_progress(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        _progress: &dyn Fn(&str),
+    ) -> Result<(WorkerOutcome, Option<String>), String> {
+        self.execute(prompt, cwd)
+    }
 }
 
 /// Copilot worker implementation
@@ -168,15 +254,25 @@ pub struct CopilotWorker;
 
 impl Worker for CopilotWorker {
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        self.execute_with_progress(prompt, cwd, &|_| {})
+    }
+
+    fn execute_with_progress(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+    ) -> Result<(WorkerOutcome, Option<String>), String> {
         use std::process::Command;
 
         let mut cmd = Command::new("copilot");
         cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
         backend::configure_noninteractive(&mut cmd, cwd);
 
-        match run_command_with_timeout(
+        match run_command_with_timeout_progress(
             cmd,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            progress,
         ) {
             Ok(status) => {
                 if status.status.success() {
@@ -271,9 +367,19 @@ impl Worker for CodexWorker {
     }
 
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
-        match run_command_with_timeout(
+        self.execute_with_progress(prompt, cwd, &|_| {})
+    }
+
+    fn execute_with_progress(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+    ) -> Result<(WorkerOutcome, Option<String>), String> {
+        match run_command_with_timeout_progress(
             self.command(prompt, cwd),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            progress,
         ) {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -326,12 +432,22 @@ impl AntigravityWorker {
 
 impl Worker for AntigravityWorker {
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        self.execute_with_progress(prompt, cwd, &|_| {})
+    }
+
+    fn execute_with_progress(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+    ) -> Result<(WorkerOutcome, Option<String>), String> {
         let mut command = std::process::Command::new("agy");
         command.args(Self::command_args(prompt));
         backend::configure_noninteractive(&mut command, cwd);
-        match run_command_with_timeout(
+        match run_command_with_timeout_progress(
             command,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            progress,
         ) {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -406,6 +522,28 @@ mod tests {
         assert_eq!(output.stderr.len(), 262144);
         assert!(output.stdout.iter().all(|byte| *byte == b'o'));
         assert!(output.stderr.iter().all(|byte| *byte == b'e'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_both_streams_before_completion_and_preserves_output() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run_command_with_timeout_progress(
+                shell("printf 'out\\n'; printf 'err\\n' >&2; sleep 1"),
+                Duration::from_secs(5),
+                |line| sender.send(line.to_owned()).unwrap(),
+            )
+        });
+        let first = receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("output should arrive while the process is running");
+        assert!(first == "out" || first == "err");
+        let second = receiver.recv_timeout(Duration::from_millis(500)).unwrap();
+        assert!(first != second);
+        let output = handle.join().unwrap().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
     }
 
     #[cfg(unix)]

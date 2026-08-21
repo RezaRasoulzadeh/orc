@@ -101,6 +101,37 @@ fn format_relative_duration(timestamp: i64) -> String {
     }
 }
 
+fn format_elapsed(started_at: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default();
+    let started = ProcessCommand::new("date")
+        .args(["-d", started_at, "+%s"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i64>()
+                .ok()
+        });
+    started.map_or_else(
+        || "unknown".to_owned(),
+        |value| format_duration(now.saturating_sub(value)),
+    )
+}
+
+fn format_duration(seconds: i64) -> String {
+    format!(
+        "{}h {:02}m {:02}s",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "orc", version, about = "Local AI engineering orchestrator")]
 struct Cli {
@@ -1299,6 +1330,11 @@ fn main() -> Result<()> {
                             run.execution_mode,
                             run.status
                         );
+                        if run.status == "running" {
+                            println!("  Phase:    {}", run.phase.as_deref().unwrap_or("unknown"));
+                            println!("  Elapsed:  {}", format_elapsed(&run.started_at));
+                            println!("  Activity: {}", run.last_activity);
+                        }
                         if let Some(finished) = run.finished_at {
                             println!("  Started:  {}", run.started_at);
                             println!("  Finished: {}", finished);

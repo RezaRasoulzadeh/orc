@@ -23,6 +23,8 @@ pub struct AgentRun {
     pub output: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    pub phase: Option<String>,
+    pub last_activity: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +336,8 @@ impl Database {
                 output TEXT,
                 started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 finished_at TEXT
+                , phase TEXT
+                , last_activity TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
             CREATE TABLE IF NOT EXISTS worktree_metadata (
                 agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -453,6 +457,16 @@ impl Database {
             conn.execute_batch(
                 "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
             )?;
+        }
+        for (name, definition) in [
+            ("phase", "TEXT"),
+            ("last_activity", "TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE agent_runs ADD COLUMN {name} {definition}"
+                ))?;
+            }
         }
         Ok(())
     }
@@ -1122,6 +1136,8 @@ impl Database {
             output: row.get(6)?,
             started_at: row.get(7)?,
             finished_at: row.get(8)?,
+            phase: row.get(9)?,
+            last_activity: row.get(10)?,
         })
     }
 
@@ -1142,7 +1158,7 @@ impl Database {
         execution_mode: &str,
     ) -> Result<i64, DbError> {
         self.conn.execute(
-            "INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, status, started_at) VALUES (?1, ?2, ?3, ?4, 'running', CURRENT_TIMESTAMP)",
+            "INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)",
             params![project_id, task_id, agent, execution_mode],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1155,7 +1171,7 @@ impl Database {
         output: Option<&str>,
     ) -> Result<bool, DbError> {
         let changed = self.conn.execute(
-            "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
             params![status, output, run_id],
         )?;
         Ok(changed != 0)
@@ -1170,7 +1186,7 @@ impl Database {
 
     pub fn get_agent_run(&self, run_id: i64) -> Result<Option<AgentRun>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE id = ?1",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE id = ?1",
             params![run_id], Self::agent_run_from_row).optional()?)
     }
 
@@ -1204,7 +1220,7 @@ impl Database {
 
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -1213,7 +1229,7 @@ impl Database {
 
     pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
         )?;
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?
@@ -1233,6 +1249,10 @@ impl Database {
             params![output, run_id],
         )?;
         Ok(changed != 0)
+    }
+
+    pub fn update_agent_run_phase(&self, run_id: i64, phase: &str) -> Result<bool, DbError> {
+        Ok(self.conn.execute("UPDATE agent_runs SET phase = ?1, last_activity = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')", params![phase, run_id])? != 0)
     }
 
     pub fn store_worktree_metadata(

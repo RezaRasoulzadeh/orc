@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::registry::{self, AgentDefinition};
 use crate::task::Task;
@@ -56,6 +57,8 @@ pub struct CandidateEvaluation {
     pub execution_mode: String,
     pub priority: i64,
     pub quota_remaining_percent: Option<i64>,
+    pub quota_reset_at: Option<String>,
+    pub capacity_score: Option<i64>,
     pub status: CandidateStatus,
 }
 
@@ -63,6 +66,7 @@ pub struct CandidateEvaluation {
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
     HighestPriority,
+    HealthierCapacity,
     LexicographicTieBreak,
     SingleEligibleCandidate,
     NoEligibleCandidates,
@@ -142,6 +146,8 @@ pub fn evaluate_candidate_with_quota_reserve(
         execution_mode: agent.execution_mode.clone(),
         priority: agent.priority,
         quota_remaining_percent: agent.quota_remaining_percent,
+        quota_reset_at: agent.quota_reset_at.clone(),
+        capacity_score: capacity_score(agent),
         status,
     };
 
@@ -216,6 +222,119 @@ pub fn evaluate_candidate_with_quota_reserve(
     make_eval(CandidateStatus::Eligible)
 }
 
+fn capacity_score(agent: &AgentDefinition) -> Option<i64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_secs() as i64);
+    capacity_score_at(agent, now)
+}
+
+fn capacity_score_at(agent: &AgentDefinition, now_epoch: i64) -> Option<i64> {
+    let remaining = agent.quota_remaining_percent?;
+    let horizon_bonus = agent
+        .quota_reset_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch)
+        .map(|reset| reset - now_epoch)
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| (2_592_000i64.saturating_sub(seconds) / 86_400).min(30))
+        .unwrap_or(0);
+    Some(remaining.saturating_add(horizon_bonus))
+}
+
+fn capacity_value(capacity_score: Option<i64>) -> i64 {
+    capacity_score.unwrap_or(0)
+}
+
+fn ranking_score(candidate: &CandidateEvaluation) -> i64 {
+    candidate.priority * 10 + capacity_value(candidate.capacity_score)
+}
+
+fn sort_eligible(eligible: &mut [CandidateEvaluation]) {
+    eligible.sort_by(|a, b| {
+        ranking_score(b)
+            .cmp(&ranking_score(a))
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+}
+
+fn selection_reason(eligible: &[CandidateEvaluation]) -> SelectionReason {
+    if eligible.len() == 1 {
+        SelectionReason::SingleEligibleCandidate
+    } else if ranking_score(&eligible[0]) > ranking_score(&eligible[1])
+        && capacity_value(eligible[0].capacity_score) > capacity_value(eligible[1].capacity_score)
+        && eligible[0].priority <= eligible[1].priority
+    {
+        SelectionReason::HealthierCapacity
+    } else if eligible[0].priority > eligible[1].priority {
+        SelectionReason::HighestPriority
+    } else {
+        SelectionReason::LexicographicTieBreak
+    }
+}
+
+fn parse_rfc3339_epoch(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let number = |start: usize, end: usize| value.get(start..end)?.parse::<i64>().ok();
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let offset_start = value[19..].find(['Z', '+', '-']).map(|index| index + 19)?;
+    let offset = if bytes[offset_start] == b'Z' {
+        0
+    } else {
+        let sign = if bytes[offset_start] == b'+' { 1 } else { -1 };
+        let offset_hour = value
+            .get(offset_start + 1..offset_start + 3)?
+            .parse::<i64>()
+            .ok()?;
+        let offset_minute = value
+            .get(offset_start + 4..offset_start + 6)?
+            .parse::<i64>()
+            .ok()?;
+        sign * (offset_hour * 3600 + offset_minute * 60)
+    };
+    let days = (1970..year)
+        .map(|y| {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                366
+            } else {
+                365
+            }
+        })
+        .sum::<i64>()
+        + [
+            31,
+            28 + if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                1
+            } else {
+                0
+            },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ][..(month - 1) as usize]
+            .iter()
+            .sum::<i64>()
+        + day
+        - 1;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
+}
+
 pub fn evaluate_candidate_with_busy(
     agent: &AgentDefinition,
     task: &Task,
@@ -270,12 +389,7 @@ pub fn schedule_with_quota_reserve(
         }
     }
 
-    // Rule 7 (highest priority) & Rule 8 (lexicographic tie-break)
-    eligible.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.agent_id.cmp(&b.agent_id))
-    });
+    sort_eligible(&mut eligible);
 
     rejected.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
 
@@ -286,6 +400,15 @@ pub fn schedule_with_quota_reserve(
             (
                 SelectionReason::SingleEligibleCandidate,
                 format!("{winner} selected by highest priority."),
+            )
+        } else if ranking_score(&eligible[0]) > ranking_score(&eligible[1])
+            && capacity_value(eligible[0].capacity_score)
+                > capacity_value(eligible[1].capacity_score)
+            && eligible[0].priority <= eligible[1].priority
+        {
+            (
+                SelectionReason::HealthierCapacity,
+                format!("{winner} selected by healthier usable capacity."),
             )
         } else if eligible[0].priority > eligible[1].priority {
             (
@@ -351,11 +474,7 @@ pub fn schedule_with_busy_and_quota_reserve(
             CandidateStatus::Rejected(_) => rejected.push(evaluation),
         }
     }
-    eligible.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.agent_id.cmp(&b.agent_id))
-    });
+    sort_eligible(&mut eligible);
     rejected.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     let selected_agent_id = eligible.first().map(|candidate| candidate.agent_id.clone());
     let explanation = selected_agent_id.as_ref().map_or_else(
@@ -365,13 +484,12 @@ pub fn schedule_with_busy_and_quota_reserve(
                 task.id
             )
         },
-        |id| format!("{id} selected by deterministic priority and lexicographic order."),
+        |id| format!("{id} selected by deterministic capacity, priority, and lexicographic order."),
     );
     let selection_reason = match selected_agent_id {
         None => SelectionReason::NoEligibleCandidates,
         Some(_) if eligible.len() == 1 => SelectionReason::SingleEligibleCandidate,
-        Some(_) if eligible[0].priority > eligible[1].priority => SelectionReason::HighestPriority,
-        Some(_) => SelectionReason::LexicographicTieBreak,
+        Some(_) => selection_reason(&eligible),
     };
     let selected = selected_agent_id.clone();
     let mut candidates = eligible;
@@ -485,6 +603,90 @@ mod tests {
     }
 
     #[test]
+    fn substantially_healthier_capacity_beats_modest_priority() {
+        let task = test_task(vec!["code"]);
+        let mut priority = test_agent("priority", 105, vec!["code"]);
+        priority.quota_remaining_percent = Some(20);
+        let mut healthy = test_agent("healthy", 100, vec!["code"]);
+        healthy.quota_remaining_percent = Some(80);
+        let decision = schedule(&task, &[priority, healthy], None).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("healthy"));
+        assert_eq!(
+            decision.selection_reason,
+            SelectionReason::HealthierCapacity
+        );
+    }
+
+    #[test]
+    fn nearby_quota_values_have_no_bucket_cliff() {
+        let task = test_task(vec!["code"]);
+        let mut nine = test_agent("nine", 100, vec!["code"]);
+        nine.quota_remaining_percent = Some(9);
+        let mut ten = test_agent("ten", 100, vec!["code"]);
+        ten.quota_remaining_percent = Some(10);
+        let nine_eval = evaluate_candidate(&nine, &task, None);
+        let ten_eval = evaluate_candidate(&ten, &task, None);
+        assert_eq!(ten_eval.capacity_score, Some(10));
+        assert_eq!(nine_eval.capacity_score, Some(9));
+        assert!(ranking_score(&ten_eval) > ranking_score(&nine_eval));
+    }
+
+    #[test]
+    fn similar_capacity_prefers_higher_priority() {
+        let task = test_task(vec!["code"]);
+        let mut high = test_agent("high", 105, vec!["code"]);
+        high.quota_remaining_percent = Some(52);
+        let mut low = test_agent("low", 100, vec!["code"]);
+        low.quota_remaining_percent = Some(54);
+        let decision = schedule(&task, &[low, high], None).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("high"));
+        assert_eq!(decision.selection_reason, SelectionReason::HighestPriority);
+    }
+
+    #[test]
+    fn reset_horizon_influences_capacity() {
+        let task = test_task(vec!["code"]);
+        let mut soon = test_agent("soon", 100, vec!["code"]);
+        soon.quota_remaining_percent = Some(50);
+        soon.quota_reset_at = Some("2026-08-22T00:00:00Z".to_string());
+        let mut far = test_agent("far", 100, vec!["code"]);
+        far.quota_remaining_percent = Some(50);
+        far.quota_reset_at = Some("2999-01-01T00:00:00Z".to_string());
+        let soon_eval = evaluate_candidate(&soon, &task, None);
+        let far_eval = evaluate_candidate(&far, &task, None);
+        assert!(soon_eval.capacity_score > far_eval.capacity_score);
+        let decision = schedule(&task, &[far, soon], None).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("soon"));
+    }
+
+    #[test]
+    fn reset_horizon_changes_ranking_score() {
+        let task = test_task(vec!["code"]);
+        let mut soon = test_agent("soon", 100, vec!["code"]);
+        soon.quota_remaining_percent = Some(50);
+        soon.quota_reset_at = Some("2026-08-22T00:00:00Z".to_string());
+        let mut far = soon.clone();
+        far.id = "far".to_string();
+        far.quota_reset_at = Some("2999-01-01T00:00:00Z".to_string());
+        let now = parse_rfc3339_epoch("2026-08-21T00:00:00Z").unwrap();
+        let soon_score = capacity_score_at(&soon, now);
+        let far_score = capacity_score_at(&far, now);
+        let soon_eval = evaluate_candidate(&soon, &task, None);
+        let far_eval = evaluate_candidate(&far, &task, None);
+        assert!(soon_score > far_score);
+        assert!(ranking_score(&soon_eval) > ranking_score(&far_eval));
+    }
+
+    #[test]
+    fn past_reset_timestamp_has_no_near_reset_bonus() {
+        let mut agent = test_agent("past", 100, vec!["code"]);
+        agent.quota_remaining_percent = Some(50);
+        agent.quota_reset_at = Some("2026-08-20T00:00:00Z".to_string());
+        let now = parse_rfc3339_epoch("2026-08-21T00:00:00Z").unwrap();
+        assert_eq!(capacity_score_at(&agent, now), Some(50));
+    }
+
+    #[test]
     fn test_lexicographic_tie_break() {
         let task = test_task(vec!["code", "terminal"]);
         let a1 = test_agent("codex-b", 100, vec!["code", "terminal"]);
@@ -547,6 +749,15 @@ mod tests {
         let decision = schedule(&task, &[a], None).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("agent-1"));
         assert_eq!(decision.candidates[0].status, CandidateStatus::Eligible);
+    }
+
+    #[test]
+    fn unknown_quota_ordering_is_deterministic() {
+        let task = test_task(vec!["code"]);
+        let first = test_agent("agent-b", 100, vec!["code"]);
+        let second = test_agent("agent-a", 100, vec!["code"]);
+        let decision = schedule(&task, &[first, second], None).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("agent-a"));
     }
 
     #[test]

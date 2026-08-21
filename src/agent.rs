@@ -273,6 +273,17 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                     };
                     progress("validation completed");
                     let validation_summary = report.summary();
+                    db.record_lifecycle_event(
+                        "validation_result",
+                        Some(task_id),
+                        Some(run_id),
+                        Some(agent_id),
+                        Some(if report.is_success() {
+                            "success"
+                        } else {
+                            "failure"
+                        }),
+                    )?;
                     let combined_output = if validation_summary.is_empty() {
                         output.unwrap_or_default()
                     } else {
@@ -374,6 +385,13 @@ pub fn revise_with_worker_and_db_as_with_runner(
     db.update_task_status(task_id, TaskStatus::Active)?;
     let run_id =
         db.create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)?;
+    db.record_lifecycle_event(
+        "review_revision",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(feedback),
+    )?;
     let prompt = format!(
         "{}\n\n## Review feedback\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
         build_worker_prompt(&contract, &project_name, &task),
@@ -415,6 +433,17 @@ pub fn revise_with_worker_and_db_as_with_runner(
         return fail(combined);
     }
     db.update_agent_run_status(run_id, "completed", Some(&combined))?;
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(if report.is_success() {
+            "success"
+        } else {
+            "failure"
+        }),
+    )?;
     db.update_task_status(task_id, TaskStatus::Review)?;
     let agent = db
         .list_agents()?
@@ -671,6 +700,7 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
     git::merge_task_branch(repo_path, &branch, task_id)?;
     git::remove_worktree(repo_path, &path)?;
     db.update_task_status(task_id, TaskStatus::Done)?;
+    db.record_lifecycle_event("review_accept", Some(task_id), None, None, None)?;
     Ok(())
 }
 
@@ -695,6 +725,7 @@ pub fn reject_task(db: &Database, task_id: &str, reason: Option<&str>) -> Result
         db.update_agent_run_output(run.id, &output)?;
     }
     db.update_task_status(task_id, TaskStatus::Ready)?;
+    db.record_lifecycle_event("review_reject", Some(task_id), None, None, reason)?;
     Ok(())
 }
 

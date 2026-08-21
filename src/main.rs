@@ -21,6 +21,25 @@ fn parse_reasoning_effort(value: &str) -> Result<registry::ReasoningEffort, Stri
     registry::ReasoningEffort::parse(value).map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Copy)]
+enum Concurrency {
+    Auto,
+    Limited(usize),
+}
+
+fn parse_concurrency(value: &str) -> Result<Concurrency, String> {
+    if value == "auto" {
+        return Ok(Concurrency::Auto);
+    }
+    let concurrency = value
+        .parse::<usize>()
+        .map_err(|_| "concurrency must be a positive integer or 'auto'".to_string())?;
+    if concurrency == 0 {
+        return Err("concurrency must be a positive integer or 'auto'".to_string());
+    }
+    Ok(Concurrency::Limited(concurrency))
+}
+
 fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
     let agent = registry::get_agent(db, id)?;
     if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
@@ -152,8 +171,8 @@ enum Command {
     /// Dispatch ready automated tasks concurrently.
     DispatchQueue {
         /// Maximum number of tasks to execute at once.
-        #[arg(long, default_value_t = 1)]
-        concurrency: usize,
+        #[arg(long, default_value = "1", value_parser = parse_concurrency)]
+        concurrency: Concurrency,
     },
     /// Review the latest task run and its worktree changes.
     Review {
@@ -646,7 +665,10 @@ fn main() -> Result<()> {
             sync_enabled_agents_after_automated_run(&task_id);
         }
         Command::DispatchQueue { concurrency } => {
-            let summaries = agent::dispatch_queue(concurrency)?;
+            let summaries = agent::dispatch_queue(match concurrency {
+                Concurrency::Auto => None,
+                Concurrency::Limited(limit) => Some(limit),
+            })?;
             for summary in &summaries {
                 println!("{}", orc::review::format_dispatch(summary));
                 if summary.run_status == "completed" {

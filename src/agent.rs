@@ -6,6 +6,7 @@ use std::thread;
 use crate::backend::WorkerFactory;
 use crate::contract;
 use crate::git;
+use crate::queue::QueueEntry;
 use crate::registry::{self, AgentDefinition};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
@@ -554,32 +555,49 @@ pub fn dispatch_selected_with_options(
     Ok(summary)
 }
 
-pub fn dispatch_queue(concurrency: usize) -> Result<Vec<DispatchSummary>> {
-    if concurrency == 0 {
+pub fn plan_dispatch_assignments(
+    ready: &[QueueEntry],
+    agents: &[AgentDefinition],
+    busy_agents: &HashSet<String>,
+    quota_reserve: i64,
+    concurrency: Option<usize>,
+) -> Result<Vec<(String, String)>> {
+    if concurrency == Some(0) {
         anyhow::bail!("concurrency must be greater than zero");
     }
-    let db = Database::open(".orc/orc.db")?;
-    let report = crate::queue::compute_queue(&db)?;
-    let agents = db.list_agents()?;
-    let quota_reserve = db.quota_reserve()?;
-    let mut reserved = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    let mut reserved = busy_agents.clone();
     let mut assignments = Vec::new();
-    for entry in report.ready {
-        if assignments.len() == concurrency {
+    for entry in ready {
+        if concurrency.is_some_and(|limit| assignments.len() == limit) {
             break;
         }
         let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
             &entry.task,
-            &agents,
+            agents,
             Some(registry::AUTOMATED),
             &reserved,
             quota_reserve,
         )?;
         if let Some(agent_id) = decision.selected_agent_id {
             reserved.insert(agent_id.clone());
-            assignments.push((entry.task.id, agent_id));
+            assignments.push((entry.task.id.clone(), agent_id));
         }
     }
+    Ok(assignments)
+}
+
+pub fn dispatch_queue(concurrency: Option<usize>) -> Result<Vec<DispatchSummary>> {
+    let db = Database::open(".orc/orc.db")?;
+    let report = crate::queue::compute_queue(&db)?;
+    let agents = db.list_agents()?;
+    let quota_reserve = db.quota_reserve()?;
+    let assignments = plan_dispatch_assignments(
+        &report.ready,
+        &agents,
+        &db.list_busy_agents()?.into_iter().collect::<HashSet<_>>(),
+        quota_reserve,
+        concurrency,
+    )?;
     let mut summaries = Vec::new();
     let handles = assignments
         .iter()

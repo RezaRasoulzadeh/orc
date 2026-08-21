@@ -4,6 +4,39 @@ use std::process::Command;
 use orc::storage::Database;
 use tempfile::tempdir;
 
+#[test]
+fn dispatch_queue_concurrency_parser_accepts_auto_and_positive_values() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+
+    for value in ["auto", "1", "3"] {
+        let output = orc_command(
+            directory.path(),
+            &["dispatch-queue", "--concurrency", value],
+        );
+        assert!(
+            output.status.success(),
+            "{value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn dispatch_queue_concurrency_parser_rejects_zero_and_invalid_text() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+
+    for value in ["0", "invalid"] {
+        let output = orc_command(
+            directory.path(),
+            &["dispatch-queue", "--concurrency", value],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("positive integer or 'auto'"));
+    }
+}
+
 fn orc_command(directory: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory)

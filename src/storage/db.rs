@@ -25,6 +25,13 @@ pub struct AgentRun {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub id: i64,
+    pub reason: String,
+    pub resolved: bool,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DbError {
     #[error("database filesystem error: {0}")]
@@ -310,6 +317,7 @@ impl Database {
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id),
                 reason TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
             CREATE TABLE IF NOT EXISTS agent_runs (
@@ -337,6 +345,7 @@ impl Database {
         Self::ensure_agent_columns(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_task_columns(&conn)?;
+        Self::ensure_approval_request_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -366,6 +375,20 @@ impl Database {
         Self::ensure_agent_columns(conn)?;
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_task_columns(conn)?;
+        Self::ensure_approval_request_columns(conn)?;
+        Ok(())
+    }
+
+    fn ensure_approval_request_columns(conn: &Connection) -> Result<(), DbError> {
+        let mut statement = conn.prepare("PRAGMA table_info(approval_requests)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "resolved") {
+            conn.execute_batch(
+                "ALTER TABLE approval_requests ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(())
     }
 
@@ -1018,13 +1041,27 @@ impl Database {
     }
 
     #[allow(dead_code)]
-    pub fn list_approval_requests(&self, project_id: i64) -> Result<Vec<String>, DbError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT reason FROM approval_requests WHERE project_id = ?1 ORDER BY id")?;
+    pub fn list_approval_requests(&self, project_id: i64) -> Result<Vec<ApprovalRequest>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, reason, resolved FROM approval_requests WHERE project_id = ?1 ORDER BY id",
+        )?;
         Ok(stmt
-            .query_map(params![project_id], |r| r.get(0))?
+            .query_map(params![project_id], |r| {
+                Ok(ApprovalRequest {
+                    id: r.get(0)?,
+                    reason: r.get(1)?,
+                    resolved: r.get::<_, i64>(2)? != 0,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn resolve_approval_request(&self, project_id: i64, id: i64) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE approval_requests SET resolved = 1 WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id],
+        )?;
+        Ok(changed != 0)
     }
 
     fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {

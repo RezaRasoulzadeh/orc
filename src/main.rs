@@ -196,10 +196,20 @@ enum Command {
         /// Optional task ID to filter runs for a specific task
         task_id: Option<String>,
     },
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
     Run {
         #[command(subcommand)]
         command: RunCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    List,
+    Resolve { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -433,6 +443,29 @@ fn main() -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
+        Command::Approvals { command } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project_id = db
+                .get_project_id()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            match command {
+                ApprovalCommand::List => {
+                    for request in db
+                        .list_approval_requests(project_id)?
+                        .into_iter()
+                        .filter(|request| !request.resolved)
+                    {
+                        println!("{}  {}", request.id, request.reason);
+                    }
+                }
+                ApprovalCommand::Resolve { id } => {
+                    if !db.resolve_approval_request(project_id, id)? {
+                        anyhow::bail!("approval request {id} not found for current project");
+                    }
+                    println!("Resolved approval request {id}.");
+                }
+            }
+        }
         Command::Report { full } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db

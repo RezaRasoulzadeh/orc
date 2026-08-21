@@ -5,7 +5,10 @@ use orc::agent;
 use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
 use orc::discovery;
 use orc::doctor::{self, CheckStatus};
-use orc::protocol::{EngineeringLeadRequest, EngineeringLeadResponse};
+use orc::protocol::{
+    EngineeringLeadRequest, EngineeringLeadResponse, PROTOCOL_VERSION, PlanResponse,
+    PlanningRequest,
+};
 use orc::registry::{self, AgentDefinition};
 use orc::storage::Database;
 use orc::task::TaskScopeMode;
@@ -94,6 +97,16 @@ enum Command {
     /// Diagnose project and configured agent health without consuming model quota.
     Doctor,
     Status,
+    /// Emit a structured project report for a manual planner.
+    Report,
+    /// Emit a structured planning request for a high-level objective.
+    PlanRequest {
+        objective: String,
+    },
+    /// Validate and atomically apply a structured plan response.
+    ApplyPlan {
+        path: String,
+    },
     /// Show the deterministic queue of tasks
     Queue {
         /// Explain task readiness, dependency state, and scheduler eligibility
@@ -403,6 +416,49 @@ fn main() -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
+        Command::Report => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project = db
+                .get_project_name()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            let contract = std::fs::read_to_string(".orc/engineering.md").unwrap_or_default();
+            let report = db.project_report(
+                db.get_project_id()?
+                    .ok_or_else(|| anyhow::anyhow!("no project found"))?,
+                project,
+                std::env::current_dir()?.display().to_string(),
+                contract,
+                orc::protocol::ReportArchitecture::default(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::PlanRequest { objective } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project = db
+                .get_project_name()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            let contract = std::fs::read_to_string(".orc/engineering.md").unwrap_or_default();
+            let request = PlanningRequest { protocol_version: PROTOCOL_VERSION, kind: "existing_project".into(), project: Some(orc::protocol::ReportProject { name: project, repository: std::env::current_dir()?.display().to_string(), branch: None, commit: None }), engineering_contract: contract, objective, constraints: Vec::new(), target_platforms: Vec::new(), stack: Vec::new(), non_goals: Vec::new(), deliverables: Vec::new(), definition_of_done: Vec::new(), response_schema: "PlanResponse v1: protocol_version, objective, assumptions, risks, questions, tasks[]. Each task requires id, title, objective, role, priority, and dependencies.".into() };
+            println!("{}", serde_json::to_string_pretty(&request)?);
+        }
+        Command::ApplyPlan { path } => {
+            let data = if path == "-" {
+                use std::io::{self, Read};
+                let mut buf = String::new();
+                io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(path)?
+            };
+            let response: PlanResponse = serde_json::from_str(&data)?;
+            response.validate()?;
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project_id = db
+                .get_project_id()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            let mapping = db.apply_plan(project_id, &response)?;
+            println!("{}", serde_json::to_string_pretty(&mapping)?);
+        }
         Command::Queue { explain } => match Database::open(DB_PATH) {
             Ok(db) => {
                 let report = orc::queue::compute_queue(&db).map_err(|e| anyhow::anyhow!(e))?;

@@ -31,6 +31,18 @@ fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn git_identity(root: &std::path::Path, command: &str) -> Result<Option<String>> {
+    let output = ProcessCommand::new("git")
+        .current_dir(root)
+        .args(command.split_whitespace())
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!value.is_empty()).then_some(value))
+}
+
 fn format_timestamp(value: &str) -> String {
     let Ok(timestamp) = value.parse::<i64>() else {
         return value.to_owned();
@@ -98,9 +110,14 @@ enum Command {
     Doctor,
     Status,
     /// Emit a structured project report for a manual planner.
-    Report,
+    Report {
+        #[arg(long)]
+        full: bool,
+    },
     /// Emit a structured planning request for a high-level objective.
     PlanRequest {
+        #[arg(long)]
+        full_report: bool,
         objective: String,
     },
     /// Validate and atomically apply a structured plan response.
@@ -416,29 +433,89 @@ fn main() -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
-        Command::Report => {
+        Command::Report { full } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db
                 .get_project_name()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
             let contract = std::fs::read_to_string(".orc/engineering.md").unwrap_or_default();
-            let report = db.project_report(
-                db.get_project_id()?
-                    .ok_or_else(|| anyhow::anyhow!("no project found"))?,
+            let project_id = db
+                .get_project_id()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            let root = std::env::current_dir()?;
+            let branch = git_identity(&root, "symbolic-ref --quiet --short HEAD")?;
+            let commit = git_identity(&root, "rev-parse HEAD")?;
+            let facts = db.project_facts(project_id)?;
+            let architecture = if full {
+                orc::protocol::ReportArchitecture {
+                    modules: serde_json::from_str(
+                        facts.get("modules").map(String::as_str).unwrap_or("[]"),
+                    )?,
+                    boundaries: serde_json::from_str(
+                        facts.get("boundaries").map(String::as_str).unwrap_or("[]"),
+                    )?,
+                    discovery: facts,
+                }
+            } else {
+                orc::protocol::ReportArchitecture::default()
+            };
+            let mut report = db.project_report(
+                project_id,
                 project,
-                std::env::current_dir()?.display().to_string(),
+                root.display().to_string(),
                 contract,
-                orc::protocol::ReportArchitecture::default(),
+                architecture,
             )?;
+            report.project.branch = branch;
+            report.project.commit = commit;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::PlanRequest { objective } => {
+        Command::PlanRequest {
+            full_report,
+            objective,
+        } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db
                 .get_project_name()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
             let contract = std::fs::read_to_string(".orc/engineering.md").unwrap_or_default();
-            let request = PlanningRequest { protocol_version: PROTOCOL_VERSION, kind: "existing_project".into(), project: Some(orc::protocol::ReportProject { name: project, repository: std::env::current_dir()?.display().to_string(), branch: None, commit: None }), engineering_contract: contract, objective, constraints: Vec::new(), target_platforms: Vec::new(), stack: Vec::new(), non_goals: Vec::new(), deliverables: Vec::new(), definition_of_done: Vec::new(), response_schema: "PlanResponse v1: protocol_version, objective, assumptions, risks, questions, tasks[]. Each task requires id, title, objective, role, priority, and dependencies.".into() };
+            let root = std::env::current_dir()?;
+            let branch = git_identity(&root, "symbolic-ref --quiet --short HEAD")?;
+            let commit = git_identity(&root, "rev-parse HEAD")?;
+            let project_info = orc::protocol::ReportProject {
+                name: project.clone(),
+                repository: root.display().to_string(),
+                branch,
+                commit,
+            };
+            let full_report = if full_report {
+                let project_id = db
+                    .get_project_id()?
+                    .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+                let facts = db.project_facts(project_id)?;
+                let architecture = orc::protocol::ReportArchitecture {
+                    modules: serde_json::from_str(
+                        facts.get("modules").map(String::as_str).unwrap_or("[]"),
+                    )?,
+                    boundaries: serde_json::from_str(
+                        facts.get("boundaries").map(String::as_str).unwrap_or("[]"),
+                    )?,
+                    discovery: facts,
+                };
+                let mut report = db.project_report(
+                    project_id,
+                    project,
+                    root.display().to_string(),
+                    contract.clone(),
+                    architecture,
+                )?;
+                report.project.branch = project_info.branch.clone();
+                report.project.commit = project_info.commit.clone();
+                Some(report)
+            } else {
+                None
+            };
+            let request = PlanningRequest { protocol_version: PROTOCOL_VERSION, kind: "existing_project".into(), project: Some(project_info), engineering_contract: contract, objective, constraints: vec!["Inspect the repository read-only; do not edit files, database state, or dispatch work.".into()], target_platforms: Vec::new(), stack: Vec::new(), non_goals: vec!["Applying or dispatching the plan".into()], deliverables: vec!["A validated PlanResponse JSON document".into()], definition_of_done: vec!["The plan is complete, dependency-safe, scoped, and ready for human approval.".into()], response_schema: orc::protocol::PlanResponseSchema::v1(), role_boundaries: vec!["Planner analyzes and proposes only; Orc persists changes only after ApplyPlan.".into()], planning_constraints: vec!["Planning must not mutate, create tasks, change lifecycle state, or dispatch agents.".into()], approval_requirements: vec!["Human approval is required before the plan is applied.".into()], current_state: Some(db.planning_project_state()?), full_report };
             println!("{}", serde_json::to_string_pretty(&request)?);
         }
         Command::ApplyPlan { path } => {

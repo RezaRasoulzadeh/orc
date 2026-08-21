@@ -16,6 +16,12 @@ pub struct ProjectReport {
     pub recent_work: Vec<ReportRun>,
     pub risks: Vec<String>,
     pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub role_boundaries: Vec<String>,
+    #[serde(default)]
+    pub planning_constraints: Vec<String>,
+    #[serde(default)]
+    pub approval_requirements: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +35,8 @@ pub struct ReportProject {
 pub struct ReportArchitecture {
     pub modules: Vec<String>,
     pub boundaries: Vec<String>,
+    #[serde(default)]
+    pub discovery: std::collections::BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReportLifecycle {
@@ -67,7 +75,72 @@ pub struct PlanningRequest {
     pub non_goals: Vec<String>,
     pub deliverables: Vec<String>,
     pub definition_of_done: Vec<String>,
-    pub response_schema: String,
+    pub response_schema: PlanResponseSchema,
+    #[serde(default)]
+    pub role_boundaries: Vec<String>,
+    #[serde(default)]
+    pub planning_constraints: Vec<String>,
+    #[serde(default)]
+    pub approval_requirements: Vec<String>,
+    #[serde(default)]
+    pub current_state: Option<PlanningProjectState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_report: Option<ProjectReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanningProjectState {
+    pub task_counts: std::collections::BTreeMap<String, usize>,
+    pub ready_tasks: Vec<TaskSummary>,
+    pub active_tasks: Vec<TaskSummary>,
+    pub review_tasks: Vec<TaskSummary>,
+    pub blocked_tasks: Vec<TaskSummary>,
+    pub usable_agents: Vec<String>,
+    pub busy_agents: Vec<String>,
+    pub quota_reserve_percent: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanResponseSchema {
+    pub name: String,
+    pub protocol_version: u32,
+    pub fields: Vec<String>,
+    pub task_fields: Vec<String>,
+}
+
+impl PlanResponseSchema {
+    pub fn v1() -> Self {
+        Self {
+            name: "PlanResponse".into(),
+            protocol_version: PROTOCOL_VERSION,
+            fields: [
+                "protocol_version",
+                "objective",
+                "assumptions",
+                "risks",
+                "questions",
+                "tasks",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            task_fields: [
+                "local_id",
+                "title",
+                "objective",
+                "role",
+                "priority",
+                "capabilities",
+                "scope_mode",
+                "context_files",
+                "expected_changes",
+                "depends_on",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

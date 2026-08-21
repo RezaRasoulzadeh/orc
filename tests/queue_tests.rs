@@ -1,10 +1,109 @@
-use orc::queue::{BlockingReason, QueueCategory, compute_queue};
+use orc::agent::plan_dispatch_assignments;
+use orc::queue::{BlockingReason, QueueCategory, QueueEntry, compute_queue};
 use orc::registry::{self, AgentDefinition};
 use orc::scheduler::{CandidateStatus, RejectionReason, schedule_with_busy};
 use orc::storage::{Database, DbError};
 use orc::task::{TaskPriority, TaskStatus};
 use std::collections::HashSet;
 use tempfile::tempdir;
+
+fn dispatch_entry(id: &str) -> QueueEntry {
+    QueueEntry {
+        task: orc::task::Task {
+            id: id.to_string(),
+            title: id.to_string(),
+            objective: "test".to_string(),
+            role: "developer".to_string(),
+            priority: TaskPriority::Normal,
+            status: TaskStatus::Ready,
+            cancellation_reason: None,
+            required_capabilities: vec!["code".into(), "terminal".into()],
+            scope_mode: None,
+            context_files: Vec::new(),
+            expected_changes: Vec::new(),
+        },
+        category: QueueCategory::Ready,
+        dependencies: Vec::new(),
+        waiting_on: Vec::new(),
+        blocking_reasons: Vec::new(),
+        active_agent: None,
+        recommended_agent: None,
+        schedule_decision: None,
+    }
+}
+
+fn dispatch_agent(id: &str) -> AgentDefinition {
+    AgentDefinition {
+        id: id.into(),
+        backend: "codex".into(),
+        display_name: id.into(),
+        enabled: true,
+        priority: 100,
+        capabilities: ["code", "terminal"].into_iter().map(String::from).collect(),
+        status: registry::AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        execution_mode: registry::AUTOMATED.into(),
+        quota_remaining_percent: Some(100),
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+    }
+}
+
+#[test]
+fn dispatch_planning_respects_numeric_limit_and_deterministic_auto_capacity() {
+    let ready = [
+        dispatch_entry("T-0002"),
+        dispatch_entry("T-0001"),
+        dispatch_entry("T-0003"),
+    ];
+    let agents = [dispatch_agent("agent-a"), dispatch_agent("agent-b")];
+    let busy = HashSet::new();
+    assert_eq!(
+        plan_dispatch_assignments(&ready, &agents, &busy, 10, Some(1))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        plan_dispatch_assignments(&ready, &agents, &busy, 10, None).unwrap(),
+        vec![
+            ("T-0002".into(), "agent-a".into()),
+            ("T-0001".into(), "agent-b".into())
+        ]
+    );
+}
+
+#[test]
+fn dispatch_planning_excludes_unusable_agents_and_reuses_none() {
+    let ready = [dispatch_entry("T-0001"), dispatch_entry("T-0002")];
+    let mut disabled = dispatch_agent("disabled");
+    disabled.enabled = false;
+    let mut unavailable = dispatch_agent("unavailable");
+    unavailable.status = "offline".into();
+    let mut exhausted = dispatch_agent("exhausted");
+    exhausted.quota_remaining_percent = Some(0);
+    let mut reserve = dispatch_agent("reserve");
+    reserve.quota_remaining_percent = Some(5);
+    let agents = [
+        disabled,
+        unavailable,
+        exhausted,
+        reserve,
+        dispatch_agent("usable"),
+        dispatch_agent("other"),
+    ];
+    let busy = HashSet::from(["other".to_string()]);
+    assert_eq!(
+        plan_dispatch_assignments(&ready, &agents, &busy, 10, None).unwrap(),
+        vec![("T-0001".into(), "usable".into())]
+    );
+}
 
 fn create_test_db() -> (tempfile::TempDir, Database, i64) {
     let dir = tempdir().unwrap();

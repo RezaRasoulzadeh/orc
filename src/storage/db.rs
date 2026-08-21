@@ -476,10 +476,7 @@ impl Database {
                 "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
             )?;
         }
-        for (name, definition) in [
-            ("phase", "TEXT"),
-            ("last_activity", "TEXT"),
-        ] {
+        for (name, definition) in [("phase", "TEXT"), ("last_activity", "TEXT")] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE agent_runs ADD COLUMN {name} {definition}"

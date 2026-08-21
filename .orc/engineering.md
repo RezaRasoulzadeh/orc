@@ -32,6 +32,7 @@
 - Workers must not change public APIs unless the task explicitly requires it.
 - Workers must stay inside their assigned task scope.
 - If architecture must change, stop and report it instead of implementing it.
+- Workers must report required architectural decisions on a line beginning with `ORC-ARCHITECTURE-DECISION:` followed by the decision text.
 
 ## Tests and validation
 Every implementation must pass:

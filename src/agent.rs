@@ -188,6 +188,13 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
             anyhow::bail!("{}", error_msg);
         }
     };
+    let progress = |phase: &str| {
+        if let Err(error) = db.update_agent_run_phase(run_id, phase) {
+            eprintln!("warning: failed to persist run progress: {error}");
+        }
+        println!("[orc] {phase}");
+    };
+    progress("worktree prepared");
 
     // Store worktree metadata
     if let Err(e) = db.store_worktree_metadata(
@@ -206,10 +213,15 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
 
     // Execute the worker in the worktree directory
     let worktree_dir = repo_path.join(&worktree_path);
-    match worker.execute(&prompt, &worktree_dir) {
+    progress("worker spawned");
+    progress("worker running");
+    match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
+        progress(&format!("worker output: {line}"));
+    }) {
         Ok((outcome, output)) => {
             match outcome {
                 WorkerOutcome::Success => {
+                    progress("worker completed");
                     let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
                         Ok(changes) => changes,
                         Err(error) => {
@@ -243,6 +255,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                             anyhow::bail!("validation setup failed for task {task_id}")
                         }
                     };
+                    progress("validation started");
                     let report = match validation::run_validation_pipeline(
                         validation_runner,
                         &validation_config.commands,
@@ -258,6 +271,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                             anyhow::bail!("validation execution failed for task {task_id}")
                         }
                     };
+                    progress("validation completed");
                     let validation_summary = report.summary();
                     let combined_output = if validation_summary.is_empty() {
                         output.unwrap_or_default()
@@ -282,6 +296,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                         .with_context(|| "failed to update agent run status to completed")?;
                     db.update_task_status(task_id, TaskStatus::Review)
                         .with_context(|| "failed to set task status to review")?;
+                    progress("review transition");
                     let task = db
                         .get_task(task_id)?
                         .context("task disappeared after dispatch")?;

@@ -37,6 +37,17 @@ pub struct WorkerResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    pub id: i64,
+    pub timestamp: String,
+    pub kind: String,
+    pub task_id: Option<String>,
+    pub run_id: Option<i64>,
+    pub agent_id: Option<String>,
+    pub payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub id: i64,
     pub reason: String,
@@ -355,6 +366,15 @@ impl Database {
                 duration_ms INTEGER,
                 metadata TEXT
             );
+            CREATE TABLE IF NOT EXISTS lifecycle_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                kind TEXT NOT NULL,
+                task_id TEXT REFERENCES tasks(id),
+                run_id INTEGER REFERENCES agent_runs(id),
+                agent_id TEXT,
+                payload TEXT
+            );
             CREATE TABLE IF NOT EXISTS worktree_metadata (
                 agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
                 task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -369,6 +389,7 @@ impl Database {
         Self::ensure_agent_columns(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
+        Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         Ok(Self { conn })
@@ -400,9 +421,47 @@ impl Database {
         Self::ensure_agent_columns(conn)?;
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_worker_results_table(conn)?;
+        Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
+    }
+
+    fn ensure_lifecycle_events_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lifecycle_events (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), kind TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), run_id INTEGER REFERENCES agent_runs(id), agent_id TEXT, payload TEXT)")?;
+        Ok(())
+    }
+
+    pub fn record_lifecycle_event(
+        &self,
+        kind: &str,
+        task_id: Option<&str>,
+        run_id: Option<i64>,
+        agent_id: Option<&str>,
+        payload: Option<&str>,
+    ) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO lifecycle_events (kind, task_id, run_id, agent_id, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, task_id, run_id, agent_id, payload],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_lifecycle_events(&self, limit: usize) -> Result<Vec<LifecycleEvent>, DbError> {
+        let mut statement = self.conn.prepare("SELECT id, timestamp, kind, task_id, run_id, agent_id, payload FROM lifecycle_events ORDER BY id DESC LIMIT ?1")?;
+        Ok(statement
+            .query_map(params![limit as i64], |row| {
+                Ok(LifecycleEvent {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    kind: row.get(2)?,
+                    task_id: row.get(3)?,
+                    run_id: row.get(4)?,
+                    agent_id: row.get(5)?,
+                    payload: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     fn ensure_approval_request_columns(conn: &Connection) -> Result<(), DbError> {
@@ -1089,6 +1148,7 @@ impl Database {
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
+                self.record_lifecycle_event("task_requeue", Some(id), None, None, Some(reason))?;
                 Ok(())
             }
             Err(error) => {
@@ -1126,7 +1186,9 @@ impl Database {
             "INSERT INTO approval_requests (project_id, reason) VALUES (?1, ?2)",
             params![project_id, reason],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.record_lifecycle_event("approval_created", None, None, None, Some(reason))?;
+        Ok(id)
     }
 
     #[allow(dead_code)]
@@ -1150,6 +1212,15 @@ impl Database {
             "UPDATE approval_requests SET resolved = 1 WHERE id = ?1 AND project_id = ?2",
             params![id, project_id],
         )?;
+        if changed != 0 {
+            self.record_lifecycle_event(
+                "approval_resolved",
+                None,
+                None,
+                None,
+                Some(&id.to_string()),
+            )?;
+        }
         Ok(changed != 0)
     }
 
@@ -1189,7 +1260,16 @@ impl Database {
             "INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)",
             params![project_id, task_id, agent, execution_mode],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        let agent_id = agent.to_owned();
+        self.record_lifecycle_event(
+            "dispatch_start",
+            Some(task_id),
+            Some(id),
+            Some(&agent_id),
+            None,
+        )?;
+        Ok(id)
     }
 
     pub fn update_agent_run_status(
@@ -1230,6 +1310,18 @@ impl Database {
         self.conn.execute(
             "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4 FROM agent_runs WHERE id = ?1",
             params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}")],
+        )?;
+        let (task_id, agent_id): (Option<String>, String) = self.conn.query_row(
+            "SELECT task_id, agent FROM agent_runs WHERE id = ?1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.record_lifecycle_event(
+            "worker_result",
+            task_id.as_deref(),
+            Some(run_id),
+            Some(&agent_id),
+            Some(&format!("{{\"outcome\":\"{outcome}\"}}")),
         )?;
         Ok(())
     }

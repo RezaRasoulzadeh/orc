@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -586,7 +586,9 @@ pub fn plan_dispatch_assignments(
     Ok(assignments)
 }
 
-pub fn dispatch_queue(concurrency: Option<usize>) -> Result<Vec<DispatchSummary>> {
+pub type DispatchQueueOutcomes = BTreeMap<String, Result<DispatchSummary, String>>;
+
+pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcomes> {
     let db = Database::open(".orc/orc.db")?;
     let report = crate::queue::compute_queue(&db)?;
     let agents = db.list_agents()?;
@@ -598,7 +600,7 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<Vec<DispatchSummary>
         quota_reserve,
         concurrency,
     )?;
-    let mut summaries = Vec::new();
+    let mut outcomes = BTreeMap::new();
     let handles = assignments
         .iter()
         .map(|(task_id, agent_id)| {
@@ -609,12 +611,22 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<Vec<DispatchSummary>
             })
         })
         .collect::<Vec<_>>();
-    for handle in handles {
-        if let Ok(Ok(summary)) = handle.join() {
-            summaries.push(summary);
-        }
+    for ((task_id, _), handle) in assignments.into_iter().zip(handles) {
+        let outcome = match handle.join() {
+            Ok(Ok(summary)) => Ok(summary),
+            Ok(Err(error)) => Err(format!("{error:#}")),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("worker thread panicked");
+                Err(format!("worker thread panicked: {message}"))
+            }
+        };
+        outcomes.insert(task_id, outcome);
     }
-    Ok(summaries)
+    Ok(outcomes)
 }
 
 pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) -> Result<()> {

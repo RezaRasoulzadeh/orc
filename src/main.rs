@@ -669,13 +669,27 @@ fn main() -> Result<()> {
                 Concurrency::Auto => None,
                 Concurrency::Limited(limit) => Some(limit),
             })?;
-            for summary in &summaries {
-                println!("{}", orc::review::format_dispatch(summary));
-                if summary.run_status == "completed" {
-                    sync_enabled_agents_after_automated_run(&summary.task.id);
+            let mut dispatched = 0;
+            let mut failed = 0;
+            for (task_id, outcome) in &summaries {
+                match outcome {
+                    Ok(summary) => {
+                        dispatched += 1;
+                        println!("{}", orc::review::format_dispatch(summary));
+                        if summary.run_status == "completed" {
+                            sync_enabled_agents_after_automated_run(&summary.task.id);
+                        }
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        eprintln!("Dispatch failed for task {}: {}", task_id, error);
+                    }
                 }
             }
-            println!("Dispatched {} task(s).", summaries.len());
+            println!(
+                "Dispatched {} task(s); failed {} task(s).",
+                dispatched, failed
+            );
         }
         Command::Review {
             task_id,

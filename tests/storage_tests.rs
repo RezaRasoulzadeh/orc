@@ -1,4 +1,4 @@
-use orc::storage::Database;
+use orc::storage::{Database, WorkerResult};
 use orc::task::{TaskPriority, TaskStatus};
 use tempfile::tempdir;
 
@@ -84,6 +84,50 @@ fn approval_requests_are_separate_from_decisions() {
     let id = db.list_approval_requests(pid).unwrap()[0].id;
     assert!(db.resolve_approval_request(pid, id).unwrap());
     assert!(db.list_approval_requests(pid).unwrap()[0].resolved);
+}
+
+#[test]
+fn worker_result_persists_once_per_run_across_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let run_id;
+    {
+        let db = Database::init(&path).unwrap();
+        let project_id = db.create_project("testproj").unwrap();
+        let task_id = db
+            .insert_task(project_id, "T1", "Do stuff", "dev", TaskPriority::Normal)
+            .unwrap();
+        run_id = db.create_agent_run(project_id, &task_id, "worker").unwrap();
+        db.insert_worker_result(&WorkerResult {
+            run_id,
+            outcome: "timeout".into(),
+            failure_category: Some("timeout".into()),
+            duration_ms: Some(1000),
+            metadata: Some("{\"attempt\":1}".into()),
+        })
+        .unwrap();
+        assert!(
+            db.insert_worker_result(&WorkerResult {
+                run_id,
+                outcome: "success".into(),
+                failure_category: None,
+                duration_ms: None,
+                metadata: None,
+            })
+            .is_err()
+        );
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.get_worker_result(run_id).unwrap(),
+        Some(WorkerResult {
+            run_id,
+            outcome: "timeout".into(),
+            failure_category: Some("timeout".into()),
+            duration_ms: Some(1000),
+            metadata: Some("{\"attempt\":1}".into()),
+        })
+    );
 }
 
 #[test]

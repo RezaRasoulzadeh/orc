@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::git::{self, WorktreeChanges};
-use crate::storage::AgentRun;
+use crate::storage::{AgentRun, WorkerResult};
 use crate::task::Task;
 
 #[derive(Debug, Clone)]
@@ -58,6 +58,7 @@ pub fn format_dispatch(summary: &DispatchSummary) -> String {
 pub struct ReviewSummary {
     pub task: Task,
     pub run: Option<AgentRun>,
+    pub result: Option<WorkerResult>,
     pub worktree_path: Option<String>,
     pub changes: WorktreeChanges,
 }
@@ -71,6 +72,10 @@ pub fn build_review(
         .get_task(task_id)?
         .with_context(|| format!("task '{task_id}' not found"))?;
     let run = db.list_agent_runs_for_task(task_id)?.into_iter().next();
+    let result = match &run {
+        Some(run) => db.get_worker_result(run.id)?,
+        None => None,
+    };
     let worktree_path = db.get_worktree_metadata(task_id)?.map(|(_, path)| path);
     let changes = match &worktree_path {
         Some(path) if repo.join(path).exists() => git::inspect_worktree(repo.join(path), repo)?,
@@ -79,6 +84,7 @@ pub fn build_review(
     Ok(ReviewSummary {
         task,
         run,
+        result,
         worktree_path,
         changes,
     })
@@ -108,6 +114,15 @@ fn format_review_with_diff_text(summary: &ReviewSummary, diff: &str) -> String {
             "Agent      {}\nMode       {}\nRun        {} {}\n",
             run.agent, run.execution_mode, run.id, run.status
         ));
+        if let Some(result) = &summary.result {
+            out.push_str(&format!("Result     {}\n", result.outcome));
+            if let Some(category) = &result.failure_category {
+                out.push_str(&format!("Failure    {category}\n"));
+            }
+            if let Some(duration_ms) = result.duration_ms {
+                out.push_str(&format!("Duration   {duration_ms} ms\n"));
+            }
+        }
         if let Some(output) = &run.output
             && let Some((_, validation)) = output.split_once("Validation:\n")
         {

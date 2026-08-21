@@ -321,6 +321,9 @@ impl StdioClient {
                     break;
                 }
             }
+            let _ = sender.send(Err(
+                "app-server closed stdout before completing the requested response".to_owned(),
+            ));
         });
         Ok(Self {
             child,
@@ -331,13 +334,7 @@ impl StdioClient {
 
     fn initialize(&mut self) -> Result<(), String> {
         self.send(&initialization_request())?;
-        let response = self.response_for(1)?;
-        if let Some(error) = response.get("error") {
-            return Err(format!("app-server initialization failed: {error}"));
-        }
-        if response.get("result").is_none() {
-            return Err("malformed app-server initialization response: missing result".into());
-        }
+        validate_initialization_response(self.response_for(1)?)?;
         self.send(&initialized_notification())
     }
 
@@ -373,6 +370,16 @@ impl StdioClient {
             }
         }
     }
+}
+
+fn validate_initialization_response(response: Value) -> Result<(), String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!("app-server initialization failed: {error}"));
+    }
+    if response.get("result").is_none() {
+        return Err("malformed app-server initialization response: missing result".into());
+    }
+    Ok(())
 }
 
 impl Drop for StdioClient {
@@ -463,6 +470,12 @@ mod tests {
             rate_limits_request(),
             json!({"id": 2, "method": "account/rateLimits/read", "params": null})
         );
+    }
+
+    #[test]
+    fn initialization_rejects_missing_result() {
+        let error = validate_initialization_response(json!({"id": 1})).unwrap_err();
+        assert!(error.contains("missing result"));
     }
 
     #[test]

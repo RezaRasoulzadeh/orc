@@ -1,7 +1,11 @@
 //! Worker abstraction for executing tasks.
 //! Keeps provider-specific logic behind this interface so tests can inject fake workers.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use crate::backend;
 use crate::registry::ReasoningEffort;
@@ -12,6 +16,60 @@ pub enum WorkerOutcome {
     Success,
     /// Worker failed with an error message
     Failure(String),
+}
+
+pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+pub fn configured_timeout(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return child.wait_with_output().map_err(|error| error.to_string());
+        }
+        if started.elapsed() >= timeout {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &format!("-{}", child.id())])
+                    .status();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "external process timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
 }
 
 /// Trait for task execution backends.
@@ -39,7 +97,10 @@ impl Worker for CopilotWorker {
         cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
         backend::configure_noninteractive(&mut cmd, cwd);
 
-        match cmd.output() {
+        match run_command_with_timeout(
+            cmd,
+            configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+        ) {
             Ok(status) => {
                 if status.status.success() {
                     let output = String::from_utf8_lossy(&status.stdout).to_string();
@@ -133,7 +194,10 @@ impl Worker for CodexWorker {
     }
 
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
-        match self.command(prompt, cwd).output() {
+        match run_command_with_timeout(
+            self.command(prompt, cwd),
+            configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+        ) {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -188,7 +252,10 @@ impl Worker for AntigravityWorker {
         let mut command = std::process::Command::new("agy");
         command.args(Self::command_args(prompt));
         backend::configure_noninteractive(&mut command, cwd);
-        match command.output() {
+        match run_command_with_timeout(
+            command,
+            configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+        ) {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();

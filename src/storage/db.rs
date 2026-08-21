@@ -3,6 +3,15 @@ use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
 
+fn priority_string(priority: TaskPriority) -> &'static str {
+    match priority {
+        TaskPriority::Low => "low",
+        TaskPriority::Normal => "normal",
+        TaskPriority::High => "high",
+        TaskPriority::Critical => "critical",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentRun {
     pub id: i64,
@@ -49,6 +58,113 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn project_report(
+        &self,
+        project_id: i64,
+        name: String,
+        repository: String,
+        engineering_contract: String,
+        architecture: crate::protocol::ReportArchitecture,
+    ) -> Result<crate::protocol::ProjectReport, DbError> {
+        let tasks = self.list_tasks()?;
+        let mut counts = std::collections::BTreeMap::new();
+        for task in &tasks {
+            *counts.entry(task.status.to_string()).or_insert(0) += 1;
+        }
+        let summaries = tasks
+            .iter()
+            .map(|task| crate::protocol::TaskSummary {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                status: task.status.to_string(),
+            })
+            .collect();
+        let busy: std::collections::HashSet<_> = self.list_busy_agents()?.into_iter().collect();
+        let agents = self
+            .list_agents()?
+            .into_iter()
+            .map(|agent| crate::protocol::ReportAgent {
+                id: agent.id.clone(),
+                display_name: agent.display_name,
+                enabled: agent.enabled,
+                status: agent.status,
+                execution_mode: agent.execution_mode,
+                capabilities: agent.capabilities,
+                busy: busy.contains(&agent.id),
+            })
+            .collect();
+        let recent_work = self
+            .list_agent_runs(project_id, 20)?
+            .into_iter()
+            .map(|run| crate::protocol::ReportRun {
+                task_id: run.task_id,
+                agent: run.agent,
+                status: run.status,
+                output: run.output,
+                finished_at: run.finished_at,
+            })
+            .collect();
+        Ok(crate::protocol::ProjectReport {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            project: crate::protocol::ReportProject {
+                name,
+                repository,
+                branch: None,
+                commit: None,
+            },
+            engineering_contract,
+            architecture,
+            lifecycle: crate::protocol::ReportLifecycle {
+                counts,
+                tasks: summaries,
+            },
+            agents,
+            queue: crate::queue::compute_queue(self)
+                .map_err(|e| DbError::Scheduler(e.to_string()))?,
+            recent_work,
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        })
+    }
+
+    pub fn apply_plan(
+        &self,
+        project_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        response
+            .validate()
+            .map_err(|e| DbError::Scheduler(e.to_string()))?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut mapping = std::collections::BTreeMap::new();
+            for task in &response.tasks {
+                let id = self.allocate_task_id()?;
+                let priority = priority_string(task.priority);
+                self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10)", params![id, project_id, task.title, task.objective, task.role, priority, serde_json::to_string(&task.capabilities)?, task.scope_mode.map(|v| v.to_string()), serde_json::to_string(&task.context_files)?, serde_json::to_string(&task.expected_changes)?])?;
+                mapping.insert(task.local_id.clone(), id);
+            }
+            for task in &response.tasks {
+                for dependency in &task.depends_on {
+                    self.add_task_dependency(
+                        mapping[&task.local_id].as_str(),
+                        mapping[dependency].as_str(),
+                    )?;
+                }
+            }
+            Ok::<_, DbError>(mapping)
+        })();
+        match result {
+            Ok(mapping) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(mapping)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
     pub fn init(path: impl AsRef<Path>) -> Result<Self, DbError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
@@ -599,26 +715,9 @@ impl Database {
     ) -> Result<String, DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let value: String = self.conn.query_row(
-                "SELECT value FROM meta WHERE key = 'next_task_id'",
-                [],
-                |r| r.get(0),
-            )?;
-            let seq = value
-                .parse::<u64>()
-                .map_err(|_| DbError::InvalidSequence(value.clone()))?;
-            let id = format!("T-{seq:04}");
-            let priority_str = match priority {
-                TaskPriority::Low => "low",
-                TaskPriority::Normal => "normal",
-                TaskPriority::High => "high",
-                TaskPriority::Critical => "critical",
-            };
+            let id = self.allocate_task_id()?;
+            let priority_str = priority_string(priority);
             self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog')", params![id, project_id, title, objective, role, priority_str])?;
-            self.conn.execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'next_task_id'",
-                params![(seq + 1).to_string()],
-            )?;
             Ok(id)
         })();
         match result {
@@ -631,6 +730,22 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    fn allocate_task_id(&self) -> Result<String, DbError> {
+        let value: String = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'next_task_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        let seq = value
+            .parse::<u64>()
+            .map_err(|_| DbError::InvalidSequence(value.clone()))?;
+        self.conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'next_task_id'",
+            params![(seq + 1).to_string()],
+        )?;
+        Ok(format!("T-{seq:04}"))
     }
 
     /// Insert a task with a specific ID (mainly for testing).

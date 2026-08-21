@@ -4,6 +4,176 @@ use crate::task::{Task, TaskPriority, TaskScopeMode};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectReport {
+    pub protocol_version: u32,
+    pub project: ReportProject,
+    pub engineering_contract: String,
+    pub architecture: ReportArchitecture,
+    pub lifecycle: ReportLifecycle,
+    pub agents: Vec<ReportAgent>,
+    pub queue: crate::queue::QueueReport,
+    pub recent_work: Vec<ReportRun>,
+    pub risks: Vec<String>,
+    pub open_questions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportProject {
+    pub name: String,
+    pub repository: String,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReportArchitecture {
+    pub modules: Vec<String>,
+    pub boundaries: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportLifecycle {
+    pub counts: std::collections::BTreeMap<String, usize>,
+    pub tasks: Vec<TaskSummary>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportAgent {
+    pub id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub status: String,
+    pub execution_mode: String,
+    pub capabilities: Vec<String>,
+    pub busy: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportRun {
+    pub task_id: Option<String>,
+    pub agent: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanningRequest {
+    pub protocol_version: u32,
+    pub kind: String,
+    pub project: Option<ReportProject>,
+    pub engineering_contract: String,
+    pub objective: String,
+    pub constraints: Vec<String>,
+    pub target_platforms: Vec<String>,
+    pub stack: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub deliverables: Vec<String>,
+    pub definition_of_done: Vec<String>,
+    pub response_schema: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanResponse {
+    pub protocol_version: u32,
+    pub objective: String,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub questions: Vec<String>,
+    pub tasks: Vec<PlannedTask>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlannedTask {
+    pub local_id: String,
+    pub title: String,
+    pub objective: String,
+    pub role: String,
+    pub priority: TaskPriority,
+    #[serde(default)]
+    #[serde(alias = "dependencies")]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub scope_mode: Option<TaskScopeMode>,
+    #[serde(default)]
+    pub context_files: Vec<String>,
+    #[serde(default)]
+    pub expected_changes: Vec<String>,
+}
+
+impl PlanningRequest {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            anyhow::bail!("unsupported planning protocol version")
+        }
+        if self.objective.trim().is_empty() {
+            anyhow::bail!("planning objective must not be empty")
+        }
+        Ok(())
+    }
+}
+impl PlanResponse {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            anyhow::bail!("unsupported planning protocol version")
+        }
+        let ids: std::collections::HashSet<_> =
+            self.tasks.iter().map(|t| t.local_id.as_str()).collect();
+        if ids.len() != self.tasks.len() {
+            anyhow::bail!("plan task IDs must be unique")
+        }
+        for task in &self.tasks {
+            if task.local_id.trim().is_empty()
+                || task.title.trim().is_empty()
+                || task.objective.trim().is_empty()
+                || task.role.trim().is_empty()
+            {
+                anyhow::bail!("plan tasks require local_id, title, objective, and role")
+            }
+            for dependency in &task.depends_on {
+                if dependency == &task.local_id || !ids.contains(dependency.as_str()) {
+                    anyhow::bail!("plan dependency '{}' is not a task in the plan", dependency)
+                }
+            }
+        }
+        fn visit(
+            id: &str,
+            tasks: &std::collections::HashMap<&str, &PlannedTask>,
+            visiting: &mut std::collections::HashSet<String>,
+            visited: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if visiting.contains(id) {
+                return true;
+            }
+            if visited.contains(id) {
+                return false;
+            }
+            visiting.insert(id.to_owned());
+            for dependency in &tasks[id].depends_on {
+                if visit(dependency, tasks, visiting, visited) {
+                    return true;
+                }
+            }
+            visiting.remove(id);
+            visited.insert(id.to_owned());
+            false
+        }
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|task| (task.local_id.as_str(), task))
+            .collect();
+        let mut visiting = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+        if self
+            .tasks
+            .iter()
+            .any(|task| visit(&task.local_id, &tasks, &mut visiting, &mut visited))
+        {
+            anyhow::bail!("plan dependencies contain a cycle")
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectDiscoveryRequest {
     pub protocol_version: u32,
@@ -94,7 +264,7 @@ impl EngineeringLeadRequest {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: String,
     pub title: String,

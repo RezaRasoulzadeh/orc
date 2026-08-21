@@ -180,6 +180,82 @@ fn successful_worker_transitions_active_to_review() {
     let runs = db.list_agent_runs_for_task(&tid).expect("list runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, "completed");
+    assert!(
+        db.list_approval_requests(pid)
+            .expect("list approvals")
+            .is_empty()
+    );
+}
+
+#[test]
+fn architecture_decision_output_creates_approval_request() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
+
+    let db_path = repo_dir.join("orc.db");
+    let db = Database::init(&db_path).expect("init");
+    let pid = db.create_project("test").expect("create project");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
+
+    let worker = FakeWorker::new_success(Some(
+        "Implemented the change.\nORC-ARCHITECTURE-DECISION: use the existing worker abstraction\nORC-ARCHITECTURE-DECISION: add a storage migration\nORC-ARCHITECTURE-DECISION: use the existing worker abstraction\n".into(),
+    ));
+    agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir)
+        .expect("dispatch");
+
+    let requests = db.list_approval_requests(pid).expect("list approvals");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].reason, "use the existing worker abstraction");
+    assert_eq!(requests[1].reason, "add a storage migration");
+    assert_eq!(
+        db.get_task(&tid).expect("get task").unwrap().status,
+        TaskStatus::Review
+    );
+}
+
+#[test]
+fn empty_and_inline_architecture_decisions_create_no_approval_requests() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
+
+    let db_path = repo_dir.join("orc.db");
+    let db = Database::init(&db_path).expect("init");
+    let pid = db.create_project("test").expect("create project");
+    let tid = get_unique_task_id();
+    db.insert_task_with_id(
+        pid,
+        &tid,
+        "Test Task",
+        "Do something",
+        "dev",
+        orc::task::TaskPriority::Normal,
+    )
+    .expect("insert task");
+
+    let worker = FakeWorker::new_success(Some(
+        "ORC-ARCHITECTURE-DECISION:\ntext ORC-ARCHITECTURE-DECISION: ignored\nORC-ARCHITECTURE-DECISION:   \n".into(),
+    ));
+    agent::dispatch_with_worker_and_db(&tid, &worker, db_path.to_str().unwrap(), &repo_dir)
+        .expect("dispatch");
+
+    assert!(
+        db.list_approval_requests(pid)
+            .expect("list approvals")
+            .is_empty()
+    );
 }
 
 #[test]

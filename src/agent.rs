@@ -16,6 +16,22 @@ use crate::validation::{
 use crate::worker::{Worker, WorkerOutcome};
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
+const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
+
+fn architecture_decisions(output: &str) -> Vec<&str> {
+    let mut decisions = Vec::new();
+    let mut reported = HashSet::new();
+    for line in output.lines() {
+        let Some(decision) = line.strip_prefix(ARCHITECTURE_DECISION_MARKER) else {
+            continue;
+        };
+        let decision = decision.trim();
+        if !decision.is_empty() && reported.insert(decision) {
+            decisions.push(decision);
+        }
+    }
+    decisions
+}
 
 fn block_automated_run(db: &Database, run_id: i64, task_id: &str, output: &str) -> Result<()> {
     db.update_agent_run_status(run_id, "failed", Some(output))
@@ -251,6 +267,12 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                             validation_summary
                         )
                     };
+                    for decision in architecture_decisions(&combined_output) {
+                        db.insert_approval_request(project_id, decision)
+                            .with_context(
+                                || "failed to record architecture decision approval request",
+                            )?;
+                    }
                     if !report.is_success() {
                         block_automated_run(&db, run_id, task_id, &combined_output)?;
                         anyhow::bail!("validation failed for task {task_id}; task remains blocked");

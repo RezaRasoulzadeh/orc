@@ -124,7 +124,79 @@ impl Database {
             recent_work,
             risks: Vec::new(),
             open_questions: Vec::new(),
+            role_boundaries: vec![
+                "Planner proposes a plan; Orc and humans apply or dispatch it.".into(),
+            ],
+            planning_constraints: vec![
+                "Planning is read-only and must not mutate project state or dispatch work.".into(),
+            ],
+            approval_requirements: vec![
+                "A human must review and approve the plan before ApplyPlan.".into(),
+            ],
         })
+    }
+
+    pub fn planning_project_state(&self) -> Result<crate::protocol::PlanningProjectState, DbError> {
+        let tasks = self.list_tasks()?;
+        let queue =
+            crate::queue::compute_queue(self).map_err(|e| DbError::Scheduler(e.to_string()))?;
+        let mut task_counts = std::collections::BTreeMap::new();
+        for task in &tasks {
+            *task_counts.entry(task.status.to_string()).or_insert(0) += 1;
+        }
+        let summaries = |status: &str| {
+            tasks
+                .iter()
+                .filter(|task| task.status.to_string() == status)
+                .map(|task| crate::protocol::TaskSummary {
+                    id: task.id.clone(),
+                    title: task.title.clone(),
+                    status: status.into(),
+                })
+                .collect()
+        };
+        let queue_summaries = |entries: &[crate::queue::QueueEntry], status: &str| {
+            entries
+                .iter()
+                .map(|entry| crate::protocol::TaskSummary {
+                    id: entry.task.id.clone(),
+                    title: entry.task.title.clone(),
+                    status: status.into(),
+                })
+                .collect()
+        };
+        let busy_agents = self.list_busy_agents()?;
+        let busy: std::collections::HashSet<_> = busy_agents.iter().cloned().collect();
+        let usable_agents = self
+            .list_agents()?
+            .into_iter()
+            .filter(|agent| {
+                agent.enabled && agent.status == "available" && !busy.contains(&agent.id)
+            })
+            .map(|agent| agent.id)
+            .collect();
+        Ok(crate::protocol::PlanningProjectState {
+            task_counts,
+            ready_tasks: queue_summaries(&queue.ready, "ready"),
+            active_tasks: summaries("active"),
+            review_tasks: summaries("review"),
+            blocked_tasks: queue_summaries(&queue.blocked, "blocked"),
+            usable_agents,
+            busy_agents,
+            quota_reserve_percent: self.quota_reserve()?,
+        })
+    }
+
+    pub fn project_facts(
+        &self,
+        project_id: i64,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT key, value FROM project_facts WHERE project_id = ?1 ORDER BY key")?;
+        Ok(statement
+            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?)
     }
 
     pub fn apply_plan(
@@ -617,6 +689,22 @@ impl Database {
             (
                 "test_commands",
                 serde_json::to_string(&response.engineering.test_commands)?,
+            ),
+            (
+                "modules",
+                serde_json::to_string(&response.architecture.modules)?,
+            ),
+            (
+                "boundaries",
+                serde_json::to_string(&response.architecture.boundaries)?,
+            ),
+            (
+                "entry_points",
+                serde_json::to_string(&response.architecture.entry_points)?,
+            ),
+            (
+                "observed_patterns",
+                serde_json::to_string(&response.engineering.observed_patterns)?,
             ),
         ];
         for (key, value) in facts {

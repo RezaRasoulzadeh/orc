@@ -1,5 +1,6 @@
 use orc::contract;
-use orc::task::{Task, TaskPriority, TaskStatus};
+use orc::protocol::{PROTOCOL_VERSION, PlanResponse, PlannedTask};
+use orc::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use tempfile::tempdir;
 
 #[test]
@@ -106,4 +107,62 @@ fn targeted_prompt_guidance_is_scoped_and_optional() {
     task.scope_mode = Some(orc::task::TaskScopeMode::Project);
     let project_prompt = orc::agent::build_worker_prompt_for_testing("# Contract", "p", &task);
     assert!(project_prompt.contains("broader repository inspection is allowed"));
+}
+
+fn planned_task() -> PlannedTask {
+    PlannedTask {
+        local_id: "task-1".into(),
+        title: "Task".into(),
+        objective: "Do task".into(),
+        role: "developer".into(),
+        priority: TaskPriority::Normal,
+        depends_on: Vec::new(),
+        capabilities: Vec::new(),
+        scope_mode: Some(TaskScopeMode::Focused),
+        context_files: vec!["src/lib.rs".into()],
+        expected_changes: vec!["src/lib.rs".into()],
+    }
+}
+
+fn plan_with_task(task: PlannedTask) -> PlanResponse {
+    PlanResponse {
+        protocol_version: PROTOCOL_VERSION,
+        objective: "Plan".into(),
+        assumptions: Vec::new(),
+        risks: Vec::new(),
+        questions: Vec::new(),
+        tasks: vec![task],
+    }
+}
+
+#[test]
+fn plan_rejects_absolute_context_file() {
+    let mut task = planned_task();
+    task.context_files = vec!["/tmp/file.rs".into()];
+    let error = plan_with_task(task).validate().unwrap_err().to_string();
+    assert!(error.contains("context_files") && error.contains("absolute"));
+}
+
+#[test]
+fn plan_rejects_traversal_expected_change() {
+    let mut task = planned_task();
+    task.expected_changes = vec!["src/../file.rs".into()];
+    let error = plan_with_task(task).validate().unwrap_err().to_string();
+    assert!(error.contains("expected_changes") && error.contains(".."));
+}
+
+#[test]
+fn targeted_scope_requires_context_files() {
+    let mut task = planned_task();
+    task.context_files.clear();
+    let error = plan_with_task(task).validate().unwrap_err().to_string();
+    assert!(error.contains("targeted scope") && error.contains("context file"));
+}
+
+#[test]
+fn valid_project_scope_without_context_still_passes() {
+    let mut task = planned_task();
+    task.scope_mode = Some(TaskScopeMode::Project);
+    task.context_files.clear();
+    assert!(plan_with_task(task).validate().is_ok());
 }

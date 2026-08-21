@@ -40,6 +40,9 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
             Ok(())
         });
     }
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn command: {error}"))?;

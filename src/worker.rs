@@ -1,6 +1,7 @@
 //! Worker abstraction for executing tasks.
 //! Keeps provider-specific logic behind this interface so tests can inject fake workers.
 
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -39,25 +40,72 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn command: {error}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("spawned command did not provide stdout pipe".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("spawned command did not provide stderr pipe".to_string());
+    };
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
     let started = Instant::now();
     loop {
         if child
             .try_wait()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("failed waiting for command: {error}"))?
             .is_some()
         {
-            return child.wait_with_output().map_err(|error| error.to_string());
+            let status = child
+                .wait()
+                .map_err(|error| format!("failed reaping command: {error}"))?;
+            return collect_output(status, stdout_reader, stderr_reader);
         }
         if started.elapsed() >= timeout {
             #[cfg(unix)]
             {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &format!("-{}", child.id())])
-                    .status();
+                unsafe {
+                    kill(-(child.id() as i32), SIGTERM);
+                }
+                let grace_deadline = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < grace_deadline {
+                    if child
+                        .try_wait()
+                        .map_err(|error| format!("failed waiting after timeout: {error}"))?
+                        .is_some()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                // The direct child may have exited while a descendant keeps the
+                // pipes open. Kill the owned group regardless, then reap the child.
+                unsafe {
+                    kill(-(child.id() as i32), SIGKILL);
+                }
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            #[cfg(not(unix))]
+            child
+                .kill()
+                .map_err(|error| format!("failed terminating timed-out command: {error}"))?;
+            let status = child
+                .wait()
+                .map_err(|error| format!("failed reaping timed-out command: {error}"))?;
+            let _ = collect_output(status, stdout_reader, stderr_reader);
             return Err(format!(
                 "external process timed out after {} seconds",
                 timeout.as_secs()
@@ -67,10 +115,36 @@ pub fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Resu
     }
 }
 
+fn collect_output(
+    status: std::process::ExitStatus,
+    stdout_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Output, String> {
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "stdout reader thread panicked".to_string())?
+        .map_err(|error| format!("failed reading stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "stderr reader thread panicked".to_string())?
+        .map_err(|error| format!("failed reading stderr: {error}"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn setsid() -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
 }
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
 
 /// Trait for task execution backends.
 /// Implementations are responsible for executing a task and returning the outcome.
@@ -306,6 +380,45 @@ mod tests {
 
         assert_eq!(profile(&main).as_deref(), Some("/profiles/main"));
         assert_eq!(profile(&third).as_deref(), Some("/profiles/third"));
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drains_large_stdout_and_stderr_without_losing_output() {
+        let output = run_command_with_timeout(
+            shell("printf '%*s' 262144 '' | tr ' ' o; printf '%*s' 262144 '' | tr ' ' e >&2"),
+            Duration::from_secs(5),
+        )
+        .expect("command should complete");
+        assert_eq!(output.stdout.len(), 262144);
+        assert_eq!(output.stderr.len(), 262144);
+        assert!(output.stdout.iter().all(|byte| *byte == b'o'));
+        assert!(output.stderr.iter().all(|byte| *byte == b'e'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_the_owned_process_group() {
+        let output = std::env::temp_dir().join(format!("orc-timeout-{}", std::process::id()));
+        let script = format!("sleep 30 & echo $! > {}; wait", output.display());
+        let error = run_command_with_timeout(shell(&script), Duration::from_millis(50))
+            .expect_err("command should time out");
+        assert!(error.contains("timed out"));
+        let descendant = std::fs::read_to_string(&output).expect("child pid should be written");
+        let _ = std::fs::remove_file(&output);
+        let status = Command::new("kill")
+            .args(["-0", descendant.trim()])
+            .status();
+        assert!(!status.expect("kill should run").success());
     }
 }
 

@@ -201,6 +201,37 @@ impl PlanResponse {
             {
                 anyhow::bail!("plan tasks require local_id, title, objective, and role")
             }
+            if matches!(
+                task.scope_mode,
+                Some(TaskScopeMode::Focused | TaskScopeMode::Module)
+            ) && task.context_files.is_empty()
+            {
+                anyhow::bail!(
+                    "plan task '{}' with targeted scope must list at least one context file",
+                    task.local_id
+                )
+            }
+            for (field, paths) in [
+                ("context_files", &task.context_files),
+                ("expected_changes", &task.expected_changes),
+            ] {
+                for path in paths {
+                    if std::path::Path::new(path).is_absolute()
+                        || path.starts_with('/')
+                        || path.starts_with('\\')
+                        || (path.as_bytes().get(1) == Some(&b':')
+                            && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+                        || path.split(['/', '\\']).any(|segment| segment == "..")
+                    {
+                        anyhow::bail!(
+                            "plan task '{}' has invalid {} path '{}': absolute and '..' paths are not allowed",
+                            task.local_id,
+                            field,
+                            path
+                        )
+                    }
+                }
+            }
             for dependency in &task.depends_on {
                 if dependency == &task.local_id || !ids.contains(dependency.as_str()) {
                     anyhow::bail!("plan dependency '{}' is not a task in the plan", dependency)

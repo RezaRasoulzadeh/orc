@@ -26,6 +26,15 @@ pub struct AgentRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerResult {
+    pub run_id: i64,
+    pub outcome: String,
+    pub failure_category: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub id: i64,
     pub reason: String,
@@ -335,6 +344,13 @@ impl Database {
                 started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 finished_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS worker_results (
+                run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+                outcome TEXT NOT NULL,
+                failure_category TEXT,
+                duration_ms INTEGER,
+                metadata TEXT
+            );
             CREATE TABLE IF NOT EXISTS worktree_metadata (
                 agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
                 task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -348,6 +364,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
+        Self::ensure_worker_results_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         Ok(Self { conn })
@@ -378,6 +395,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(conn)?;
         Self::ensure_agent_run_columns(conn)?;
+        Self::ensure_worker_results_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
@@ -454,6 +472,11 @@ impl Database {
                 "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
             )?;
         }
+        Ok(())
+    }
+
+    fn ensure_worker_results_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS worker_results (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, outcome TEXT NOT NULL, failure_category TEXT, duration_ms INTEGER, metadata TEXT)")?;
         Ok(())
     }
 
@@ -1158,7 +1181,52 @@ impl Database {
             "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP WHERE id = ?3",
             params![status, output, run_id],
         )?;
+        if changed != 0 && matches!(status, "completed" | "failed" | "no_changes") {
+            self.record_worker_result(run_id, status, output)?;
+        }
         Ok(changed != 0)
+    }
+
+    fn record_worker_result(
+        &self,
+        run_id: i64,
+        status: &str,
+        output: Option<&str>,
+    ) -> Result<(), DbError> {
+        let outcome = match status {
+            "completed" => "success",
+            "no_changes" => "no_changes",
+            _ if output.is_some_and(|value| value.to_ascii_lowercase().contains("timed out")) => {
+                "timeout"
+            }
+            _ if output.is_some_and(|value| value.contains("Validation")) => "validation_failure",
+            _ => "worker_failure",
+        };
+        let failure_category = match outcome {
+            "success" | "no_changes" => None,
+            value => Some(value),
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4 FROM agent_runs WHERE id = ?1",
+            params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}")],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_worker_result(&self, result: &WorkerResult) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![result.run_id, result.outcome, result.failure_category, result.duration_ms, result.metadata],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_worker_result(&self, run_id: i64) -> Result<Option<WorkerResult>, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT run_id, outcome, failure_category, duration_ms, metadata FROM worker_results WHERE run_id = ?1",
+            params![run_id],
+            |row| Ok(WorkerResult { run_id: row.get(0)?, outcome: row.get(1)?, failure_category: row.get(2)?, duration_ms: row.get(3)?, metadata: row.get(4)? }),
+        ).optional()?)
     }
 
     pub fn set_agent_run_waiting_external(&self, run_id: i64) -> Result<bool, DbError> {
@@ -1186,6 +1254,7 @@ impl Database {
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
+        self.record_worker_result(run_id, "completed", Some(output))?;
         Ok(task_id)
     }
 
@@ -1199,6 +1268,7 @@ impl Database {
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
+        self.record_worker_result(run_id, "failed", Some(reason))?;
         Ok(task_id)
     }
 

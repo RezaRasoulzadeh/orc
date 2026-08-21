@@ -1,3 +1,4 @@
+use crate::worker::{DEFAULT_VALIDATION_TIMEOUT, configured_timeout, run_command_with_timeout};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -49,12 +50,14 @@ pub struct SystemValidationRunner;
 
 impl ValidationRunner for SystemValidationRunner {
     fn run(&self, command: &str, working_dir: &Path) -> Result<ValidationStepResult> {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
-            .output()
-            .with_context(|| format!("failed to spawn validation command: {command}"))?;
+        let mut process = Command::new("sh");
+        process.arg("-c").arg(command).current_dir(working_dir);
+        let output = run_command_with_timeout(
+            process,
+            configured_timeout("ORC_VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT),
+        )
+        .map_err(|error| anyhow::anyhow!("validation command '{command}' failed: {error}"))
+        .with_context(|| format!("failed to execute validation command: {command}"))?;
 
         let passed = output.status.success();
         let stdout = String::from_utf8_lossy(&output.stdout);

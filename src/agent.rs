@@ -183,8 +183,8 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
         Ok((branch, path)) => (branch, path),
         Err(e) => {
             let error_msg = format!("Failed to create worktree: {}", e);
-            let _ = db.update_agent_run_status(run_id, "failed", Some(&error_msg));
-            let _ = db.update_task_status(task_id, TaskStatus::Blocked);
+            block_automated_run(&db, run_id, task_id, &error_msg)
+                .context("failed to record worktree creation failure")?;
             anyhow::bail!("{}", error_msg);
         }
     };
@@ -204,8 +204,8 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
         &worktree_path.to_string_lossy(),
     ) {
         let error_msg = format!("Failed to store worktree metadata: {}", e);
-        let _ = db.update_agent_run_status(run_id, "failed", Some(&error_msg));
-        let _ = db.update_task_status(task_id, TaskStatus::Blocked);
+        block_automated_run(&db, run_id, task_id, &error_msg)
+            .context("failed to record worktree metadata failure")?;
         anyhow::bail!("{}", error_msg);
     }
 
@@ -821,7 +821,8 @@ pub fn submit_patch_with_runner(
 
     if patch_content.trim().is_empty() {
         let err_msg = "malformed patch: patch content is empty";
-        let _ = db.update_agent_run_output(run_id, err_msg);
+        db.update_agent_run_output(run_id, err_msg)
+            .context("failed to record malformed patch error")?;
         anyhow::bail!("{}", err_msg);
     }
 
@@ -837,27 +838,31 @@ pub fn submit_patch_with_runner(
     };
 
     // Record worktree metadata for this run
-    let _ = db.store_worktree_metadata(
+    db.store_worktree_metadata(
         run_id,
         &task_id,
         &branch_name,
         &worktree_path.to_string_lossy(),
-    );
+    )
+    .context("failed to store worktree metadata for patch submission")?;
 
     let absolute_worktree = repo_path.join(&worktree_path);
 
     // 1. Validate patch against worktree (git apply --check)
     if let Err(e) = git::validate_patch(&absolute_worktree, patch_content) {
         let err_msg = format!("patch validation failed: {:#}", e);
-        let _ = db.update_agent_run_output(run_id, &err_msg);
+        db.update_agent_run_output(run_id, &err_msg)
+            .context("failed to record patch validation error")?;
         anyhow::bail!("{}", err_msg);
     }
 
     // 2. Apply patch to worktree (git apply)
     if let Err(e) = git::apply_patch(&absolute_worktree, patch_content) {
         let err_msg = format!("patch apply failed: {:#}", e);
-        let _ = db.fail_run(run_id, &err_msg);
-        let _ = db.update_task_status(&task_id, TaskStatus::Blocked);
+        db.fail_run(run_id, &err_msg)
+            .context("failed to mark patch submission run as failed")?;
+        db.update_task_status(&task_id, TaskStatus::Blocked)
+            .context("failed to block task after patch apply failure")?;
         anyhow::bail!("{}", err_msg);
     }
 
@@ -875,8 +880,10 @@ pub fn submit_patch_with_runner(
             worktree_path.display(),
             report.summary()
         );
-        let _ = db.fail_run(run_id, &failure_summary);
-        let _ = db.update_task_status(&task_id, TaskStatus::Blocked);
+        db.fail_run(run_id, &failure_summary)
+            .context("failed to mark patch validation run as failed")?;
+        db.update_task_status(&task_id, TaskStatus::Blocked)
+            .context("failed to block task after patch validation failure")?;
         anyhow::bail!(
             "Validation failed after applying patch to {}:\n{}",
             worktree_path.display(),

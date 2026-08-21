@@ -77,9 +77,13 @@ fn approval_requests_are_separate_from_decisions() {
     db.insert_approval_request(pid, "security review")
         .expect("approval");
     assert_eq!(
-        db.list_approval_requests(pid).unwrap(),
-        vec!["security review"]
+        db.list_approval_requests(pid).unwrap()[0].reason,
+        "security review"
     );
+    assert!(!db.list_approval_requests(pid).unwrap()[0].resolved);
+    let id = db.list_approval_requests(pid).unwrap()[0].id;
+    assert!(db.resolve_approval_request(pid, id).unwrap());
+    assert!(db.list_approval_requests(pid).unwrap()[0].resolved);
 }
 
 #[test]

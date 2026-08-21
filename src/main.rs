@@ -329,6 +329,10 @@ enum AgentCommand {
 #[derive(Subcommand)]
 enum TaskCommand {
     List,
+    /// Recover an interrupted active task and return it to the queue.
+    Requeue {
+        task_id: String,
+    },
     /// Display task details
     Show {
         /// Task ID to display
@@ -1041,6 +1045,14 @@ fn main() -> Result<()> {
                     eprintln!("No DB found. Run `orc init` to initialize repository state.");
                 }
             },
+            TaskCommand::Requeue { task_id } => {
+                let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+                db.requeue_task(
+                    &task_id,
+                    "Task manually requeued after interrupted Orc process recovery",
+                )?;
+                println!("Requeued task {task_id}");
+            }
             TaskCommand::Show { task_id } => match Database::open(DB_PATH) {
                 Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {
                     Some(task) => {
@@ -1438,6 +1450,17 @@ fn print_doctor(report: &doctor::DoctorReport) {
     } else {
         for check in &report.agents {
             print_check(check);
+        }
+    }
+    println!("\nActive tasks");
+    if report.active_tasks.is_empty() {
+        println!("  (none)");
+    } else {
+        for task in &report.active_tasks {
+            println!(
+                "  {}  run: {}  started_at: {}",
+                task.task_id, task.run_status, task.started_at
+            );
         }
     }
     println!("\nOverall: {}", report.overall());

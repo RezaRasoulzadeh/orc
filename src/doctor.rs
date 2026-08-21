@@ -23,6 +23,14 @@ pub struct Check {
 pub struct DoctorReport {
     pub project: Vec<Check>,
     pub agents: Vec<Check>,
+    pub active_tasks: Vec<ActiveTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveTask {
+    pub task_id: String,
+    pub run_status: String,
+    pub started_at: String,
 }
 
 impl DoctorReport {
@@ -108,7 +116,28 @@ pub fn inspect(root: impl AsRef<Path>, runner: &dyn HealthCommandRunner) -> Doct
     let db_path = root.join(".orc/orc.db");
     let database = Database::open(&db_path).and_then(|db| {
         let agents = db.list_agents()?;
-        Ok((db, agents))
+        let active_tasks = db
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| task.status == crate::task::TaskStatus::Active)
+            .map(|task| {
+                let run = db.list_agent_runs_for_task(&task.id).ok().and_then(|runs| {
+                    runs.into_iter()
+                        .find(|run| matches!(run.status.as_str(), "running" | "waiting_external"))
+                });
+                ActiveTask {
+                    task_id: task.id,
+                    run_status: run
+                        .as_ref()
+                        .map(|run| run.status.clone())
+                        .unwrap_or_else(|| "none".into()),
+                    started_at: run
+                        .map(|run| run.started_at)
+                        .unwrap_or_else(|| "none".into()),
+                }
+            })
+            .collect();
+        Ok((agents, active_tasks))
     });
     project.push(check(
         "database",
@@ -130,17 +159,18 @@ pub fn inspect(root: impl AsRef<Path>, runner: &dyn HealthCommandRunner) -> Doct
     ));
 
     let agents = database
-        .map(|(_db, agents)| {
+        .as_ref()
+        .map(|(agents, _active_tasks)| {
             agents
-                .into_iter()
+                .iter()
                 .filter(|agent| agent.enabled)
                 .map(|agent| {
-                    let status = match backend::check_health(&agent, root, runner) {
+                    let status = match backend::check_health(agent, root, runner) {
                         Ok(()) => CheckStatus::Ok,
                         Err(error) => CheckStatus::Unavailable(error),
                     };
                     Check {
-                        name: agent.id,
+                        name: agent.id.clone(),
                         status,
                         detail: Some(format!(
                             "availability: {}; quota: {}{}",
@@ -160,7 +190,14 @@ pub fn inspect(root: impl AsRef<Path>, runner: &dyn HealthCommandRunner) -> Doct
                 .collect()
         })
         .unwrap_or_default();
-    DoctorReport { project, agents }
+    let active_tasks = database
+        .map(|(_agents, active_tasks)| active_tasks)
+        .unwrap_or_default();
+    DoctorReport {
+        project,
+        agents,
+        active_tasks,
+    }
 }
 
 fn check(name: &str, healthy: bool, failure: &str) -> Check {

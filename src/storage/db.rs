@@ -58,6 +58,10 @@ pub enum DbError {
     DependencyNotFound(String, String),
     #[error("scheduler error: {0}")]
     Scheduler(String),
+    #[error("task '{0}' is not active")]
+    TaskNotActive(String),
+    #[error("task '{0}' has no non-terminal agent run to recover")]
+    NoRecoverableRun(String),
 }
 
 pub struct Database {
@@ -1007,6 +1011,49 @@ impl Database {
             params![status.to_string(), id],
         )?;
         Ok(changed != 0)
+    }
+
+    pub fn requeue_task(&self, id: &str, reason: &str) -> Result<(), DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let status: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM tasks WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match status.as_deref() {
+                Some("active") => {}
+                Some(_) => return Err(DbError::TaskNotActive(id.into())),
+                None => return Err(DbError::TaskNotFound(id.into())),
+            }
+            let run_id: Option<i64> = self.conn.query_row(
+                "SELECT id FROM agent_runs WHERE task_id = ?1 AND status IN ('running', 'waiting_external') ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![id], |row| row.get(0),
+            ).optional()?;
+            let run_id = run_id.ok_or_else(|| DbError::NoRecoverableRun(id.into()))?;
+            self.conn.execute(
+                "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+                params![reason, run_id],
+            )?;
+            self.conn.execute(
+                "UPDATE tasks SET status = 'backlog', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'active'",
+                params![id],
+            )?;
+            Ok::<_, DbError>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn cancel_task(&self, id: &str, reason: Option<&str>) -> Result<bool, DbError> {

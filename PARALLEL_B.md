@@ -1,1 +1,0 @@
-PARALLEL_B_OK

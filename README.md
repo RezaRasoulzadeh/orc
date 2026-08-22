@@ -1,10 +1,14 @@
 # Orc
 
-Orc is a local Rust CLI for coordinating AI-assisted engineering work. It keeps project, task, agent, run, approval, and lifecycle state in `.orc/orc.db`, and uses Git worktrees to isolate dispatched task changes.
+Orc is a local, operator-controlled control plane for AI-assisted engineering. It stores project, task, agent, run, approval, and lifecycle state in SQLite and uses Git worktrees to isolate dispatched work. A Tauri desktop application presents the same project state and actions as the CLI.
 
-## Install and first project
+Orc v0.2 is a local developer tool. It does not silently plan, dispatch, apply patches, or mutate project state on behalf of an AI provider.
 
-Orc currently runs from a Rust checkout:
+## Install and five-minute workflow
+
+Prerequisites: Rust stable with Cargo, Git, and (for automated Codex workers or the Lead) an installed and authenticated `codex` CLI. Desktop development additionally needs Node.js/npm and the Tauri platform prerequisites.
+
+Build from a checkout:
 
 ```bash
 cargo install --path .
@@ -15,7 +19,18 @@ orc status
 orc queue --explain
 ```
 
-`orc init` creates local SQLite state and a project record. Run it from the repository Orc should manage. `orc adopt` records the current Git repository, and `discovery-request` emits a read-only JSON request. Apply a discovery response with `orc apply-discovery RESPONSE.json` (or `-` for stdin). `orc doctor` reports project, agent, and active-task health.
+`orc init` creates `.orc/orc.db`; `orc adopt` records the current Git repository and writes the engineering contract used by workers. Discovery, planning, dispatch, review, and acceptance are separate operator actions. Start with [`docs/getting-started.md`](docs/getting-started.md).
+
+## What Orc provides
+
+- Persistent projects, tasks, dependencies, agents, runs, approvals, and lifecycle events.
+- Deterministic readiness and scheduling with capabilities, priority, availability, execution mode, and quota reserve.
+- Automated workers in isolated Git worktrees and manual-agent task packets or validated patches.
+- Review, revision, rejection, acceptance, cancellation, and recovery operations.
+- Read-only discovery/planning protocols and a human-gated Engineering Lead proposal workflow.
+- CLI and Tauri desktop views over the same SQLite-backed application state.
+
+See the [documentation index](docs/getting-started.md) for the detailed operator, architecture, and contributor guides.
 
 ## Planning and task lifecycle
 

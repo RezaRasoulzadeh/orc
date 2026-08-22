@@ -1,8 +1,10 @@
-# Orc v0.1 — Local orchestration workflow
+# Orc v0.2 — Local orchestration workflow and operator documentation
 
 ## Goal
 
-Provide a persistent, operator-controlled loop for planning, scheduling, executing, reviewing, and accepting AI-assisted engineering tasks in a local Git repository.
+Provide a persistent, operator-controlled loop for planning, scheduling, executing, reviewing, and accepting AI-assisted engineering tasks in a local Git repository, with documentation that describes only the implemented CLI, desktop, storage, and provider boundaries.
+
+The v0.2 documentation set is indexed from [`docs/getting-started.md`](docs/getting-started.md). It covers concepts, automated and manual workflows, recovery, configuration, CLI, desktop usage, architecture/API, database behavior, troubleshooting, and contributing.
 
 ## Supported workflow
 

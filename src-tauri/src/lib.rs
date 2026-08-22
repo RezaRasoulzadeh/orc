@@ -29,12 +29,52 @@ fn runs(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<orc::stor
     state.0.lock().map_err(|_| "application lock poisoned".to_string())?.runs(limit).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn lead_context(state: tauri::State<'_, AppState>, limit: usize) -> Result<orc::lead::LeadContext, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.lead().context(limit).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn lead_proposals(state: tauri::State<'_, AppState>) -> Result<Vec<orc::lead::LeadProposal>, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.lead().pending_proposals().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn invoke_lead(
+    state: tauri::State<'_, AppState>,
+    message: String,
+    config: Option<orc::lead::LeadProviderConfig>,
+) -> Result<orc::lead::LeadResponse, String> {
+    let config = config.unwrap_or_else(|| orc::lead::LeadProviderConfig {
+        agent_id: "project-lead".into(),
+        model: None,
+        reasoning_effort: None,
+    });
+    state
+        .0
+        .lock()
+        .map_err(|_| "application lock poisoned".to_string())?
+        .invoke_configured_lead(&message, &config, 20)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn apply_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> Result<(), String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.apply_lead_proposal(proposal_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reject_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> Result<(), String> {
+    let changed = state.0.lock().map_err(|_| "application lock poisoned".to_string())?.lead().reject_proposal(proposal_id).map_err(|error| error.to_string())?;
+    if changed { Ok(()) } else { Err("Lead proposal is no longer pending".into()) }
+}
+
 pub fn run() -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     let app = OrcApp::open(root.join(".orc/orc.db"), &root)?;
     tauri::Builder::default()
         .manage(AppState(Mutex::new(app)))
-        .invoke_handler(tauri::generate_handler![snapshot, tasks, runs])
+        .invoke_handler(tauri::generate_handler![snapshot, tasks, runs, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
         .run(tauri::generate_context!())?;
     Ok(())
 }

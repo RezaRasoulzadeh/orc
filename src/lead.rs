@@ -84,7 +84,7 @@ pub trait LeadBackend {
     fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeadProviderConfig {
     pub agent_id: String,
     pub model: Option<String>,

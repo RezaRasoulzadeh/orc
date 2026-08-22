@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orc::adoption;
 use orc::agent;
+use orc::cli::agent::AgentCommand;
+use orc::cli::run::RunCommand;
 use orc::cli::task::TaskCommand;
 use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
 use orc::discovery;
@@ -10,7 +12,7 @@ use orc::protocol::{
     EngineeringLeadRequest, EngineeringLeadResponse, PROTOCOL_VERSION, PlanResponse,
     PlanningRequest,
 };
-use orc::registry::{self, AgentDefinition};
+use orc::registry;
 use orc::storage::Database;
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +41,7 @@ fn parse_concurrency(value: &str) -> Result<Concurrency, String> {
     Ok(Concurrency::Limited(concurrency))
 }
 
+#[allow(dead_code)]
 fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
     let agent = registry::get_agent(db, id)?;
     if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
@@ -259,101 +262,6 @@ enum Command {
 enum ApprovalCommand {
     List,
     Resolve { id: i64 },
-}
-
-#[derive(Subcommand)]
-enum RunCommand {
-    Submit {
-        run_id: i64,
-        #[arg(long)]
-        file: Option<String>,
-    },
-    /// Submit a git patch for a waiting manual run
-    SubmitPatch {
-        run_id: i64,
-        /// Path to patch file (use - for stdin)
-        patch_file: String,
-    },
-    Fail {
-        run_id: i64,
-        reason: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCommand {
-    List,
-    Add {
-        id: String,
-        #[arg(long)]
-        backend: String,
-        #[arg(long, default_value_t = 0)]
-        priority: i64,
-        #[arg(long)]
-        capability: Vec<String>,
-        #[arg(long)]
-        display_name: Option<String>,
-        #[arg(long)]
-        profile: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, value_parser = parse_reasoning_effort)]
-        effort: Option<registry::ReasoningEffort>,
-        #[arg(long, value_parser = ["automated", "manual"], default_value = "automated")]
-        mode: String,
-    },
-    Enable {
-        id: String,
-    },
-    Disable {
-        id: String,
-    },
-    Unavailable {
-        id: String,
-        reason: String,
-    },
-    Available {
-        id: String,
-    },
-    Priority {
-        id: String,
-        priority: i64,
-    },
-    /// Set the configuration profile directory for an existing agent.
-    Profile {
-        id: String,
-        path: String,
-    },
-    Model {
-        id: String,
-        model: String,
-    },
-    Effort {
-        id: String,
-        #[arg(value_parser = parse_reasoning_effort)]
-        effort: registry::ReasoningEffort,
-    },
-    Quota {
-        id: String,
-        #[arg(long, value_parser = clap::value_parser!(i64).range(0..=100))]
-        remaining: i64,
-        #[arg(long)]
-        reset: Option<String>,
-    },
-    QuotaClear {
-        id: String,
-    },
-    QuotaReserve {
-        #[arg(value_parser = clap::value_parser!(i64).range(0..=100))]
-        remaining: i64,
-    },
-    /// Synchronize quota through the provider's machine-readable protocol.
-    Sync {
-        id: String,
-    },
-    Show {
-        id: String,
-    },
 }
 
 fn main() -> Result<()> {
@@ -732,259 +640,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Run { command } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
-            match command {
-                RunCommand::Submit { run_id, file } => {
-                    let output = match file.as_deref() {
-                        Some(path) => std::fs::read_to_string(path)?,
-                        None => {
-                            use std::io::Read;
-                            let mut output = String::new();
-                            std::io::stdin().read_to_string(&mut output)?;
-                            output
-                        }
-                    };
-                    let task_id = agent::submit_run(&db, run_id, &output)?;
-                    println!(
-                        "Run {} completed; task {} moved to review.",
-                        run_id, task_id
-                    );
-                }
-                RunCommand::SubmitPatch { run_id, patch_file } => {
-                    let patch_content = if patch_file == "-" {
-                        use std::io::Read;
-                        let mut output = String::new();
-                        std::io::stdin().read_to_string(&mut output)?;
-                        output
-                    } else {
-                        std::fs::read_to_string(&patch_file).map_err(|e| {
-                            anyhow::anyhow!("failed to read patch file '{}': {}", patch_file, e)
-                        })?
-                    };
-
-                    match agent::submit_patch(&db, run_id, &patch_content, ".") {
-                        Ok(outcome) => {
-                            println!("Run {}", outcome.run_id);
-                            println!("Patch: valid");
-                            println!("Worktree: {}", outcome.worktree_path.display());
-                            println!("Applied: yes\n");
-                            println!("Validation:");
-                            for step in &outcome.validation_report.steps {
-                                let status = if step.passed { "PASS" } else { "FAIL" };
-                                println!("  {:<42} {}", step.command, status);
-                            }
-                            println!("\nRun: completed");
-                            println!("Task {}: review", outcome.task_id);
-                        }
-                        Err(e) => {
-                            eprintln!("Submit patch failed: {:#}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-                RunCommand::Fail { run_id, reason } => {
-                    let task_id = agent::fail_run(
-                        &db,
-                        run_id,
-                        reason.as_deref().unwrap_or("manual run failed"),
-                    )?;
-                    println!("Run {} failed; task {} moved to blocked.", run_id, task_id);
-                }
-            }
-        }
-        Command::Agent { command } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
-            match command {
-                AgentCommand::List => {
-                    print_agents(&db)?;
-                }
-                AgentCommand::Add {
-                    id,
-                    backend,
-                    priority,
-                    capability,
-                    display_name,
-                    profile,
-                    model,
-                    effort,
-                    mode,
-                } => {
-                    registry::validate_backend(&backend)?;
-                    if (model.is_some() || effort.is_some())
-                        && (backend != "codex" || mode == registry::MANUAL)
-                    {
-                        anyhow::bail!(
-                            "only automated Codex agents support model and reasoning-effort configuration"
-                        );
-                    }
-                    if mode == registry::AUTOMATED
-                        && backend != "codex"
-                        && backend != "copilot"
-                        && backend != "antigravity"
-                    {
-                        anyhow::bail!("backend '{}' requires --mode manual", backend);
-                    }
-                    let agent = AgentDefinition {
-                        display_name: display_name.unwrap_or_else(|| id.clone()),
-                        id,
-                        backend,
-                        execution_mode: mode,
-                        enabled: true,
-                        priority,
-                        capabilities: capability,
-                        status: registry::AVAILABLE.to_owned(),
-                        unavailable_reason: None,
-                        profile_path: profile,
-                        model,
-                        reasoning_effort: effort,
-                        config_metadata: None,
-                        quota_remaining_percent: None,
-                        quota_reset_at: None,
-                        quota_checked_at: None,
-                        quota_source: None,
-                        quota_limits: None,
-                    };
-                    db.insert_agent(&agent).map_err(|e| anyhow::anyhow!(e))?;
-                    println!("Added agent {}", agent.id);
-                }
-                AgentCommand::Enable { id } => update_agent_enabled(&db, &id, true)?,
-                AgentCommand::Disable { id } => update_agent_enabled(&db, &id, false)?,
-                AgentCommand::Unavailable { id, reason } => {
-                    ensure_agent_updated(
-                        db.set_agent_availability(&id, registry::UNAVAILABLE, Some(&reason))
-                            .map_err(|e| anyhow::anyhow!(e))?,
-                        &id,
-                    )?;
-                }
-                AgentCommand::Available { id } => {
-                    ensure_agent_updated(
-                        db.set_agent_availability(&id, registry::AVAILABLE, None)
-                            .map_err(|e| anyhow::anyhow!(e))?,
-                        &id,
-                    )?;
-                }
-                AgentCommand::Priority { id, priority } => ensure_agent_updated(
-                    db.set_agent_priority(&id, priority)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    &id,
-                )?,
-                AgentCommand::Profile { id, path } => ensure_agent_updated(
-                    db.set_agent_profile_path(&id, &path)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    &id,
-                )?,
-                AgentCommand::Model { id, model } => {
-                    ensure_codex_automated_agent(&db, &id)?;
-                    ensure_agent_updated(
-                        db.set_agent_model(&id, &model)
-                            .map_err(|e| anyhow::anyhow!(e))?,
-                        &id,
-                    )?;
-                }
-                AgentCommand::Effort { id, effort } => {
-                    ensure_codex_automated_agent(&db, &id)?;
-                    ensure_agent_updated(
-                        db.set_agent_reasoning_effort(&id, effort)
-                            .map_err(|e| anyhow::anyhow!(e))?,
-                        &id,
-                    )?;
-                }
-                AgentCommand::Quota {
-                    id,
-                    remaining,
-                    reset,
-                } => ensure_agent_updated(
-                    db.set_agent_quota(&id, remaining, reset.as_deref())
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    &id,
-                )?,
-                AgentCommand::QuotaClear { id } => ensure_agent_updated(
-                    db.clear_agent_quota(&id).map_err(|e| anyhow::anyhow!(e))?,
-                    &id,
-                )?,
-                AgentCommand::QuotaReserve { remaining } => {
-                    db.set_quota_reserve(remaining)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    println!("Automatic dispatch quota reserve set to {remaining}%.");
-                }
-                AgentCommand::Sync { id } => {
-                    let agent = registry::get_agent(&db, &id)?;
-                    let snapshot = codex_app_server::sync_agent(&db, &agent, &CodexAppServer)
-                        .map_err(anyhow::Error::msg)?;
-                    print_synced_quota(&id, &snapshot);
-                }
-                AgentCommand::Show { id } => {
-                    let agent = registry::get_agent(&db, &id)?;
-                    println!("ID:                 {}", agent.id);
-                    println!("Backend:            {}", agent.backend);
-                    println!("Execution mode:     {}", agent.execution_mode);
-                    println!(
-                        "Model:              {}",
-                        agent.model.as_deref().unwrap_or("-")
-                    );
-                    println!(
-                        "Reasoning effort:   {}",
-                        agent
-                            .reasoning_effort
-                            .map(|value| value.as_str())
-                            .unwrap_or("-")
-                    );
-                    println!("Display name:       {}", agent.display_name);
-                    println!("Enabled:            {}", agent.enabled);
-                    println!("Availability:       {}", agent.status);
-                    println!(
-                        "Unavailable reason: {}",
-                        agent.unavailable_reason.as_deref().unwrap_or("-")
-                    );
-                    println!("Priority:            {}", agent.priority);
-                    println!(
-                        "Quota:               {}",
-                        agent
-                            .quota_remaining_percent
-                            .map(|value| format!("{value}%"))
-                            .unwrap_or_else(|| "unknown".into())
-                    );
-                    println!(
-                        "Quota reset:         {}",
-                        agent
-                            .quota_reset_at
-                            .as_deref()
-                            .map(format_timestamp)
-                            .unwrap_or_else(|| "-".into())
-                    );
-                    println!(
-                        "Quota checked:       {}",
-                        agent
-                            .quota_checked_at
-                            .as_deref()
-                            .map(format_timestamp)
-                            .unwrap_or_else(|| "-".into())
-                    );
-                    println!(
-                        "Quota source:        {}",
-                        agent.quota_source.as_deref().unwrap_or("-")
-                    );
-                    if let Some(limits) = &agent.quota_limits {
-                        println!("Effective limit:    {}", limits.effective);
-                        print_quota_limit("Primary limit:", limits.primary.as_ref());
-                        print_quota_limit("Secondary limit:", limits.secondary.as_ref());
-                        if let Some(limit) = &limits.individual_limit {
-                            println!(
-                                "Individual limit:   {}% remaining, reset {}",
-                                limit.remaining_percent,
-                                format_timestamp(&limit.reset_at.to_string())
-                            );
-                        }
-                    }
-                    println!("Capabilities:        {}", agent.capabilities.join(", "));
-                    println!(
-                        "Profile/config:      {}",
-                        agent.profile_path.as_deref().unwrap_or("-")
-                    );
-                }
-            }
-        }
+        Command::Run { command } => orc::cli::run::run(command, DB_PATH)?,
+        Command::Agent { command } => orc::cli::agent::run(command, DB_PATH)?,
         Command::Task { command } => orc::cli::task::run(command, DB_PATH)?,
         Command::Runs { task_id } => match Database::open(DB_PATH) {
             Ok(db) => {
@@ -1040,6 +697,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn update_agent_enabled(db: &Database, id: &str, enabled: bool) -> Result<()> {
     ensure_agent_updated(
         db.set_agent_enabled(id, enabled)
@@ -1048,6 +706,7 @@ fn update_agent_enabled(db: &Database, id: &str, enabled: bool) -> Result<()> {
     )
 }
 
+#[allow(dead_code)]
 fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
     if !changed {
         anyhow::bail!("agent '{}' is not registered", id);
@@ -1110,6 +769,7 @@ fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
     println!("  effective limit: {}", snapshot.limits.effective);
 }
 
+#[allow(dead_code)]
 fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
     match limit {
         Some(limit) => println!(

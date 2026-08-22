@@ -71,6 +71,8 @@ export interface RunDetails { run: AgentRun; result: WorkerResult | null; activi
 export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }
 export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: AgentRun[]; activity: LifecycleEvent[] }
 export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string } }
+export interface PlanningRequest { protocol_version: number; kind: string; project: unknown; engineering_contract: string; objective: string; constraints: string[]; target_platforms: string[]; stack: string[]; non_goals: string[]; deliverables: string[]; definition_of_done: string[]; response_schema: unknown; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[]; current_state: unknown; full_report: ProjectReport | null }
+export interface ProjectReport { protocol_version: number; project: { name: string; repository: string; branch: string | null; commit: string | null }; engineering_contract: string; architecture: { modules: string[]; boundaries: string[]; discovery: Record<string, string> }; lifecycle: { counts: Record<string, number>; tasks: { id: string; title: string; status: string }[] }; agents: unknown[]; queue: QueueReport; recent_work: unknown[]; risks: string[]; open_questions: string[]; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[] }
 
 export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
@@ -96,4 +98,10 @@ export const api = {
   invokeLead: (message: string, config?: LeadProviderConfig) => invoke<LeadResponse>('invoke_lead', { message, config }),
   applyLeadProposal: (proposalId: number) => invoke<void>('apply_lead_proposal', { proposalId }),
   rejectLeadProposal: (proposalId: number) => invoke<void>('reject_lead_proposal', { proposalId }),
+  planningRequest: () => invoke<PlanningRequest>('planning_request'),
+  plannerValidate: (json: string) => invoke<PlanResponse>('planner_validate', { json }),
+  plannerApply: (json: string) => invoke<Record<string, string>>('planner_apply', { json }),
+  approvals: () => invoke<ApprovalRequest[]>('approvals'),
+  resolveApproval: (id: number) => invoke<void>('resolve_approval', { id }),
+  projectReport: () => invoke<ProjectReport>('project_report'),
 }

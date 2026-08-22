@@ -148,7 +148,16 @@ impl OrcApp {
         })
     }
 
-    pub fn project_report(
+    pub fn project_report(&self) -> Result<ProjectReport> {
+        let engineering_contract =
+            crate::contract::load_contract(self.repo_path.join(".orc/engineering.md"))?;
+        self.project_report_with(
+            engineering_contract,
+            crate::protocol::ReportArchitecture::default(),
+        )
+    }
+
+    fn project_report_with(
         &self,
         engineering_contract: String,
         architecture: crate::protocol::ReportArchitecture,
@@ -205,6 +214,35 @@ impl OrcApp {
         Ok(crate::read_model::PlannerSummary {
             state: self.planning_state()?,
         })
+    }
+    pub fn planning_request(&self) -> Result<crate::protocol::PlanningRequest> {
+        let report = self.project_report()?;
+        let contract = report.engineering_contract.clone();
+        Ok(crate::protocol::PlanningRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            kind: "project_plan".into(),
+            project: Some(report.project.clone()),
+            engineering_contract: contract,
+            objective: "Plan the next useful project work from persisted state.".into(),
+            constraints: report.planning_constraints.clone(),
+            target_platforms: Vec::new(),
+            stack: Vec::new(),
+            non_goals: vec!["Do not mutate project state while planning.".into()],
+            deliverables: vec!["A validated PlanResponse JSON document.".into()],
+            definition_of_done: vec!["Every task has a unique id and valid dependencies.".into()],
+            response_schema: crate::protocol::PlanResponseSchema::v1(),
+            role_boundaries: report.role_boundaries.clone(),
+            planning_constraints: report.planning_constraints.clone(),
+            approval_requirements: report.approval_requirements.clone(),
+            current_state: Some(self.planning_state()?),
+            full_report: Some(report),
+        })
+    }
+    pub fn validate_plan_json(&self, json: &str) -> Result<PlanResponse> {
+        let response: PlanResponse =
+            serde_json::from_str(json).context("invalid PlanResponse JSON")?;
+        response.validate()?;
+        Ok(response)
     }
     pub fn task(&self, id: &str) -> Result<Option<Task>> {
         Ok(self.db.get_task(id)?)

@@ -129,6 +129,19 @@ fn queue(state: tauri::State<'_, AppState>) -> Result<orc::queue::QueueReport, S
 }
 
 #[tauri::command]
+fn planning_request(state: tauri::State<'_, AppState>) -> Result<orc::protocol::PlanningRequest, String> { state.0.lock().map_err(|_| "application lock poisoned".to_string())?.planning_request().map_err(|error| error.to_string()) }
+#[tauri::command]
+fn planner_validate(state: tauri::State<'_, AppState>, json: String) -> Result<orc::protocol::PlanResponse, String> { state.0.lock().map_err(|_| "application lock poisoned".to_string())?.validate_plan_json(&json).map_err(|error| error.to_string()) }
+#[tauri::command]
+fn planner_apply(state: tauri::State<'_, AppState>, json: String) -> Result<std::collections::BTreeMap<String, String>, String> { let app = state.0.lock().map_err(|_| "application lock poisoned".to_string())?; let plan = app.validate_plan_json(&json).map_err(|error| error.to_string())?; app.apply_plan(&plan).map_err(|error| error.to_string()) }
+#[tauri::command]
+fn approvals(state: tauri::State<'_, AppState>) -> Result<Vec<orc::storage::db::ApprovalRequest>, String> { state.0.lock().map_err(|_| "application lock poisoned".to_string())?.approvals().map_err(|error| error.to_string()) }
+#[tauri::command]
+fn resolve_approval(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> { state.0.lock().map_err(|_| "application lock poisoned".to_string())?.resolve_approval(id).map_err(|error| error.to_string()) }
+#[tauri::command]
+fn project_report(state: tauri::State<'_, AppState>) -> Result<orc::protocol::ProjectReport, String> { state.0.lock().map_err(|_| "application lock poisoned".to_string())?.project_report().map_err(|error| error.to_string()) }
+
+#[tauri::command]
 fn task_details(state: tauri::State<'_, AppState>, task_id: String, activity_limit: usize) -> Result<Option<orc::read_model::TaskDetails>, String> {
     state.0.lock().map_err(|_| "application lock poisoned".to_string())?.task_details(&task_id, activity_limit).map_err(|error| error.to_string())
 }
@@ -230,7 +243,7 @@ pub fn run() -> anyhow::Result<()> {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![snapshot, tasks, agents, configure_agent, sync_agent, manual_runs, manual_run_action, manual_workspace_info, open_manual_workspace, close_manual_workspace, queue, task_details, review, dispatch, task_action, runs, runs_workspace, run_details, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
+        .invoke_handler(tauri::generate_handler![snapshot, tasks, agents, configure_agent, sync_agent, manual_runs, manual_run_action, manual_workspace_info, open_manual_workspace, close_manual_workspace, queue, planning_request, planner_validate, planner_apply, approvals, resolve_approval, project_report, task_details, review, dispatch, task_action, runs, runs_workspace, run_details, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
         .run(tauri::generate_context!())?;
     Ok(())
 }

@@ -54,6 +54,49 @@ pub struct ApprovalRequest {
     pub resolved: bool,
 }
 
+fn lead_proposal_kind(proposal: &crate::lead::LeadProposalKind) -> &'static str {
+    match proposal {
+        crate::lead::LeadProposalKind::Plan(_) => "plan",
+        crate::lead::LeadProposalKind::Task(_) => "task",
+        crate::lead::LeadProposalKind::Revision { .. } => "revision",
+        crate::lead::LeadProposalKind::ApprovalRequest { .. } => "approval_request",
+    }
+}
+
+fn lead_proposal_status(status: crate::lead::LeadProposalStatus) -> &'static str {
+    match status {
+        crate::lead::LeadProposalStatus::Pending => "pending",
+        crate::lead::LeadProposalStatus::Applying => "applying",
+        crate::lead::LeadProposalStatus::Applied => "applied",
+        crate::lead::LeadProposalStatus::Rejected => "rejected",
+    }
+}
+
+fn lead_proposal_from_row(row: &Row<'_>) -> rusqlite::Result<crate::lead::LeadProposal> {
+    let proposal = serde_json::from_str(&row.get::<_, String>(1)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let status = match row.get::<_, String>(2)?.as_str() {
+        "pending" => crate::lead::LeadProposalStatus::Pending,
+        "applying" => crate::lead::LeadProposalStatus::Applying,
+        "applied" => crate::lead::LeadProposalStatus::Applied,
+        "rejected" => crate::lead::LeadProposalStatus::Rejected,
+        value => {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid Lead proposal status: {value}"
+            )));
+        }
+    };
+    Ok(crate::lead::LeadProposal {
+        id: row.get(0)?,
+        proposal,
+        status,
+        created_at: row.get(3)?,
+        applying_at: row.get(4)?,
+        resolved_at: row.get(5)?,
+    })
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DbError {
     #[error("database filesystem error: {0}")]
@@ -392,6 +435,7 @@ impl Database {
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
+        Self::ensure_lead_tables(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         Ok(Self {
@@ -410,6 +454,7 @@ impl Database {
         let conn = Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Self::configure(&conn)?;
         Self::ensure_registry_schema(&conn)?;
+        Self::ensure_lead_tables(&conn)?;
         Ok(Self {
             conn,
             lifecycle_sink: None,
@@ -635,6 +680,186 @@ impl Database {
     fn ensure_worktree_metadata_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS worktree_metadata (agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, branch_name TEXT NOT NULL, worktree_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
         Ok(())
+    }
+
+    fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT);")?;
+        let columns = conn
+            .prepare("PRAGMA table_info(lead_decisions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "status") {
+            conn.execute(
+                "ALTER TABLE lead_decisions ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "resolved_at") {
+            conn.execute("ALTER TABLE lead_decisions ADD COLUMN resolved_at TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "applying_at") {
+            conn.execute("ALTER TABLE lead_decisions ADD COLUMN applying_at TEXT", [])?;
+        }
+        let legacy = {
+            let mut statement = conn.prepare("SELECT id, kind, proposal FROM lead_decisions")?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, kind, value) in legacy {
+            if serde_json::from_str::<crate::lead::LeadProposalKind>(&value).is_err() {
+                let proposal = crate::lead::LeadProposalKind::ApprovalRequest {
+                    reason: format!("Migrated legacy Lead proposal ({kind})"),
+                    details: value,
+                };
+                conn.execute(
+                    "UPDATE lead_decisions SET kind = 'approval_request', proposal = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&proposal)?, id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_lead_turn(
+        &self,
+        project_id: i64,
+        role: crate::lead::LeadRole,
+        content: &str,
+    ) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO lead_turns (project_id, role, content) VALUES (?1, ?2, ?3)",
+            params![project_id, serde_json::to_value(role)?.as_str(), content],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn list_lead_turns(
+        &self,
+        project_id: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::lead::LeadTurn>, DbError> {
+        let mut s = self.conn.prepare("SELECT id, role, content, created_at FROM lead_turns WHERE project_id = ?1 ORDER BY id DESC LIMIT ?2")?;
+        Ok(s.query_map(params![project_id, limit as i64], |r| {
+            Ok(crate::lead::LeadTurn {
+                id: r.get(0)?,
+                role: serde_json::from_value(serde_json::Value::String(r.get(1)?)).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+                content: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+    }
+    pub fn get_lead_turn(
+        &self,
+        project_id: i64,
+        id: i64,
+    ) -> Result<Option<crate::lead::LeadTurn>, DbError> {
+        Ok(self.conn.query_row("SELECT id, role, content, created_at FROM lead_turns WHERE project_id = ?1 AND id = ?2", params![project_id, id], |r| {
+            Ok(crate::lead::LeadTurn { id: r.get(0)?, role: serde_json::from_value(serde_json::Value::String(r.get(1)?)).map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error)))?, content: r.get(2)?, created_at: r.get(3)? })
+        }).optional()?)
+    }
+
+    pub fn record_lead_proposal(
+        &self,
+        project_id: i64,
+        proposal: &crate::lead::LeadProposalKind,
+    ) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO lead_decisions (project_id, kind, proposal) VALUES (?1, ?2, ?3)",
+            params![
+                project_id,
+                lead_proposal_kind(proposal),
+                serde_json::to_string(proposal)?
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_lead_proposal(
+        &self,
+        project_id: i64,
+        id: i64,
+    ) -> Result<Option<crate::lead::LeadProposal>, DbError> {
+        Ok(self.conn.query_row("SELECT id, proposal, status, created_at, applying_at, resolved_at FROM lead_decisions WHERE project_id = ?1 AND id = ?2", params![project_id, id], lead_proposal_from_row).optional()?)
+    }
+
+    pub fn list_lead_proposals(
+        &self,
+        project_id: i64,
+        limit: usize,
+        status: Option<crate::lead::LeadProposalStatus>,
+    ) -> Result<Vec<crate::lead::LeadProposal>, DbError> {
+        let status = status.map(lead_proposal_status);
+        let mut statement = self.conn.prepare("SELECT id, proposal, status, created_at, applying_at, resolved_at FROM lead_decisions WHERE project_id = ?1 AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3")?;
+        Ok(statement
+            .query_map(
+                params![project_id, status, limit.min(i64::MAX as usize) as i64],
+                lead_proposal_from_row,
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn resolve_lead_proposal(
+        &self,
+        project_id: i64,
+        id: i64,
+        status: crate::lead::LeadProposalStatus,
+    ) -> Result<bool, DbError> {
+        if status == crate::lead::LeadProposalStatus::Pending {
+            return Ok(false);
+        }
+        Ok(self.conn.execute("UPDATE lead_decisions SET status = ?1, resolved_at = CURRENT_TIMESTAMP WHERE project_id = ?2 AND id = ?3 AND status = 'pending'", params![lead_proposal_status(status), project_id, id])? != 0)
+    }
+
+    pub fn transition_lead_proposal(
+        &self,
+        project_id: i64,
+        id: i64,
+        from: crate::lead::LeadProposalStatus,
+        to: crate::lead::LeadProposalStatus,
+    ) -> Result<bool, DbError> {
+        let resolved_at = if matches!(
+            to,
+            crate::lead::LeadProposalStatus::Applied | crate::lead::LeadProposalStatus::Rejected
+        ) {
+            "CURRENT_TIMESTAMP"
+        } else {
+            "NULL"
+        };
+        let applying_at = match (from, to) {
+            (
+                crate::lead::LeadProposalStatus::Pending,
+                crate::lead::LeadProposalStatus::Applying,
+            ) => "CURRENT_TIMESTAMP",
+            (_, crate::lead::LeadProposalStatus::Pending) => "NULL",
+            _ => "applying_at",
+        };
+        let sql = format!(
+            "UPDATE lead_decisions SET status = ?1, applying_at = {applying_at}, resolved_at = {resolved_at} WHERE project_id = ?2 AND id = ?3 AND status = ?4"
+        );
+        Ok(self.conn.execute(
+            &sql,
+            params![
+                lead_proposal_status(to),
+                project_id,
+                id,
+                lead_proposal_status(from)
+            ],
+        )? != 0)
     }
 
     pub fn create_project(&self, name: &str) -> Result<i64, DbError> {

@@ -25,6 +25,108 @@ pub enum CancelError {
 }
 
 impl OrcApp {
+    pub fn lead(&self) -> crate::lead::LeadService<'_> {
+        crate::lead::LeadService::new(&self.db, &self.repo_path)
+    }
+    pub fn invoke_lead(
+        &self,
+        message: &str,
+        backend: &dyn crate::lead::LeadBackend,
+        context_limit: usize,
+    ) -> Result<crate::lead::LeadResponse> {
+        self.lead().invoke(message, backend, context_limit)
+    }
+    pub fn invoke_configured_lead(
+        &self,
+        message: &str,
+        config: &crate::lead::LeadProviderConfig,
+        context_limit: usize,
+    ) -> Result<crate::lead::LeadResponse> {
+        let agent = self
+            .db
+            .get_agent(&config.agent_id)?
+            .with_context(|| format!("Lead provider agent '{}' not found", config.agent_id))?;
+        let backend = crate::lead::CodexLeadBackend::from_agent(
+            &agent,
+            &self.repo_path,
+            config.model.clone(),
+            config.reasoning_effort,
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.lead().invoke(message, &backend, context_limit)
+    }
+    pub fn recover_lead_proposal(&self, proposal_id: i64) -> Result<()> {
+        if !self.lead().recover_proposal(proposal_id)? {
+            anyhow::bail!("Lead proposal is not applying")
+        }
+        Ok(())
+    }
+    pub fn apply_lead_proposal(&self, proposal_id: i64) -> Result<()> {
+        use crate::lead::{LeadProposalKind, LeadProposalStatus, single_task_plan};
+        let proposal = self
+            .lead()
+            .proposal(proposal_id)?
+            .context("Lead proposal not found for current project")?;
+        if proposal.status != LeadProposalStatus::Pending {
+            anyhow::bail!("Lead proposal is not pending")
+        }
+        if matches!(proposal.proposal, LeadProposalKind::Revision { .. }) {
+            anyhow::bail!("revision proposals require an explicit agent selection")
+        }
+        if !self.lead().claim_proposal(proposal_id)? {
+            anyhow::bail!("Lead proposal is not pending")
+        }
+        let result = match proposal.proposal {
+            LeadProposalKind::Plan(plan) => self.apply_plan(&plan).map(|_| ()),
+            LeadProposalKind::Task(task) => self.apply_plan(&single_task_plan(task)).map(|_| ()),
+            LeadProposalKind::ApprovalRequest { reason, details } => (|| -> Result<()> {
+                let project_id = self
+                    .db
+                    .get_project_id()?
+                    .context("no project found in DB")?;
+                self.db
+                    .insert_approval_request(project_id, &format!("{reason}\n\n{details}"))?;
+                Ok(())
+            })(),
+            LeadProposalKind::Revision { .. } => unreachable!(),
+        };
+        if let Err(error) = result {
+            if !self.lead().release_proposal(proposal_id)? {
+                anyhow::bail!("{error:#}; Lead proposal could not be returned to pending")
+            }
+            return Err(error);
+        }
+        if !self.lead().finish_proposal(proposal_id)? {
+            anyhow::bail!("Lead proposal changed while it was being applied")
+        }
+        Ok(())
+    }
+    pub fn apply_lead_revision_proposal(&self, proposal_id: i64, agent_id: &str) -> Result<()> {
+        use crate::lead::{LeadProposalKind, LeadProposalStatus};
+        let proposal = self
+            .lead()
+            .proposal(proposal_id)?
+            .context("Lead proposal not found for current project")?;
+        if proposal.status != LeadProposalStatus::Pending {
+            anyhow::bail!("Lead proposal is not pending")
+        }
+        let LeadProposalKind::Revision { task_id, feedback } = proposal.proposal else {
+            anyhow::bail!("Lead proposal is not a revision")
+        };
+        if !self.lead().claim_proposal(proposal_id)? {
+            anyhow::bail!("Lead proposal is not pending")
+        }
+        if let Err(error) = self.revise(&task_id, &feedback, agent_id) {
+            if !self.lead().release_proposal(proposal_id)? {
+                anyhow::bail!("{error:#}; Lead proposal could not be returned to pending")
+            }
+            return Err(error);
+        }
+        if !self.lead().finish_proposal(proposal_id)? {
+            anyhow::bail!("Lead proposal changed while it was being applied")
+        }
+        Ok(())
+    }
     pub fn open(db_path: impl AsRef<Path>, repo_path: impl AsRef<Path>) -> Result<Self> {
         let events = crate::events::EventHub::new();
         let mut db = Database::open(db_path)?;

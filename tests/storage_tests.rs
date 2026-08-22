@@ -65,12 +65,16 @@ fn open_migrates_legacy_schema_without_losing_project_state() {
         CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), title TEXT NOT NULL, objective TEXT NOT NULL, role TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL);
         CREATE TABLE approval_requests (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
         CREATE TABLE agent_runs (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), task_id TEXT REFERENCES tasks(id), agent TEXT NOT NULL, status TEXT NOT NULL, output TEXT, started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), finished_at TEXT);
+        CREATE TABLE lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
+        CREATE TABLE lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, proposal TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
         INSERT INTO meta VALUES ('next_task_id', '2');
         INSERT INTO projects (id, name) VALUES (7, 'legacy-project');
         INSERT INTO agents (id, backend, display_name, capabilities) VALUES ('legacy-agent', 'test', 'Legacy Agent', '[]');
         INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES ('T-0001', 7, 'Legacy task', 'Keep it', 'dev', 'normal', 'backlog');
         INSERT INTO approval_requests (id, project_id, reason) VALUES (11, 7, 'Legacy approval');
         INSERT INTO agent_runs (id, project_id, task_id, agent, status, output) VALUES (13, 7, 'T-0001', 'legacy-agent', 'completed', 'Legacy output');
+        INSERT INTO lead_turns (id, project_id, role, content) VALUES (14, 7, 'user', 'Legacy question');
+        INSERT INTO lead_decisions (id, project_id, kind, proposal) VALUES (15, 7, 'ProposeTask', 'Legacy proposal');
         ",
     )
     .unwrap();
@@ -96,6 +100,16 @@ fn open_migrates_legacy_schema_without_losing_project_state() {
         "Legacy approval"
     );
     assert!(!db.list_approval_requests(7).unwrap()[0].resolved);
+    assert_eq!(
+        db.list_lead_turns(7, 10).unwrap()[0].content,
+        "Legacy question"
+    );
+    let migrated = db.list_lead_proposals(7, 10, None).unwrap();
+    assert_eq!(migrated.len(), 1);
+    assert!(matches!(
+        migrated[0].proposal,
+        orc::lead::LeadProposalKind::ApprovalRequest { .. }
+    ));
 
     let schema = Connection::open(&path).unwrap();
     for (table, columns) in [

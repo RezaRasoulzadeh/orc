@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod events;
 pub mod git;
+pub mod lead;
 pub mod protocol;
 pub mod queue;
 pub mod read_model;

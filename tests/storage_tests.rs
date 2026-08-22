@@ -244,6 +244,9 @@ fn worker_result_persists_once_per_run_across_reopen() {
             failure_category: Some("timeout".into()),
             duration_ms: Some(1000),
             metadata: Some("{\"attempt\":1}".into()),
+            total_tokens: Some(130),
+            input_tokens: Some(100),
+            output_tokens: Some(30),
         })
         .unwrap();
         assert!(
@@ -253,6 +256,9 @@ fn worker_result_persists_once_per_run_across_reopen() {
                 failure_category: None,
                 duration_ms: None,
                 metadata: None,
+                total_tokens: None,
+                input_tokens: None,
+                output_tokens: None,
             })
             .is_err()
         );
@@ -266,6 +272,9 @@ fn worker_result_persists_once_per_run_across_reopen() {
             failure_category: Some("timeout".into()),
             duration_ms: Some(1000),
             metadata: Some("{\"attempt\":1}".into()),
+            total_tokens: Some(130),
+            input_tokens: Some(100),
+            output_tokens: Some(30),
         })
     );
 }

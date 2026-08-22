@@ -1,6 +1,7 @@
 use orc::app::OrcApp;
 use serde::Serialize;
 use std::sync::Mutex;
+use tauri::Emitter;
 
 struct AppState(Mutex<OrcApp>);
 
@@ -27,6 +28,16 @@ fn tasks(state: tauri::State<'_, AppState>) -> Result<Vec<orc::task::Task>, Stri
 #[tauri::command]
 fn runs(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<orc::storage::AgentRun>, String> {
     state.0.lock().map_err(|_| "application lock poisoned".to_string())?.runs(limit).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn runs_workspace(state: tauri::State<'_, AppState>, limit: usize, activity_limit: usize) -> Result<orc::read_model::RunsWorkspace, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.runs_workspace(limit, activity_limit).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn run_details(state: tauri::State<'_, AppState>, run_id: i64, activity_limit: usize) -> Result<Option<orc::read_model::RunDetails>, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.run_details(run_id, activity_limit).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -74,7 +85,18 @@ pub fn run() -> anyhow::Result<()> {
     let app = OrcApp::open(root.join(".orc/orc.db"), &root)?;
     tauri::Builder::default()
         .manage(AppState(Mutex::new(app)))
-        .invoke_handler(tauri::generate_handler![snapshot, tasks, runs, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
+        .setup(|handle| {
+            let state = handle.state::<AppState>();
+            let subscription = state.0.lock().map_err(|_| anyhow::anyhow!("application lock poisoned"))?.subscribe();
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                while let Ok(event) = subscription.recv() {
+                    if handle.emit("orc://run-event", event).is_err() { break; }
+                }
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![snapshot, tasks, runs, runs_workspace, run_details, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
         .run(tauri::generate_context!())?;
     Ok(())
 }

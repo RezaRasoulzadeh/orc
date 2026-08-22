@@ -212,6 +212,13 @@ impl OrcApp {
             .context("no project found in DB")?;
         Ok(self.db.list_agent_runs(id, limit)?)
     }
+    pub fn runs_workspace(
+        &self,
+        limit: usize,
+        activity_limit: usize,
+    ) -> Result<crate::read_model::RunsWorkspace> {
+        crate::read_model::runs_workspace(&self.db, limit, activity_limit)
+    }
     pub fn agents(&self) -> Result<Vec<AgentDefinition>> {
         Ok(self.db.list_agents()?)
     }

@@ -8,7 +8,7 @@ use crate::registry::{self, AgentDefinition};
 use crate::review::{DispatchSummary, ReviewSummary, build_review};
 use crate::storage::db::ApprovalRequest;
 use crate::storage::{AgentRun, Database};
-use crate::task::{Task, TaskScopeMode};
+use crate::task::{CreateTaskInput, Task, TaskScopeMode};
 
 #[derive(Debug, serde::Serialize)]
 pub struct ManualRunContext {
@@ -435,6 +435,13 @@ impl OrcApp {
             .get_project_id()?
             .context("no project found in DB")?;
         Ok(self.db.apply_plan(id, response)?)
+    }
+    pub fn create_task(&self, input: CreateTaskInput) -> Result<String> {
+        let project_id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        Ok(self.db.create_task(project_id, &input)?)
     }
     pub fn add_dependency(&self, task_id: &str, dependency_id: &str) -> Result<()> {
         Ok(self.db.add_task_dependency(task_id, dependency_id)?)

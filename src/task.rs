@@ -2,6 +2,19 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone)]
+pub struct CreateTaskInput {
+    pub title: String,
+    pub objective: String,
+    pub role: String,
+    pub priority: TaskPriority,
+    pub required_capabilities: Vec<String>,
+    pub scope_mode: Option<TaskScopeMode>,
+    pub context_files: Vec<String>,
+    pub expected_changes: Vec<String>,
+    pub dependencies: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
     pub id: String,

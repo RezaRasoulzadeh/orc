@@ -1269,6 +1269,41 @@ impl Database {
         }
     }
 
+    pub fn create_task(
+        &self,
+        project_id: i64,
+        input: &crate::task::CreateTaskInput,
+    ) -> Result<String, DbError> {
+        if input.title.trim().is_empty() {
+            return Err(DbError::Scheduler("task title must not be empty".into()));
+        }
+        if input.objective.trim().is_empty() {
+            return Err(DbError::Scheduler(
+                "task objective must not be empty".into(),
+            ));
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let id = self.allocate_task_id()?;
+            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?])?;
+            for dependency in &input.dependencies {
+                self.add_task_dependency(&id, dependency)?;
+            }
+            self.record_lifecycle_event("task_created", Some(&id), None, None, None)?;
+            Ok(id)
+        })();
+        match result {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn allocate_task_id(&self) -> Result<String, DbError> {
         let value: String = self.conn.query_row(
             "SELECT value FROM meta WHERE key = 'next_task_id'",

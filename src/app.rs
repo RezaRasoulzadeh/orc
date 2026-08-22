@@ -170,7 +170,7 @@ impl OrcApp {
         Ok(self.db.list_tasks()?)
     }
     pub fn dashboard(&self, activity_limit: usize) -> Result<crate::read_model::Dashboard> {
-        crate::read_model::dashboard(&self.db, activity_limit)
+        crate::read_model::dashboard(&self.db, &self.repo_path, activity_limit)
     }
     pub fn task_details(
         &self,

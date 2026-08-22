@@ -9,11 +9,17 @@ use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Dashboard {
+    pub project_name: String,
+    pub repository_path: String,
     pub queue: QueueReport,
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentDefinition>,
     pub approvals: Vec<ApprovalRequest>,
     pub recent_activity: Vec<LifecycleEvent>,
+    pub running_agents: Vec<AgentRun>,
+    pub capacity: AgentCapacity,
+    pub outcome_trends: std::collections::BTreeMap<String, usize>,
+    pub repository_available: bool,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskDetails {
@@ -71,14 +77,38 @@ pub struct PlannerSummary {
 }
 pub type ReportSummary = crate::protocol::ProjectReport;
 
-pub fn dashboard(db: &crate::storage::Database, activity_limit: usize) -> Result<Dashboard> {
+pub fn dashboard(
+    db: &crate::storage::Database,
+    repository_path: &std::path::Path,
+    activity_limit: usize,
+) -> Result<Dashboard> {
     let project = db.get_project_id()?.context("no project found in DB")?;
+    const OUTCOME_LIMIT: usize = 50;
+    let runs = db.list_agent_runs(project, usize::MAX)?;
+    let recent_runs = db.list_agent_runs(project, OUTCOME_LIMIT)?;
+    let mut outcome_trends = std::collections::BTreeMap::new();
+    for run in &recent_runs {
+        if let Some(result) = db.get_worker_result(run.id)? {
+            *outcome_trends.entry(result.outcome).or_insert(0) += 1;
+        }
+    }
     Ok(Dashboard {
+        project_name: db
+            .get_project_name()?
+            .unwrap_or_else(|| "unnamed project".into()),
+        repository_path: repository_path.display().to_string(),
         queue: crate::queue::compute_queue(db)?,
         tasks: db.list_tasks()?,
         agents: db.list_agents()?,
         approvals: db.list_approval_requests(project)?,
         recent_activity: db.list_lifecycle_events(activity_limit)?,
+        running_agents: runs
+            .into_iter()
+            .filter(|run| matches!(run.status.as_str(), "running" | "waiting_external"))
+            .collect(),
+        capacity: agent_capacity(db)?,
+        outcome_trends,
+        repository_available: crate::git::is_usable_repository(repository_path),
     })
 }
 pub fn task_details(
@@ -181,5 +211,33 @@ mod tests {
             workspace.details[0].result.as_ref().unwrap().total_tokens,
             Some(34)
         );
+    }
+
+    #[test]
+    fn dashboard_health_requires_a_git_worktree() {
+        let directory = tempdir().unwrap();
+        let db = crate::storage::Database::init(directory.path().join("orc.db")).unwrap();
+        db.create_project("project").unwrap();
+        assert!(
+            !dashboard(&db, directory.path(), 10)
+                .unwrap()
+                .repository_available
+        );
+    }
+
+    #[test]
+    fn dashboard_outcomes_use_recent_persisted_worker_results() {
+        let directory = tempdir().unwrap();
+        let db = crate::storage::Database::init(directory.path().join("orc.db")).unwrap();
+        let project = db.create_project("project").unwrap();
+        let task = db
+            .insert_task(project, "task", "work", "developer", TaskPriority::Normal)
+            .unwrap();
+        let run = db.create_agent_run(project, &task, "codex").unwrap();
+        db.update_agent_run_status_with_usage(run, "completed", None, None)
+            .unwrap();
+        let dashboard = dashboard(&db, directory.path(), 10).unwrap();
+        assert_eq!(dashboard.outcome_trends.get("success"), Some(&1));
+        assert!(!dashboard.outcome_trends.contains_key("completed"));
     }
 }

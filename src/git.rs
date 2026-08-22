@@ -23,6 +23,14 @@ pub fn is_runtime_artifact(path: &str) -> bool {
         || path.starts_with(".orc/worktrees/")
 }
 
+pub fn is_usable_repository(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.is_dir()
+        && git_output(path, &["rev-parse", "--is-inside-work-tree"])
+            .map(|value| value.trim() == "true")
+            .unwrap_or(false)
+}
+
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .current_dir(dir)

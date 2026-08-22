@@ -37,3 +37,5 @@ Both protocols are structured JSON interfaces. Orc does not include a built-in A
 - Ready work can be queued, scheduled, dispatched automatically or manually, recovered, reviewed, revised, rejected, accepted, or cancelled.
 - Approvals, quotas, worker runs, worktrees, validation, and health checks are observable through the CLI.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` pass.
+
+The v0.1 release gate includes `tests/v01_acceptance_tests.rs`, which exercises the complete provider-independent happy path, including explicit initialization and adoption, manual task packet delivery, validation, review, Git integration, and healthy doctor output in a clean temporary Git repository.

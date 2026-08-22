@@ -1429,6 +1429,10 @@ impl Database {
         Ok(self.conn.execute("UPDATE agent_runs SET phase = ?1, last_activity = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')", params![phase, run_id])? != 0)
     }
 
+    pub fn touch_agent_run_activity(&self, run_id: i64) -> Result<bool, DbError> {
+        Ok(self.conn.execute("UPDATE agent_runs SET last_activity = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('running', 'waiting_external')", params![run_id])? != 0)
+    }
+
     pub fn store_worktree_metadata(
         &self,
         agent_run_id: i64,

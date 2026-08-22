@@ -1,5 +1,6 @@
 pub mod adoption;
 pub mod agent;
+pub mod app;
 pub mod backend;
 pub mod cli;
 pub mod codex_app_server;

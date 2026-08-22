@@ -16,7 +16,9 @@ export interface Task {
   expected_changes: string[]
 }
 
-export interface QueueEntry { task: Task }
+export interface DependencyInfo { task_id: string; status: TaskStatus | null; is_done: boolean }
+export interface BlockingReason { kind: string; incomplete_dependencies?: DependencyInfo[]; explanation?: string }
+export interface QueueEntry { task: Task; category: string; dependencies: DependencyInfo[]; waiting_on: string[]; blocking_reasons: BlockingReason[]; active_agent: string | null; recommended_agent: string | null }
 export interface QueueReport {
   ready: QueueEntry[]
   blocked: QueueEntry[]
@@ -26,7 +28,8 @@ export interface QueueReport {
   cancelled: QueueEntry[]
   backlog: QueueEntry[]
 }
-export interface Dashboard { queue: QueueReport; tasks: Task[] }
+export interface AgentDefinition { id: string; display_name: string; enabled: boolean; status: string; capabilities: string[] }
+export interface Dashboard { queue: QueueReport; tasks: Task[]; agents: AgentDefinition[] }
 export interface ProjectHealth {
   task_counts: Record<string, number>
   active_runs: number
@@ -62,10 +65,17 @@ export interface WorkerResult { run_id: number; outcome: string; failure_categor
 export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
 export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[] }
 export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }
+export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: AgentRun[]; activity: LifecycleEvent[] }
+export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string } }
 
 export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
+  queue: () => invoke<QueueReport>('queue'),
+  taskDetails: (taskId: string, activityLimit = 100) => invoke<TaskDetails | null>('task_details', { taskId, activityLimit }),
+  review: (taskId: string) => invoke<ReviewSummary>('review', { taskId }),
+  dispatch: (taskId: string, agentId?: string) => invoke('dispatch', { taskId, agentId }),
+  taskAction: (action: string, taskId: string, reason?: string, agentId?: string) => invoke<void>('task_action', { action, taskId, reason, agentId }),
   runs: (limit: number) => invoke<AgentRun[]>('runs', { limit }),
   runsWorkspace: (limit = 50, activityLimit = 100) => invoke<RunsWorkspace>('runs_workspace', { limit, activityLimit }),
   runDetails: (runId: number, activityLimit = 100) => invoke<RunDetails | null>('run_details', { runId, activityLimit }),

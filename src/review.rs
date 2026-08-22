@@ -5,7 +5,7 @@ use crate::git::{self, WorktreeChanges};
 use crate::storage::{AgentRun, WorkerResult};
 use crate::task::Task;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DispatchSummary {
     pub task: Task,
     pub agent: String,
@@ -54,7 +54,7 @@ pub fn format_dispatch(summary: &DispatchSummary) -> String {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewSummary {
     pub task: Task,
     pub run: Option<AgentRun>,

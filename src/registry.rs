@@ -41,7 +41,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const AUTOMATED: &str = "automated";
 pub const MANUAL: &str = "manual";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReasoningEffort {
     None,
     Low,
@@ -72,7 +72,7 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentDefinition {
     pub id: String,
     pub backend: String,

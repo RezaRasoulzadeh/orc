@@ -204,6 +204,12 @@ pub fn dispatch_with_worker_on_db(
         }
         println!("[orc] {phase}");
     };
+    let worker_output = |line: &str| {
+        if let Err(error) = db.record_worker_output(run_id, line) {
+            eprintln!("warning: failed to persist worker output: {error}");
+        }
+        println!("[orc] worker output: {line}");
+    };
     progress("worktree prepared");
 
     // Store worktree metadata
@@ -226,7 +232,7 @@ pub fn dispatch_with_worker_on_db(
     progress("worker spawned");
     progress("worker running");
     match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
-        progress(&format!("worker output: {line}"));
+        worker_output(line);
     }) {
         Ok((outcome, output)) => {
             match outcome {
@@ -428,6 +434,12 @@ pub fn revise_with_worker_on_db(
         }
         println!("[orc] {phase}");
     };
+    let worker_output = |line: &str| {
+        if let Err(error) = db.record_worker_output(run_id, line) {
+            eprintln!("warning: failed to persist worker output: {error}");
+        }
+        println!("[orc] worker output: {line}");
+    };
     progress("revision/worker starting");
     let prompt = format!(
         "{}\n\n## Review feedback\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
@@ -445,10 +457,7 @@ pub fn revise_with_worker_on_db(
     };
     progress("worker running");
     let (outcome, output) = match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
-        if let Err(error) = db.touch_agent_run_activity(run_id) {
-            eprintln!("warning: failed to persist worker activity: {error}");
-        }
-        println!("[orc] worker output: {line}");
+        worker_output(line);
     }) {
         Ok(result) => result,
         Err(error) => {

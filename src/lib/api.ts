@@ -29,7 +29,9 @@ export interface QueueReport {
   backlog: QueueEntry[]
 }
 export interface AgentDefinition { id: string; backend: string; execution_mode: string; display_name: string; enabled: boolean; priority: number; capabilities: string[]; status: string; unavailable_reason: string | null; profile_path: string | null; model: string | null; reasoning_effort: string | null; config_metadata: string | null; quota_remaining_percent: number | null; quota_reset_at: string | null; quota_checked_at: string | null; quota_source: string | null; quota_limits: unknown | null }
-export interface Dashboard { queue: QueueReport; tasks: Task[]; agents: AgentDefinition[] }
+export interface Dashboard { project_name: string; repository_path: string; queue: QueueReport; tasks: Task[]; agents: AgentDefinition[]; approvals: ApprovalRequest[]; recent_activity: LifecycleEvent[]; running_agents: AgentRun[]; capacity: AgentCapacity; outcome_trends: Record<string, number>; repository_available: boolean }
+export interface AgentCapacity { agents: AgentDefinition[]; busy: string[]; quota_reserve_percent: number }
+export interface ApprovalRequest { id: number; reason: string; resolved: boolean }
 export interface ProjectHealth {
   task_counts: Record<string, number>
   active_runs: number

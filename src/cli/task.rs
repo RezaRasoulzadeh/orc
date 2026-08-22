@@ -1,11 +1,30 @@
 use crate::app::{CancelError, OrcApp};
 use crate::storage::Database;
-use crate::task::TaskScopeMode;
+use crate::task::{CreateTaskInput, TaskPriority, TaskScopeMode};
 use anyhow::Result;
 use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
+    /// Create one task directly in the current project.
+    Create {
+        title: String,
+        objective: String,
+        #[arg(long, default_value = "developer")]
+        role: String,
+        #[arg(long, value_parser = ["low", "normal", "high", "critical"], default_value = "normal")]
+        priority: String,
+        #[arg(long, value_delimiter = ',')]
+        capability: Vec<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        context: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        expect: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        depends_on: Vec<String>,
+    },
     List,
     /// Recover an interrupted active task and return it to the queue.
     Requeue {
@@ -84,6 +103,43 @@ pub enum TaskCommand {
 
 pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
     match command {
+        TaskCommand::Create {
+            title,
+            objective,
+            role,
+            priority,
+            capability,
+            scope,
+            context,
+            expect,
+            depends_on,
+        } => {
+            let priority = match priority.as_str() {
+                "low" => TaskPriority::Low,
+                "normal" => TaskPriority::Normal,
+                "high" => TaskPriority::High,
+                "critical" => TaskPriority::Critical,
+                _ => unreachable!(),
+            };
+            let scope_mode = scope
+                .map(|value| {
+                    TaskScopeMode::parse(&value)
+                        .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {value}"))
+                })
+                .transpose()?;
+            let id = OrcApp::open(db_path, ".")?.create_task(CreateTaskInput {
+                title,
+                objective,
+                role,
+                priority,
+                required_capabilities: capability,
+                scope_mode,
+                context_files: context,
+                expected_changes: expect,
+                dependencies: depends_on,
+            })?;
+            println!("Created task {id}");
+        }
         TaskCommand::List => match Database::open(db_path) {
             Ok(db) => {
                 let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;

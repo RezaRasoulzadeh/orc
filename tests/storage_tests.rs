@@ -1,5 +1,6 @@
 use orc::storage::{Database, WorkerResult};
 use orc::task::{TaskPriority, TaskStatus};
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 #[test]
@@ -48,6 +49,131 @@ fn reopen_preserves_data() {
     let db2 = Database::open(&db_path).expect("open");
     let tasks = db2.list_tasks().expect("list");
     assert_eq!(tasks.len(), 1);
+}
+
+#[test]
+fn open_migrates_legacy_schema_without_losing_project_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
+        CREATE TABLE agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), title TEXT NOT NULL, objective TEXT NOT NULL, role TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE approval_requests (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
+        CREATE TABLE agent_runs (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), task_id TEXT REFERENCES tasks(id), agent TEXT NOT NULL, status TEXT NOT NULL, output TEXT, started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), finished_at TEXT);
+        INSERT INTO meta VALUES ('next_task_id', '2');
+        INSERT INTO projects (id, name) VALUES (7, 'legacy-project');
+        INSERT INTO agents (id, backend, display_name, capabilities) VALUES ('legacy-agent', 'test', 'Legacy Agent', '[]');
+        INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES ('T-0001', 7, 'Legacy task', 'Keep it', 'dev', 'normal', 'backlog');
+        INSERT INTO approval_requests (id, project_id, reason) VALUES (11, 7, 'Legacy approval');
+        INSERT INTO agent_runs (id, project_id, task_id, agent, status, output) VALUES (13, 7, 'T-0001', 'legacy-agent', 'completed', 'Legacy output');
+        ",
+    )
+    .unwrap();
+    drop(raw);
+
+    let db = Database::open(&path).expect("open and migrate");
+    assert_eq!(
+        db.get_project_name().unwrap().as_deref(),
+        Some("legacy-project")
+    );
+    let task = db.get_task("T-0001").unwrap().unwrap();
+    assert_eq!(task.title, "Legacy task");
+    assert_eq!(task.scope_mode, None);
+    assert!(task.context_files.is_empty());
+    assert!(task.expected_changes.is_empty());
+    assert_eq!(db.list_agents().unwrap().len(), 1);
+    let run = &db.list_agent_runs(7, 10).unwrap()[0];
+    assert_eq!(run.output.as_deref(), Some("Legacy output"));
+    assert_eq!(run.execution_mode, "automated");
+    assert!(!run.last_activity.is_empty());
+    assert_eq!(
+        db.list_approval_requests(7).unwrap()[0].reason,
+        "Legacy approval"
+    );
+    assert!(!db.list_approval_requests(7).unwrap()[0].resolved);
+
+    let schema = Connection::open(&path).unwrap();
+    for (table, columns) in [
+        ("project_facts", vec!["project_id", "key", "value"]),
+        ("worker_results", vec!["run_id", "outcome", "metadata"]),
+        ("lifecycle_events", vec!["id", "kind", "payload"]),
+        ("worktree_metadata", vec!["agent_run_id", "branch_name"]),
+    ] {
+        assert!(
+            schema
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |_| Ok(())
+                )
+                .is_ok()
+        );
+        let actual: Vec<String> = schema
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in columns {
+            assert!(actual.iter().any(|actual_column| actual_column == column));
+        }
+    }
+    for (table, column) in [
+        ("agents", "model"),
+        ("tasks", "scope_mode"),
+        ("agent_runs", "phase"),
+        ("approval_requests", "resolved"),
+    ] {
+        let exists: i64 = schema
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+    }
+    db.store_worktree_metadata(13, "T-0001", "legacy-branch", "/tmp/legacy-worktree")
+        .unwrap();
+    assert_eq!(
+        db.get_worktree_metadata("T-0001").unwrap(),
+        Some((
+            "legacy-branch".to_string(),
+            "/tmp/legacy-worktree".to_string()
+        ))
+    );
+}
+
+#[test]
+fn repeated_init_is_idempotent_and_open_preserves_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let project_id = db.create_project("project").unwrap();
+    let task_id = db
+        .insert_task(project_id, "Task", "Objective", "dev", TaskPriority::Normal)
+        .unwrap();
+    let run_id = db.create_agent_run(project_id, &task_id, "agent").unwrap();
+    db.insert_approval_request(project_id, "approval").unwrap();
+    drop(db);
+
+    let db = Database::init(&path).unwrap();
+    assert_eq!(db.get_project_id().unwrap(), Some(project_id));
+    assert_eq!(db.list_tasks().unwrap().len(), 1);
+    assert_eq!(db.list_agent_runs(project_id, 10).unwrap().len(), 1);
+    assert_eq!(db.list_approval_requests(project_id).unwrap().len(), 1);
+    assert_eq!(db.list_agent_runs(project_id, 10).unwrap()[0].id, run_id);
+    drop(db);
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.get_task(&task_id).unwrap().unwrap().title, "Task");
+    assert_eq!(db.list_approval_requests(project_id).unwrap().len(), 1);
 }
 
 #[test]

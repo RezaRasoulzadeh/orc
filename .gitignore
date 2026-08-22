@@ -17,3 +17,11 @@ Cargo.lock
 .orc/orc.db-wal
 .orc/orc.db-shm
 .orc/worktrees/
+
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.vite/
+.tauri/

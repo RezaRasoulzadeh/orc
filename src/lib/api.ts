@@ -28,7 +28,7 @@ export interface QueueReport {
   cancelled: QueueEntry[]
   backlog: QueueEntry[]
 }
-export interface AgentDefinition { id: string; display_name: string; enabled: boolean; status: string; capabilities: string[] }
+export interface AgentDefinition { id: string; backend: string; execution_mode: string; display_name: string; enabled: boolean; priority: number; capabilities: string[]; status: string; unavailable_reason: string | null; profile_path: string | null; model: string | null; reasoning_effort: string | null; config_metadata: string | null; quota_remaining_percent: number | null; quota_reset_at: string | null; quota_checked_at: string | null; quota_source: string | null; quota_limits: unknown | null }
 export interface Dashboard { queue: QueueReport; tasks: Task[]; agents: AgentDefinition[] }
 export interface ProjectHealth {
   task_counts: Record<string, number>
@@ -61,6 +61,8 @@ export interface AgentRun {
   phase: string | null
   last_activity: string
 }
+export interface ManualRunContext { run: AgentRun; task: Task; task_packet: string }
+export interface ManualWorkspaceInfo { supported: boolean; url: string | null; error: string | null }
 export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null }
 export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
 export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[] }
@@ -71,6 +73,14 @@ export interface ReviewSummary { task: Task; run: AgentRun | null; result: Worke
 export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
+  agents: () => invoke<AgentDefinition[]>('agents'),
+  configureAgent: (id: string, field: string, value: string) => invoke<void>('configure_agent', { id, field, value }),
+  syncAgent: (id: string) => invoke<void>('sync_agent', { id }),
+  manualRuns: (agentId: string) => invoke<ManualRunContext[]>('manual_runs', { agentId }),
+  manualRunAction: (action: 'submit' | 'patch' | 'fail', runId: number, value: string) => invoke<void>('manual_run_action', { action, runId, value }),
+  manualWorkspaceInfo: (agentId: string) => invoke<ManualWorkspaceInfo>('manual_workspace_info', { agentId }),
+  openManualWorkspace: (agentId: string) => invoke<void>('open_manual_workspace', { agentId }),
+  closeManualWorkspace: (agentId: string) => invoke<void>('close_manual_workspace', { agentId }),
   queue: () => invoke<QueueReport>('queue'),
   taskDetails: (taskId: string, activityLimit = 100) => invoke<TaskDetails | null>('task_details', { taskId, activityLimit }),
   review: (taskId: string) => invoke<ReviewSummary>('review', { taskId }),

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "manual-provider-window",
+  "description": "An isolated provider webview with no Orc IPC permissions.",
+  "windows": ["manual-*"],
+  "permissions": []
+}

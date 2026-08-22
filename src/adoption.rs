@@ -45,16 +45,8 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
                 root.display()
             )
         })?;
-        let clean = db.get_project_id()?.is_some()
-            && [
-                "engineering.md",
-                "project.md",
-                "architecture.md",
-                "roadmap.md",
-            ]
-            .iter()
-            .all(|name| orc_dir.join(name).is_file());
-        if clean {
+        if db.get_project_id()?.is_some() {
+            ensure_adoption_files(&orc_dir)?;
             return Ok(root);
         }
         bail!(
@@ -74,11 +66,16 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
     db.create_project(project_name)
         .context("failed to create adopted project record")?;
 
+    ensure_adoption_files(&orc_dir)?;
+    Ok(root)
+}
+
+fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
     ensure_file(&orc_dir.join("engineering.md"), ENGINEERING_TEMPLATE)?;
     ensure_file(&orc_dir.join("project.md"), PROJECT_TEMPLATE)?;
     ensure_file(&orc_dir.join("architecture.md"), ARCHITECTURE_TEMPLATE)?;
     ensure_file(&orc_dir.join("roadmap.md"), ROADMAP_TEMPLATE)?;
-    Ok(root)
+    Ok(())
 }
 
 fn ensure_file(path: &Path, contents: &str) -> Result<()> {

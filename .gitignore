@@ -12,3 +12,8 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+.orc/orc.db
+.orc/orc.db-wal
+.orc/orc.db-shm
+.orc/worktrees/

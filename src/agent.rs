@@ -137,11 +137,21 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
 ) -> Result<DispatchSummary> {
-    let repo_path = repo_path.as_ref();
-    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
-
     let db = Database::open(db_path)
         .with_context(|| format!("failed to open orc DB ({}); run `orc init` first", db_path))?;
+    dispatch_with_worker_on_db(task_id, worker, &db, repo_path, agent_id, validation_runner)
+}
+
+pub fn dispatch_with_worker_on_db(
+    task_id: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<DispatchSummary> {
+    let repo_path = repo_path.as_ref();
+    let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
     let project_id = db
         .get_project_id()
@@ -183,7 +193,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
         Ok((branch, path)) => (branch, path),
         Err(e) => {
             let error_msg = format!("Failed to create worktree: {}", e);
-            block_automated_run(&db, run_id, task_id, &error_msg)
+            block_automated_run(db, run_id, task_id, &error_msg)
                 .context("failed to record worktree creation failure")?;
             anyhow::bail!("{}", error_msg);
         }
@@ -204,7 +214,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
         &worktree_path.to_string_lossy(),
     ) {
         let error_msg = format!("Failed to store worktree metadata: {}", e);
-        block_automated_run(&db, run_id, task_id, &error_msg)
+        block_automated_run(db, run_id, task_id, &error_msg)
             .context("failed to record worktree metadata failure")?;
         anyhow::bail!("{}", error_msg);
     }
@@ -229,7 +239,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                                 "{}\n\nPost-worker inspection failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(&db, run_id, task_id, &output)?;
+                            block_automated_run(db, run_id, task_id, &output)?;
                             anyhow::bail!("could not inspect task worktree after worker completion")
                         }
                     };
@@ -251,7 +261,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                                 "{}\n\nValidation setup failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(&db, run_id, task_id, &output)?;
+                            block_automated_run(db, run_id, task_id, &output)?;
                             anyhow::bail!("validation setup failed for task {task_id}")
                         }
                     };
@@ -267,7 +277,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                                 "{}\n\nValidation execution failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(&db, run_id, task_id, &output)?;
+                            block_automated_run(db, run_id, task_id, &output)?;
                             anyhow::bail!("validation execution failed for task {task_id}")
                         }
                     };
@@ -300,7 +310,7 @@ pub fn dispatch_with_worker_and_db_as_with_runner(
                             )?;
                     }
                     if !report.is_success() {
-                        block_automated_run(&db, run_id, task_id, &combined_output)?;
+                        block_automated_run(db, run_id, task_id, &combined_output)?;
                         anyhow::bail!("validation failed for task {task_id}; task remains blocked");
                     }
                     db.update_agent_run_status(run_id, "completed", Some(&combined_output))
@@ -362,9 +372,29 @@ pub fn revise_with_worker_and_db_as_with_runner(
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
 ) -> Result<DispatchSummary> {
+    let db = Database::open(db_path)?;
+    revise_with_worker_on_db(
+        task_id,
+        feedback,
+        worker,
+        &db,
+        repo_path,
+        agent_id,
+        validation_runner,
+    )
+}
+
+pub fn revise_with_worker_on_db(
+    task_id: &str,
+    feedback: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
-    let db = Database::open(db_path)?;
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
@@ -392,22 +422,45 @@ pub fn revise_with_worker_and_db_as_with_runner(
         Some(agent_id),
         Some(feedback),
     )?;
+    let progress = |phase: &str| {
+        if let Err(error) = db.update_agent_run_phase(run_id, phase) {
+            eprintln!("warning: failed to persist run progress: {error}");
+        }
+        println!("[orc] {phase}");
+    };
+    progress("revision/worker starting");
     let prompt = format!(
         "{}\n\n## Review feedback\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
         build_worker_prompt(&contract, &project_name, &task),
         feedback
     );
     let fail = |message: String| -> Result<DispatchSummary> {
-        block_automated_run(&db, run_id, task_id, &message)?;
+        progress(if message.to_ascii_lowercase().contains("timeout") {
+            "worker timeout"
+        } else {
+            "revision failed"
+        });
+        block_automated_run(db, run_id, task_id, &message)?;
         anyhow::bail!("{message}")
     };
-    let (outcome, output) = match worker.execute(&prompt, &worktree_dir) {
+    progress("worker running");
+    let (outcome, output) = match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
+        if let Err(error) = db.touch_agent_run_activity(run_id) {
+            eprintln!("warning: failed to persist worker activity: {error}");
+        }
+        println!("[orc] worker output: {line}");
+    }) {
         Ok(result) => result,
-        Err(error) => return fail(error),
+        Err(error) => {
+            progress("worker failed");
+            return fail(error);
+        }
     };
     if let WorkerOutcome::Failure(error) = outcome {
+        progress("worker failed");
         return fail(format!("Worker failed: {error}"));
     }
+    progress("worker completed");
     let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(changes) => changes,
         Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
@@ -419,6 +472,7 @@ pub fn revise_with_worker_and_db_as_with_runner(
         Ok(config) => config,
         Err(error) => return fail(format!("Validation setup failed: {error:#}")),
     };
+    progress("validation started");
     let report = match validation::run_validation_pipeline(
         validation_runner,
         &config.commands,
@@ -427,6 +481,7 @@ pub fn revise_with_worker_and_db_as_with_runner(
         Ok(report) => report,
         Err(error) => return fail(format!("Validation execution failed: {error:#}")),
     };
+    progress("validation completed");
     let summary = report.summary();
     let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
     if !report.is_success() {
@@ -445,6 +500,7 @@ pub fn revise_with_worker_and_db_as_with_runner(
         }),
     )?;
     db.update_task_status(task_id, TaskStatus::Review)?;
+    progress("review transition");
     let agent = db
         .list_agents()?
         .into_iter()
@@ -526,11 +582,30 @@ pub fn dispatch_selected_with_options(
     let db_path = ".orc/orc.db";
     let db = Database::open(db_path)
         .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
+    dispatch_selected_with_db_and_repo(
+        &db,
+        ".",
+        task_id,
+        requested_agent,
+        model_override,
+        effort_override,
+    )
+}
+
+pub fn dispatch_selected_with_db_and_repo(
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    task_id: &str,
+    requested_agent: Option<&str>,
+    model_override: Option<String>,
+    effort_override: Option<crate::registry::ReasoningEffort>,
+) -> Result<DispatchSummary> {
+    let repo_path = repo_path.as_ref();
     let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
     let agent = if let Some(agent_id) = requested_agent {
-        let agent = registry::get_agent(&db, agent_id)?;
+        let agent = registry::get_agent(db, agent_id)?;
         crate::scheduler::validate_override(&agent, &task)?;
         agent
     } else {
@@ -557,7 +632,7 @@ pub fn dispatch_selected_with_options(
                 agent.id
             );
         }
-        dispatch_manual(task_id, &agent, &db, ".")?;
+        dispatch_manual(task_id, &agent, db, repo_path)?;
         let task = db
             .get_task(task_id)?
             .context("task disappeared after manual dispatch")?;
@@ -584,11 +659,11 @@ pub fn dispatch_selected_with_options(
     let reasoning_effort = effort_override.or(agent.reasoning_effort);
     let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
         .map_err(anyhow::Error::msg)?;
-    let mut summary = dispatch_with_worker_and_db_as_with_runner(
+    let mut summary = dispatch_with_worker_on_db(
         task_id,
         worker.as_ref(),
-        db_path,
-        ".",
+        db,
+        repo_path,
         &agent.id,
         &SystemValidationRunner,
     )?;

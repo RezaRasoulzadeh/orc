@@ -1,3 +1,4 @@
+use crate::app::{CancelError, OrcApp};
 use crate::storage::Database;
 use crate::task::TaskScopeMode;
 use anyhow::Result;
@@ -95,11 +96,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             }
         },
         TaskCommand::Requeue { task_id } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            db.requeue_task(
-                &task_id,
-                "Task manually requeued after interrupted Orc process recovery",
-            )?;
+            OrcApp::open(db_path, ".")?.requeue(&task_id)?;
             println!("Requeued task {task_id}");
         }
         TaskCommand::Show { task_id } => match Database::open(db_path) {
@@ -163,15 +160,21 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             Err(_) => eprintln!("No DB found. Run `orc init` to initialize repository state."),
         },
         TaskCommand::Cancel { task_id, reason } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            if !db.cancel_task(&task_id, reason.as_deref())? {
-                let task = db.get_task(&task_id)?;
-                match task {
-                    None => anyhow::bail!("task '{}' not found", task_id),
-                    Some(task) if task.status == crate::task::TaskStatus::Done => {
-                        anyhow::bail!("task '{}' is done and cannot be cancelled", task_id)
+            let app = OrcApp::open(db_path, ".")?;
+            if let Err(error) = app.cancel(&task_id, reason.as_deref()) {
+                match error {
+                    CancelError::Database(error) => return Err(error.into()),
+                    CancelError::Invalid(_) => {
+                        let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
+                        let task = db.get_task(&task_id)?;
+                        match task {
+                            None => anyhow::bail!("task '{}' not found", task_id),
+                            Some(task) if task.status == crate::task::TaskStatus::Done => {
+                                anyhow::bail!("task '{}' is done and cannot be cancelled", task_id)
+                            }
+                            Some(_) => anyhow::bail!("task '{}' is already cancelled", task_id),
+                        }
                     }
-                    Some(_) => anyhow::bail!("task '{}' is already cancelled", task_id),
                 }
             }
             println!("Cancelled task {}", task_id);
@@ -218,16 +221,14 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Diff { task_id } => show_diff(db_path, &task_id)?,
         TaskCommand::Worktree { task_id } => show_worktree(db_path, &task_id)?,
         TaskCommand::Accept { task_id } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            crate::agent::accept_task(&db, &task_id, ".")?;
+            OrcApp::open(db_path, ".")?.accept(&task_id)?;
             println!(
                 "Accepted task {}; changes integrated and task marked done.",
                 task_id
             );
         }
         TaskCommand::Reject { task_id, reason } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            crate::agent::reject_task(&db, &task_id, reason.as_deref())?;
+            OrcApp::open(db_path, ".")?.reject(&task_id, reason.as_deref())?;
             println!(
                 "Rejected task {}; worktree preserved and task moved to ready.",
                 task_id

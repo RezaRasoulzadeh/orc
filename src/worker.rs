@@ -20,6 +20,20 @@ pub enum WorkerOutcome {
     Failure(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub total_tokens: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerExecution {
+    pub outcome: WorkerOutcome,
+    pub output: Option<String>,
+    pub token_usage: Option<TokenUsage>,
+}
+
 pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -247,6 +261,20 @@ pub trait Worker: Send + Sync {
     ) -> Result<(WorkerOutcome, Option<String>), String> {
         self.execute(prompt, cwd)
     }
+
+    fn execute_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let (outcome, output) = self.execute_with_progress(prompt, cwd, progress)?;
+        Ok(WorkerExecution {
+            outcome,
+            output,
+            token_usage: None,
+        })
+    }
 }
 
 /// Copilot worker implementation
@@ -331,21 +359,26 @@ impl CodexWorker {
         model: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Vec<String> {
-        vec!["exec".into(), "--sandbox".into(), "workspace-write".into()]
-            .into_iter()
-            .chain(
-                model
-                    .into_iter()
-                    .flat_map(|model| ["--model".into(), model.into()]),
-            )
-            .chain(reasoning_effort.into_iter().flat_map(|effort| {
-                [
-                    "--config".into(),
-                    format!("model_reasoning_effort=\"{}\"", effort.as_str()),
-                ]
-            }))
-            .chain(std::iter::once(prompt.into()))
-            .collect()
+        vec![
+            "exec".into(),
+            "--json".into(),
+            "--sandbox".into(),
+            "workspace-write".into(),
+        ]
+        .into_iter()
+        .chain(
+            model
+                .into_iter()
+                .flat_map(|model| ["--model".into(), model.into()]),
+        )
+        .chain(reasoning_effort.into_iter().flat_map(|effort| {
+            [
+                "--config".into(),
+                format!("model_reasoning_effort=\"{}\"", effort.as_str()),
+            ]
+        }))
+        .chain(std::iter::once(prompt.into()))
+        .collect()
     }
 
     fn command(&self, prompt: &str, cwd: &Path) -> std::process::Command {
@@ -376,6 +409,16 @@ impl Worker for CodexWorker {
         cwd: &Path,
         progress: &dyn Fn(&str),
     ) -> Result<(WorkerOutcome, Option<String>), String> {
+        let execution = self.execute_with_progress_and_usage(prompt, cwd, progress)?;
+        Ok((execution.outcome, execution.output))
+    }
+
+    fn execute_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
         match run_command_with_timeout_progress(
             self.command(prompt, cwd),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
@@ -384,17 +427,18 @@ impl Worker for CodexWorker {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let combined = if stderr.is_empty() {
-                    stdout
-                } else if stdout.is_empty() {
-                    stderr
-                } else {
-                    format!("{stdout}\n{stderr}")
+                let (final_output, token_usage) = parse_codex_jsonl(&stdout)?;
+                let combined = match (final_output, stderr.is_empty()) {
+                    (Some(output), true) => Some(output),
+                    (Some(output), false) => Some(format!("{output}\n{stderr}")),
+                    (None, false) => Some(stderr),
+                    (None, true) => None,
                 };
-                Ok((
-                    WorkerOutcome::Success,
-                    (!combined.is_empty()).then_some(combined),
-                ))
+                Ok(WorkerExecution {
+                    outcome: WorkerOutcome::Success,
+                    output: combined,
+                    token_usage,
+                })
             }
             Ok(output) => {
                 let code = output
@@ -409,6 +453,52 @@ impl Worker for CodexWorker {
             )),
         }
     }
+}
+
+fn parse_codex_jsonl(output: &str) -> Result<(Option<String>, Option<TokenUsage>), String> {
+    let mut messages = Vec::new();
+    let mut usage = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let event: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid JSON event from Codex: {error}"))?;
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("item.completed")
+            && event
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("agent_message")
+            && let Some(text) = event
+                .pointer("/item/text")
+                .and_then(serde_json::Value::as_str)
+        {
+            messages.push(text.to_owned());
+        }
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("turn.completed")
+            && let Some(value) = event.get("usage")
+        {
+            let input_tokens = value
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64);
+            let output_tokens = value
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_i64);
+            let total_tokens = value
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| {
+                    input_tokens
+                        .zip(output_tokens)
+                        .map(|(input, output)| input + output)
+                });
+            if let Some(total_tokens) = total_tokens {
+                usage = Some(TokenUsage {
+                    total_tokens,
+                    input_tokens,
+                    output_tokens,
+                });
+            }
+        }
+    }
+    Ok(((!messages.is_empty()).then(|| messages.join("\n")), usage))
 }
 
 /// Antigravity CLI worker. Runs `agy` in headless print mode with JSON output
@@ -482,6 +572,32 @@ impl Worker for AntigravityWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_json_events_preserve_final_message_and_reported_usage() {
+        let events = r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30}}"#;
+        let (output, usage) = parse_codex_jsonl(events).unwrap();
+        assert_eq!(output.as_deref(), Some("done"));
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                total_tokens: 150,
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+            })
+        );
+    }
+
+    #[test]
+    fn codex_json_events_leave_unreported_usage_unavailable() {
+        let (output, usage) = parse_codex_jsonl(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+        )
+        .unwrap();
+        assert_eq!(output.as_deref(), Some("done"));
+        assert_eq!(usage, None);
+    }
 
     #[test]
     fn codex_commands_receive_the_registered_profile_environment() {

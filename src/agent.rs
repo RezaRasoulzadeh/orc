@@ -231,10 +231,13 @@ pub fn dispatch_with_worker_on_db(
     let worktree_dir = repo_path.join(&worktree_path);
     progress("worker spawned");
     progress("worker running");
-    match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
+    match worker.execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| {
         worker_output(line);
     }) {
-        Ok((outcome, output)) => {
+        Ok(execution) => {
+            let outcome = execution.outcome;
+            let output = execution.output;
+            let token_usage = execution.token_usage;
             match outcome {
                 WorkerOutcome::Success => {
                     progress("worker completed");
@@ -245,7 +248,13 @@ pub fn dispatch_with_worker_on_db(
                                 "{}\n\nPost-worker inspection failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(db, run_id, task_id, &output)?;
+                            db.update_agent_run_status_with_usage(
+                                run_id,
+                                "failed",
+                                Some(&output),
+                                token_usage,
+                            )?;
+                            db.update_task_status(task_id, TaskStatus::Blocked)?;
                             anyhow::bail!("could not inspect task worktree after worker completion")
                         }
                     };
@@ -254,7 +263,12 @@ pub fn dispatch_with_worker_on_db(
                             "{}\n\nDispatch result: no meaningful project changes.",
                             output.as_deref().unwrap_or_default()
                         );
-                        db.update_agent_run_status(run_id, "no_changes", Some(&output))?;
+                        db.update_agent_run_status_with_usage(
+                            run_id,
+                            "no_changes",
+                            Some(&output),
+                            token_usage,
+                        )?;
                         db.update_task_status(task_id, TaskStatus::Blocked)?;
                         anyhow::bail!(
                             "worker completed without meaningful project changes; task remains blocked"
@@ -267,7 +281,13 @@ pub fn dispatch_with_worker_on_db(
                                 "{}\n\nValidation setup failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(db, run_id, task_id, &output)?;
+                            db.update_agent_run_status_with_usage(
+                                run_id,
+                                "failed",
+                                Some(&output),
+                                token_usage,
+                            )?;
+                            db.update_task_status(task_id, TaskStatus::Blocked)?;
                             anyhow::bail!("validation setup failed for task {task_id}")
                         }
                     };
@@ -283,7 +303,13 @@ pub fn dispatch_with_worker_on_db(
                                 "{}\n\nValidation execution failed: {error:#}",
                                 output.as_deref().unwrap_or_default()
                             );
-                            block_automated_run(db, run_id, task_id, &output)?;
+                            db.update_agent_run_status_with_usage(
+                                run_id,
+                                "failed",
+                                Some(&output),
+                                token_usage,
+                            )?;
+                            db.update_task_status(task_id, TaskStatus::Blocked)?;
                             anyhow::bail!("validation execution failed for task {task_id}")
                         }
                     };
@@ -316,11 +342,22 @@ pub fn dispatch_with_worker_on_db(
                             )?;
                     }
                     if !report.is_success() {
-                        block_automated_run(db, run_id, task_id, &combined_output)?;
+                        db.update_agent_run_status_with_usage(
+                            run_id,
+                            "failed",
+                            Some(&combined_output),
+                            token_usage,
+                        )?;
+                        db.update_task_status(task_id, TaskStatus::Blocked)?;
                         anyhow::bail!("validation failed for task {task_id}; task remains blocked");
                     }
-                    db.update_agent_run_status(run_id, "completed", Some(&combined_output))
-                        .with_context(|| "failed to update agent run status to completed")?;
+                    db.update_agent_run_status_with_usage(
+                        run_id,
+                        "completed",
+                        Some(&combined_output),
+                        token_usage,
+                    )
+                    .with_context(|| "failed to update agent run status to completed")?;
                     db.update_task_status(task_id, TaskStatus::Review)
                         .with_context(|| "failed to set task status to review")?;
                     progress("review transition");
@@ -344,8 +381,13 @@ pub fn dispatch_with_worker_on_db(
                 WorkerOutcome::Failure(error) => {
                     // Mark agent run as failed and task as blocked
                     let error_msg = format!("Worker failed: {}", error);
-                    db.update_agent_run_status(run_id, "failed", Some(&error_msg))
-                        .with_context(|| "failed to update agent run status to failed")?;
+                    db.update_agent_run_status_with_usage(
+                        run_id,
+                        "failed",
+                        Some(&error_msg),
+                        token_usage,
+                    )
+                    .with_context(|| "failed to update agent run status to failed")?;
                     db.update_task_status(task_id, TaskStatus::Blocked)
                         .with_context(|| "failed to set task status to blocked")?;
                     anyhow::bail!("{}", error_msg);
@@ -456,7 +498,7 @@ pub fn revise_with_worker_on_db(
         anyhow::bail!("{message}")
     };
     progress("worker running");
-    let (outcome, output) = match worker.execute_with_progress(&prompt, &worktree_dir, &|line| {
+    let execution = match worker.execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| {
         worker_output(line);
     }) {
         Ok(result) => result,
@@ -464,6 +506,19 @@ pub fn revise_with_worker_on_db(
             progress("worker failed");
             return fail(error);
         }
+    };
+    let outcome = execution.outcome;
+    let output = execution.output;
+    let token_usage = execution.token_usage;
+    let fail = |message: String| -> Result<DispatchSummary> {
+        progress(if message.to_ascii_lowercase().contains("timeout") {
+            "worker timeout"
+        } else {
+            "revision failed"
+        });
+        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
+        db.update_task_status(task_id, TaskStatus::Blocked)?;
+        anyhow::bail!("{message}")
     };
     if let WorkerOutcome::Failure(error) = outcome {
         progress("worker failed");
@@ -496,7 +551,7 @@ pub fn revise_with_worker_on_db(
     if !report.is_success() {
         return fail(combined);
     }
-    db.update_agent_run_status(run_id, "completed", Some(&combined))?;
+    db.update_agent_run_status_with_usage(run_id, "completed", Some(&combined), token_usage)?;
     db.record_lifecycle_event(
         "validation_result",
         Some(task_id),

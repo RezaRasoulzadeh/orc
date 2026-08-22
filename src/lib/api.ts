@@ -58,11 +58,17 @@ export interface AgentRun {
   phase: string | null
   last_activity: string
 }
+export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null }
+export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
+export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[] }
+export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }
 
 export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
   runs: (limit: number) => invoke<AgentRun[]>('runs', { limit }),
+  runsWorkspace: (limit = 50, activityLimit = 100) => invoke<RunsWorkspace>('runs_workspace', { limit, activityLimit }),
+  runDetails: (runId: number, activityLimit = 100) => invoke<RunDetails | null>('run_details', { runId, activityLimit }),
   leadContext: (limit = 20) => invoke<LeadContext>('lead_context', { limit }),
   leadProposals: () => invoke<LeadProposal[]>('lead_proposals'),
   invokeLead: (message: string, config?: LeadProviderConfig) => invoke<LeadResponse>('invoke_lead', { message, config }),

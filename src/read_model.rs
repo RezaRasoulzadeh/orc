@@ -28,6 +28,31 @@ pub struct RunDetails {
     pub activity: Vec<LifecycleEvent>,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunsWorkspace {
+    pub runs: Vec<AgentRun>,
+    pub details: Vec<RunDetails>,
+}
+
+pub fn runs_workspace(
+    db: &crate::storage::Database,
+    limit: usize,
+    activity_limit: usize,
+) -> Result<RunsWorkspace> {
+    let project = db.get_project_id()?.context("no project found in DB")?;
+    let runs = db.list_agent_runs(project, limit)?;
+    let details = runs
+        .iter()
+        .map(|run| {
+            Ok(RunDetails {
+                run: run.clone(),
+                result: db.get_worker_result(run.id)?,
+                activity: db.list_lifecycle_events_for_run(run.id, activity_limit)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RunsWorkspace { runs, details })
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCapacity {
     pub agents: Vec<AgentDefinition>,
     pub busy: Vec<String>,
@@ -114,4 +139,45 @@ pub fn project_health(db: &crate::storage::Database) -> Result<ProjectHealth> {
         active_runs,
         unresolved_approvals,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::TaskPriority;
+    use crate::worker::TokenUsage;
+    use tempfile::tempdir;
+
+    #[test]
+    fn historical_run_details_expose_persisted_token_usage() {
+        let directory = tempdir().unwrap();
+        let db = crate::storage::Database::init(directory.path().join("orc.db")).unwrap();
+        let project = db.create_project("project").unwrap();
+        let task = db
+            .insert_task(project, "task", "work", "developer", TaskPriority::Normal)
+            .unwrap();
+        let run = db.create_agent_run(project, &task, "codex").unwrap();
+        db.update_agent_run_status_with_usage(
+            run,
+            "completed",
+            Some("complete"),
+            Some(TokenUsage {
+                total_tokens: 34,
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+            }),
+        )
+        .unwrap();
+
+        let details = run_details(&db, run, 10).unwrap().unwrap();
+        let result = details.result.unwrap();
+        assert_eq!(result.total_tokens, Some(34));
+        assert_eq!(result.input_tokens, Some(21));
+        assert_eq!(result.output_tokens, Some(13));
+        let workspace = runs_workspace(&db, 10, 10).unwrap();
+        assert_eq!(
+            workspace.details[0].result.as_ref().unwrap().total_tokens,
+            Some(34)
+        );
+    }
 }

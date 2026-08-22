@@ -34,6 +34,9 @@ pub struct WorkerResult {
     pub failure_category: Option<String>,
     pub duration_ms: Option<i64>,
     pub metadata: Option<String>,
+    pub total_tokens: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -408,7 +411,10 @@ impl Database {
                 outcome TEXT NOT NULL,
                 failure_category TEXT,
                 duration_ms INTEGER,
-                metadata TEXT
+                metadata TEXT,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER
             );
             CREATE TABLE IF NOT EXISTS lifecycle_events (
                 id INTEGER PRIMARY KEY,
@@ -674,6 +680,17 @@ impl Database {
 
     fn ensure_worker_results_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS worker_results (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, outcome TEXT NOT NULL, failure_category TEXT, duration_ms INTEGER, metadata TEXT)")?;
+        let columns = conn
+            .prepare("PRAGMA table_info(worker_results)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for column in ["total_tokens", "input_tokens", "output_tokens"] {
+            if !columns.iter().any(|value| value == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE worker_results ADD COLUMN {column} INTEGER"
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -1582,12 +1599,22 @@ impl Database {
         status: &str,
         output: Option<&str>,
     ) -> Result<bool, DbError> {
+        self.update_agent_run_status_with_usage(run_id, status, output, None)
+    }
+
+    pub fn update_agent_run_status_with_usage(
+        &self,
+        run_id: i64,
+        status: &str,
+        output: Option<&str>,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<bool, DbError> {
         let changed = self.conn.execute(
             "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
             params![status, output, run_id],
         )?;
         if changed != 0 && matches!(status, "completed" | "failed" | "no_changes") {
-            self.record_worker_result(run_id, status, output)?;
+            self.record_worker_result(run_id, status, output, token_usage)?;
         }
         Ok(changed != 0)
     }
@@ -1597,6 +1624,7 @@ impl Database {
         run_id: i64,
         status: &str,
         output: Option<&str>,
+        token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<(), DbError> {
         let outcome = match status {
             "completed" => "success",
@@ -1612,8 +1640,8 @@ impl Database {
             value => Some(value),
         };
         self.conn.execute(
-            "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4 FROM agent_runs WHERE id = ?1",
-            params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}")],
+            "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4, ?5, ?6, ?7 FROM agent_runs WHERE id = ?1",
+            params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}"), token_usage.map(|usage| usage.total_tokens), token_usage.and_then(|usage| usage.input_tokens), token_usage.and_then(|usage| usage.output_tokens)],
         )?;
         let (task_id, agent_id): (Option<String>, String) = self.conn.query_row(
             "SELECT task_id, agent FROM agent_runs WHERE id = ?1",
@@ -1632,17 +1660,17 @@ impl Database {
 
     pub fn insert_worker_result(&self, result: &WorkerResult) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![result.run_id, result.outcome, result.failure_category, result.duration_ms, result.metadata],
+            "INSERT INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![result.run_id, result.outcome, result.failure_category, result.duration_ms, result.metadata, result.total_tokens, result.input_tokens, result.output_tokens],
         )?;
         Ok(())
     }
 
     pub fn get_worker_result(&self, run_id: i64) -> Result<Option<WorkerResult>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT run_id, outcome, failure_category, duration_ms, metadata FROM worker_results WHERE run_id = ?1",
+            "SELECT run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens FROM worker_results WHERE run_id = ?1",
             params![run_id],
-            |row| Ok(WorkerResult { run_id: row.get(0)?, outcome: row.get(1)?, failure_category: row.get(2)?, duration_ms: row.get(3)?, metadata: row.get(4)? }),
+            |row| Ok(WorkerResult { run_id: row.get(0)?, outcome: row.get(1)?, failure_category: row.get(2)?, duration_ms: row.get(3)?, metadata: row.get(4)?, total_tokens: row.get(5)?, input_tokens: row.get(6)?, output_tokens: row.get(7)? }),
         ).optional()?)
     }
 
@@ -1671,7 +1699,7 @@ impl Database {
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
-        self.record_worker_result(run_id, "completed", Some(output))?;
+        self.record_worker_result(run_id, "completed", Some(output), None)?;
         Ok(task_id)
     }
 
@@ -1685,7 +1713,7 @@ impl Database {
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
-        self.record_worker_result(run_id, "failed", Some(reason))?;
+        self.record_worker_result(run_id, "failed", Some(reason), None)?;
         Ok(task_id)
     }
 

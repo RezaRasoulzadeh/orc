@@ -390,6 +390,7 @@ impl Database {
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
+        Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         Ok(Self { conn })
@@ -422,6 +423,7 @@ impl Database {
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
+        Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
@@ -555,6 +557,11 @@ impl Database {
 
     fn ensure_worker_results_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS worker_results (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, outcome TEXT NOT NULL, failure_category TEXT, duration_ms INTEGER, metadata TEXT)")?;
+        Ok(())
+    }
+
+    fn ensure_worktree_metadata_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS worktree_metadata (agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, branch_name TEXT NOT NULL, worktree_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
         Ok(())
     }
 

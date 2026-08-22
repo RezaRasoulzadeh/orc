@@ -26,6 +26,42 @@ fn tasks(state: tauri::State<'_, AppState>) -> Result<Vec<orc::task::Task>, Stri
 }
 
 #[tauri::command]
+fn queue(state: tauri::State<'_, AppState>) -> Result<orc::queue::QueueReport, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.queue().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn task_details(state: tauri::State<'_, AppState>, task_id: String, activity_limit: usize) -> Result<Option<orc::read_model::TaskDetails>, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.task_details(&task_id, activity_limit).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn review(state: tauri::State<'_, AppState>, task_id: String) -> Result<orc::review::ReviewSummary, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.review(&task_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn dispatch(state: tauri::State<'_, AppState>, task_id: String, agent_id: Option<String>) -> Result<orc::review::DispatchSummary, String> {
+    state.0.lock().map_err(|_| "application lock poisoned".to_string())?.dispatch(&task_id, agent_id.as_deref()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn task_action(state: tauri::State<'_, AppState>, action: String, task_id: String, reason: Option<String>, agent_id: Option<String>) -> Result<(), String> {
+    let app = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
+    match action.as_str() {
+        "dispatch" => app.dispatch(&task_id, agent_id.as_deref()).map(|_| ()),
+        "accept" => app.accept(&task_id),
+        "reject" => app.reject(&task_id, reason.as_deref()),
+        "cancel" => app.cancel(&task_id, reason.as_deref()).map_err(|error| error.to_string()),
+        "requeue" => app.requeue(&task_id),
+        "add_dependency" => app.add_dependency(&task_id, reason.as_deref().ok_or_else(|| "dependency id is required".to_string())?),
+        "remove_dependency" => app.remove_dependency(&task_id, reason.as_deref().ok_or_else(|| "dependency id is required".to_string())?).map(|_| ()),
+        "revise" => app.revise(&task_id, reason.as_deref().ok_or_else(|| "feedback is required".to_string())?, agent_id.as_deref().ok_or_else(|| "agent id is required".to_string())?),
+        _ => Err(format!("unknown task action: {action}")),
+    }.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn runs(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<orc::storage::AgentRun>, String> {
     state.0.lock().map_err(|_| "application lock poisoned".to_string())?.runs(limit).map_err(|error| error.to_string())
 }
@@ -96,7 +132,7 @@ pub fn run() -> anyhow::Result<()> {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![snapshot, tasks, runs, runs_workspace, run_details, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
+        .invoke_handler(tauri::generate_handler![snapshot, tasks, queue, task_details, review, dispatch, task_action, runs, runs_workspace, run_details, lead_context, lead_proposals, invoke_lead, apply_lead_proposal, reject_lead_proposal])
         .run(tauri::generate_context!())?;
     Ok(())
 }

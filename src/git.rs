@@ -4,13 +4,13 @@ use std::process::Command;
 
 const RUNTIME_ARTIFACTS: [&str; 3] = [".orc/orc.db", ".orc/orc.db-wal", ".orc/orc.db-shm"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangedFile {
     pub status: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
     pub stat: String,

@@ -18,6 +18,7 @@ pub struct Dashboard {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskDetails {
     pub task: Task,
+    pub queue: Option<crate::queue::QueueEntry>,
     pub runs: Vec<AgentRun>,
     pub activity: Vec<LifecycleEvent>,
 }
@@ -90,6 +91,7 @@ pub fn task_details(
     };
     Ok(Some(TaskDetails {
         task,
+        queue: crate::queue::compute_queue(db)?.find_item(id).cloned(),
         runs: db.list_agent_runs_for_task(id)?,
         activity: db.list_lifecycle_events_for_task(id, activity_limit)?,
     }))

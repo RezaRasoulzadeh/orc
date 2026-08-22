@@ -496,3 +496,81 @@ fn multiple_runs_per_task_are_tracked() {
     assert_eq!(runs[0].status, "failed");
     assert_eq!(runs[1].status, "completed");
 }
+
+#[test]
+fn scoped_lifecycle_limits_are_applied_after_scoping() {
+    let directory = TempDir::new().unwrap();
+    let db = Database::init(directory.path().join("state.sqlite")).unwrap();
+    let project = db.create_project("test").unwrap();
+    let target = db
+        .insert_task(
+            project,
+            "target",
+            "objective",
+            "dev",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let other = db
+        .insert_task(
+            project,
+            "other",
+            "objective",
+            "dev",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let target_run = db.create_agent_run(project, &target, "agent").unwrap();
+    let other_run = db.create_agent_run(project, &other, "agent").unwrap();
+    db.record_lifecycle_event("other", Some(&other), Some(other_run), None, None)
+        .unwrap();
+    db.record_lifecycle_event("target_old", Some(&target), Some(target_run), None, None)
+        .unwrap();
+    db.record_lifecycle_event("target_new", Some(&target), Some(target_run), None, None)
+        .unwrap();
+    db.record_lifecycle_event("run_new", Some(&other), Some(target_run), None, None)
+        .unwrap();
+
+    let task_events = db.list_lifecycle_events_for_task(&target, 2).unwrap();
+    assert_eq!(
+        task_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["target_new", "target_old"]
+    );
+    let run_events = db.list_lifecycle_events_for_run(target_run, 2).unwrap();
+    assert_eq!(
+        run_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_new", "target_new"]
+    );
+}
+
+#[test]
+fn worker_output_is_activity_without_changing_semantic_phase() {
+    let directory = TempDir::new().unwrap();
+    let db = Database::init(directory.path().join("state.sqlite")).unwrap();
+    let project = db.create_project("test").unwrap();
+    let task = db
+        .insert_task(
+            project,
+            "task",
+            "objective",
+            "dev",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let run = db.create_agent_run(project, &task, "agent").unwrap();
+    db.update_agent_run_phase(run, "executing").unwrap();
+    db.record_worker_output(run, "line").unwrap();
+
+    let events = db.list_lifecycle_events_for_run(run, 10).unwrap();
+    assert_eq!(events[0].kind, "worker_output");
+    assert_eq!(
+        db.get_agent_run(run).unwrap().unwrap().phase.as_deref(),
+        Some("executing")
+    );
+}

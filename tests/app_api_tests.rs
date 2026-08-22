@@ -2,6 +2,7 @@ use orc::app::OrcApp;
 use orc::protocol::{PROTOCOL_VERSION, PlanResponse, PlannedTask};
 use orc::storage::Database;
 use orc::task::TaskPriority;
+use std::sync::mpsc::TryRecvError;
 use tempfile::tempdir;
 
 fn app_with_task(name: &str) -> (tempfile::TempDir, OrcApp, String) {
@@ -28,6 +29,9 @@ fn app_with_task(name: &str) -> (tempfile::TempDir, OrcApp, String) {
             TaskPriority::Normal,
         )
         .unwrap();
+    db.update_task_status(&task, orc::task::TaskStatus::Active)
+        .unwrap();
+    db.create_agent_run(project, &task, "agent").unwrap();
     let app = OrcApp::open(&db_path, directory.path()).unwrap();
     (directory, app, task)
 }
@@ -72,4 +76,51 @@ fn app_plan_uses_database_validation() {
         questions: vec![],
     };
     assert!(app.apply_plan(&invalid).is_err());
+}
+
+#[test]
+fn app_subscription_receives_domain_events_in_order_without_replay() {
+    let (_directory, app, task) = app_with_task("events");
+    let subscription = app.subscribe();
+
+    app.requeue(&task).unwrap();
+    let first = subscription.recv().unwrap();
+    assert!(
+        matches!(first, orc::events::AppEvent::TaskLifecycle(ref event) if event.kind == "task_requeue")
+    );
+    assert_eq!(subscription.try_recv(), Err(TryRecvError::Empty));
+
+    let second_subscription = app.subscribe();
+    assert_eq!(second_subscription.try_recv(), Err(TryRecvError::Empty));
+    assert!(matches!(subscription.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
+fn disconnected_subscriber_does_not_affect_other_subscribers_or_operation() {
+    let (_directory, app, task) = app_with_task("disconnect");
+    let dropped = app.subscribe();
+    let remaining = app.subscribe();
+    drop(dropped);
+
+    app.requeue(&task).unwrap();
+    assert!(remaining.recv().is_ok());
+}
+
+#[test]
+fn persisted_history_reconstructs_without_subscriber() {
+    let (directory, app, task) = app_with_task("persisted");
+    app.requeue(&task).unwrap();
+    let history = app.lifecycle_events(10).unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|event| event.task_id.as_deref() == Some(&task))
+    );
+    drop(app);
+    let reopened = OrcApp::open(directory.path().join("state.sqlite"), directory.path()).unwrap();
+    assert_eq!(
+        reopened.task(&task).unwrap().unwrap().status.to_string(),
+        "backlog"
+    );
+    assert!(!reopened.lifecycle_events(10).unwrap().is_empty());
 }

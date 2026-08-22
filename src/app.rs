@@ -13,6 +13,7 @@ use crate::task::{Task, TaskScopeMode};
 pub struct OrcApp {
     db: Database,
     repo_path: PathBuf,
+    events: crate::events::EventHub,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,9 +26,16 @@ pub enum CancelError {
 
 impl OrcApp {
     pub fn open(db_path: impl AsRef<Path>, repo_path: impl AsRef<Path>) -> Result<Self> {
+        let events = crate::events::EventHub::new();
+        let mut db = Database::open(db_path)?;
+        let sink = events.clone();
+        db.set_lifecycle_sink(Some(std::sync::Arc::new(move |event| {
+            sink.publish(crate::events::AppEvent::from_lifecycle(event));
+        })));
         Ok(Self {
-            db: Database::open(db_path)?,
+            db,
             repo_path: repo_path.as_ref().to_path_buf(),
+            events,
         })
     }
 
@@ -51,6 +59,43 @@ impl OrcApp {
     }
     pub fn tasks(&self) -> Result<Vec<Task>> {
         Ok(self.db.list_tasks()?)
+    }
+    pub fn dashboard(&self, activity_limit: usize) -> Result<crate::read_model::Dashboard> {
+        crate::read_model::dashboard(&self.db, activity_limit)
+    }
+    pub fn task_details(
+        &self,
+        id: &str,
+        activity_limit: usize,
+    ) -> Result<Option<crate::read_model::TaskDetails>> {
+        crate::read_model::task_details(&self.db, id, activity_limit)
+    }
+    pub fn run_details(
+        &self,
+        id: i64,
+        activity_limit: usize,
+    ) -> Result<Option<crate::read_model::RunDetails>> {
+        crate::read_model::run_details(&self.db, id, activity_limit)
+    }
+    pub fn subscribe(&self) -> crate::events::EventSubscription {
+        self.events.subscribe()
+    }
+    pub fn lifecycle_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::db::LifecycleEvent>> {
+        Ok(self.db.list_lifecycle_events(limit)?)
+    }
+    pub fn agent_capacity(&self) -> Result<crate::read_model::AgentCapacity> {
+        crate::read_model::agent_capacity(&self.db)
+    }
+    pub fn project_health(&self) -> Result<crate::read_model::ProjectHealth> {
+        crate::read_model::project_health(&self.db)
+    }
+    pub fn planner_summary(&self) -> Result<crate::read_model::PlannerSummary> {
+        Ok(crate::read_model::PlannerSummary {
+            state: self.planning_state()?,
+        })
     }
     pub fn task(&self, id: &str) -> Result<Option<Task>> {
         Ok(self.db.get_task(id)?)
@@ -82,10 +127,11 @@ impl OrcApp {
         build_review(&self.db, task_id, &self.repo_path)
     }
     pub fn requeue(&self, task_id: &str) -> Result<()> {
-        Ok(self.db.requeue_task(
+        self.db.requeue_task(
             task_id,
             "Task manually requeued after interrupted Orc process recovery",
-        )?)
+        )?;
+        Ok(())
     }
     pub fn cancel(
         &self,
@@ -101,25 +147,28 @@ impl OrcApp {
         )))
     }
     pub fn accept(&self, task_id: &str) -> Result<()> {
-        agent::accept_task(&self.db, task_id, &self.repo_path)
+        agent::accept_task(&self.db, task_id, &self.repo_path)?;
+        Ok(())
     }
     pub fn reject(&self, task_id: &str, reason: Option<&str>) -> Result<()> {
-        agent::reject_task(&self.db, task_id, reason)
+        agent::reject_task(&self.db, task_id, reason)?;
+        Ok(())
     }
     pub fn dispatch(&self, task_id: &str, agent_id: Option<&str>) -> Result<DispatchSummary> {
-        agent::dispatch_selected_with_db_and_repo(
+        let result = agent::dispatch_selected_with_db_and_repo(
             &self.db,
             &self.repo_path,
             task_id,
             agent_id,
             None,
             None,
-        )
+        )?;
+        Ok(result)
     }
     pub fn revise(&self, task_id: &str, feedback: &str, agent_id: &str) -> Result<()> {
         let agent = self.db.get_agent(agent_id)?.context("agent not found")?;
         if agent.execution_mode == registry::MANUAL {
-            agent::revise_manual(task_id, feedback, &agent, &self.db, &self.repo_path)
+            agent::revise_manual(task_id, feedback, &agent, &self.db, &self.repo_path)?;
         } else {
             let worker =
                 crate::backend::WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
@@ -132,27 +181,32 @@ impl OrcApp {
                 &agent.id,
                 &crate::SystemValidationRunner,
             )?;
-            Ok(())
         }
+        Ok(())
     }
     pub fn submit_manual_run(&self, run_id: i64, output: &str) -> Result<String> {
-        agent::submit_run(&self.db, run_id, output)
+        let result = agent::submit_run(&self.db, run_id, output)?;
+        Ok(result)
     }
     pub fn fail_manual_run(&self, run_id: i64, reason: &str) -> Result<String> {
-        agent::fail_run(&self.db, run_id, reason)
+        let result = agent::fail_run(&self.db, run_id, reason)?;
+        Ok(result)
     }
     pub fn submit_patch(&self, run_id: i64, patch: &str) -> Result<agent::PatchSubmissionOutcome> {
         agent::submit_patch(&self.db, run_id, patch, &self.repo_path)
     }
     pub fn configure_agent(&self, agent: AgentDefinition) -> Result<()> {
         registry::validate_backend(&agent.backend)?;
-        Ok(self.db.insert_agent(&agent)?)
+        self.db.insert_agent(&agent)?;
+        Ok(())
     }
     pub fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        Ok(self.db.set_agent_enabled(id, enabled)?)
+        let result = self.db.set_agent_enabled(id, enabled)?;
+        Ok(result)
     }
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool> {
-        Ok(self.db.set_agent_priority(id, priority)?)
+        let result = self.db.set_agent_priority(id, priority)?;
+        Ok(result)
     }
     pub fn set_agent_profile(&self, id: &str, path: &str) -> Result<bool> {
         Ok(self.db.set_agent_profile_path(id, path)?)

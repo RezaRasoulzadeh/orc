@@ -12,7 +12,7 @@ fn priority_string(priority: TaskPriority) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRun {
     pub id: i64,
     pub project_id: i64,
@@ -27,7 +27,7 @@ pub struct AgentRun {
     pub last_activity: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerResult {
     pub run_id: i64,
     pub outcome: String,
@@ -36,7 +36,7 @@ pub struct WorkerResult {
     pub metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleEvent {
     pub id: i64,
     pub timestamp: String,
@@ -47,7 +47,7 @@ pub struct LifecycleEvent {
     pub payload: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalRequest {
     pub id: i64,
     pub reason: String,
@@ -88,6 +88,7 @@ pub enum DbError {
 
 pub struct Database {
     conn: Connection,
+    lifecycle_sink: Option<std::sync::Arc<dyn Fn(LifecycleEvent) + Send + Sync>>,
 }
 
 impl Database {
@@ -393,7 +394,10 @@ impl Database {
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            lifecycle_sink: None,
+        })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
@@ -406,7 +410,10 @@ impl Database {
         let conn = Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Self::configure(&conn)?;
         Self::ensure_registry_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            lifecycle_sink: None,
+        })
     }
 
     fn configure(conn: &Connection) -> Result<(), DbError> {
@@ -446,7 +453,30 @@ impl Database {
             "INSERT INTO lifecycle_events (kind, task_id, run_id, agent_id, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![kind, task_id, run_id, agent_id, payload],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(LifecycleEvent {
+                id,
+                timestamp: self.conn.query_row(
+                    "SELECT timestamp FROM lifecycle_events WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?,
+                kind: kind.to_owned(),
+                task_id: task_id.map(str::to_owned),
+                run_id,
+                agent_id: agent_id.map(str::to_owned),
+                payload: payload.map(str::to_owned),
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn set_lifecycle_sink(
+        &mut self,
+        sink: Option<std::sync::Arc<dyn Fn(LifecycleEvent) + Send + Sync>>,
+    ) {
+        self.lifecycle_sink = sink;
     }
 
     pub fn list_lifecycle_events(&self, limit: usize) -> Result<Vec<LifecycleEvent>, DbError> {
@@ -464,6 +494,48 @@ impl Database {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_lifecycle_events_for_task(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LifecycleEvent>, DbError> {
+        self.list_lifecycle_events_scoped("task_id = ?1", params![task_id], limit)
+    }
+
+    pub fn list_lifecycle_events_for_run(
+        &self,
+        run_id: i64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleEvent>, DbError> {
+        self.list_lifecycle_events_scoped("run_id = ?1", params![run_id], limit)
+    }
+
+    fn list_lifecycle_events_scoped(
+        &self,
+        predicate: &str,
+        values: impl rusqlite::Params,
+        limit: usize,
+    ) -> Result<Vec<LifecycleEvent>, DbError> {
+        let sql = format!(
+            "SELECT id, timestamp, kind, task_id, run_id, agent_id, payload FROM lifecycle_events WHERE {predicate} ORDER BY id DESC LIMIT {limit}"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query(values)?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(LifecycleEvent {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                kind: row.get(2)?,
+                task_id: row.get(3)?,
+                run_id: row.get(4)?,
+                agent_id: row.get(5)?,
+                payload: row.get(6)?,
+            });
+        }
+        Ok(events)
     }
 
     fn ensure_approval_request_columns(conn: &Connection) -> Result<(), DbError> {
@@ -1426,7 +1498,23 @@ impl Database {
     }
 
     pub fn update_agent_run_phase(&self, run_id: i64, phase: &str) -> Result<bool, DbError> {
-        Ok(self.conn.execute("UPDATE agent_runs SET phase = ?1, last_activity = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')", params![phase, run_id])? != 0)
+        let changed = self.conn.execute("UPDATE agent_runs SET phase = ?1, last_activity = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')", params![phase, run_id])? != 0;
+        if changed {
+            let kind = if phase == "validation started" {
+                "validation_started"
+            } else if phase == "validation completed" {
+                "validation_completed"
+            } else {
+                "run_phase_changed"
+            };
+            self.record_lifecycle_event(kind, None, Some(run_id), None, Some(phase))?;
+        }
+        Ok(changed)
+    }
+
+    pub fn record_worker_output(&self, run_id: i64, output: &str) -> Result<i64, DbError> {
+        self.touch_agent_run_activity(run_id)?;
+        self.record_lifecycle_event("worker_output", None, Some(run_id), None, Some(output))
     }
 
     pub fn touch_agent_run_activity(&self, run_id: i64) -> Result<bool, DbError> {

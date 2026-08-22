@@ -41,6 +41,30 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const AUTOMATED: &str = "automated";
 pub const MANUAL: &str = "manual";
 
+#[derive(Debug, serde::Deserialize)]
+struct AgentConfigMetadata {
+    manual_workspace_url: Option<String>,
+}
+
+pub fn manual_workspace_url(agent: &AgentDefinition) -> Result<Option<String>> {
+    if agent.execution_mode != MANUAL {
+        return Ok(None);
+    }
+    if let Some(metadata) = &agent.config_metadata {
+        let metadata: AgentConfigMetadata = serde_json::from_str(metadata).map_err(|error| {
+            anyhow::anyhow!("invalid config_metadata for agent '{}': {error}", agent.id)
+        })?;
+        if let Some(url) = metadata.manual_workspace_url {
+            return Ok(Some(url));
+        }
+    }
+    Ok(match agent.backend.as_str() {
+        "chatgpt" => Some("https://chatgpt.com/".into()),
+        "claude" => Some("https://claude.ai/".into()),
+        _ => None,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReasoningEffort {
     None,

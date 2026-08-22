@@ -10,6 +10,13 @@ use crate::storage::db::ApprovalRequest;
 use crate::storage::{AgentRun, Database};
 use crate::task::{Task, TaskScopeMode};
 
+#[derive(Debug, serde::Serialize)]
+pub struct ManualRunContext {
+    pub run: AgentRun,
+    pub task: Task,
+    pub task_packet: String,
+}
+
 pub struct OrcApp {
     db: Database,
     repo_path: PathBuf,
@@ -222,6 +229,39 @@ impl OrcApp {
     pub fn agents(&self) -> Result<Vec<AgentDefinition>> {
         Ok(self.db.list_agents()?)
     }
+    pub fn manual_runs(&self, agent_id: &str) -> Result<Vec<ManualRunContext>> {
+        let agent = registry::get_agent(&self.db, agent_id)?;
+        if agent.execution_mode != registry::MANUAL {
+            anyhow::bail!("agent '{}' is not a manual agent", agent_id)
+        }
+        let project_id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        let project = self.db.get_project_name()?.unwrap_or_else(|| "orc".into());
+        let contract = crate::contract::load_contract(self.repo_path.join(".orc/engineering.md"))?;
+        self.db
+            .list_agent_runs(project_id, usize::MAX)?
+            .into_iter()
+            .filter(|run| run.agent == agent_id && run.status == "waiting_external")
+            .map(|run| {
+                let task_id = run
+                    .task_id
+                    .as_deref()
+                    .context("manual run has no task id")?;
+                let task = self
+                    .db
+                    .get_task(task_id)?
+                    .context("manual run task not found")?;
+                let task_packet = agent::build_manual_packet(&contract, &project, &task, agent_id);
+                Ok(ManualRunContext {
+                    run,
+                    task,
+                    task_packet,
+                })
+            })
+            .collect()
+    }
     pub fn approvals(&self) -> Result<Vec<ApprovalRequest>> {
         let id = self
             .db
@@ -318,13 +358,32 @@ impl OrcApp {
         Ok(result)
     }
     pub fn set_agent_profile(&self, id: &str, path: &str) -> Result<bool> {
+        registry::get_agent(&self.db, id)?;
         Ok(self.db.set_agent_profile_path(id, path)?)
     }
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<bool> {
+        let agent = registry::get_agent(&self.db, id)?;
+        if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
+            anyhow::bail!("agent '{}' does not support Codex model settings", id)
+        }
         Ok(self.db.set_agent_model(id, model)?)
     }
     pub fn set_agent_effort(&self, id: &str, effort: registry::ReasoningEffort) -> Result<bool> {
+        let agent = registry::get_agent(&self.db, id)?;
+        if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
+            anyhow::bail!("agent '{}' does not support Codex reasoning settings", id)
+        }
         Ok(self.db.set_agent_reasoning_effort(id, effort)?)
+    }
+    pub fn sync_agent_capacity(&self, id: &str) -> Result<()> {
+        let agent = registry::get_agent(&self.db, id)?;
+        crate::codex_app_server::sync_agent(
+            &self.db,
+            &agent,
+            &crate::codex_app_server::CodexAppServer,
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(())
     }
     pub fn set_task_scope(&self, id: &str, scope: TaskScopeMode) -> Result<bool> {
         Ok(self.db.set_task_scope(id, scope)?)

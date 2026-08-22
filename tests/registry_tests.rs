@@ -29,6 +29,25 @@ fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
 }
 
 #[test]
+fn manual_workspace_url_uses_metadata_then_backend_mapping() {
+    let mut manual = agent("manual", 1, registry::AVAILABLE);
+    manual.execution_mode = registry::MANUAL.into();
+    manual.backend = "chatgpt".into();
+    assert_eq!(
+        registry::manual_workspace_url(&manual).unwrap().as_deref(),
+        Some("https://chatgpt.com/")
+    );
+    manual.config_metadata =
+        Some(serde_json::json!({ "manual_workspace_url": "https://example.com/work" }).to_string());
+    assert_eq!(
+        registry::manual_workspace_url(&manual).unwrap().as_deref(),
+        Some("https://example.com/work")
+    );
+    manual.config_metadata = Some("not-json".into());
+    assert!(registry::manual_workspace_url(&manual).is_err());
+}
+
+#[test]
 fn registry_persists_multiple_profiles_and_reopens() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("orc.db");

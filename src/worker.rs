@@ -493,7 +493,8 @@ impl CodexWorker {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let (final_output, token_usage) = parse_codex_jsonl(&stdout)?;
+                let (final_output, token_usage) =
+                    parse_codex_jsonl(&stdout, schema_path.is_some())?;
                 let combined = match (final_output, stderr.is_empty()) {
                     (Some(output), true) => Some(output),
                     (Some(output), false) => Some(format!("{output}\n{stderr}")),
@@ -521,8 +522,12 @@ impl CodexWorker {
     }
 }
 
-fn parse_codex_jsonl(output: &str) -> Result<(Option<String>, Option<TokenUsage>), String> {
+fn parse_codex_jsonl(
+    output: &str,
+    structured: bool,
+) -> Result<(Option<String>, Option<TokenUsage>), String> {
     let mut messages = Vec::new();
+    let mut final_message = None;
     let mut usage = None;
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let event: serde_json::Value = serde_json::from_str(line)
@@ -536,7 +541,11 @@ fn parse_codex_jsonl(output: &str) -> Result<(Option<String>, Option<TokenUsage>
                 .pointer("/item/text")
                 .and_then(serde_json::Value::as_str)
         {
-            messages.push(text.to_owned());
+            if structured {
+                final_message = Some(text.to_owned());
+            } else {
+                messages.push(text.to_owned());
+            }
         }
         if event.get("type").and_then(serde_json::Value::as_str) == Some("turn.completed")
             && let Some(value) = event.get("usage")
@@ -564,7 +573,12 @@ fn parse_codex_jsonl(output: &str) -> Result<(Option<String>, Option<TokenUsage>
             }
         }
     }
-    Ok(((!messages.is_empty()).then(|| messages.join("\n")), usage))
+    let output = if structured {
+        final_message
+    } else {
+        (!messages.is_empty()).then(|| messages.join("\n"))
+    };
+    Ok((output, usage))
 }
 
 /// Antigravity CLI worker. Runs `agy` in headless print mode with JSON output
@@ -643,7 +657,7 @@ mod tests {
     fn codex_json_events_preserve_final_message_and_reported_usage() {
         let events = r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
 {"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30}}"#;
-        let (output, usage) = parse_codex_jsonl(events).unwrap();
+        let (output, usage) = parse_codex_jsonl(events, false).unwrap();
         assert_eq!(output.as_deref(), Some("done"));
         assert_eq!(
             usage,
@@ -659,9 +673,19 @@ mod tests {
     fn codex_json_events_leave_unreported_usage_unavailable() {
         let (output, usage) = parse_codex_jsonl(
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+            false,
         )
         .unwrap();
         assert_eq!(output.as_deref(), Some("done"));
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn codex_structured_json_events_use_only_the_final_message() {
+        let events = r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"verdict\":\"reviewing\"}"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"verdict\":\"revise\"}"}}"#;
+        let (output, usage) = parse_codex_jsonl(events, true).unwrap();
+        assert_eq!(output.as_deref(), Some(r#"{"verdict":"revise"}"#));
         assert_eq!(usage, None);
     }
 

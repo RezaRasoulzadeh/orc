@@ -26,6 +26,12 @@ pub enum TaskCommand {
         depends_on: Vec<String>,
     },
     List,
+    /// Irreversibly delete a task and its persisted state.
+    Purge {
+        task_id: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Recover an interrupted active task or failed blocked task and return it to the queue.
     Requeue {
         task_id: String,
@@ -151,6 +157,10 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
+        TaskCommand::Purge { task_id, force } => {
+            OrcApp::open(db_path, ".")?.purge_task(&task_id, force)?;
+            println!("Purged task {}", task_id);
+        }
         TaskCommand::Requeue { task_id } => {
             OrcApp::open(db_path, ".")?.requeue(&task_id)?;
             println!("Requeued task {task_id}");

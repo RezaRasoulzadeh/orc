@@ -425,12 +425,40 @@ impl OrcApp {
     }
     pub fn configure_agent(&self, agent: AgentDefinition) -> Result<()> {
         registry::validate_backend(&agent.backend)?;
+        if (agent.model.is_some() || agent.reasoning_effort.is_some())
+            && (agent.backend != "codex" || agent.execution_mode == registry::MANUAL)
+        {
+            anyhow::bail!(
+                "only automated Codex agents support model and reasoning-effort configuration"
+            );
+        }
+        if agent.execution_mode == registry::AUTOMATED
+            && !matches!(agent.backend.as_str(), "codex" | "copilot" | "antigravity")
+        {
+            anyhow::bail!("backend '{}' requires --mode manual", agent.backend);
+        }
         self.db.insert_agent(&agent)?;
         Ok(())
     }
     pub fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let result = self.db.set_agent_enabled(id, enabled)?;
         Ok(result)
+    }
+    pub fn set_agent_availability(
+        &self,
+        id: &str,
+        available: bool,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.db.set_agent_availability(
+            id,
+            if available {
+                registry::AVAILABLE
+            } else {
+                registry::UNAVAILABLE
+            },
+            reason,
+        )?)
     }
     pub fn remove_agent(&self, id: &str) -> Result<()> {
         self.db.archive_agent(id).map_err(anyhow::Error::from)
@@ -456,6 +484,15 @@ impl OrcApp {
             anyhow::bail!("agent '{}' does not support Codex reasoning settings", id)
         }
         Ok(self.db.set_agent_reasoning_effort(id, effort)?)
+    }
+    pub fn set_agent_quota(&self, id: &str, remaining: i64, reset: Option<&str>) -> Result<bool> {
+        Ok(self.db.set_agent_quota(id, remaining, reset)?)
+    }
+    pub fn clear_agent_quota(&self, id: &str) -> Result<bool> {
+        Ok(self.db.clear_agent_quota(id)?)
+    }
+    pub fn set_quota_reserve(&self, remaining: i64) -> Result<()> {
+        Ok(self.db.set_quota_reserve(remaining)?)
     }
     pub fn execution_template(
         &self,
@@ -486,6 +523,31 @@ impl OrcApp {
     }
     pub fn set_task_scope(&self, id: &str, scope: TaskScopeMode) -> Result<bool> {
         Ok(self.db.set_task_scope(id, scope)?)
+    }
+    pub fn set_task_required_capabilities(
+        &self,
+        id: &str,
+        capabilities: &[String],
+    ) -> Result<bool> {
+        Ok(self.db.set_task_required_capabilities(id, capabilities)?)
+    }
+    pub fn add_task_context(&self, id: &str, paths: &[String]) -> Result<bool> {
+        let task = self.task(id)?.context("task not found")?;
+        let mut values = task.context_files;
+        values.extend_from_slice(paths);
+        Ok(self.db.set_task_context(id, &values)?)
+    }
+    pub fn clear_task_context(&self, id: &str) -> Result<bool> {
+        Ok(self.db.set_task_context(id, &[])?)
+    }
+    pub fn add_expected_changes(&self, id: &str, paths: &[String]) -> Result<bool> {
+        let task = self.task(id)?.context("task not found")?;
+        let mut values = task.expected_changes;
+        values.extend_from_slice(paths);
+        Ok(self.db.set_task_expected_changes(id, &values)?)
+    }
+    pub fn clear_expected_changes(&self, id: &str) -> Result<bool> {
+        Ok(self.db.set_task_expected_changes(id, &[])?)
     }
     pub fn apply_plan(
         &self,

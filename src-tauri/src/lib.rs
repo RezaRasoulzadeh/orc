@@ -13,6 +13,18 @@ struct RegistryState(Mutex<project::ProjectRegistry>);
 
 struct SessionState(Mutex<Option<project::ProjectSession>>);
 
+fn remove_project_state(
+    registry: &mut project::ProjectRegistry,
+    session: &mut Option<project::ProjectSession>,
+    id: &str,
+) -> anyhow::Result<bool> {
+    let removed = registry.remove(id)?;
+    if removed && session.as_ref().is_some_and(|active| active.project.id == id) {
+        *session = None;
+    }
+    Ok(removed)
+}
+
 struct SessionGuard<'a>(std::sync::MutexGuard<'a, Option<project::ProjectSession>>);
 
 impl std::ops::Deref for SessionGuard<'_> {
@@ -65,13 +77,44 @@ fn register_project(
 }
 
 #[tauri::command]
-fn remove_project(state: tauri::State<'_, RegistryState>, id: String) -> Result<bool, String> {
-    state
+fn import_project(
+    state: tauri::State<'_, RegistryState>,
+    root: String,
+    display_name: Option<String>,
+) -> Result<project::RegisteredProject, String> {
+    register_project(state, root, display_name)
+}
+
+#[tauri::command]
+fn project_availability(
+    state: tauri::State<'_, RegistryState>,
+    id: String,
+) -> Result<project::ProjectAvailability, String> {
+    state.0.lock().map_err(|_| "project registry lock poisoned".to_string())?
+        .availability(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn current_project(state: tauri::State<'_, AppState>) -> Result<Option<project::RegisteredProject>, String> {
+    let guard = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
+    Ok(guard.0.as_ref().map(|session| session.project.clone()))
+}
+
+#[tauri::command]
+fn remove_project(
+    app_state: tauri::State<'_, AppState>,
+    registry_state: tauri::State<'_, RegistryState>,
+    id: String,
+) -> Result<bool, String> {
+    let mut registry = registry_state
         .0
         .lock()
-        .map_err(|_| "project registry lock poisoned".to_string())?
-        .remove(&id)
-        .map_err(|error| error.to_string())
+        .map_err(|_| "project registry lock poisoned".to_string())?;
+    let mut session = app_state
+        .0
+        .lock()
+        .map_err(|_| "application lock poisoned".to_string())?;
+    remove_project_state(&mut registry, &mut session, &id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -332,6 +375,43 @@ fn close_manual_workspace(app_handle: tauri::AppHandle, agent_id: String) -> Res
         window.close().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod project_lifecycle_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn registered_projects() -> (tempfile::TempDir, project::ProjectRegistry) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".orc")).unwrap();
+        orc::Database::init(root.join(".orc/orc.db")).unwrap();
+        let mut registry = project::ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
+        registry.register(root, None).unwrap();
+        (dir, registry)
+    }
+
+    #[test]
+    fn removing_active_project_closes_session() {
+        let (_dir, mut registry) = registered_projects();
+        let project = registry.projects().pop().unwrap();
+        let mut session = Some(project::ProjectSession::open(project.clone()).unwrap());
+
+        assert!(remove_project_state(&mut registry, &mut session, &project.id).unwrap());
+        assert!(session.is_none());
+        assert!(registry.projects().is_empty());
+    }
+
+    #[test]
+    fn removing_inactive_project_preserves_session() {
+        let (_dir, mut registry) = registered_projects();
+        let project = registry.projects().pop().unwrap();
+        let mut session = None;
+
+        assert!(remove_project_state(&mut registry, &mut session, &project.id).unwrap());
+        assert!(session.is_none());
+    }
 }
 
 #[tauri::command]
@@ -698,9 +778,12 @@ pub fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             registered_projects,
             register_project,
+            import_project,
+            project_availability,
             remove_project,
             open_project,
             close_project,
+            current_project,
             snapshot,
             tasks,
             agents,

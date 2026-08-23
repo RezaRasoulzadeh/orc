@@ -316,7 +316,7 @@ impl OrcApp {
     pub fn requeue(&self, task_id: &str) -> Result<()> {
         self.db.requeue_task(
             task_id,
-            "Task manually requeued after interrupted Orc process recovery",
+            "Operator manually requeued task after recoverable run failure",
         )?;
         Ok(())
     }

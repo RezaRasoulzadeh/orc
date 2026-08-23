@@ -79,6 +79,43 @@ fn app_plan_uses_database_validation() {
 }
 
 #[test]
+fn blocked_failed_task_can_be_requeued_without_losing_run_history() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("state.sqlite");
+    let db = Database::init(&database).unwrap();
+    let project = db.create_project("recovery").unwrap();
+    let task = db
+        .insert_task(
+            project,
+            "task",
+            "objective",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let run = db.create_agent_run(project, &task, "agent").unwrap();
+    db.update_agent_run_status(run, "failed", Some("validation failed"))
+        .unwrap();
+    db.update_task_status(&task, orc::task::TaskStatus::Blocked)
+        .unwrap();
+
+    let app = OrcApp::open(&database, directory.path()).unwrap();
+    app.requeue(&task).unwrap();
+
+    assert_eq!(
+        app.task(&task).unwrap().unwrap().status,
+        orc::task::TaskStatus::Backlog
+    );
+    assert_eq!(app.runs_workspace(10, 10).unwrap().runs[0].status, "failed");
+    assert!(
+        app.lifecycle_events(10)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "task_requeue" && event.task_id.as_deref() == Some(&task))
+    );
+}
+
+#[test]
 fn app_subscription_receives_domain_events_in_order_without_replay() {
     let (_directory, app, task) = app_with_task("events");
     let subscription = app.subscribe();

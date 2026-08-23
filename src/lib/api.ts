@@ -28,7 +28,9 @@ export interface QueueReport {
   cancelled: QueueEntry[]
   backlog: QueueEntry[]
 }
-export interface AgentDefinition { id: string; backend: string; execution_mode: string; display_name: string; enabled: boolean; priority: number; capabilities: string[]; status: string; unavailable_reason: string | null; profile_path: string | null; model: string | null; reasoning_effort: string | null; config_metadata: string | null; quota_remaining_percent: number | null; quota_reset_at: string | null; quota_checked_at: string | null; quota_source: string | null; quota_limits: unknown | null }
+export interface AgentDefinition { id: string; backend: string; execution_mode: string; display_name: string; enabled: boolean; priority: number; capabilities: string[]; status: string; unavailable_reason: string | null; profile_path: string | null; model: string | null; reasoning_effort: string | null; config_metadata: string | null; quota_remaining_percent: number | null; quota_reset_at: string | null; quota_checked_at: string | null; quota_source: string | null; quota_limits: unknown | null; actions: AgentActionProfile['action'][] }
+export interface CreateTaskInput { title: string; objective: string; role: string; priority: Task['priority']; required_capabilities: string[]; scope_mode: Task['scope_mode']; context_files: string[]; expected_changes: string[]; dependencies: string[] }
+export interface AgentActionProfile { action: 'code' | 'review' | 'plan' | 'lead'; model: string | null; reasoning_effort: string | null }
 export interface Dashboard { project_name: string; repository_path: string; queue: QueueReport; tasks: Task[]; agents: AgentDefinition[]; approvals: ApprovalRequest[]; recent_activity: LifecycleEvent[]; running_agents: AgentRun[]; capacity: AgentCapacity; outcome_trends: Record<string, number>; repository_available: boolean }
 export interface AgentCapacity { agents: AgentDefinition[]; busy: string[]; quota_reserve_percent: number }
 export interface ApprovalRequest { id: number; reason: string; resolved: boolean }
@@ -80,6 +82,11 @@ export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
   agents: () => invoke<AgentDefinition[]>('agents'),
+  createTask: (input: CreateTaskInput) => invoke<string>('create_task', { input }),
+  configureAgentRecord: (agent: unknown) => invoke<void>('configure_agent_record', { agent }),
+  archiveAgent: (id: string) => invoke<void>('archive_agent', { id }),
+  agentActions: (id: string) => invoke<AgentActionProfile[]>('agent_actions', { id }),
+  configureAgentAction: (id: string, action: AgentActionProfile['action'], enabled: boolean) => invoke<void>('configure_agent_action', { id, action, enabled }),
   configureAgent: (id: string, field: string, value: string) => invoke<void>('configure_agent', { id, field, value }),
   syncAgent: (id: string) => invoke<void>('sync_agent', { id }),
   manualRuns: (agentId: string) => invoke<ManualRunContext[]>('manual_runs', { agentId }),

@@ -37,9 +37,22 @@ const selectedTask = ref<string | null>(null)
 const taskDetails = ref<TaskDetails | null>(null)
 const taskReview = ref<ReviewSummary | null>(null)
 const taskError = ref('')
+const taskModal = ref(false)
+const newTaskTitle = ref('')
+const newTaskObjective = ref('')
+const newTaskRole = ref('developer')
 const agentList = ref<AgentDefinition[]>([])
 const selectedAgent = ref<string | null>(null)
 const agentError = ref('')
+const agentModal = ref(false)
+const agentArchiveModal = ref(false)
+const newAgentId = ref('')
+const newAgentDisplayName = ref('')
+const newAgentBackend = ref('codex')
+const newAgentMode = ref('automated')
+const newAgentPriority = ref('0')
+const newAgentCapabilities = ref('')
+const newAgentProfile = ref('')
 const manualRuns = ref<ManualRunContext[]>([])
 const selectedManualRunId = ref<number | null>(null)
 const workspaceInfo = ref<ManualWorkspaceInfo | null>(null)
@@ -65,6 +78,10 @@ function blockingReason(reason: QueueEntry['blocking_reasons'][number]) {
   return reason.kind.replaceAll('_', ' ')
 }
 async function selectTask(id: string) { selectedTask.value = id; taskError.value = ''; taskDetails.value = await api.taskDetails(id); taskReview.value = null }
+async function createTask() {
+  if (!newTaskTitle.value.trim() || !newTaskObjective.value.trim()) return
+  try { await api.createTask({ title: newTaskTitle.value.trim(), objective: newTaskObjective.value.trim(), role: newTaskRole.value.trim() || 'developer', priority: 'normal', required_capabilities: [], scope_mode: null, context_files: [], expected_changes: [], dependencies: [] }); taskModal.value = false; newTaskTitle.value = ''; newTaskObjective.value = ''; newTaskRole.value = 'developer'; await refreshSnapshot() } catch (err: unknown) { taskError.value = String(err) }
+}
 async function loadReview() { if (selectedTask.value) taskReview.value = await api.review(selectedTask.value) }
 function requiredInput(message: string) {
   const value = window.prompt(message)?.trim()
@@ -113,6 +130,12 @@ async function refreshRuns() { try { runsWorkspace.value = await api.runsWorkspa
 async function refreshAgents() { try { agentList.value = await api.agents(); if (!selectedAgent.value && agentList.value.length) selectedAgent.value = agentList.value[0].id; if (selectedAgent.value) await selectAgent(selectedAgent.value); agentError.value = '' } catch (err: unknown) { agentError.value = String(err) } }
 async function selectAgent(id: string) { selectedAgent.value = id; manualRuns.value = []; selectedManualRunId.value = null; workspaceInfo.value = null; const agent = agentList.value.find(item => item.id === id); if (agent?.execution_mode === 'manual') { try { [manualRuns.value, workspaceInfo.value] = await Promise.all([api.manualRuns(id), api.manualWorkspaceInfo(id)]); selectedManualRunId.value = manualRuns.value[0]?.run.id ?? null } catch (err: unknown) { agentError.value = String(err) } } }
 async function updateAgent(field: string, value: string) { if (!selectedAgent.value) return; try { await api.configureAgent(selectedAgent.value, field, value); await refreshAgents() } catch (err: unknown) { agentError.value = String(err) } }
+async function archiveSelectedAgent() { if (!selectedAgent.value) return; try { await api.archiveAgent(selectedAgent.value); agentArchiveModal.value = false; selectedAgent.value = null; await refreshAgents() } catch (err: unknown) { agentError.value = String(err) } }
+async function toggleAgentAction(action: 'code' | 'review' | 'plan' | 'lead') { if (!selectedAgentDefinition.value) return; try { await api.configureAgentAction(selectedAgentDefinition.value.id, action, !selectedAgentDefinition.value.actions.includes(action)); await refreshAgents() } catch (err: unknown) { agentError.value = String(err) } }
+async function createAgent() {
+  if (!newAgentId.value.trim()) return
+  try { await api.configureAgentRecord({ id: newAgentId.value.trim(), display_name: newAgentDisplayName.value.trim() || newAgentId.value.trim(), backend: newAgentBackend.value, execution_mode: newAgentMode.value, enabled: true, priority: Number.parseInt(newAgentPriority.value, 10) || 0, capabilities: newAgentCapabilities.value.split(',').map(value => value.trim()).filter(Boolean), status: 'available', unavailable_reason: null, profile_path: newAgentProfile.value.trim() || null, model: null, reasoning_effort: null, config_metadata: null, quota_remaining_percent: null, quota_reset_at: null, quota_checked_at: null, quota_source: null, quota_limits: null, actions: ['Code'] }); agentModal.value = false; newAgentId.value = ''; newAgentDisplayName.value = ''; newAgentCapabilities.value = ''; newAgentProfile.value = ''; await refreshAgents() } catch (err: unknown) { agentError.value = String(err) }
+}
 async function syncAgent() { if (!selectedAgent.value) return; try { await api.syncAgent(selectedAgent.value); await refreshAgents() } catch (err: unknown) { agentError.value = String(err) } }
 async function promptAgent(field: string, current: string | number | null) { const value = window.prompt(`New ${field.replace('_', ' ')}:`, String(current ?? ''))?.trim(); if (value != null && value !== '') await updateAgent(field, value) }
 async function workspaceAction(action: 'open' | 'close') { if (!selectedAgent.value) return; try { action === 'open' ? await api.openManualWorkspace(selectedAgent.value) : await api.closeManualWorkspace(selectedAgent.value); agentError.value = '' } catch (err: unknown) { agentError.value = String(err) } }
@@ -201,4 +224,9 @@ onMounted(async () => {
     </main>
     <button v-if="active !== 'Lead'" class="lead-fab" @click="leadPanel = !leadPanel; refreshLead()">LEAD</button><aside v-if="leadPanel" class="lead-panel"><div class="panel-head"><h3>LEAD</h3><button class="text-button" @click="leadPanel = false">CLOSE</button></div><p>Ask about the current project from any screen.</p><div v-if="leadError" class="notice compact">{{ leadError }}</div><form class="lead-composer compact" @submit.prevent="sendLead(panelMessage, 'panel')"><textarea v-model="panelMessage" aria-label="Message the Lead" placeholder="Ask the Lead…" rows="3" :disabled="leadLoading"></textarea><button class="apply-button" type="submit" :disabled="leadLoading || !panelMessage.trim()">{{ leadLoading ? 'SENDING…' : 'SEND' }}</button></form><button class="text-button open-lead" @click="active = 'Lead'; leadPanel = false; refreshLead()">OPEN WORKSPACE →</button></aside>
   </div>
+  <UiModal :open="taskModal" title="Create task" @close="taskModal = false"><form @submit.prevent="createTask"><label>Title<input v-model="newTaskTitle" required autofocus /></label><label>Objective<textarea v-model="newTaskObjective" required rows="4" /></label><label>Role<input v-model="newTaskRole" /></label><div class="lead-actions"><UiButton type="button" @click="taskModal = false">CANCEL</UiButton><UiButton variant="primary" type="submit">CREATE TASK</UiButton></div></form></UiModal>
+  <UiModal :open="agentModal" title="Register agent" @close="agentModal = false"><form @submit.prevent="createAgent"><label>Agent ID<input v-model="newAgentId" required autofocus /></label><label>Display name<input v-model="newAgentDisplayName" /></label><label>Backend<select v-model="newAgentBackend"><option value="codex">codex</option><option value="copilot">copilot</option><option value="antigravity">antigravity</option></select></label><label>Execution mode<select v-model="newAgentMode"><option value="automated">automated</option><option value="manual">manual</option></select></label><label>Priority<input v-model="newAgentPriority" type="number" /></label><label>Capabilities<input v-model="newAgentCapabilities" placeholder="comma,separated" /></label><label>Profile path<input v-model="newAgentProfile" /></label><div class="lead-actions"><UiButton type="button" @click="agentModal = false">CANCEL</UiButton><UiButton variant="primary" type="submit">REGISTER AGENT</UiButton></div></form></UiModal>
+  <UiModal :open="agentArchiveModal" title="Archive agent" @close="agentArchiveModal = false"><p>Archive {{ selectedAgent }}? This removes it from the selectable agent registry.</p><div class="lead-actions"><UiButton @click="agentArchiveModal = false">CANCEL</UiButton><UiButton variant="danger" @click="archiveSelectedAgent">ARCHIVE</UiButton></div></UiModal>
+  <div v-if="active === 'Tasks'" class="lead-actions"><UiButton variant="primary" @click="taskModal = true">NEW TASK</UiButton></div>
+  <div v-if="active === 'Agents'" class="lead-actions"><UiButton variant="primary" @click="agentModal = true">REGISTER AGENT</UiButton><UiButton v-if="selectedAgentDefinition" variant="danger" @click="agentArchiveModal = true">ARCHIVE SELECTED</UiButton><UiButton v-for="action in ['code', 'review', 'plan', 'lead']" :key="action" @click="toggleAgentAction(action as 'code' | 'review' | 'plan' | 'lead')">{{ selectedAgentDefinition?.actions.includes(action) ? '✓ ' : '' }}{{ action.toUpperCase() }}</UiButton></div>
 </template>

@@ -1,4 +1,6 @@
 fn main() {
-    orc_desktop_lib::run().expect("failed to start Orc desktop application");
+    if let Err(error) = orc_desktop_lib::run() {
+        eprintln!("Orc desktop startup failed: {error:#}");
+        std::process::exit(1);
+    }
 }
-

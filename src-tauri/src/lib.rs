@@ -1,5 +1,6 @@
 use orc::app::OrcApp;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
@@ -96,7 +97,7 @@ fn open_manual_workspace(app_handle: tauri::AppHandle, state: tauri::State<'_, A
     let url = {
         let app = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
         workspace_url(&app, &agent_id)?
-    }
+    };
     let label = format!("manual-{}", agent_id.chars().map(|character| if character.is_ascii_alphanumeric() { character } else { '-' }).collect::<String>());
     if let Some(window) = app_handle.get_webview_window(&label) {
         window.set_focus().map_err(|error| error.to_string())?;
@@ -227,12 +228,41 @@ fn reject_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> 
     if changed { Ok(()) } else { Err("Lead proposal is no longer pending".into()) }
 }
 
-pub fn run() -> anyhow::Result<()> {
-    let mut root = std::env::current_dir()?;
-    if root.file_name().is_some_and(|name| name == "src-tauri") {
-        root.pop();
+fn resolve_project_paths(manifest_dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let root = manifest_dir
+        .parent()
+        .filter(|_| manifest_dir.file_name().is_some_and(|name| name == "src-tauri"))
+        .unwrap_or(manifest_dir)
+        .to_path_buf();
+    let db_path = root.join(".orc/orc.db");
+    if !db_path.is_file() {
+        anyhow::bail!("project database not found at {}", db_path.display());
     }
-    let app = OrcApp::open(root.join(".orc/orc.db"), &root)?;
+    Ok((root, db_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_project_paths;
+    use std::path::Path;
+
+    #[test]
+    fn project_root_is_the_parent_of_src_tauri() {
+        let result = resolve_project_paths(Path::new("/workspace/orc/src-tauri"));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "project database not found at /workspace/orc/.orc/orc.db");
+    }
+
+    #[test]
+    fn missing_project_database_is_reported() {
+        let result = resolve_project_paths(Path::new("/workspace/orc"));
+        assert!(result.is_err());
+    }
+}
+
+pub fn run() -> anyhow::Result<()> {
+    let (root, db_path) = resolve_project_paths(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let app = OrcApp::open(db_path, &root)?;
     tauri::Builder::default()
         .manage(AppState(Mutex::new(app)))
         .setup(|handle| {

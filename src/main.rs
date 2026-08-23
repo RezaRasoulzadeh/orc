@@ -174,6 +174,16 @@ enum Command {
         #[arg(long, conflicts_with = "diff")]
         file: Option<String>,
     },
+    /// Run an unrestricted project-wide review using a task's captured evidence.
+    ProjectReview {
+        task_id: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
     /// Revise a reviewed task using review feedback.
     Revise {
         task_id: String,
@@ -650,6 +660,24 @@ fn main() -> Result<()> {
                 ),
             };
             println!("{output}");
+        }
+        Command::ProjectReview {
+            task_id,
+            agent,
+            model,
+            effort,
+        } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let (_, result) = app.automated_project_review_with_backend(
+                &task_id,
+                &orc::automated::ActionOverrides {
+                    agent_id: agent,
+                    model,
+                    reasoning_effort: effort,
+                },
+                &orc::automated::WorkerActionBackend::new("."),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Revise {
             task_id,

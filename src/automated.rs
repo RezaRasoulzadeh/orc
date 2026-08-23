@@ -570,6 +570,7 @@ mod tests {
 
     struct FakeBackend {
         calls: RefCell<Vec<Invocation>>,
+        output: String,
     }
 
     impl ActionBackend for FakeBackend {
@@ -609,7 +610,11 @@ mod tests {
                 AgentAction::Code => unreachable!(),
             };
             Ok(ActionExecution {
-                output: output.to_string(),
+                output: if action == AgentAction::Review {
+                    self.output.clone()
+                } else {
+                    output.to_string()
+                },
                 token_usage: Some(TokenUsage {
                     total_tokens: 30,
                     input_tokens: Some(20),
@@ -678,6 +683,15 @@ mod tests {
         let app = crate::app::OrcApp::open(&db_path, directory.path()).unwrap();
         let backend = FakeBackend {
             calls: RefCell::new(Vec::new()),
+            output: serde_json::json!({
+                "verdict": "revise",
+                "findings": ["missing coverage"],
+                "blocking_findings": [],
+                "non_blocking_findings": [],
+                "severity": "medium",
+                "revision_feedback": "add a test"
+            })
+            .to_string(),
         };
         let request = app.planning_request().unwrap();
         app.automated_plan_with_backend(&request, &ActionOverrides::default(), &backend)
@@ -723,6 +737,93 @@ mod tests {
                 .unwrap()
                 .is_some_and(|result| result.total_tokens == Some(30))
         }));
+    }
+
+    fn review_fixture(output: serde_json::Value) -> (Database, ReviewSummary, FakeBackend) {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("orc.db");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("project").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        db.insert_agent(&agent()).unwrap();
+        let task = db.get_task(&task).unwrap().unwrap();
+        let summary = ReviewSummary {
+            task,
+            run: None,
+            result: None,
+            worktree_path: None,
+            changes: crate::git::WorktreeChanges::default(),
+            change_evidence: None,
+        };
+        (
+            db,
+            summary,
+            FakeBackend {
+                calls: RefCell::new(Vec::new()),
+                output: output.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn task_review_passes_with_non_blocking_findings() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "REVISE",
+            "findings": ["unrelated project defect"],
+            "blocking_findings": [],
+            "non_blocking_findings": ["unrelated project defect"],
+            "severity": "low",
+            "revision_feedback": null
+        }));
+        let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
+            .unwrap()
+            .1;
+        assert_eq!(result.verdict, "PASS");
+        assert_eq!(result.non_blocking_findings.len(), 1);
+    }
+
+    #[test]
+    fn task_review_keeps_in_scope_and_regression_findings_blocking() {
+        for finding in ["missing expected change", "regression introduced by task"] {
+            let (db, summary, backend) = review_fixture(serde_json::json!({
+                "verdict": "REVISE",
+                "findings": [finding],
+                "blocking_findings": [finding],
+                "non_blocking_findings": [],
+                "severity": "high",
+                "revision_feedback": finding
+            }));
+            let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
+                .unwrap()
+                .1;
+            assert_eq!(result.verdict, "REVISE");
+            assert_eq!(result.blocking_findings, vec![finding]);
+        }
+    }
+
+    #[test]
+    fn project_review_can_report_broader_findings() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "REVISE",
+            "findings": ["architectural debt"],
+            "blocking_findings": [],
+            "non_blocking_findings": ["architectural debt"],
+            "severity": "low",
+            "revision_feedback": null
+        }));
+        let result = run_project_review(&db, &summary, &ActionOverrides::default(), &backend)
+            .unwrap()
+            .1;
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(result.non_blocking_findings, vec!["architectural debt"]);
     }
 
     #[test]

@@ -568,18 +568,20 @@ pub fn revise_with_worker_on_db(
     };
     progress("validation completed");
     let summary = report.summary();
-    let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
-    if !report.is_success() {
-        return fail(combined);
-    }
-    db.update_agent_run_status_with_usage(run_id, "completed", Some(&combined), token_usage)?;
+    let validation_evidence =
+        serde_json::to_string(&report).context("failed to serialize validation result")?;
     db.record_lifecycle_event(
         "validation_result",
         Some(task_id),
         Some(run_id),
         Some(agent_id),
-        Some(&serde_json::to_string(&report)?),
+        Some(&validation_evidence),
     )?;
+    let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
+    if !report.is_success() {
+        return fail(combined);
+    }
+    db.update_agent_run_status_with_usage(run_id, "completed", Some(&combined), token_usage)?;
     db.update_task_status(task_id, TaskStatus::Review)?;
     progress("review transition");
     Ok(DispatchSummary {
@@ -1062,12 +1064,33 @@ pub fn submit_patch_with_runner(
         anyhow::bail!("{}", err_msg);
     }
 
+    let changes = git::inspect_worktree(&absolute_worktree, repo_path)
+        .context("failed to capture applied patch change evidence")?;
+    let change_evidence = serde_json::to_string(&changes)
+        .context("failed to serialize applied patch change evidence")?;
+    db.record_lifecycle_event(
+        "change_evidence",
+        Some(&task_id),
+        Some(run_id),
+        Some(&run.agent),
+        Some(&change_evidence),
+    )?;
+
     // 3. Run project validation pipeline
     let validation_config = ValidationConfig::load(repo_path)?;
     let report = validation::run_validation_pipeline(
         validation_runner,
         &validation_config.commands,
         &absolute_worktree,
+    )?;
+    let validation_evidence =
+        serde_json::to_string(&report).context("failed to serialize validation result")?;
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(&task_id),
+        Some(run_id),
+        Some(&run.agent),
+        Some(&validation_evidence),
     )?;
 
     if !report.is_success() {

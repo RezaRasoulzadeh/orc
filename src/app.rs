@@ -83,6 +83,38 @@ impl OrcApp {
         let config = self.lead_provider_config()?.ok_or_else(|| anyhow::anyhow!("Lead is not configured. Configure one with `orc lead set <agent>` before running `orc ask`."))?;
         self.invoke_configured_lead(message, &config, context_limit)
     }
+    pub fn automated_plan_with_backend(
+        &self,
+        request: &crate::protocol::PlanningRequest,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<(i64, PlanResponse)> {
+        crate::automated::run_plan(&self.db, request, overrides, backend)
+    }
+    pub fn automated_plan(
+        &self,
+        request: &crate::protocol::PlanningRequest,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<(i64, PlanResponse)> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.automated_plan_with_backend(request, overrides, &backend)
+    }
+    pub fn automated_lead_with_backend(
+        &self,
+        message: &str,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<(i64, crate::lead::LeadResponse)> {
+        crate::automated::run_lead(&self.db, &self.repo_path, message, overrides, backend)
+    }
+    pub fn automated_lead(
+        &self,
+        message: &str,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<(i64, crate::lead::LeadResponse)> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.automated_lead_with_backend(message, overrides, &backend)
+    }
     pub fn lead_provider_config(&self) -> Result<Option<crate::lead::LeadProviderConfig>> {
         Ok(self.db.lead_provider_config()?)
     }
@@ -381,6 +413,23 @@ impl OrcApp {
     }
     pub fn review(&self, task_id: &str) -> Result<ReviewSummary> {
         build_review(&self.db, task_id, &self.repo_path)
+    }
+    pub fn automated_review_with_backend(
+        &self,
+        task_id: &str,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<(i64, crate::automated::ReviewResult)> {
+        let summary = self.review(task_id)?;
+        crate::automated::run_review(&self.db, &summary, overrides, backend)
+    }
+    pub fn automated_review(
+        &self,
+        task_id: &str,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<(i64, crate::automated::ReviewResult)> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.automated_review_with_backend(task_id, overrides, &backend)
     }
     pub fn requeue(&self, task_id: &str) -> Result<()> {
         self.db.requeue_task(

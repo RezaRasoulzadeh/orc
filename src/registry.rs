@@ -194,6 +194,31 @@ pub fn select_agent<'a>(
         })
 }
 
+pub fn select_agent_for_action<'a>(
+    agents: &'a [AgentDefinition],
+    action: AgentAction,
+    required_capabilities: &[String],
+) -> Result<&'a AgentDefinition> {
+    agents
+        .iter()
+        .filter(|agent| {
+            agent.execution_mode == AUTOMATED
+                && agent.is_selectable(required_capabilities)
+                && agent.supports_action(action)
+        })
+        .max_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.id.cmp(&left.id))
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no enabled, available agent supports action '{}'",
+                action.as_str()
+            )
+        })
+}
+
 pub fn get_agent(db: &Database, id: &str) -> Result<AgentDefinition> {
     db.get_agent(id)?
         .ok_or_else(|| anyhow::anyhow!("agent '{}' is not registered", id))

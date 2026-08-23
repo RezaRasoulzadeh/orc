@@ -1916,6 +1916,19 @@ impl Database {
         Ok(id)
     }
 
+    pub fn create_project_action_run(
+        &self,
+        project_id: i64,
+        action: &str,
+        agent: &str,
+        execution: AgentRunExecution<'_>,
+    ) -> Result<i64, DbError> {
+        self.conn.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, NULL, ?2, 'automated', ?3, ?4, ?5, ?6, 'running', CURRENT_TIMESTAMP, ?3, CURRENT_TIMESTAMP)", params![project_id, agent, action, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
+        let id = self.conn.last_insert_rowid();
+        self.record_lifecycle_event("action_start", None, Some(id), Some(agent), Some(action))?;
+        Ok(id)
+    }
+
     pub fn update_agent_run_status(
         &self,
         run_id: i64,

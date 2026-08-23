@@ -281,7 +281,7 @@ onUnmounted(() => { stopRunEvents?.() })
       <ProjectPicker v-if="!activeProject" :projects="projects" :import-project="importPickerProject" :adopt-project="adoptPickerProject" :open-project="openPickerProject" @changed="refreshProjects" />
       <UiModal :open="closeConfirmation" title="Close active project" @close="closeConfirmation = false"><p>Close {{ activeProject?.display_name }}? The project stays registered and repository data is unchanged.</p><div class="lead-actions"><UiButton @click="closeConfirmation = false">CANCEL</UiButton><UiButton variant="primary" @click="confirmCloseProject">CLOSE PROJECT</UiButton></div></UiModal>
       <UiModal :open="taskActionModal !== null" :title="taskActionModal ? humanStatus(taskActionModal.action) + ' task' : 'Task action'" @close="taskActionModal = null">
-        <form v-if="taskActionModal" @submit.prevent="continueTaskAction">
+        <form v-if="taskActionModal" class="ui-form" @submit.prevent="continueTaskAction">
           <label v-if="taskActionModal.action === 'add_dependency'">Dependency task ID<input v-model="taskActionModal.reason" required autofocus /></label>
           <label v-else> {{ taskActionModal.action === 'revise' ? 'Revision feedback' : `${humanStatus(taskActionModal.action)} reason` }}<textarea v-model="taskActionModal.reason" required autofocus rows="4"></textarea></label>
           <label v-if="taskActionModal.action === 'revise'">Revision agent<select v-model="taskActionModal.agentId" required><option value="" disabled>Select an agent</option><option v-for="agent in revisionAgents" :key="agent.id" :value="agent.id">{{ agent.display_name }}</option></select></label>

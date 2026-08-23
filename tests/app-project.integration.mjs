@@ -137,3 +137,12 @@ serial('activation failure remains in ProjectPicker without loading project-scop
   assert.deepEqual(api.calls.filter(call => ['snapshot', 'runsWorkspace', 'projectReport'].includes(call)), [])
   app.unmount()
 })
+
+test('shared UI styles define control, form, and action contracts', async () => {
+  const foundation = await readFile(join(process.cwd(), 'src/ui-foundation.css'), 'utf8')
+  assert.match(foundation, /--ui-control-height:40px/)
+  assert.match(foundation, /input,select,textarea\{[^}]*width:100%[^}]*min-height:var\(--ui-control-height\)[^}]*box-sizing:border-box/)
+  assert.match(foundation, /textarea\{min-height:104px;resize:vertical\}/)
+  assert.match(foundation, /form:not\(\.lead-composer\),\.ui-form\{display:grid;gap:var\(--ui-form-gap\)/)
+  assert.match(foundation, /\.ui-button,\.text-button,\.apply-button,\.reject-button,\.action-chip\{min-height:var\(--ui-hit-area\)/)
+})

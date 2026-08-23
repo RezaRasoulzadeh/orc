@@ -1,6 +1,6 @@
 {
   "name": "orc-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "typecheck": "vue-tsc --noEmit", "tauri": "tauri" },

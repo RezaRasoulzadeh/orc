@@ -95,6 +95,16 @@ fn project_availability(
 }
 
 #[tauri::command]
+fn relocate_project(
+    state: tauri::State<'_, RegistryState>,
+    id: String,
+    root: String,
+) -> Result<project::RegisteredProject, String> {
+    state.0.lock().map_err(|_| "project registry lock poisoned".to_string())?
+        .relocate(&id, root).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn current_project(state: tauri::State<'_, AppState>) -> Result<Option<project::RegisteredProject>, String> {
     let guard = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
     Ok(guard.0.as_ref().map(|session| session.project.clone()))
@@ -780,6 +790,7 @@ pub fn run() -> anyhow::Result<()> {
             register_project,
             import_project,
             project_availability,
+            relocate_project,
             remove_project,
             open_project,
             close_project,

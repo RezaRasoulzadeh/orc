@@ -6,7 +6,7 @@ Orc v0.2 is a local developer tool. It does not silently plan, dispatch, apply p
 
 ## Install and five-minute workflow
 
-Prerequisites: Rust stable with Cargo, Git, and (for automated Codex workers or the Lead) an installed and authenticated `codex` CLI. Desktop development additionally needs Node.js/npm and the Tauri platform prerequisites.
+Prerequisites: Rust stable with Cargo and Git. Automated Codex workers and the Lead additionally require an installed and authenticated `codex` CLI; the manual-agent workflow and the acceptance suite require no live AI provider. Desktop development additionally needs Node.js/npm and the Tauri platform prerequisites.
 
 Build from a checkout:
 
@@ -61,3 +61,7 @@ Send feedback with `orc revise TASK_ID "feedback"`. Integrate satisfactory work 
 Architecture or other worker decisions requiring approval are listed with `orc approvals list` and resolved with `orc approvals resolve APPROVAL_ID`. After an interrupted process, inspect `orc runs` and recover an interrupted task with `orc task requeue TASK_ID`.
 
 `orc status` gives a compact project/task view, `orc queue --explain` explains scheduler state, `orc runs` shows run status, phase, elapsed time, activity, output, and timestamps, `orc report` emits structured project state, and `orc doctor` checks operational health. Orc preserves this state in SQLite and does not silently discard invalid protocol responses or corrupted state.
+
+## v0.2 release gate
+
+The provider-independent v0.2 acceptance coverage uses a clean temporary project and exercises planning, agent registration, safe lifecycle transitions, persistent execution-template resolution, deterministic queue explanations, manual dispatch and submission, failed-run recovery, review and acceptance, Lead configuration and human-gated proposals, approvals, reopen persistence, and operator-facing output. It uses test doubles and manual runs, so it does not require a live AI provider.

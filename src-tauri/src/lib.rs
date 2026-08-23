@@ -554,7 +554,8 @@ mod project_lifecycle_tests {
 
         assert!(state.0.lock().unwrap().is_none());
         assert!(app.contains("<ProjectPicker v-if=\"!activeProject\""));
-        assert!(app.contains("if (activeProject.value) { await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }"));
+        assert!(app.contains("const projectRuntime = new ProjectRuntime(api"));
+        assert!(app.contains("await projectRuntime.start()"));
         assert!(app.contains("v-else-if=\"activeProject && error\""));
         assert!(!app.contains(
             "v-else-if=\"error\" class=\"notice\" role=\"alert\">Unable to load project state"
@@ -588,8 +589,8 @@ mod project_lifecycle_tests {
         assert_eq!(registry.projects()[0].id, registered.id);
 
         let app = include_str!("../../src/App.vue");
-        assert!(app.contains("async function openPickerProject() { resetProjectState(); await refreshProjects(); active.value = 'Dashboard'; error.value = ''; await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }"));
-        assert!(app.contains("async function confirmCloseProject() { try { await api.closeProject(); resetProjectState(); activeProject.value = null; closeConfirmation.value = false; await refreshProjects()"));
+        assert!(app.contains("async function openPickerProject(id: string) { await projectRuntime.openProject(id)"));
+        assert!(app.contains("await projectRuntime.closeProject()"));
         assert!(app.contains("function resetProjectState()"));
     }
 }

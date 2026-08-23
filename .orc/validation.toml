@@ -1,0 +1,9 @@
+commands = [
+  "npm run typecheck",
+  "npm run build",
+  "npm test",
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+  "cargo test --manifest-path src-tauri/Cargo.toml",
+]

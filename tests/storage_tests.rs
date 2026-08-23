@@ -1,7 +1,54 @@
-use orc::storage::{Database, WorkerResult};
+use orc::registry::ReasoningEffort;
+use orc::storage::{AgentRunExecution, Database, WorkerResult};
 use orc::task::{TaskPriority, TaskStatus};
 use rusqlite::Connection;
 use tempfile::tempdir;
+
+#[test]
+fn agent_run_execution_survives_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let (project, task, run_id) = {
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("execution").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let run_id = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "agent",
+                "automated",
+                AgentRunExecution {
+                    class: "coder",
+                    model: Some("configured-model"),
+                    effort: Some(ReasoningEffort::Low),
+                    source: "template",
+                },
+            )
+            .unwrap();
+        (project, task, run_id)
+    };
+    let db = Database::open(&path).unwrap();
+    let run = db
+        .list_agent_runs(project, 10)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.id == run_id)
+        .unwrap();
+    assert_eq!(run.task_id.as_deref(), Some(task.as_str()));
+    assert_eq!(run.execution_class, "coder");
+    assert_eq!(run.resolved_model.as_deref(), Some("configured-model"));
+    assert_eq!(run.resolved_reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(run.resolution_source, "template");
+}
 
 #[test]
 fn opening_missing_db_fails_without_creating_file() {

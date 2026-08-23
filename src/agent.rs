@@ -461,8 +461,30 @@ pub fn revise_with_worker_on_db(
         anyhow::bail!("task worktree does not exist: {}", worktree_dir.display());
     }
     db.update_task_status(task_id, TaskStatus::Active)?;
-    let run_id =
-        db.create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)?;
+    let agent = db
+        .list_agents()?
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
+    let resolution = crate::execution::resolve(
+        &task.role,
+        agent.model.as_deref(),
+        agent.reasoning_effort,
+        None,
+        None,
+    );
+    let run_id = db.create_agent_run_with_execution(
+        project_id,
+        task_id,
+        agent_id,
+        registry::AUTOMATED,
+        crate::storage::AgentRunExecution {
+            class: resolution.class.as_str(),
+            model: resolution.model.as_deref(),
+            effort: resolution.reasoning_effort,
+            source: &resolution.source,
+        },
+    )?;
     db.record_lifecycle_event(
         "review_revision",
         Some(task_id),
@@ -565,22 +587,15 @@ pub fn revise_with_worker_on_db(
     )?;
     db.update_task_status(task_id, TaskStatus::Review)?;
     progress("review transition");
-    let agent = db
-        .list_agents()?
-        .into_iter()
-        .find(|agent| agent.id == agent_id);
     Ok(DispatchSummary {
         task: db
             .get_task(task_id)?
             .context("task disappeared after revision")?,
         agent: agent_id.into(),
-        backend: agent
-            .as_ref()
-            .map(|agent| agent.backend.clone())
-            .unwrap_or_else(|| "unknown".into()),
-        profile: agent.as_ref().and_then(|agent| agent.profile_path.clone()),
-        model: agent.as_ref().and_then(|agent| agent.model.clone()),
-        reasoning_effort: agent.as_ref().and_then(|agent| agent.reasoning_effort),
+        backend: agent.backend,
+        profile: agent.profile_path,
+        model: resolution.model,
+        reasoning_effort: resolution.reasoning_effort,
         worktree_path,
         run_id,
         run_status: "completed".into(),
@@ -719,8 +734,15 @@ pub fn dispatch_selected_with_db_and_repo(
             changes: Default::default(),
         });
     }
-    let model = model_override.or_else(|| agent.model.clone());
-    let reasoning_effort = effort_override.or(agent.reasoning_effort);
+    let resolution = crate::execution::resolve(
+        &task.role,
+        agent.model.as_deref(),
+        agent.reasoning_effort,
+        model_override,
+        effort_override,
+    );
+    let model = resolution.model.clone();
+    let reasoning_effort = resolution.reasoning_effort;
     let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
         .map_err(anyhow::Error::msg)?;
     let mut summary = dispatch_with_worker_on_db(
@@ -730,6 +752,13 @@ pub fn dispatch_selected_with_db_and_repo(
         repo_path,
         &agent.id,
         &SystemValidationRunner,
+    )?;
+    db.set_agent_run_execution(
+        summary.run_id,
+        resolution.class.as_str(),
+        model.as_deref(),
+        reasoning_effort,
+        &resolution.source,
     )?;
     summary.backend = agent.backend;
     summary.profile = agent.profile_path;

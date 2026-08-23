@@ -25,6 +25,18 @@ pub struct AgentRun {
     pub finished_at: Option<String>,
     pub phase: Option<String>,
     pub last_activity: String,
+    pub execution_class: String,
+    pub resolved_model: Option<String>,
+    pub resolved_reasoning_effort: Option<ReasoningEffort>,
+    pub resolution_source: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRunExecution<'a> {
+    pub class: &'a str,
+    pub model: Option<&'a str>,
+    pub effort: Option<ReasoningEffort>,
+    pub source: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -660,7 +672,14 @@ impl Database {
                 "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
             )?;
         }
-        for (name, definition) in [("phase", "TEXT"), ("last_activity", "TEXT")] {
+        for (name, definition) in [
+            ("phase", "TEXT"),
+            ("last_activity", "TEXT"),
+            ("execution_class", "TEXT NOT NULL DEFAULT 'general'"),
+            ("resolved_model", "TEXT"),
+            ("resolved_reasoning_effort", "TEXT"),
+            ("resolution_source", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE agent_runs ADD COLUMN {name} {definition}"
@@ -1593,6 +1612,22 @@ impl Database {
             finished_at: row.get(8)?,
             phase: row.get(9)?,
             last_activity: row.get(10)?,
+            execution_class: row.get(11)?,
+            resolved_model: row.get(12)?,
+            resolved_reasoning_effort: match row.get::<_, Option<String>>(13)? {
+                Some(value) => Some(ReasoningEffort::parse(&value).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )),
+                    )
+                })?),
+                None => None,
+            },
+            resolution_source: row.get(14)?,
         })
     }
 
@@ -1612,10 +1647,29 @@ impl Database {
         agent: &str,
         execution_mode: &str,
     ) -> Result<i64, DbError> {
-        self.conn.execute(
-            "INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)",
-            params![project_id, task_id, agent, execution_mode],
-        )?;
+        self.create_agent_run_with_execution(
+            project_id,
+            task_id,
+            agent,
+            execution_mode,
+            AgentRunExecution {
+                class: "general",
+                model: None,
+                effort: None,
+                source: "legacy",
+            },
+        )
+    }
+
+    pub fn create_agent_run_with_execution(
+        &self,
+        project_id: i64,
+        task_id: &str,
+        agent: &str,
+        execution_mode: &str,
+        execution: AgentRunExecution<'_>,
+    ) -> Result<i64, DbError> {
+        self.conn.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)", params![project_id, task_id, agent, execution_mode, execution.class, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
         let id = self.conn.last_insert_rowid();
         let agent_id = agent.to_owned();
         self.record_lifecycle_event(
@@ -1635,6 +1689,17 @@ impl Database {
         output: Option<&str>,
     ) -> Result<bool, DbError> {
         self.update_agent_run_status_with_usage(run_id, status, output, None)
+    }
+
+    pub fn set_agent_run_execution(
+        &self,
+        run_id: i64,
+        class: &str,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+        source: &str,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute("UPDATE agent_runs SET execution_class = ?1, resolved_model = ?2, resolved_reasoning_effort = ?3, resolution_source = ?4 WHERE id = ?5", params![class, model, effort.map(|value| value.as_str()), source, run_id])? != 0)
     }
 
     pub fn update_agent_run_status_with_usage(
@@ -1718,7 +1783,7 @@ impl Database {
 
     pub fn get_agent_run(&self, run_id: i64) -> Result<Option<AgentRun>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE id = ?1",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE id = ?1",
             params![run_id], Self::agent_run_from_row).optional()?)
     }
 
@@ -1754,7 +1819,7 @@ impl Database {
 
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -1763,7 +1828,7 @@ impl Database {
 
     pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
         )?;
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?

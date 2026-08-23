@@ -1,67 +1,93 @@
 # Orc
 
-Orc is a local, operator-controlled control plane for AI-assisted engineering. It stores project, task, agent, run, approval, and lifecycle state in SQLite and uses Git worktrees to isolate dispatched work. A Tauri desktop application presents the same project state and actions as the CLI.
+Orc v0.2.2 is a local, operator-controlled orchestrator for AI-assisted engineering. It keeps project, task, agent, run, approval, and lifecycle state in SQLite, uses Git worktrees to isolate dispatched work, and exposes the same state through a CLI and a Tauri desktop application.
 
-Orc v0.2 is a local developer tool. It does not silently plan, dispatch, apply patches, or mutate project state on behalf of an AI provider.
+Orc orchestrates external AI providers; it is not an AI model or provider. Provider credentials remain with the provider's own CLI or service. Orc does not silently plan, dispatch, apply patches, merge work, or mutate project state on an AI provider's behalf.
 
-## Install and five-minute workflow
+## Core concepts
 
-Prerequisites: Rust stable with Cargo and Git. Automated Codex workers and the Lead additionally require an installed and authenticated `codex` CLI; the manual-agent workflow and the acceptance suite require no live AI provider. Desktop development additionally needs Node.js/npm and the Tauri platform prerequisites.
+An Orc project is an adopted Git repository. Tasks are durable units of work with an objective, role, priority, dependencies, required capabilities, scope, context files, and expected changes. Agents are registered workers with a backend, automated or manual execution mode, capabilities, priority, availability, and optional provider configuration.
 
-Build from a checkout:
+Project-local state lives under `.orc/`. The authoritative database is `.orc/orc.db`; `.orc/engineering.md` is the worker contract; discovery can add project, architecture, and roadmap documents; and `.orc/worktrees/` contains isolated task checkouts. Keep the database and its SQLite WAL files together.
+
+## Installation and initialization
+
+Install Rust stable, Cargo, and Git. From an Orc checkout, install the CLI with:
 
 ```bash
 cargo install --path .
+```
+
+Run `orc init` in the repository Orc should manage, then `orc adopt` to record its Git identity and engineering contract. Automated Codex workers and the configured Lead additionally require an installed and authenticated `codex` CLI. Manual workers and provider-independent acceptance tests do not require a live AI provider.
+
+## Verified quick start
+
+From a Git repository, the smallest useful inspection workflow is:
+
+```bash
 orc init
 orc adopt
-orc discovery-request > /tmp/orc-discovery.json
 orc status
+orc task create "Document the project" "Write a concise project overview" --role developer
+orc task list
 orc queue --explain
 ```
 
-`orc init` creates `.orc/orc.db`; `orc adopt` records the current Git repository and writes the engineering contract used by workers. Discovery, planning, dispatch, review, and acceptance are separate operator actions. Start with [`docs/getting-started.md`](docs/getting-started.md).
+Register an agent with `orc agent add`, inspect eligibility with `orc schedule TASK_ID --explain`, and dispatch with `orc dispatch TASK_ID` or `orc dispatch-queue --concurrency 2`. Use `orc --help` and the [complete CLI reference](docs/cli-reference.md) for exact options and command-specific usage.
 
-## What Orc provides
+## Command families
 
-- Persistent projects, tasks, dependencies, agents, runs, approvals, and lifecycle events.
-- Deterministic readiness and scheduling with capabilities, priority, availability, execution mode, and quota reserve.
-- Automated workers in isolated Git worktrees and manual-agent task packets or validated patches.
-- Review, revision, rejection, acceptance, cancellation, and recovery operations.
-- Read-only discovery/planning protocols and a human-gated Engineering Lead proposal workflow.
-- CLI and Tauri desktop views over the same SQLite-backed application state.
+- Project and health: `init`, `adopt`, `discovery-request`, `apply-discovery`, `status`, `report`, `doctor`.
+- Planning and Lead: `plan-request`, `apply-plan`, `plan`, `ask`, `apply-response`, and `lead show|set|clear`.
+- Tasks and queue: `task ...`, `queue`, and deterministic `schedule`.
+- Agents and configuration: `agents` and `agent ...` for registration, enablement, availability, capabilities, profiles, model, effort, priority, and quota.
+- Execution: `dispatch`, `dispatch-queue`, `runs`, and `run submit|submit-patch|fail`.
+- Review and lifecycle: `review`, `revise`, `task diff|worktree|accept|reject|cancel|requeue`.
+- Approvals: `approvals list|resolve`.
+- Persistent execution templates: `template list|set|clear`.
 
-See the [documentation index](docs/getting-started.md) for the detailed operator, architecture, and contributor guides.
+The [CLI reference](docs/cli-reference.md) is exhaustive; this overview intentionally omits the full option list.
 
-## Planning and task lifecycle
+## Agents, profiles, models, and effort
 
-Inspect the current project for a manual planner with `orc report` or `orc report --full`. Create a read-only planning request with `orc plan-request "Describe the next engineering increment"` or `orc plan-request --full-report "..."`. A human reviews the returned `PlanResponse` JSON, then applies it explicitly with `orc apply-plan plan-response.json`.
+Agents can be automated or manual. Automated workers execute through supported backends in isolated worktrees; manual agents receive a task packet and wait for submitted output or a validated patch. A registered agent may have a provider profile directory, model, reasoning effort (`none`, `low`, `medium`, or `high`), capabilities, availability, and quota settings.
 
-The Engineering Lead protocol is also available: `orc ask "..."` emits an `EngineeringLeadRequest`, and `orc apply-response RESPONSE.json` validates and persists an `EngineeringLeadResponse`. Neither protocol dispatches work implicitly.
+v0.2.2 persists action-specific profiles for code, review, planning, and Lead actions. A single automated agent can therefore resolve different model and effort settings per action. Explicit per-command overrides take precedence and execution records the resolved action, agent, settings, status, token usage, and result. The desktop exposes these settings; the CLI provides the agent, Lead, and per-run configuration commands documented in the CLI reference.
 
-Tasks move through backlog/ready, active, review, done, blocked, or cancelled states. Inspect them with `orc status`, `orc task list`, and `orc task show TASK_ID`. Configure dependencies, capabilities, scope, context, and expected changes with `orc task depend`, `orc task undepend`, `orc task require`, `orc task scope`, `orc task context-add`, `orc task expect-change`, and their clear commands.
+Execution templates persist in SQLite for `coder`, `reviewer`, `architect`, `researcher`, and `general`. Resolution is deterministic: per-run override, persistent class template, compatible environment template, the coder low-effort compatibility default, agent configuration, then provider default. See [configuration](docs/configuration.md) for environment variables and timeouts.
 
-## Queue, agents, and scheduling
+## Tasks, queue, and dispatch
 
-`orc queue` shows the deterministic queue; `orc queue --explain` includes dependency, readiness, and scheduler eligibility details. Register and maintain workers with `orc agent add`, `orc agent list`, `orc agent show`, `orc agent enable`, `orc agent disable`, `orc agent available`, and `orc agent unavailable`. Agents have a backend, execution mode (`automated` or `manual`), priority, capabilities, and optional Codex model/reasoning configuration.
+Create tasks directly with `orc task create`, or apply a reviewed structured plan. Dependencies and required capabilities determine readiness. `orc queue --explain` reports the deterministic queue and explains dependency, readiness, and scheduler eligibility decisions. `orc schedule TASK_ID --explain` evaluates candidates using enabled and available agents, execution mode, capabilities, priority, and quota reserve.
 
-Use `orc schedule TASK_ID --explain` to see candidate evaluation, or `orc schedule TASK_ID` to select an eligible agent. Dispatch automated work with `orc dispatch TASK_ID` or ready tasks with `orc dispatch-queue --concurrency 2` (default: 1; `auto` is supported). Quota can be inspected or synchronized with `orc agents --sync` and `orc agent sync AGENT_ID`, and configured with the agent quota commands.
+Dispatch a selected task with `orc dispatch TASK_ID`, or dispatch ready automated tasks with bounded concurrency using `orc dispatch-queue --concurrency 2` (the default is `1`; `auto` is supported). Scheduling and dispatch are explicit operator actions.
 
-## Manual workers
+## Runs, review, acceptance, and recovery
 
-Dispatch to a manual agent with `orc dispatch TASK_ID --agent AGENT_ID`. Orc prints a task packet and records a waiting external run. Submit worker output with `orc run submit RUN_ID --file RESPONSE.txt`, or submit a Git patch with `orc run submit-patch RUN_ID PATCH_FILE`. Use `-` for stdin. Record failure with `orc run fail RUN_ID "reason"`.
+Automated runs work in task-specific Git worktrees. Manual runs print a task packet and wait for `orc run submit RUN_ID`, `orc run submit-patch RUN_ID PATCH_FILE`, or `orc run fail RUN_ID`. Inspect runs with `orc runs`; inspect changes with `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`.
 
-## Review, revision, and acceptance
+Review does not accept or merge work. Send feedback with `orc revise TASK_ID "feedback"`; integrate satisfactory work with `orc task accept TASK_ID`; reject it with `orc task reject TASK_ID "reason"` while preserving the worktree; or cancel unfinished work with `orc task cancel TASK_ID "reason"`. An interrupted active task or failed blocked task can return to the queue with `orc task requeue TASK_ID`.
 
-Completed runs enter review. Inspect with `orc runs`, `orc runs TASK_ID`, `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`. `orc review TASK_ID --diff` includes the complete diff; `--file PATH` limits it to one changed file.
+## Planning, Lead, review, and approvals
 
-Send feedback with `orc revise TASK_ID "feedback"`. Integrate satisfactory work with `orc task accept TASK_ID`. Preserve the worktree and return the task to ready with `orc task reject TASK_ID "reason"`. Cancel unfinished work with `orc task cancel TASK_ID "reason"`.
+`orc report` and `orc report --full` provide structured project state for a manual planner. `orc plan-request OBJECTIVE` emits a read-only `PlanningRequest`; a human reviews the returned `PlanResponse` and explicitly applies it with `orc apply-plan FILE`. The Engineering Lead protocol works similarly: `orc ask REQUEST` emits an `EngineeringLeadRequest`, and `orc apply-response FILE` validates and persists the response. `orc plan` and `orc review --automated` can run supported automated actions, but their results still follow the review and approval boundaries.
 
-## Approvals, recovery, and observability
+Planner and Lead exchanges use structured, versioned protocols. Invalid versions, actions, plans, or responses fail without mutating state. Proposals that require approval are listed with `orc approvals list` and resolved explicitly with `orc approvals resolve APPROVAL_ID`.
 
-Architecture or other worker decisions requiring approval are listed with `orc approvals list` and resolved with `orc approvals resolve APPROVAL_ID`. After an interrupted process, inspect `orc runs` and recover an interrupted task with `orc task requeue TASK_ID`.
+## Desktop project registry
 
-`orc status` gives a compact project/task view, `orc queue --explain` explains scheduler state, `orc runs` shows run status, phase, elapsed time, activity, output, and timestamps, `orc report` emits structured project state, and `orc doctor` checks operational health. Orc preserves this state in SQLite and does not silently discard invalid protocol responses or corrupted state.
+The Tauri desktop application shares the CLI's SQLite project state and provides dashboard, queue, tasks, agents, runs, review, planning, Lead, approvals, and manual-run views. Its persistent project registry supports registering projects, switching between them, detecting missing or moved projects, and relocating a registered project. Removing a project removes only its registry entry; re-importing it preserves the existing `.orc/orc.db`. A project must already be initialized and adopted before it can be opened.
 
-## v0.2.2 release gate
+This v0.2.2 desktop architecture supports persistent projects and sessions at the registry level. The major UI redesign is planned for v0.3. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
 
-The provider-independent v0.2.2 acceptance coverage exercises project registration, switching, relocation, re-import persistence, manifest-relative startup, human-gated planning/review/Lead actions, malformed-output rejection, action profiles, explicit overrides, and persisted execution metadata. It uses test doubles and manual runs, so it does not require a live AI provider. The v0.3 visual redesign is not part of this release.
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+npm run typecheck
+npm run build
+```
+
+See the [documentation index](docs/getting-started.md), [configuration guide](docs/configuration.md), [desktop guide](docs/desktop.md), and [CLI reference](docs/cli-reference.md) for further details.

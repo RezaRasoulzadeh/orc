@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { api, type AgentDefinition, type DesktopSnapshot, type LeadContext, type LeadProposal, type ManualRunContext, type ManualWorkspaceInfo, type QueueEntry, type QueueReport, type TaskDetails, type ReviewSummary, type PlanningRequest, type ProjectReport, type ApprovalRequest, type PlanResponse } from './lib/api'
+import { api, type AgentDefinition, type DesktopSnapshot, type LeadContext, type LeadProposal, type ManualRunContext, type ManualWorkspaceInfo, type QueueEntry, type QueueReport, type TaskDetails, type ReviewSummary, type PlanningRequest, type ProjectReport, type ApprovalRequest, type PlanResponse, type RegisteredProject } from './lib/api'
 import { listen } from '@tauri-apps/api/event'
 import UiBadge from './components/UiBadge.vue'
 import UiButton from './components/UiButton.vue'
+import UiModal from './components/UiModal.vue'
+import ProjectPicker from './components/ProjectPicker.vue'
 
 const sections = ['Dashboard', 'Tasks', 'Runs', 'Agents', 'Lead', 'Planner', 'Approvals', 'Reports', 'Project', 'Settings']
 const active = ref('Dashboard')
 const snapshot = ref<DesktopSnapshot | null>(null)
 const error = ref('')
+const projects = ref<RegisteredProject[]>([])
+const activeProject = ref<RegisteredProject | null>(null)
+const closeConfirmation = ref(false)
 const tasks = computed(() => snapshot.value?.dashboard?.tasks ?? [])
 const lead = ref<LeadContext | null>(null)
 const proposals = ref<LeadProposal[]>([])
@@ -94,6 +99,11 @@ async function taskAction(action: string, suppliedReason?: string) {
   }
 }
 async function refreshSnapshot() { snapshot.value = await api.snapshot() }
+async function refreshProjects() { projects.value = await api.registeredProjects(); activeProject.value = await api.currentProject() }
+function resetProjectState() { snapshot.value = null; report.value = null; runsWorkspace.value = null; selectedRun.value = null; lead.value = null; proposals.value = []; planning.value = null; plan.value = null; approvalList.value = []; taskDetails.value = null; taskReview.value = null; agentList.value = []; manualRuns.value = []; workspaceInfo.value = null; selectedTask.value = null; selectedAgent.value = null }
+async function openPickerProject() { resetProjectState(); await refreshProjects(); active.value = 'Dashboard'; error.value = ''; await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }
+async function closeActiveProject() { if (!activeProject.value) return; closeConfirmation.value = true }
+async function confirmCloseProject() { try { await api.closeProject(); resetProjectState(); activeProject.value = null; closeConfirmation.value = false; await refreshProjects() } catch (err: unknown) { error.value = String(err) } }
 async function dispatchReady() {
   const ready = queue.value?.ready ?? []
   if (!ready.length) return
@@ -146,9 +156,7 @@ async function applyPlan() { if (!plan.value || !window.confirm('Apply this vali
 async function resolveApprovalItem(item: ApprovalRequest) { if (!window.confirm(`Resolve approval #${item.id}?`)) return; try { await api.resolveApproval(item.id); await refreshControl('Approvals'); await refreshSnapshot() } catch (err: unknown) { controlError.value = String(err) } }
 
 onMounted(async () => {
-  try { await refreshSnapshot() } catch (err: unknown) { error.value = String(err) }
-  await refreshRuns()
-  await refreshControl('Project')
+  try { await refreshProjects(); if (activeProject.value) { await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') } } catch (err: unknown) { error.value = String(err) }
   await listen('orc://run-event', () => { if (active.value === 'Runs') void refreshRuns() })
 })
 </script>
@@ -165,10 +173,13 @@ onMounted(async () => {
       <div class="connection"><i></i><span>LOCAL / SQLITE</span><small>CONNECTED</small></div>
     </aside>
     <main class="content">
-      <header class="topbar"><div class="topbar-title"><span class="eyebrow">WORKSPACE / ORC</span><h1>{{ active }}</h1></div><div class="project-context"><div class="project-switcher"><span class="project-glyph">◈</span><div><strong>{{ projectName }}</strong><small :title="repositoryPath">{{ repositoryPath }}</small></div><UiButton size="compact" @click="active = 'Project'; refreshControl('Project')">PROJECT</UiButton></div><span class="branch">⌘ {{ projectBranch }}</span><UiBadge :tone="snapshot?.dashboard.repository_available ? 'success' : 'danger'" dot>{{ healthLabel }}</UiBadge><UiBadge tone="neutral" dot>{{ snapshot?.health.unresolved_approvals ?? 0 }} APPROVALS</UiBadge></div><div class="top-actions"><kbd>⌘ K</kbd><span class="avatar">RZ</span></div></header>
+      <header class="topbar"><div class="topbar-title"><span class="eyebrow">WORKSPACE / ORC</span><h1>{{ activeProject ? active : 'PROJECT PICKER' }}</h1></div><div v-if="activeProject" class="project-context"><div class="project-switcher"><span class="project-glyph">◈</span><div><strong>{{ projectName }}</strong><small :title="repositoryPath">{{ repositoryPath }}</small></div><UiButton size="compact" @click="active = 'Project'; refreshControl('Project')">PROJECT</UiButton></div><span class="branch">⌘ {{ projectBranch }}</span><UiBadge :tone="snapshot?.dashboard.repository_available ? 'success' : 'danger'" dot>{{ healthLabel }}</UiBadge><UiBadge tone="neutral" dot>{{ snapshot?.health.unresolved_approvals ?? 0 }} APPROVALS</UiBadge><UiButton size="compact" @click="closeActiveProject">CLOSE</UiButton></div><div class="top-actions"><kbd>⌘ K</kbd><span class="avatar">RZ</span></div></header>
       <div class="workspace-scroll">
-      <div v-if="error" class="notice">Unable to load project state: {{ error }}</div>
-      <section v-else-if="active === 'Dashboard'" class="dashboard">
+      <ProjectPicker v-if="!activeProject" :projects="projects" @changed="refreshProjects" @opened="openPickerProject" />
+      <UiModal :open="closeConfirmation" title="Close active project" @close="closeConfirmation = false"><p>Close {{ activeProject?.display_name }}? The project stays registered and repository data is unchanged.</p><div class="lead-actions"><UiButton @click="closeConfirmation = false">CANCEL</UiButton><UiButton variant="primary" @click="confirmCloseProject">CLOSE PROJECT</UiButton></div></UiModal>
+      <div v-else-if="error" class="notice">Unable to load project state: {{ error }}</div>
+      <template v-else>
+      <section v-if="active === 'Dashboard'" class="dashboard">
         <div class="intro"><div><span class="eyebrow">PROJECT / {{ snapshot?.dashboard.project_name || 'CURRENT PROJECT' }}</span><h2>Operational control surface</h2><p>{{ snapshot?.dashboard.repository_path }}</p></div><span class="timestamp">{{ healthLabel }} · {{ new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</span></div>
         <div class="lead-actions"><button class="action-chip" @click="active = 'Lead'; refreshLead()">PLAN WORK</button><button class="action-chip" @click="active = 'Tasks'">NEW TASK</button><button class="action-chip" @click="dispatchReady">DISPATCH READY</button><button class="action-chip" @click="active = 'Tasks'; taskFilter = 'review'">REVIEW QUEUE</button><button class="action-chip" @click="active = 'Agents'; refreshAgents()">SYNC AGENTS</button><button class="action-chip" @click="active = 'Lead'; refreshLead()">OPEN LEAD</button></div>
         <div class="metrics"><article v-for="category in queueCategories.filter(category => ['ready', 'active', 'review', 'blocked'].includes(category))" :key="category"><span>{{ category.toUpperCase() }}</span><strong>{{ queue?.[category]?.length ?? 0 }}</strong><small>tasks in persisted state</small></article><article><span>APPROVALS</span><strong>{{ snapshot?.health?.unresolved_approvals ?? 0 }}</strong><small>awaiting resolution</small></article></div>
@@ -185,6 +196,7 @@ onMounted(async () => {
       <section v-else-if="active === 'Project'" class="panel"><div class="intro"><div><span class="eyebrow">CONTROL PLANE / PROJECT</span><h2>Project identity, state, and health</h2><p>Application-owned project facts from the shared read models.</p></div><button class="text-button" @click="refreshControl('Project')">REFRESH ↻</button></div><div v-if="controlError" class="notice">{{ controlError }}</div><template v-if="report"><p><b>Name:</b> {{ report.project.name }}</p><p><b>Repository:</b> {{ report.project.repository }}</p><p><b>Branch:</b> {{ report.project.branch || 'unknown' }}</p><p><b>Commit:</b> {{ report.project.commit || 'unknown' }}</p><h3>HEALTH</h3><p><b>Task counts:</b> {{ JSON.stringify(snapshot?.health.task_counts) }}</p><p><b>Active runs:</b> {{ snapshot?.health.active_runs }}</p><p><b>Unresolved approvals:</b> {{ snapshot?.health.unresolved_approvals }}</p><h3>ARCHITECTURE & DISCOVERY</h3><p>{{ report.architecture.modules.join(', ') || 'No modules recorded.' }}</p><p v-for="(value, key) in report.architecture.discovery" :key="key"><b>{{ key }}:</b> {{ value }}</p></template></section>
       <section v-else-if="active === 'Settings'" class="panel"><div class="intro"><div><span class="eyebrow">CONTROL PLANE / SETTINGS</span><h2>Application and provider settings</h2><p>Safe settings use the existing Agent controls; project state and SQLite remain application-owned.</p></div><button class="text-button" @click="refreshControl('Settings')">REFRESH ↻</button></div><div v-if="controlError" class="notice">{{ controlError }}</div><h3>PROVIDER CONFIGURATION</h3><p>Model, reasoning, priority, profile, enablement, and manual provider workspace settings are managed in Agents.</p><button class="apply-button" @click="active = 'Agents'; refreshAgents()">OPEN AGENT SETTINGS</button><h3>READ-ONLY APPLICATION STATE</h3><p>Repository identity, engineering contract, validation, architecture, and persisted project state are controlled by Orc and displayed in Project and Reports. This surface does not edit SQLite.</p><div class="grid"><article class="panel"><h3>REGISTERED AGENTS</h3><p v-for="agent in agentList" :key="agent.id"><b>{{ agent.display_name }}</b> · {{ agent.backend }} · {{ agent.execution_mode }} · {{ agent.enabled ? 'enabled' : 'disabled' }}</p></article><article class="panel"><h3>SUPPORTED OPERATIONS</h3><p>Agent configuration and manual workspace actions are available through the existing Agents controls.</p></article></div></section>
       <section v-else class="placeholder"><span class="eyebrow">SECTION / {{ active.toUpperCase() }}</span><h2>{{ active }}</h2><p>This workspace is connected to the Orc application API. Its operational view will appear here as the section is implemented.</p></section>
+      </template>
       </div>
     </main>
     <button v-if="active !== 'Lead'" class="lead-fab" @click="leadPanel = !leadPanel; refreshLead()">LEAD</button><aside v-if="leadPanel" class="lead-panel"><div class="panel-head"><h3>LEAD</h3><button class="text-button" @click="leadPanel = false">CLOSE</button></div><p>Ask about the current project from any screen.</p><div v-if="leadError" class="notice compact">{{ leadError }}</div><form class="lead-composer compact" @submit.prevent="sendLead(panelMessage, 'panel')"><textarea v-model="panelMessage" aria-label="Message the Lead" placeholder="Ask the Lead…" rows="3" :disabled="leadLoading"></textarea><button class="apply-button" type="submit" :disabled="leadLoading || !panelMessage.trim()">{{ leadLoading ? 'SENDING…' : 'SEND' }}</button></form><button class="text-button open-lead" @click="active = 'Lead'; leadPanel = false; refreshLead()">OPEN WORKSPACE →</button></aside>

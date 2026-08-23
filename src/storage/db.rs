@@ -142,6 +142,10 @@ pub enum DbError {
     TaskNotActive(String),
     #[error("task '{0}' has no non-terminal agent run to recover")]
     NoRecoverableRun(String),
+    #[error("agent '{0}' has an active run")]
+    AgentHasActiveRun(String),
+    #[error("agent '{0}' is already archived")]
+    AgentAlreadyArchived(String),
 }
 
 pub struct Database {
@@ -1012,6 +1016,36 @@ impl Database {
             "UPDATE agents SET enabled = ?1 WHERE id = ?2",
             params![enabled, id],
         )? != 0)
+    }
+
+    pub fn archive_agent(&self, id: &str) -> Result<(), DbError> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        };
+        if status == "archived" {
+            return Err(DbError::AgentAlreadyArchived(id.to_owned()));
+        }
+        let active: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1 AND status IN ('running', 'waiting_external'))",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if active != 0 {
+            return Err(DbError::AgentHasActiveRun(id.to_owned()));
+        }
+        self.conn.execute(
+            "UPDATE agents SET status = 'archived', enabled = 0, unavailable_reason = 'archived' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool, DbError> {

@@ -32,6 +32,9 @@ pub enum AgentCommand {
     Disable {
         id: String,
     },
+    Remove {
+        id: String,
+    },
     Unavailable {
         id: String,
         reason: String,
@@ -137,6 +140,10 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
         }
         AgentCommand::Enable { id } => update_agent_enabled(&db, &id, true)?,
         AgentCommand::Disable { id } => update_agent_enabled(&db, &id, false)?,
+        AgentCommand::Remove { id } => {
+            db.archive_agent(&id).map_err(|e| anyhow::anyhow!(e))?;
+            println!("Archived agent {}", id);
+        }
         AgentCommand::Unavailable { id, reason } => {
             ensure_agent_updated(
                 db.set_agent_availability(&id, registry::UNAVAILABLE, Some(&reason))
@@ -305,7 +312,7 @@ fn format_timestamp(value: &str) -> String {
 }
 fn print_agents(db: &Database) -> Result<()> {
     for a in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
-        println!("{}", a.id);
+        println!("{}\t{}", a.id, a.status);
     }
     Ok(())
 }

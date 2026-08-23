@@ -24,6 +24,7 @@ pub struct AgentRun {
     pub execution_mode: String,
     pub status: String,
     pub output: Option<String>,
+    pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub phase: Option<String>,
@@ -430,6 +431,7 @@ impl Database {
                 execution_mode TEXT NOT NULL DEFAULT 'automated',
                 status TEXT NOT NULL,
                 output TEXT,
+                error TEXT,
                 started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 finished_at TEXT
                 , phase TEXT
@@ -846,6 +848,7 @@ impl Database {
         }
         for (name, definition) in [
             ("phase", "TEXT"),
+            ("error", "TEXT"),
             ("last_activity", "TEXT"),
             ("execution_class", "TEXT NOT NULL DEFAULT 'general'"),
             ("resolved_model", "TEXT"),
@@ -1880,16 +1883,17 @@ impl Database {
             execution_mode: row.get(4)?,
             status: row.get(5)?,
             output: row.get(6)?,
-            started_at: row.get(7)?,
-            finished_at: row.get(8)?,
-            phase: row.get(9)?,
-            last_activity: row.get(10)?,
-            execution_class: row.get(11)?,
-            resolved_model: row.get(12)?,
-            resolved_reasoning_effort: match row.get::<_, Option<String>>(13)? {
+            error: row.get(7)?,
+            started_at: row.get(8)?,
+            finished_at: row.get(9)?,
+            phase: row.get(10)?,
+            last_activity: row.get(11)?,
+            execution_class: row.get(12)?,
+            resolved_model: row.get(13)?,
+            resolved_reasoning_effort: match row.get::<_, Option<String>>(14)? {
                 Some(value) => Some(ReasoningEffort::parse(&value).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        13,
+                        14,
                         rusqlite::types::Type::Text,
                         Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1899,7 +1903,7 @@ impl Database {
                 })?),
                 None => None,
             },
-            resolution_source: row.get(14)?,
+            resolution_source: row.get(15)?,
         })
     }
 
@@ -1995,11 +1999,28 @@ impl Database {
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<bool, DbError> {
         let changed = self.conn.execute(
-            "UPDATE agent_runs SET status = ?1, output = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
+            "UPDATE agent_runs SET status = ?1, output = ?2, error = CASE WHEN ?1 = 'failed' THEN error ELSE NULL END, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
             params![status, output, run_id],
         )?;
         if changed != 0 && matches!(status, "completed" | "failed" | "no_changes") {
             self.record_worker_result(run_id, status, output, token_usage)?;
+        }
+        Ok(changed != 0)
+    }
+
+    pub fn update_agent_run_failure(
+        &self,
+        run_id: i64,
+        raw_output: Option<&str>,
+        error: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE agent_runs SET status = 'failed', output = ?1, error = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
+            params![raw_output, error, run_id],
+        )?;
+        if changed != 0 {
+            self.record_worker_result(run_id, "failed", Some(error), token_usage)?;
         }
         Ok(changed != 0)
     }
@@ -2068,7 +2089,7 @@ impl Database {
 
     pub fn get_agent_run(&self, run_id: i64) -> Result<Option<AgentRun>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE id = ?1",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE id = ?1",
             params![run_id], Self::agent_run_from_row).optional()?)
     }
 
@@ -2104,7 +2125,7 @@ impl Database {
 
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -2113,7 +2134,7 @@ impl Database {
 
     pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
         )?;
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?

@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { api, type RegisteredProject } from '../lib/api'
 import UiButton from './UiButton.vue'
 import UiModal from './UiModal.vue'
-function humanStatus(value: string | null | undefined) { if (!value) return 'Not available'; return value.replaceAll('_', ' ').replace(/w/g, letter => letter.toUpperCase()) }
+function humanStatus(value: string | null | undefined) { if (!value) return 'Not available'; return value.replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase()) }
 const props = defineProps<{ projects: RegisteredProject[] }>()
 const emit = defineEmits<{ changed: []; opened: [] }>()
 const error = ref(''); const busy = ref(false); const modal = ref<'import'|'adopt'|'relocate'|'remove'|'open'|null>(null); const project = ref<RegisteredProject|null>(null); const root = ref(''); const displayName = ref('')

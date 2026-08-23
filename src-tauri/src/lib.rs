@@ -63,7 +63,8 @@ fn agent_actions(state: tauri::State<'_, AppState>, id: String) -> Result<Vec<or
 
 #[tauri::command]
 fn configure_agent_action(state: tauri::State<'_, AppState>, id: String, action: String, enabled: bool) -> Result<(), String> {
-    let app = state.0.active()?.app()?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     let action = orc::registry::AgentAction::parse(&action).map_err(|error| error.to_string())?;
     let changed = if enabled { app.add_agent_action(&id, action) } else { app.remove_agent_action(&id, action) };
     if changed.map_err(|error| error.to_string())? { Ok(()) } else { Err(format!("agent '{id}' action was not changed")) }
@@ -86,7 +87,7 @@ fn remove_project_state(
 }
 
 struct SessionGuard<'a> {
-    guard: std::sync::MutexGuard<'a, Option<project::ProjectSession>>,
+    _guard: std::sync::MutexGuard<'a, Option<project::ProjectSession>>,
     app: *const OrcApp,
 }
 
@@ -106,7 +107,7 @@ impl SessionState {
             .as_ref()
             .map(|session| &session.app as *const OrcApp)
             .ok_or_else(|| "no active project".to_string())?;
-        Ok(SessionGuard { guard, app })
+        Ok(SessionGuard { _guard: guard, app })
     }
 
     fn replace(&self, session: Option<project::ProjectSession>) -> Result<(), String> {

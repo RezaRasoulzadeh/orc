@@ -1,6 +1,6 @@
 # Orc
 
-Orc v0.2.2 is a local, operator-controlled orchestrator for AI-assisted engineering. It keeps project, task, agent, run, approval, and lifecycle state in SQLite, uses Git worktrees to isolate dispatched work, and exposes the same state through a CLI and a Tauri desktop application.
+Orc v0.3.0 is a local, operator-controlled orchestrator for AI-assisted engineering. It keeps project, task, agent, run, approval, and lifecycle state in SQLite, uses Git worktrees to isolate dispatched work, and exposes the same state through a CLI and a Tauri desktop application.
 
 Orc orchestrates external AI providers; it is not an AI model or provider. Provider credentials remain with the provider's own CLI or service. Orc does not silently plan, dispatch, apply patches, merge work, or mutate project state on an AI provider's behalf.
 
@@ -184,7 +184,7 @@ Planner and Lead exchanges use structured, versioned protocols. Invalid versions
 
 The Tauri desktop application shares the CLI's SQLite project state and provides dashboard, queue, tasks, agents, runs, review, planning, Lead, approvals, and manual-run views. Its persistent project registry supports registering projects, switching between them, detecting missing or moved projects, and relocating a registered project. Removing a project removes only its registry entry; re-importing it preserves the existing `.orc/orc.db`. A project must already be initialized and adopted before it can be opened.
 
-This v0.2.2 desktop architecture supports persistent projects and sessions at the registry level. The major UI redesign is planned for v0.3. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
+The v0.3.0 desktop workspace supports the complete normal operator lifecycle through controls and forms, with raw protocol JSON limited to advanced disclosures. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
 
 ## Development
 

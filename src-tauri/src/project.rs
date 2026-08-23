@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::ErrorKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredProject {
@@ -15,6 +16,8 @@ pub struct RegisteredProject {
     pub project_name: String,
     pub last_opened_at: Option<u64>,
     pub available: bool,
+    #[serde(default = "default_project_status")]
+    pub status: ProjectStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -31,8 +34,19 @@ pub struct ProjectRegistry {
 pub struct ProjectAvailability {
     pub project_id: String,
     pub available: bool,
+    pub status: ProjectStatus,
     pub error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProjectStatus {
+    Available,
+    Missing,
+    Invalid,
+    TemporarilyUnavailable,
+}
+
+fn default_project_status() -> ProjectStatus { ProjectStatus::Available }
 
 pub struct ProjectSession {
     pub project: RegisteredProject,
@@ -87,7 +101,9 @@ impl ProjectRegistry {
             .iter()
             .map(|project| {
                 let mut project = project.clone();
-                project.available = self.validate(project.id.as_str()).is_ok();
+                let availability = self.inspect(&project.id);
+                project.available = availability.status == ProjectStatus::Available;
+                project.status = availability.status;
                 project
             })
             .collect()
@@ -96,13 +112,15 @@ impl ProjectRegistry {
     pub fn availability(&self, id: &str) -> Result<ProjectAvailability> {
         let project = self.file.projects.iter().find(|project| project.id == id);
         let result = match project {
-            Some(project) => self.validate(&project.id),
+            Some(project) => self.inspect(&project.id),
             None => Err(anyhow::anyhow!("registered project '{id}' not found")),
         };
+        let result = result?;
         Ok(ProjectAvailability {
             project_id: id.to_string(),
-            available: result.is_ok(),
-            error: result.err().map(|error| error.to_string()),
+            available: result.status == ProjectStatus::Available,
+            status: result.status,
+            error: result.error,
         })
     }
 
@@ -148,6 +166,7 @@ impl ProjectRegistry {
             project_name,
             last_opened_at: None,
             available: true,
+            status: ProjectStatus::Available,
         };
         self.file.projects.push(project.clone());
         self.save()?;
@@ -178,6 +197,21 @@ impl ProjectRegistry {
         Ok(result)
     }
 
+    pub fn relocate(&mut self, id: &str, root: impl AsRef<Path>) -> Result<RegisteredProject> {
+        let root = root.as_ref().canonicalize().with_context(|| format!("canonicalize replacement project root {}", root.as_ref().display()))?;
+        let project = self.file.projects.iter_mut().find(|project| project.id == id).context("registered project not found")?;
+        let identity = read_identity(&root)?;
+        if identity != (project.project_id, project.project_name.clone()) {
+            bail!("replacement project identity does not match registered project");
+        }
+        project.repository_root = root;
+        project.available = true;
+        project.status = ProjectStatus::Available;
+        let result = project.clone();
+        self.save()?;
+        Ok(result)
+    }
+
     fn validate(&self, id: &str) -> Result<()> {
         let project = self
             .file
@@ -185,20 +219,31 @@ impl ProjectRegistry {
             .iter()
             .find(|project| project.id == id)
             .context("registered project not found")?;
-        if !project.repository_root.is_dir() {
-            bail!("repository root is not a directory: {}", project.repository_root.display());
-        }
-        let db = project.repository_root.join(".orc/orc.db");
-        if !db.is_file() {
-            bail!("project database not found at {}", db.display());
-        }
-        let database = orc::Database::open(&db).context("open project database")?;
-        let project_id = database.get_project_id()?.context("project database has no project")?;
-        let project_name = database.get_project_name()?.unwrap_or_else(|| "orc".into());
-        if project_id != project.project_id || project_name != project.project_name {
+        let identity = read_identity(&project.repository_root)?;
+        if identity != (project.project_id, project.project_name.clone()) {
             bail!("project database identity does not match registered project");
         }
         Ok(())
+    }
+
+    fn inspect(&self, id: &str) -> ProjectAvailability {
+        let path = self.file.projects.iter().find(|project| project.id == id).map(|project| project.repository_root.clone());
+        if let Some(path) = path {
+            if !path.exists() {
+                return ProjectAvailability { project_id: id.to_string(), available: false, status: ProjectStatus::Missing, error: Some(format!("repository root does not exist: {}", path.display())) };
+            }
+            if std::fs::metadata(&path).is_err() {
+                return ProjectAvailability { project_id: id.to_string(), available: false, status: ProjectStatus::TemporarilyUnavailable, error: Some(format!("repository root is temporarily unavailable: {}", path.display())) };
+            }
+        }
+        let result = self.validate(id);
+        let status = match &result {
+            Ok(()) => ProjectStatus::Available,
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == ErrorKind::NotFound) => ProjectStatus::Missing,
+            Err(error) if error.to_string().contains("identity does not match") || error.to_string().contains("database") => ProjectStatus::Invalid,
+            Err(_) => ProjectStatus::TemporarilyUnavailable,
+        };
+        ProjectAvailability { project_id: id.to_string(), available: status == ProjectStatus::Available, status, error: result.err().map(|e| e.to_string()) }
     }
 
     fn save(&self) -> Result<()> {
@@ -208,6 +253,14 @@ impl ProjectRegistry {
         std::fs::write(&self.path, serde_json::to_vec_pretty(&self.file)?)?;
         Ok(())
     }
+}
+
+fn read_identity(root: &Path) -> Result<(i64, String)> {
+    if !root.is_dir() { bail!("repository root is not a directory: {}", root.display()); }
+    let db = root.join(".orc/orc.db");
+    if !db.is_file() { bail!("project database not found at {}", db.display()); }
+    let database = orc::Database::open(&db).context("open project database")?;
+    Ok((database.get_project_id()?.context("project database has no project")?, database.get_project_name()?.unwrap_or_else(|| "orc".into())))
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-# Orc v0.2 — Local orchestration workflow and operator documentation
+# Orc v0.2.2 — Local orchestration workflow and operator documentation
 
 ## Goal
 
@@ -32,7 +32,7 @@ The planner protocol is `PlanRequest`/`PlanResponse`: `orc plan-request` is read
 
 Both protocols are structured JSON interfaces. Orc does not include a built-in AI provider, silently dispatch work, or apply a plan without an explicit operator command.
 
-## v0.2 freeze gate
+## v0.2.2 freeze gate
 
 - A repository can be initialized and adopted, with project state persisted in `.orc/orc.db`.
 - Operators can plan or request task changes, validate and apply structured responses, and inspect the resulting lifecycle.
@@ -42,4 +42,4 @@ Both protocols are structured JSON interfaces. Orc does not include a built-in A
 - No acceptance path requires a live external AI provider.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `npm run typecheck`, and `npm run build` pass.
 
-The v0.2 release gate includes `tests/v02_acceptance_tests.rs`; after it passes, v0.2 core behavior is frozen and subsequent desktop redesign belongs to v0.3. The earlier `tests/v01_acceptance_tests.rs` remains historical coverage for initialization, adoption, manual task packet delivery, validation, review, Git integration, and doctor output.
+The v0.2.2 release gate includes `tests/v02_acceptance_tests.rs` and the Tauri project-registry acceptance tests; subsequent desktop visual redesign belongs to v0.3. The earlier `tests/v01_acceptance_tests.rs` remains historical coverage for initialization, adoption, manual task packet delivery, validation, review, Git integration, and doctor output.

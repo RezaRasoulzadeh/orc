@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Orc",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "identifier": "dev.orc.desktop",
   "build": { "frontendDist": "../dist" },
   "app": { "windows": [{ "title": "Orc", "width": 1440, "height": 900, "minWidth": 960, "minHeight": 640 }], "security": { "csp": null } },

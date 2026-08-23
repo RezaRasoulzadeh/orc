@@ -1,7 +1,9 @@
 use anyhow::Context;
 use orc::app::OrcApp;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, Manager};
@@ -120,11 +122,8 @@ fn remove_project(
         .0
         .lock()
         .map_err(|_| "project registry lock poisoned".to_string())?;
-    let mut session = app_state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
-    remove_project_state(&mut registry, &mut session, &id).map_err(|error| error.to_string())
+    let mut session = app_state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
+    remove_project_state(&mut registry, &mut session.0, &id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -397,7 +396,8 @@ mod project_lifecycle_tests {
         let dir = tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join(".orc")).unwrap();
-        orc::Database::init(root.join(".orc/orc.db")).unwrap();
+        let database = orc::Database::init(root.join(".orc/orc.db")).unwrap();
+        database.create_project("project").unwrap();
         let mut registry = project::ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         registry.register(root, None).unwrap();
         (dir, registry)
@@ -706,6 +706,7 @@ fn reject_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> 
     }
 }
 
+#[cfg(test)]
 fn resolve_project_paths(manifest_dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let root = manifest_dir
         .parent()
@@ -760,7 +761,7 @@ fn spawn_event_forwarder(
     });
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ProjectEvent<'a> {
     project_id: &'a str,
     event: orc::events::AppEvent,

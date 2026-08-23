@@ -103,6 +103,12 @@ fn import_project(
 }
 
 #[tauri::command]
+fn adopt_project(state: tauri::State<'_, RegistryState>, root: String, display_name: Option<String>) -> Result<project::RegisteredProject, String> {
+    let adopted_root = orc::adoption::adopt(&root).map_err(|error| error.to_string())?;
+    register_project(state, adopted_root.to_string_lossy().into_owned(), display_name)
+}
+
+#[tauri::command]
 fn project_availability(
     state: tauri::State<'_, RegistryState>,
     id: String,
@@ -133,15 +139,12 @@ fn relocate_project(
 fn current_project(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<project::RegisteredProject>, String> {
-    let guard = state.0.active()?;
-    Ok(Some(
-        guard
-            .guard
-            .as_ref()
-            .ok_or_else(|| "no active project".to_string())?
-            .project
-            .clone(),
-    ))
+    let guard = state
+        .0
+        .0
+        .lock()
+        .map_err(|_| "application lock poisoned".to_string())?;
+    Ok(guard.as_ref().map(|session| session.project.clone()))
 }
 
 #[tauri::command]
@@ -865,6 +868,7 @@ pub fn run() -> anyhow::Result<()> {
             registered_projects,
             register_project,
             import_project,
+            adopt_project,
             project_availability,
             relocate_project,
             remove_project,

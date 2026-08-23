@@ -73,6 +73,8 @@ export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: Agent
 export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string } }
 export interface PlanningRequest { protocol_version: number; kind: string; project: unknown; engineering_contract: string; objective: string; constraints: string[]; target_platforms: string[]; stack: string[]; non_goals: string[]; deliverables: string[]; definition_of_done: string[]; response_schema: unknown; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[]; current_state: unknown; full_report: ProjectReport | null }
 export interface ProjectReport { protocol_version: number; project: { name: string; repository: string; branch: string | null; commit: string | null }; engineering_contract: string; architecture: { modules: string[]; boundaries: string[]; discovery: Record<string, string> }; lifecycle: { counts: Record<string, number>; tasks: { id: string; title: string; status: string }[] }; agents: unknown[]; queue: QueueReport; recent_work: unknown[]; risks: string[]; open_questions: string[]; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[] }
+export type ProjectStatus = 'Available' | 'Missing' | 'Invalid' | 'TemporarilyUnavailable'
+export interface RegisteredProject { id: string; display_name: string; repository_root: string; project_id: number; project_name: string; last_opened_at: number | null; available: boolean; status: ProjectStatus }
 
 export const api = {
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
@@ -104,4 +106,12 @@ export const api = {
   approvals: () => invoke<ApprovalRequest[]>('approvals'),
   resolveApproval: (id: number) => invoke<void>('resolve_approval', { id }),
   projectReport: () => invoke<ProjectReport>('project_report'),
+  registeredProjects: () => invoke<RegisteredProject[]>('registered_projects'),
+  currentProject: () => invoke<RegisteredProject | null>('current_project'),
+  importProject: (root: string, displayName?: string) => invoke<RegisteredProject>('import_project', { root, displayName }),
+  adoptProject: (root: string, displayName?: string) => invoke<RegisteredProject>('adopt_project', { root, displayName }),
+  openProject: (id: string) => invoke<void>('open_project', { id }),
+  closeProject: () => invoke<void>('close_project'),
+  relocateProject: (id: string, root: string) => invoke<RegisteredProject>('relocate_project', { id, root }),
+  removeProject: (id: string) => invoke<boolean>('remove_project', { id }),
 }

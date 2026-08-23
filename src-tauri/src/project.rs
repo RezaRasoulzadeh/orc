@@ -27,6 +27,13 @@ pub struct ProjectRegistry {
     file: RegistryFile,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectAvailability {
+    pub project_id: String,
+    pub available: bool,
+    pub error: Option<String>,
+}
+
 pub struct ProjectSession {
     pub project: RegisteredProject,
     pub app: OrcApp,
@@ -75,7 +82,28 @@ impl ProjectRegistry {
     }
 
     pub fn projects(&self) -> Vec<RegisteredProject> {
-        self.file.projects.clone()
+        self.file
+            .projects
+            .iter()
+            .map(|project| {
+                let mut project = project.clone();
+                project.available = self.validate(project.id.as_str()).is_ok();
+                project
+            })
+            .collect()
+    }
+
+    pub fn availability(&self, id: &str) -> Result<ProjectAvailability> {
+        let project = self.file.projects.iter().find(|project| project.id == id);
+        let result = match project {
+            Some(project) => self.validate(&project.id),
+            None => Err(anyhow::anyhow!("registered project '{id}' not found")),
+        };
+        Ok(ProjectAvailability {
+            project_id: id.to_string(),
+            available: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        })
     }
 
     pub fn register(
@@ -136,6 +164,7 @@ impl ProjectRegistry {
     }
 
     pub fn mark_opened(&mut self, id: &str) -> Result<RegisteredProject> {
+        self.validate(id)?;
         let project = self
             .file
             .projects
@@ -143,10 +172,33 @@ impl ProjectRegistry {
             .find(|project| project.id == id)
             .context("registered project not found")?;
         project.last_opened_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
-        project.available = project.repository_root.join(".orc/orc.db").is_file();
+        project.available = true;
         let result = project.clone();
         self.save()?;
         Ok(result)
+    }
+
+    fn validate(&self, id: &str) -> Result<()> {
+        let project = self
+            .file
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .context("registered project not found")?;
+        if !project.repository_root.is_dir() {
+            bail!("repository root is not a directory: {}", project.repository_root.display());
+        }
+        let db = project.repository_root.join(".orc/orc.db");
+        if !db.is_file() {
+            bail!("project database not found at {}", db.display());
+        }
+        let database = orc::Database::open(&db).context("open project database")?;
+        let project_id = database.get_project_id()?.context("project database has no project")?;
+        let project_name = database.get_project_name()?.unwrap_or_else(|| "orc".into());
+        if project_id != project.project_id || project_name != project.project_name {
+            bail!("project database identity does not match registered project");
+        }
+        Ok(())
     }
 
     fn save(&self) -> Result<()> {

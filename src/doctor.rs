@@ -182,7 +182,9 @@ pub fn inspect(root: impl AsRef<Path>, runner: &dyn HealthCommandRunner) -> Doct
                             agent
                                 .quota_reset_at
                                 .as_deref()
-                                .map(|reset| format!(", reset: {reset}"))
+                                .map(|reset| {
+                                    format!(", reset: {}", crate::format::timestamp(reset))
+                                })
                                 .unwrap_or_default()
                         )),
                     }

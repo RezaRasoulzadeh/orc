@@ -402,6 +402,14 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
         } else {
             None
         };
+        let persisted_execution = crate::execution::resolve_with_template(
+            &task.role,
+            &db.execution_template(crate::execution::class_for_role(&task.role))?,
+            None,
+            None,
+            None,
+            None,
+        );
 
         match task.status {
             TaskStatus::Done => {
@@ -414,7 +422,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
-                    recommended_execution: None,
+                    recommended_execution: Some(persisted_execution.clone()),
                 });
             }
             TaskStatus::Cancelled => {
@@ -427,7 +435,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
-                    recommended_execution: None,
+                    recommended_execution: Some(persisted_execution.clone()),
                 });
             }
             TaskStatus::Review => {
@@ -440,7 +448,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent,
                     recommended_agent: None,
                     schedule_decision: None,
-                    recommended_execution: None,
+                    recommended_execution: Some(persisted_execution.clone()),
                 });
             }
             TaskStatus::Active => {
@@ -453,7 +461,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent,
                     recommended_agent: None,
                     schedule_decision: None,
-                    recommended_execution: None,
+                    recommended_execution: Some(persisted_execution.clone()),
                 });
             }
             TaskStatus::Blocked => {
@@ -472,7 +480,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
-                    recommended_execution: None,
+                    recommended_execution: Some(persisted_execution.clone()),
                 });
             }
             TaskStatus::Backlog | TaskStatus::Ready => {
@@ -489,7 +497,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         active_agent: None,
                         recommended_agent: None,
                         schedule_decision: None,
-                        recommended_execution: None,
+                        recommended_execution: Some(persisted_execution.clone()),
                     });
                 } else {
                     let decision = scheduler::schedule_with_busy_and_quota_reserve(
@@ -550,7 +558,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                             active_agent: None,
                             recommended_agent: None,
                             schedule_decision: Some(decision),
-                            recommended_execution: None,
+                            recommended_execution: Some(persisted_execution.clone()),
                         });
                     }
                 }

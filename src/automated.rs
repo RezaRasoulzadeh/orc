@@ -260,6 +260,7 @@ fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> R
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     Ok(db.create_project_action_run(
         project_id,
+        None,
         action.as_str(),
         &resolved.agent,
         AgentRunExecution {
@@ -362,11 +363,22 @@ fn run_review_mode(
     project_review: bool,
 ) -> Result<(i64, ReviewResult)> {
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
-    let run = start_run(db, AgentAction::Review, &resolved)?;
+    let run = db.create_project_action_run(
+        db.get_project_id()?.context("no project found in DB")?,
+        (!project_review).then_some(summary.task.id.as_str()),
+        AgentAction::Review.as_str(),
+        &resolved.agent,
+        AgentRunExecution {
+            class: AgentAction::Review.as_str(),
+            model: resolved.model.as_deref(),
+            effort: resolved.reasoning_effort,
+            source: "action",
+        },
+    )?;
     let instructions = if project_review {
         "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
     } else {
-        "Perform a task-scoped contract review, not an unrestricted project audit. Compare the task title, objective, context files, expected changes, dependencies, role/capabilities, task instructions, submitted diff, and validation results. Only a finding that materially prevents this task from being complete, correct, safe, or non-regressive is blocking; pre-existing defects and unrelated improvements are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction, unsafe implementation, or substantial redesign."
+        "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, structured validation evidence, and review history. On a revision, evaluate prior blockers first, classify them resolved or unresolved, then inspect primarily for regressions introduced by the revision. Do not restate equivalent findings. A blocker must identify an explicit requirement, concrete evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. Keep blocking findings to at most 5. Code quality, polish, preferences, extra tests, and unrelated defects are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation."
     };
     let prompt = format!(
         "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
@@ -381,6 +393,9 @@ fn run_review_mode(
                         bail!("review verdict must not be empty")
                     }
                     let mut result = result;
+                    if !project_review {
+                        result.blocking_findings.truncate(5);
+                    }
                     if result.blocking_findings.is_empty()
                         && result.non_blocking_findings.is_empty()
                         && (result.verdict.eq_ignore_ascii_case("revise")
@@ -400,6 +415,9 @@ fn run_review_mode(
                             || result.verdict.eq_ignore_ascii_case("reject"))
                     {
                         result.verdict = "PASS".into();
+                    }
+                    if result.verdict.eq_ignore_ascii_case("pass") {
+                        result.blocking_findings.clear();
                     }
                     Ok(result)
                 },
@@ -762,6 +780,8 @@ mod tests {
             worktree_path: None,
             changes: crate::git::WorktreeChanges::default(),
             change_evidence: None,
+            validation_evidence: None,
+            prior_reviews: Vec::new(),
         };
         (
             db,
@@ -824,6 +844,64 @@ mod tests {
             .1;
         assert_eq!(result.verdict, "REVISE");
         assert_eq!(result.non_blocking_findings, vec!["architectural debt"]);
+    }
+
+    #[test]
+    fn task_review_run_is_associated_with_task() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "PASS",
+            "findings": [],
+            "blocking_findings": [],
+            "non_blocking_findings": [],
+            "severity": null,
+            "revision_feedback": null
+        }));
+        let (run_id, _) = run_review(&db, &summary, &ActionOverrides::default(), &backend).unwrap();
+        let run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(run.task_id.as_deref(), Some(summary.task.id.as_str()));
+        assert_eq!(run.execution_class, "review");
+    }
+
+    #[test]
+    fn review_context_includes_prior_reviews_without_selecting_them_as_implementation() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "REVISE",
+            "findings": ["required behavior is missing"],
+            "blocking_findings": ["required behavior is missing"],
+            "non_blocking_findings": ["optional cleanup"],
+            "severity": "high",
+            "revision_feedback": "implement the required behavior"
+        }));
+        let project_id = db.get_project_id().unwrap().unwrap();
+        let implementation_run = db
+            .create_agent_run_with_execution(
+                project_id,
+                &summary.task.id,
+                "multi",
+                "automated",
+                AgentRunExecution {
+                    class: "code",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.update_agent_run_status(implementation_run, "completed", Some("implemented"))
+            .unwrap();
+        run_review(&db, &summary, &ActionOverrides::default(), &backend).unwrap();
+
+        let next = crate::review::build_review(&db, &summary.task.id, Path::new(".")).unwrap();
+        assert_eq!(next.run.unwrap().id, implementation_run);
+        assert_eq!(next.prior_reviews.len(), 1);
+        assert_eq!(
+            next.prior_reviews[0].blocking_findings,
+            vec!["required behavior is missing"]
+        );
+        assert_eq!(
+            next.prior_reviews[0].revision_feedback.as_deref(),
+            Some("implement the required behavior")
+        );
     }
 
     #[test]

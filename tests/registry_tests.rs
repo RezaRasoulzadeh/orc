@@ -25,6 +25,7 @@ fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
         quota_checked_at: None,
         quota_source: None,
         quota_limits: None,
+        actions: vec![registry::AgentAction::Code],
     }
 }
 

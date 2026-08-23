@@ -589,6 +589,7 @@ mod tests {
             quota_checked_at: None,
             quota_source: None,
             quota_limits: None,
+            actions: vec![crate::registry::AgentAction::Code],
         }
     }
 

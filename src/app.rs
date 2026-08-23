@@ -91,7 +91,10 @@ impl OrcApp {
             .db
             .get_agent(&config.agent_id)?
             .with_context(|| format!("Lead agent '{}' does not exist", config.agent_id))?;
-        if agent.execution_mode != registry::AUTOMATED || agent.backend != "codex" {
+        if !agent.supports_action(registry::AgentAction::Lead)
+            || agent.execution_mode != registry::AUTOMATED
+            || agent.backend != "codex"
+        {
             anyhow::bail!(
                 "Lead agent '{}' is not compatible with Lead execution",
                 config.agent_id
@@ -99,6 +102,31 @@ impl OrcApp {
         }
         self.db.set_lead_provider_config(&config)?;
         Ok(())
+    }
+    pub fn agent_action_profiles(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::registry::AgentActionProfile>> {
+        Ok(self.db.agent_action_profiles(id)?)
+    }
+    pub fn set_agent_action_profile(
+        &self,
+        id: &str,
+        action: crate::registry::AgentAction,
+        model: Option<&str>,
+        effort: Option<registry::ReasoningEffort>,
+    ) -> Result<bool> {
+        registry::get_agent(&self.db, id)?;
+        Ok(self
+            .db
+            .set_agent_action_profile(id, action, model, effort)?)
+    }
+    pub fn clear_agent_action_profile(
+        &self,
+        id: &str,
+        action: crate::registry::AgentAction,
+    ) -> Result<bool> {
+        Ok(self.db.clear_agent_action_profile(id, action)?)
     }
     pub fn clear_lead_provider_config(&self) -> Result<()> {
         Ok(self.db.clear_lead_provider_config()?)

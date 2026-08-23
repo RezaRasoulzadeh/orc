@@ -1,5 +1,7 @@
 use crate::execution::{ExecutionClass, ExecutionTemplate};
-use crate::registry::{AgentDefinition, QuotaLimits, ReasoningEffort};
+use crate::registry::{
+    AgentAction, AgentActionProfile, AgentDefinition, QuotaLimits, ReasoningEffort,
+};
 use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
@@ -455,6 +457,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(&conn)?;
         Self::ensure_execution_templates_table(&conn)?;
+        Self::ensure_agent_actions_table(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
@@ -499,6 +502,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(conn)?;
         Self::ensure_execution_templates_table(conn)?;
+        Self::ensure_agent_actions_table(conn)?;
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
@@ -516,6 +520,49 @@ impl Database {
     fn ensure_execution_templates_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS execution_templates (class TEXT PRIMARY KEY, model TEXT, reasoning_effort TEXT)")?;
         Ok(())
+    }
+
+    fn ensure_agent_actions_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_action_profiles (agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE, action TEXT NOT NULL, model TEXT, reasoning_effort TEXT, PRIMARY KEY(agent_id, action))")?;
+        Ok(())
+    }
+
+    pub fn agent_action_profiles(&self, id: &str) -> Result<Vec<AgentActionProfile>, DbError> {
+        let mut s = self.conn.prepare("SELECT action, model, reasoning_effort FROM agent_action_profiles WHERE agent_id = ?1 ORDER BY action")?;
+        Ok(s.query_map([id], |r| {
+            Ok(AgentActionProfile {
+                action: AgentAction::parse(&r.get::<_, String>(0)?)
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?,
+                model: r.get(1)?,
+                reasoning_effort: r
+                    .get::<_, Option<String>>(2)?
+                    .map(|v| ReasoningEffort::parse(&v))
+                    .transpose()
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+    }
+
+    pub fn set_agent_action_profile(
+        &self,
+        id: &str,
+        action: AgentAction,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute("INSERT INTO agent_action_profiles(agent_id, action, model, reasoning_effort) VALUES(?1, ?2, ?3, ?4) ON CONFLICT(agent_id, action) DO UPDATE SET model=excluded.model, reasoning_effort=excluded.reasoning_effort", params![id, action.as_str(), model, effort.map(|v| v.as_str())])? != 0)
+    }
+
+    pub fn clear_agent_action_profile(
+        &self,
+        id: &str,
+        action: AgentAction,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM agent_action_profiles WHERE agent_id=?1 AND action=?2",
+            params![id, action.as_str()],
+        )? != 0)
     }
 
     fn ensure_lead_provider_config_table(conn: &Connection) -> Result<(), DbError> {
@@ -1061,10 +1108,18 @@ impl Database {
                 agent.quota_limits.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
+        for action in &agent.actions {
+            self.set_agent_action_profile(
+                &agent.id,
+                *action,
+                agent.model.as_deref(),
+                agent.reasoning_effort,
+            )?;
+        }
         Ok(())
     }
 
-    fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<AgentDefinition> {
+    fn agent_from_row(&self, row: &Row<'_>) -> rusqlite::Result<AgentDefinition> {
         let capabilities_json: String = row.get(5)?;
         let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
             rusqlite::Error::InvalidParameterName(format!("invalid agent capabilities: {error}"))
@@ -1076,7 +1131,7 @@ impl Database {
             .map_err(|error| {
                 rusqlite::Error::InvalidParameterName(format!("invalid quota limits: {error}"))
             })?;
-        Ok(AgentDefinition {
+        let mut agent = AgentDefinition {
             id: row.get(0)?,
             backend: row.get(1)?,
             execution_mode: row.get(12)?,
@@ -1099,7 +1154,27 @@ impl Database {
             quota_checked_at: row.get(15)?,
             quota_source: row.get(16)?,
             quota_limits,
-        })
+            actions: Vec::new(),
+        };
+        agent.actions = self
+            .agent_action_profiles(&agent.id)
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?
+            .into_iter()
+            .map(|p| p.action)
+            .collect();
+        if agent.actions.is_empty() {
+            agent.actions = if agent.execution_mode == crate::registry::MANUAL {
+                vec![
+                    AgentAction::Code,
+                    AgentAction::Review,
+                    AgentAction::Plan,
+                    AgentAction::Lead,
+                ]
+            } else {
+                vec![AgentAction::Code]
+            };
+        }
+        Ok(agent)
     }
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentDefinition>, DbError> {
@@ -1108,7 +1183,7 @@ impl Database {
             .query_row(
                 "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents WHERE id = ?1",
                 params![id],
-                Self::agent_from_row,
+                |row| self.agent_from_row(row),
             )
             .optional()?)
     }
@@ -1118,7 +1193,7 @@ impl Database {
             "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents ORDER BY id",
         )?;
         Ok(statement
-            .query_map([], Self::agent_from_row)?
+            .query_map([], |row| self.agent_from_row(row))?
             .collect::<Result<Vec<_>, _>>()?)
     }
 

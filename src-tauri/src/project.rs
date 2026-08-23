@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
+use orc::app::OrcApp;
+use orc::events::EventSubscription;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +25,39 @@ struct RegistryFile {
 pub struct ProjectRegistry {
     path: PathBuf,
     file: RegistryFile,
+}
+
+pub struct ProjectSession {
+    pub project: RegisteredProject,
+    pub app: OrcApp,
+    subscription: Option<EventSubscription>,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl ProjectSession {
+    pub fn open(project: RegisteredProject) -> Result<Self> {
+        let app = OrcApp::open(
+            project.repository_root.join(".orc/orc.db"),
+            &project.repository_root,
+        )?;
+        let subscription = app.subscribe();
+        Ok(Self {
+            project,
+            app,
+            subscription: Some(subscription),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn take_subscription(&mut self) -> (EventSubscription, Arc<AtomicBool>) {
+        (self.subscription.take().expect("session subscription"), self.cancellation.clone())
+    }
+}
+
+impl Drop for ProjectSession {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
 }
 
 impl ProjectRegistry {

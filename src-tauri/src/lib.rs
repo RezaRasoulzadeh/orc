@@ -3,12 +3,40 @@ use orc::app::OrcApp;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, Manager};
 mod project;
 mod storage;
 
-struct AppState(Mutex<OrcApp>);
+struct AppState(SessionState);
 struct RegistryState(Mutex<project::ProjectRegistry>);
+
+struct SessionState(Mutex<Option<project::ProjectSession>>);
+
+struct SessionGuard<'a>(std::sync::MutexGuard<'a, Option<project::ProjectSession>>);
+
+impl std::ops::Deref for SessionGuard<'_> {
+    type Target = OrcApp;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.as_ref().expect("active project session").app
+    }
+}
+
+impl SessionState {
+    fn lock(&self) -> Result<SessionGuard<'_>, String> {
+        let guard = self.0.lock().map_err(|_| "application lock poisoned".to_string())?;
+        if guard.is_none() {
+            return Err("no active project".into());
+        }
+        Ok(SessionGuard(guard))
+    }
+
+    fn replace(&self, session: Option<project::ProjectSession>) -> Result<(), String> {
+        *self.0.lock().map_err(|_| "application lock poisoned".to_string())? = session;
+        Ok(())
+    }
+}
 
 #[tauri::command]
 fn registered_projects(
@@ -44,6 +72,30 @@ fn remove_project(state: tauri::State<'_, RegistryState>, id: String) -> Result<
         .map_err(|_| "project registry lock poisoned".to_string())?
         .remove(&id)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_project(
+    app_handle: tauri::AppHandle,
+    app_state: tauri::State<'_, AppState>,
+    registry_state: tauri::State<'_, RegistryState>,
+    id: String,
+) -> Result<(), String> {
+    let project = registry_state
+        .0
+        .lock()
+        .map_err(|_| "project registry lock poisoned".to_string())?
+        .mark_opened(&id)
+        .map_err(|error| error.to_string())?;
+    let mut session = project::ProjectSession::open(project).map_err(|error| error.to_string())?;
+    let (subscription, cancellation) = session.take_subscription();
+    app_state.0.replace(Some(session))
+        .map(|_| spawn_event_forwarder(app_handle, subscription, cancellation))
+}
+
+#[tauri::command]
+fn close_project(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.0.replace(None)
 }
 
 #[derive(Debug, Serialize)]
@@ -596,22 +648,27 @@ fn dirs_path(_: &tauri::Config) -> anyhow::Result<PathBuf> {
     Ok(base.join("orc").join("projects.json"))
 }
 
-fn opportunistic_project_app(registry: &mut project::ProjectRegistry) -> Option<OrcApp> {
-    let project = registry.projects().into_iter().next()?;
-    let project = registry.mark_opened(&project.id).ok()?;
-    OrcApp::open(
-        project.repository_root.join(".orc/orc.db"),
-        &project.repository_root,
-    )
-    .ok()
+fn spawn_event_forwarder(
+    handle: tauri::AppHandle,
+    subscription: orc::events::EventSubscription,
+    cancellation: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(event) = subscription.recv() {
+            if cancellation.load(Ordering::Acquire) {
+                break;
+            }
+            if handle.emit("orc://run-event", event).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{opportunistic_project_app, resolve_project_paths};
-    use crate::project::ProjectRegistry;
+    use super::resolve_project_paths;
     use std::path::Path;
-    use tempfile::tempdir;
 
     #[test]
     fn project_root_is_the_parent_of_src_tauri() {
@@ -628,58 +685,22 @@ mod tests {
         let result = resolve_project_paths(Path::new("/workspace/orc"));
         assert!(result.is_err());
     }
-
-    #[test]
-    fn empty_registry_has_no_opportunistic_project() {
-        let dir = tempdir().unwrap();
-        let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        assert!(opportunistic_project_app(&mut registry).is_none());
-    }
-
-    #[test]
-    fn stale_registered_project_does_not_prevent_startup() {
-        let dir = tempdir().unwrap();
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(project_dir.join(".orc")).unwrap();
-        orc::Database::init(project_dir.join(".orc/orc.db")).unwrap();
-        let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        let registered = registry.register(&project_dir, None).unwrap();
-        std::fs::remove_dir_all(&project_dir).unwrap();
-        assert!(opportunistic_project_app(&mut registry).is_none());
-        assert_eq!(registry.projects()[0].id, registered.id);
-    }
 }
 
 pub fn run() -> anyhow::Result<()> {
     let app_data = tauri::Config::default();
     let registry_path = dirs_path(&app_data)?;
-    let mut registry = project::ProjectRegistry::open(&registry_path)?;
-    let mut builder = tauri::Builder::default();
-    if let Some(app) = opportunistic_project_app(&mut registry) {
-        builder = builder.manage(AppState(Mutex::new(app))).setup(|handle| {
-            let state = handle.state::<AppState>();
-            let subscription = state
-                .0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("application lock poisoned"))?
-                .subscribe();
-            let handle = handle.handle().clone();
-            std::thread::spawn(move || {
-                while let Ok(event) = subscription.recv() {
-                    if handle.emit("orc://run-event", event).is_err() {
-                        break;
-                    }
-                }
-            });
-            Ok(())
-        });
-    }
+    let registry = project::ProjectRegistry::open(&registry_path)?;
+    let builder = tauri::Builder::default();
     builder
+        .manage(AppState(SessionState(Mutex::new(None))))
         .manage(RegistryState(Mutex::new(registry)))
         .invoke_handler(tauri::generate_handler![
             registered_projects,
             register_project,
             remove_project,
+            open_project,
+            close_project,
             snapshot,
             tasks,
             agents,

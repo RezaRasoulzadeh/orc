@@ -274,6 +274,7 @@ pub fn dispatch_with_worker_on_db(
                             "worker completed without meaningful project changes; task remains blocked"
                         );
                     }
+                    db.store_change_evidence(run_id, &changes)?;
                     let validation_config = match ValidationConfig::load(&worktree_dir) {
                         Ok(config) => config,
                         Err(error) => {
@@ -320,11 +321,7 @@ pub fn dispatch_with_worker_on_db(
                         Some(task_id),
                         Some(run_id),
                         Some(agent_id),
-                        Some(if report.is_success() {
-                            "success"
-                        } else {
-                            "failure"
-                        }),
+                        Some(&serde_json::to_string(&report)?),
                     )?;
                     let combined_output = if validation_summary.is_empty() {
                         output.unwrap_or_default()
@@ -555,6 +552,7 @@ pub fn revise_with_worker_on_db(
     if changes.files.is_empty() {
         return fail("Revision completed without meaningful project changes.".into());
     }
+    db.store_change_evidence(run_id, &changes)?;
     let config = match ValidationConfig::load(&worktree_dir) {
         Ok(config) => config,
         Err(error) => return fail(format!("Validation setup failed: {error:#}")),
@@ -580,11 +578,7 @@ pub fn revise_with_worker_on_db(
         Some(task_id),
         Some(run_id),
         Some(agent_id),
-        Some(if report.is_success() {
-            "success"
-        } else {
-            "failure"
-        }),
+        Some(&serde_json::to_string(&report)?),
     )?;
     db.update_task_status(task_id, TaskStatus::Review)?;
     progress("review transition");
@@ -762,6 +756,7 @@ pub fn dispatch_selected_with_db_and_repo(
         reasoning_effort,
         &resolution.source,
     )?;
+    db.set_agent_run_profile(summary.run_id, agent.profile_path.as_deref())?;
     summary.backend = agent.backend;
     summary.profile = agent.profile_path;
     summary.model = model;
@@ -1099,6 +1094,8 @@ pub fn submit_patch_with_runner(
         report.summary(),
         patch_content
     );
+    let changes = git::inspect_worktree(&absolute_worktree, repo_path)?;
+    db.store_change_evidence(run_id, &changes)?;
     db.complete_manual_run(run_id, &success_output)?;
     db.update_task_status(&task_id, TaskStatus::Review)?;
 

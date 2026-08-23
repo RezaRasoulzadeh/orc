@@ -61,6 +61,7 @@ pub struct ReviewSummary {
     pub result: Option<WorkerResult>,
     pub worktree_path: Option<String>,
     pub changes: WorktreeChanges,
+    pub change_evidence: Option<WorktreeChanges>,
 }
 
 pub fn build_review(
@@ -81,12 +82,49 @@ pub fn build_review(
         Some(path) if repo.join(path).exists() => git::inspect_worktree(repo.join(path), repo)?,
         _ => WorktreeChanges::default(),
     };
+    let change_evidence = run
+        .as_ref()
+        .map(|value| db.get_change_evidence(value.id))
+        .transpose()?
+        .flatten();
     Ok(ReviewSummary {
         task,
         run,
         result,
         worktree_path,
         changes,
+        change_evidence,
+    })
+}
+
+pub fn build_review_for_run(
+    db: &crate::storage::Database,
+    run_id: i64,
+    _repo: &Path,
+) -> Result<ReviewSummary> {
+    let run = db
+        .get_agent_run(run_id)?
+        .with_context(|| format!("run {run_id} not found"))?;
+    let task_id = run
+        .task_id
+        .as_deref()
+        .context("run has no associated task")?;
+    let task = db
+        .get_task(task_id)?
+        .with_context(|| format!("task '{task_id}' not found"))?;
+    let result = db.get_worker_result(run_id)?;
+    let worktree_path = db
+        .get_worktree_metadata_for_run(run_id)?
+        .map(|(_, path)| path);
+    let changes = WorktreeChanges::default();
+    let change_evidence = db.get_change_evidence(run_id)?;
+    Ok(ReviewSummary {
+        task,
+        run: Some(run),
+        result,
+        worktree_path,
+        changes,
+        change_evidence,
     })
 }
 

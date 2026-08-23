@@ -325,6 +325,17 @@ impl OrcApp {
     ) -> Result<Option<crate::read_model::RunDetails>> {
         crate::read_model::run_details(&self.db, id, activity_limit)
     }
+    pub fn worker_log(&self, id: i64) -> Result<Vec<crate::storage::db::LifecycleEvent>> {
+        let run = self.db.get_agent_run(id)?.context("run not found")?;
+        let project = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        if run.project_id != project {
+            anyhow::bail!("run does not belong to the active project")
+        }
+        Ok(self.db.list_worker_output(id)?)
+    }
     pub fn subscribe(&self) -> crate::events::EventSubscription {
         self.events.subscribe()
     }
@@ -393,6 +404,9 @@ impl OrcApp {
         activity_limit: usize,
     ) -> Result<crate::read_model::RunsWorkspace> {
         crate::read_model::runs_workspace(&self.db, limit, activity_limit)
+    }
+    pub fn review_run(&self, run_id: i64) -> Result<crate::review::ReviewSummary> {
+        crate::review::build_review_for_run(&self.db, run_id, &self.repo_path)
     }
     pub fn agents(&self) -> Result<Vec<AgentDefinition>> {
         Ok(self.db.list_agents()?)

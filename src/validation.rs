@@ -9,14 +9,14 @@ pub struct ValidationConfig {
     pub commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationStepResult {
     pub command: String,
     pub passed: bool,
     pub output: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationReport {
     pub steps: Vec<ValidationStepResult>,
 }

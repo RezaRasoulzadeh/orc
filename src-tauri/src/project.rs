@@ -176,10 +176,11 @@ impl ProjectRegistry {
     pub fn remove(&mut self, id: &str) -> Result<bool> {
         let old = self.file.projects.len();
         self.file.projects.retain(|project| project.id != id);
-        if old != self.file.projects.len() {
+        let removed = old != self.file.projects.len();
+        if removed {
             self.save()?;
         }
-        Ok(old != self.file.projects.len())
+        Ok(removed)
     }
 
     pub fn mark_opened(&mut self, id: &str) -> Result<RegisteredProject> {
@@ -281,5 +282,31 @@ mod tests {
         assert_eq!(first.id, duplicate.id);
         let reopened = ProjectRegistry::open(path).unwrap();
         assert_eq!(reopened.projects(), vec![first]);
+    }
+
+    #[test]
+    fn removal_only_forgets_registration_and_reimport_recovers_state() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".orc")).unwrap();
+        let database_path = root.join(".orc/orc.db");
+        orc::Database::init(&database_path).unwrap();
+        let database_before = std::fs::read(&database_path).unwrap();
+        let path = dir.path().join("registry.json");
+        let mut registry = ProjectRegistry::open(&path).unwrap();
+        let project = registry.register(&root, Some("Demo".into())).unwrap();
+
+        assert!(registry.remove(&project.id).unwrap());
+        assert!(!registry.remove(&project.id).unwrap());
+        assert!(!registry.remove("unknown").unwrap());
+        assert!(registry.projects().is_empty());
+        assert_eq!(std::fs::read(&database_path).unwrap(), database_before);
+        assert!(root.join(".orc/orc.db").is_file());
+
+        let recovered = registry.register(&root, None).unwrap();
+        assert_eq!(recovered.project_id, project.project_id);
+        assert_eq!(recovered.project_name, project.project_name);
+        assert_eq!(recovered.repository_root, project.repository_root);
+        assert_eq!(std::fs::read(&database_path).unwrap(), database_before);
     }
 }

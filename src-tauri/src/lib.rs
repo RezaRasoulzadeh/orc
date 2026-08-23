@@ -274,6 +274,34 @@ fn configure_agent(
 }
 
 #[tauri::command]
+fn lead_provider_config(state: tauri::State<'_, AppState>) -> Result<Option<orc::lead::LeadProviderConfig>, String> {
+    state.0.active()?.app()?.lead_provider_config().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_lead_provider(state: tauri::State<'_, AppState>, config: orc::lead::LeadProviderConfig) -> Result<(), String> {
+    state.0.active()?.app()?.set_lead_provider_config(config).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_lead_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.0.active()?.app()?.clear_lead_provider_config().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn execution_template(state: tauri::State<'_, AppState>, class: String) -> Result<orc::execution::ExecutionTemplate, String> {
+    let class = class.parse().map_err(|error: String| error)?;
+    state.0.active()?.app()?.execution_template(class).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_execution_template(state: tauri::State<'_, AppState>, class: String, model: Option<String>, effort: Option<String>) -> Result<(), String> {
+    let class = class.parse().map_err(|error: String| error)?;
+    let effort = effort.map(|value| orc::registry::ReasoningEffort::parse(&value)).transpose().map_err(|error| error.to_string())?;
+    state.0.active()?.app()?.set_execution_template(class, model.as_deref(), effort).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn sync_agent(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     state
         .0
@@ -522,6 +550,15 @@ fn planner_validate(
         .app()?
         .validate_plan_json(&json)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn automated_plan(state: tauri::State<'_, AppState>, objective: String) -> Result<(), String> {
+    let guard = state.0.active()?;
+    let app = guard.app()?;
+    let mut request = app.planning_request().map_err(|error| error.to_string())?;
+    request.objective = objective;
+    app.automated_plan(&request, &orc::automated::ActionOverrides::default()).map(|_| ()).map_err(|error| error.to_string())
 }
 #[tauri::command]
 fn planner_apply(
@@ -879,6 +916,11 @@ pub fn run() -> anyhow::Result<()> {
             tasks,
             agents,
             configure_agent,
+            lead_provider_config,
+            set_lead_provider,
+            clear_lead_provider,
+            execution_template,
+            set_execution_template,
             sync_agent,
             manual_runs,
             manual_run_action,
@@ -888,6 +930,7 @@ pub fn run() -> anyhow::Result<()> {
             queue,
             planning_request,
             planner_validate,
+            automated_plan,
             planner_apply,
             approvals,
             resolve_approval,

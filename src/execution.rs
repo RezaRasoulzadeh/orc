@@ -69,7 +69,7 @@ pub struct ExecutionResolution {
     pub source: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionTemplate {
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,

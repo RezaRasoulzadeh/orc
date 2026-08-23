@@ -1,4 +1,4 @@
-use orc::execution::{ExecutionClass, resolve};
+use orc::execution::{ExecutionClass, ExecutionTemplate, resolve, resolve_with_template};
 use orc::registry::ReasoningEffort;
 use std::sync::Mutex;
 
@@ -84,4 +84,64 @@ fn resolution_precedence_and_templates_are_explicit() {
         assert_eq!(general.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(general.source, "agent");
     });
+}
+
+#[test]
+fn persisted_template_precedes_environment_and_agent_defaults() {
+    with_env(
+        Some("environment-model"),
+        Some("environment-review"),
+        || {
+            let persisted = ExecutionTemplate {
+                model: Some("persistent-model".into()),
+                reasoning_effort: Some(ReasoningEffort::Medium),
+            };
+            let resolved = resolve_with_template(
+                "developer",
+                &persisted,
+                Some("agent-model"),
+                Some(ReasoningEffort::High),
+                None,
+                None,
+            );
+            assert_eq!(resolved.model.as_deref(), Some("persistent-model"));
+            assert_eq!(resolved.reasoning_effort, Some(ReasoningEffort::Medium));
+            assert_eq!(resolved.source, "persistent-template");
+
+            let overridden = resolve_with_template(
+                "developer",
+                &persisted,
+                Some("agent-model"),
+                Some(ReasoningEffort::High),
+                Some("override-model".into()),
+                Some(ReasoningEffort::Low),
+            );
+            assert_eq!(overridden.model.as_deref(), Some("override-model"));
+            assert_eq!(overridden.reasoning_effort, Some(ReasoningEffort::Low));
+            assert_eq!(overridden.source, "override");
+
+            let env_only = resolve_with_template(
+                "developer",
+                &ExecutionTemplate::default(),
+                Some("agent-model"),
+                Some(ReasoningEffort::High),
+                None,
+                None,
+            );
+            assert_eq!(env_only.model.as_deref(), Some("environment-model"));
+            assert_eq!(env_only.reasoning_effort, Some(ReasoningEffort::Low));
+
+            let agent_only = resolve_with_template(
+                "general",
+                &ExecutionTemplate::default(),
+                Some("agent-model"),
+                Some(ReasoningEffort::High),
+                None,
+                None,
+            );
+            assert_eq!(agent_only.model.as_deref(), Some("agent-model"));
+            assert_eq!(agent_only.reasoning_effort, Some(ReasoningEffort::High));
+            assert_eq!(agent_only.source, "agent");
+        },
+    );
 }

@@ -1,3 +1,4 @@
+use crate::execution::{ExecutionClass, ExecutionTemplate};
 use crate::registry::{AgentDefinition, QuotaLimits, ReasoningEffort};
 use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
@@ -453,6 +454,7 @@ impl Database {
             "#,
         )?;
         Self::ensure_agent_columns(&conn)?;
+        Self::ensure_execution_templates_table(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
@@ -494,6 +496,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
         )?;
         Self::ensure_agent_columns(conn)?;
+        Self::ensure_execution_templates_table(conn)?;
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
@@ -505,6 +508,61 @@ impl Database {
 
     fn ensure_lifecycle_events_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS lifecycle_events (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), kind TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), run_id INTEGER REFERENCES agent_runs(id), agent_id TEXT, payload TEXT)")?;
+        Ok(())
+    }
+
+    fn ensure_execution_templates_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS execution_templates (class TEXT PRIMARY KEY, model TEXT, reasoning_effort TEXT)")?;
+        Ok(())
+    }
+
+    pub fn execution_template(&self, class: ExecutionClass) -> Result<ExecutionTemplate, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT model, reasoning_effort FROM execution_templates WHERE class = ?1",
+                [class.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row
+            .map(|(model, effort)| ExecutionTemplate {
+                model,
+                reasoning_effort: effort.and_then(|v| ReasoningEffort::parse(&v).ok()),
+            })
+            .unwrap_or_default())
+    }
+
+    pub fn execution_templates(&self) -> Result<Vec<(ExecutionClass, ExecutionTemplate)>, DbError> {
+        ExecutionClass::all()
+            .into_iter()
+            .map(|class| {
+                self.execution_template(class)
+                    .map(|template| (class, template))
+            })
+            .collect()
+    }
+
+    pub fn set_execution_template(
+        &self,
+        class: ExecutionClass,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), DbError> {
+        self.conn.execute("INSERT INTO execution_templates (class, model, reasoning_effort) VALUES (?1, ?2, ?3) ON CONFLICT(class) DO UPDATE SET model = excluded.model, reasoning_effort = excluded.reasoning_effort", params![class.as_str(), model, effort.map(|v| v.as_str())])?;
+        Ok(())
+    }
+
+    pub fn clear_execution_template(&self, class: ExecutionClass) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM execution_templates WHERE class = ?1",
+            [class.as_str()],
+        )?;
         Ok(())
     }
 

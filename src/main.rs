@@ -182,6 +182,10 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
     Ask {
         request: String,
     },
@@ -255,6 +259,21 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    List,
+    Set {
+        class: orc::execution::ExecutionClass,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
+    Clear {
+        class: orc::execution::ExecutionClass,
     },
 }
 
@@ -475,6 +494,32 @@ fn main() -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
+        Command::Template { command } => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            match command {
+                TemplateCommand::List => {
+                    for (class, template) in db.execution_templates()? {
+                        println!(
+                            "{} model={} effort={}",
+                            class.as_str(),
+                            template.model.as_deref().unwrap_or("-"),
+                            template.reasoning_effort.map(|v| v.as_str()).unwrap_or("-")
+                        );
+                    }
+                }
+                TemplateCommand::Set {
+                    class,
+                    model,
+                    effort,
+                } => {
+                    if model.is_none() && effort.is_none() {
+                        anyhow::bail!("set requires --model or --effort")
+                    }
+                    db.set_execution_template(class, model.as_deref(), effort)?;
+                }
+                TemplateCommand::Clear { class } => db.clear_execution_template(class)?,
+            }
+        }
         Command::Ask { request } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db

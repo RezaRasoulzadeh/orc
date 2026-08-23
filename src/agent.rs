@@ -466,8 +466,9 @@ pub fn revise_with_worker_on_db(
         .into_iter()
         .find(|agent| agent.id == agent_id)
         .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
-    let resolution = crate::execution::resolve(
+    let resolution = crate::execution::resolve_with_template(
         &task.role,
+        &db.execution_template(crate::execution::class_for_role(&task.role))?,
         agent.model.as_deref(),
         agent.reasoning_effort,
         None,
@@ -734,8 +735,9 @@ pub fn dispatch_selected_with_db_and_repo(
             changes: Default::default(),
         });
     }
-    let resolution = crate::execution::resolve(
+    let resolution = crate::execution::resolve_with_template(
         &task.role,
+        &db.execution_template(crate::execution::class_for_role(&task.role))?,
         agent.model.as_deref(),
         agent.reasoning_effort,
         model_override,

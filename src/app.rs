@@ -416,6 +416,23 @@ impl OrcApp {
         }
         Ok(self.db.set_agent_reasoning_effort(id, effort)?)
     }
+    pub fn execution_template(
+        &self,
+        class: crate::execution::ExecutionClass,
+    ) -> Result<crate::execution::ExecutionTemplate> {
+        Ok(self.db.execution_template(class)?)
+    }
+    pub fn set_execution_template(
+        &self,
+        class: crate::execution::ExecutionClass,
+        model: Option<&str>,
+        effort: Option<registry::ReasoningEffort>,
+    ) -> Result<()> {
+        Ok(self.db.set_execution_template(class, model, effort)?)
+    }
+    pub fn clear_execution_template(&self, class: crate::execution::ExecutionClass) -> Result<()> {
+        Ok(self.db.clear_execution_template(class)?)
+    }
     pub fn sync_agent_capacity(&self, id: &str) -> Result<()> {
         let agent = registry::get_agent(&self.db, id)?;
         crate::codex_app_server::sync_agent(

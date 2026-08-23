@@ -495,12 +495,7 @@ impl CodexWorker {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 let (final_output, token_usage) =
                     parse_codex_jsonl(&stdout, schema_path.is_some())?;
-                let combined = match (final_output, stderr.is_empty()) {
-                    (Some(output), true) => Some(output),
-                    (Some(output), false) => Some(format!("{output}\n{stderr}")),
-                    (None, false) => Some(stderr),
-                    (None, true) => None,
-                };
+                let combined = combine_codex_output(final_output, &stderr, schema_path.is_some());
                 Ok(WorkerExecution {
                     outcome: WorkerOutcome::Success,
                     output: combined,
@@ -508,12 +503,12 @@ impl CodexWorker {
                 })
             }
             Ok(output) => {
-                let code = output
-                    .status
-                    .code()
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                Err(format!("Codex exited with non-zero status: {code}"))
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(codex_failure_error(
+                    &output.status,
+                    &stderr,
+                    schema_path.is_some(),
+                ))
             }
             Err(error) => Err(format!(
                 "failed to spawn 'codex' executable; ensure it is installed and on PATH: {error}"
@@ -579,6 +574,39 @@ fn parse_codex_jsonl(
         (!messages.is_empty()).then(|| messages.join("\n"))
     };
     Ok((output, usage))
+}
+
+fn combine_codex_output(
+    final_output: Option<String>,
+    stderr: &str,
+    structured: bool,
+) -> Option<String> {
+    if structured {
+        return final_output;
+    }
+    match (final_output, stderr.is_empty()) {
+        (Some(output), true) => Some(output),
+        (Some(output), false) => Some(format!("{output}\n{stderr}")),
+        (None, false) => Some(stderr.to_owned()),
+        (None, true) => None,
+    }
+}
+
+fn codex_failure_error(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+    structured: bool,
+) -> String {
+    let code = status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let stderr = stderr.trim();
+    if structured && !stderr.is_empty() {
+        format!("Codex exited with non-zero status: {code}: {stderr}")
+    } else {
+        format!("Codex exited with non-zero status: {code}")
+    }
 }
 
 /// Antigravity CLI worker. Runs `agy` in headless print mode with JSON output
@@ -687,6 +715,32 @@ mod tests {
         let (output, usage) = parse_codex_jsonl(events, true).unwrap();
         assert_eq!(output.as_deref(), Some(r#"{"verdict":"revise"}"#));
         assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn codex_structured_success_ignores_stderr_in_result() {
+        let output = combine_codex_output(
+            Some(r#"{"verdict":"pass"}"#.to_owned()),
+            "Reading additional input from stdin...",
+            true,
+        );
+        assert_eq!(output.as_deref(), Some(r#"{"verdict":"pass"}"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_structured_failure_preserves_stderr_diagnostics() {
+        let output = run_command_with_timeout(
+            shell("printf 'schema rejected\\n' >&2; exit 7"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let error = codex_failure_error(&output.status, &stderr, true);
+        assert_eq!(
+            error,
+            "Codex exited with non-zero status: 7: schema rejected"
+        );
     }
 
     #[test]

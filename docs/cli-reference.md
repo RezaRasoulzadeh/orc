@@ -227,6 +227,7 @@ Registers a new agent.
 - `--backend BACKEND` — one of `copilot`, `codex`, `antigravity`, `chatgpt`, `claude`, `generic_manual` (required). Automated mode additionally requires the backend to be `codex`, `copilot`, or `antigravity`.
 - `--priority N` — selection priority (default: `0`).
 - `--capability CAP` — a capability the agent provides; repeatable.
+- `--action ACTION` — a supported action (`code`, `review`, `plan`, or `lead`); repeatable. Defaults to `code`.
 - `--display-name NAME` — human-readable display name (default: the agent ID).
 - `--profile PATH` — provider configuration profile directory.
 - `--model MODEL` — model to use (automated Codex agents only).
@@ -279,7 +280,16 @@ Sets the global automatic-dispatch quota reserve.
 Synchronizes an agent's quota through the provider's machine-readable protocol and prints the resulting quota snapshot.
 
 ### `orc agent show ID`
-Prints full agent detail: ID, backend, execution mode, model, reasoning effort, display name, enabled state, availability, unavailable reason, priority, quota (remaining/reset/checked/source and effective/primary/secondary/individual limits when known), capabilities, and profile path.
+Prints full agent detail: ID, backend, execution mode, model, reasoning effort, display name, enabled state, availability, unavailable reason, priority, quota (remaining/reset/checked/source and effective/primary/secondary/individual limits when known), capabilities, supported actions, and profile path.
+
+### `orc agent actions ID`
+Shows each supported action and its configured model and reasoning-effort profile.
+
+### `orc agent action-add ID ACTION`
+Adds one supported action. `ACTION` is `code`, `review`, `plan`, or `lead`.
+
+### `orc agent action-remove ID ACTION`
+Removes one supported action. The final supported action cannot be removed.
 
 ## Execution templates
 

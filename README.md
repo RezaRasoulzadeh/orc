@@ -119,7 +119,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 |---|---|
 | `orc agents [--sync]` | List registered agents, optionally syncing quota first. |
 | `orc agent list` | List registered agents. |
-| `orc agent add <ID> --backend NAME [options]` | Register an agent (`--priority`, `--capability`, `--display-name`, `--profile`, `--model`, `--effort`, `--mode`). |
+| `orc agent add <ID> --backend NAME [options]` | Register an agent (`--priority`, `--capability`, repeatable `--action` (`code`, `review`, `plan`, `lead`), `--display-name`, `--profile`, `--model`, `--effort`, `--mode`). |
 | `orc agent enable <ID>` / `disable <ID>` | Enable or disable an agent. |
 | `orc agent remove <ID>` | Archive an agent. |
 | `orc agent available <ID>` / `unavailable <ID> <REASON>` | Mark an agent available or unavailable. |
@@ -132,6 +132,9 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc agent quota-reserve <REMAINING>` | Set the global automatic-dispatch quota reserve. |
 | `orc agent sync <ID>` | Synchronize quota through the provider's protocol. |
 | `orc agent show <ID>` | Show full agent detail. |
+| `orc agent actions <ID>` | Show supported actions and their profiles. |
+| `orc agent action-add <ID> ACTION` | Add a supported action. |
+| `orc agent action-remove <ID> ACTION` | Remove a supported action (the final action cannot be removed). |
 
 ### Execution templates
 

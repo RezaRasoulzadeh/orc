@@ -160,6 +160,35 @@ impl OrcApp {
     ) -> Result<bool> {
         Ok(self.db.clear_agent_action_profile(id, action)?)
     }
+    pub fn add_agent_action(&self, id: &str, action: registry::AgentAction) -> Result<bool> {
+        let agent = registry::get_agent(&self.db, id)?;
+        Ok(self.db.set_agent_action_profile(
+            id,
+            action,
+            agent.model.as_deref(),
+            agent.reasoning_effort,
+        )?)
+    }
+    pub fn remove_agent_action(&self, id: &str, action: registry::AgentAction) -> Result<bool> {
+        let agent = registry::get_agent(&self.db, id)?;
+        if !agent.supports_action(action) {
+            return Ok(false);
+        }
+        if agent.actions.len() <= 1 {
+            anyhow::bail!("cannot remove the final supported action from agent '{id}'")
+        }
+        if self.db.agent_action_profiles(id)?.is_empty() {
+            for supported in &agent.actions {
+                self.db.set_agent_action_profile(
+                    id,
+                    *supported,
+                    agent.model.as_deref(),
+                    agent.reasoning_effort,
+                )?;
+            }
+        }
+        Ok(self.db.clear_agent_action_profile(id, action)?)
+    }
     pub fn clear_lead_provider_config(&self) -> Result<()> {
         Ok(self.db.clear_lead_provider_config()?)
     }

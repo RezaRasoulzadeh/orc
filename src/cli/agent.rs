@@ -16,6 +16,8 @@ pub enum AgentCommand {
         priority: i64,
         #[arg(long)]
         capability: Vec<String>,
+        #[arg(long, value_parser = parse_agent_action)]
+        action: Vec<registry::AgentAction>,
         #[arg(long)]
         display_name: Option<String>,
         #[arg(long)]
@@ -85,6 +87,19 @@ pub enum AgentCommand {
     Show {
         id: String,
     },
+    Actions {
+        id: String,
+    },
+    ActionAdd {
+        id: String,
+        #[arg(value_parser = parse_agent_action)]
+        action: registry::AgentAction,
+    },
+    ActionRemove {
+        id: String,
+        #[arg(value_parser = parse_agent_action)]
+        action: registry::AgentAction,
+    },
 }
 
 pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
@@ -99,6 +114,7 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
             backend,
             priority,
             capability,
+            action,
             display_name,
             profile,
             model,
@@ -139,7 +155,11 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
                 quota_checked_at: None,
                 quota_source: None,
                 quota_limits: None,
-                actions: vec![registry::AgentAction::Code],
+                actions: if action.is_empty() {
+                    vec![registry::AgentAction::Code]
+                } else {
+                    action
+                },
             };
             app.configure_agent(agent.clone())?;
             println!("Added agent {}", agent.id);
@@ -257,9 +277,53 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
             }
             println!("Capabilities:        {}", agent.capabilities.join(", "));
             println!(
+                "Actions:             {}",
+                agent
+                    .actions
+                    .iter()
+                    .map(|action| action.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
                 "Profile/config:      {}",
                 agent.profile_path.as_deref().unwrap_or("-")
             );
+        }
+        AgentCommand::Actions { id } => {
+            for profile in app.agent_action_profiles(&id)? {
+                println!(
+                    "{}\tmodel={}\teffort={}",
+                    profile.action.as_str(),
+                    profile.model.as_deref().unwrap_or("-"),
+                    profile
+                        .reasoning_effort
+                        .map(|value| value.as_str())
+                        .unwrap_or("-")
+                );
+            }
+            if app.agent_action_profiles(&id)?.is_empty() {
+                let agent = registry::get_agent(&db, &id)?;
+                for action in agent.actions {
+                    println!("{}\tmodel=-\teffort=-", action.as_str());
+                }
+            }
+        }
+        AgentCommand::ActionAdd { id, action } => {
+            if !app.add_agent_action(&id, action)? {
+                anyhow::bail!("agent '{}' is not registered", id);
+            }
+            println!("Added action {} to agent {}", action.as_str(), id);
+        }
+        AgentCommand::ActionRemove { id, action } => {
+            if !app.remove_agent_action(&id, action)? {
+                anyhow::bail!(
+                    "agent '{}' does not support action '{}'",
+                    id,
+                    action.as_str()
+                );
+            }
+            println!("Removed action {} from agent {}", action.as_str(), id);
         }
     }
 
@@ -268,6 +332,9 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
 
 fn parse_reasoning_effort(value: &str) -> Result<registry::ReasoningEffort, String> {
     registry::ReasoningEffort::parse(value).map_err(|e| e.to_string())
+}
+fn parse_agent_action(value: &str) -> Result<registry::AgentAction, String> {
+    registry::AgentAction::parse(value).map_err(|e| e.to_string())
 }
 fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
     if !changed {

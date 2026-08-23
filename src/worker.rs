@@ -1,7 +1,7 @@
 //! Worker abstraction for executing tasks.
 //! Keeps provider-specific logic behind this interface so tests can inject fake workers.
 
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -50,8 +50,17 @@ pub fn run_command_with_timeout(command: Command, timeout: Duration) -> Result<O
 }
 
 pub fn run_command_with_timeout_progress(
+    command: Command,
+    timeout: Duration,
+    progress: impl Fn(&str),
+) -> Result<Output, String> {
+    run_command_with_timeout_progress_and_stdin(command, timeout, None, progress)
+}
+
+pub fn run_command_with_timeout_progress_and_stdin(
     mut command: Command,
     timeout: Duration,
+    stdin: Option<&[u8]>,
     progress: impl Fn(&str),
 ) -> Result<Output, String> {
     #[cfg(unix)]
@@ -66,9 +75,20 @@ pub fn run_command_with_timeout_progress(
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn command: {error}"))?;
+    let _stdin_writer = stdin.and_then(|input| {
+        child.stdin.take().map(|mut pipe| {
+            let input = input.to_owned();
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&input);
+            })
+        })
+    });
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -365,7 +385,7 @@ impl CodexWorker {
     }
 
     pub fn command_args_with_execution(
-        prompt: &str,
+        _prompt: &str,
         model: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Vec<String> {
@@ -387,7 +407,7 @@ impl CodexWorker {
                 format!("model_reasoning_effort=\"{}\"", effort.as_str()),
             ]
         }))
-        .chain(std::iter::once(prompt.into()))
+        .chain(std::iter::once("-".into()))
         .collect()
     }
 
@@ -401,10 +421,10 @@ impl CodexWorker {
         let mut args =
             Self::command_args_with_execution(prompt, self.model.as_deref(), self.reasoning_effort);
         if let Some(path) = schema_path {
-            let prompt = args.pop().expect("Codex command includes a prompt");
+            let stdin_marker = args.pop().expect("Codex command includes stdin marker");
             args.push("--output-schema".into());
             args.push(path.to_string_lossy().into_owned());
-            args.push(prompt);
+            args.push(stdin_marker);
         }
         command.args(args);
         backend::apply_profile_environment(&mut command, &self.profile_path);
@@ -485,9 +505,10 @@ impl CodexWorker {
         schema_path: Option<&Path>,
         progress: &dyn Fn(&str),
     ) -> Result<WorkerExecution, String> {
-        match run_command_with_timeout_progress(
+        match run_command_with_timeout_progress_and_stdin(
             self.command_with_schema(prompt, cwd, schema_path),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            Some(prompt.as_bytes()),
             progress,
         ) {
             Ok(output) if output.status.success() => {
@@ -510,9 +531,10 @@ impl CodexWorker {
                     schema_path.is_some(),
                 ))
             }
-            Err(error) => Err(format!(
+            Err(error) if error.contains("No such file or directory") => Err(format!(
                 "failed to spawn 'codex' executable; ensure it is installed and on PATH: {error}"
             )),
+            Err(error) => Err(format!("failed to spawn 'codex' executable: {error}")),
         }
     }
 }
@@ -780,7 +802,7 @@ mod tests {
                     "/tmp/schema.json".to_string(),
                 ]
         }));
-        assert_eq!(args.last().map(String::as_str), Some("inspect"));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
     }
 
     #[cfg(unix)]
@@ -804,6 +826,20 @@ mod tests {
         assert_eq!(output.stderr.len(), 262144);
         assert!(output.stdout.iter().all(|byte| *byte == b'o'));
         assert!(output.stderr.iter().all(|byte| *byte == b'e'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_complete_large_input_through_stdin() {
+        let input = "prompt-".repeat(32 * 1024);
+        let output = run_command_with_timeout_progress_and_stdin(
+            shell("cat"),
+            Duration::from_secs(5),
+            Some(input.as_bytes()),
+            |_| {},
+        )
+        .expect("command should complete");
+        assert_eq!(output.stdout, input.as_bytes());
     }
 
     #[cfg(unix)]

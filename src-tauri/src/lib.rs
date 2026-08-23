@@ -1,6 +1,6 @@
 use anyhow::Context;
 use orc::app::OrcApp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,6 +17,57 @@ struct AppState(SessionState);
 struct RegistryState(Mutex<project::ProjectRegistry>);
 
 struct SessionState(Mutex<Option<project::ProjectSession>>);
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskCommand {
+    title: String,
+    objective: String,
+    role: String,
+    priority: orc::task::TaskPriority,
+    required_capabilities: Vec<String>,
+    scope_mode: Option<orc::task::TaskScopeMode>,
+    context_files: Vec<String>,
+    expected_changes: Vec<String>,
+    dependencies: Vec<String>,
+}
+
+#[tauri::command]
+fn create_task(state: tauri::State<'_, AppState>, input: CreateTaskCommand) -> Result<String, String> {
+    state.0.active()?.app()?.create_task(orc::task::CreateTaskInput {
+        title: input.title,
+        objective: input.objective,
+        role: input.role,
+        priority: input.priority,
+        required_capabilities: input.required_capabilities,
+        scope_mode: input.scope_mode,
+        context_files: input.context_files,
+        expected_changes: input.expected_changes,
+        dependencies: input.dependencies,
+    }).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn configure_agent_record(state: tauri::State<'_, AppState>, agent: orc::registry::AgentDefinition) -> Result<(), String> {
+    state.0.active()?.app()?.configure_agent(agent).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn archive_agent(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state.0.active()?.app()?.remove_agent(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn agent_actions(state: tauri::State<'_, AppState>, id: String) -> Result<Vec<orc::registry::AgentActionProfile>, String> {
+    state.0.active()?.app()?.agent_action_profiles(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn configure_agent_action(state: tauri::State<'_, AppState>, id: String, action: String, enabled: bool) -> Result<(), String> {
+    let app = state.0.active()?.app()?;
+    let action = orc::registry::AgentAction::parse(&action).map_err(|error| error.to_string())?;
+    let changed = if enabled { app.add_agent_action(&id, action) } else { app.remove_agent_action(&id, action) };
+    if changed.map_err(|error| error.to_string())? { Ok(()) } else { Err(format!("agent '{id}' action was not changed")) }
+}
 
 fn remove_project_state(
     registry: &mut project::ProjectRegistry,
@@ -878,6 +929,11 @@ pub fn run() -> anyhow::Result<()> {
             snapshot,
             tasks,
             agents,
+            create_task,
+            configure_agent_record,
+            archive_agent,
+            agent_actions,
+            configure_agent_action,
             configure_agent,
             sync_agent,
             manual_runs,

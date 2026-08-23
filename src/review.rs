@@ -62,6 +62,16 @@ pub struct ReviewSummary {
     pub worktree_path: Option<String>,
     pub changes: WorktreeChanges,
     pub change_evidence: Option<WorktreeChanges>,
+    pub validation_evidence: Option<String>,
+    pub prior_reviews: Vec<PriorReview>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PriorReview {
+    pub verdict: String,
+    pub blocking_findings: Vec<String>,
+    pub non_blocking_findings: Vec<String>,
+    pub revision_feedback: Option<String>,
 }
 
 pub fn build_review(
@@ -72,7 +82,11 @@ pub fn build_review(
     let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{task_id}' not found"))?;
-    let run = db.list_agent_runs_for_task(task_id)?.into_iter().next();
+    let task_runs = db.list_agent_runs_for_task(task_id)?;
+    let run = task_runs
+        .iter()
+        .find(|run| run.execution_class != "review")
+        .cloned();
     let result = match &run {
         Some(run) => db.get_worker_result(run.id)?,
         None => None,
@@ -87,6 +101,17 @@ pub fn build_review(
         .map(|value| db.get_change_evidence(value.id))
         .transpose()?
         .flatten();
+    let validation_evidence = run
+        .as_ref()
+        .map(|value| db.latest_validation_result_for_run(value.id))
+        .transpose()?
+        .flatten();
+    let prior_reviews = task_runs
+        .iter()
+        .filter(|value| value.execution_class == "review")
+        .filter_map(|value| value.output.as_deref())
+        .filter_map(|output| serde_json::from_str::<PriorReview>(output).ok())
+        .collect();
     Ok(ReviewSummary {
         task,
         run,
@@ -94,6 +119,8 @@ pub fn build_review(
         worktree_path,
         changes,
         change_evidence,
+        validation_evidence,
+        prior_reviews,
     })
 }
 
@@ -125,6 +152,8 @@ pub fn build_review_for_run(
         worktree_path,
         changes,
         change_evidence,
+        validation_evidence: None,
+        prior_reviews: Vec::new(),
     })
 }
 

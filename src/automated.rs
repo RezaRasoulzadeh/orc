@@ -256,6 +256,43 @@ pub struct ReviewResult {
     pub revision_feedback: Option<String>,
 }
 
+fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
+    if reviews.is_empty() {
+        return "No prior task reviews.".into();
+    }
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for review in reviews {
+        if review.verdict.eq_ignore_ascii_case("pass") {
+            resolved.append(&mut unresolved);
+        } else {
+            unresolved.extend(review.blocking_findings.iter().cloned());
+        }
+    }
+    let mut ledger = String::new();
+    if !resolved.is_empty() {
+        ledger.push_str(
+            "RESOLVED prior blockers (do not reintroduce without current regression evidence):\n",
+        );
+        for finding in resolved {
+            ledger.push_str("- ");
+            ledger.push_str(&finding);
+            ledger.push('\n');
+        }
+    }
+    if !unresolved.is_empty() {
+        ledger.push_str("UNRESOLVED prior blockers (recheck against current evidence):\n");
+        for finding in unresolved {
+            ledger.push_str("- ");
+            ledger.push_str(&finding);
+            ledger.push('\n');
+        }
+    }
+    ledger
+}
+
+const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, persisted structured validation evidence, and review history; worker narrative is not validation evidence. On a revision, evaluate prior blockers first using the resolution ledger: a blocker from a prior review whose later review classified it resolved, or whose later PASS had no blocking findings, is RESOLVED and must not be reported as blocking again. Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression, and explain that evidence. Clearly distinguish RESOLVED from UNRESOLVED prior blockers in your findings. Do not restate equivalent findings. A blocker must identify an explicit requirement, concrete current evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. If required commands are outside the persisted project validation pipeline, report that accurately rather than requesting fabricated evidence. Keep blocking findings to at most 5. Code quality, polish, preferences, extra tests, and unrelated defects are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation.";
+
 fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> Result<i64> {
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     Ok(db.create_project_action_run(
@@ -378,10 +415,15 @@ fn run_review_mode(
     let instructions = if project_review {
         "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
     } else {
-        "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, structured validation evidence, and review history. On a revision, evaluate prior blockers first, classify them resolved or unresolved, then inspect primarily for regressions introduced by the revision. Do not restate equivalent findings. A blocker must identify an explicit requirement, concrete evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. Keep blocking findings to at most 5. Code quality, polish, preferences, extra tests, and unrelated defects are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation."
+        TASK_REVIEW_INSTRUCTIONS
+    };
+    let history = if project_review {
+        String::new()
+    } else {
+        review_resolution_ledger(&summary.prior_reviews)
     };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\nResolution ledger:\n{history}\nReview packet:\n{}",
         serde_json::to_string(summary)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -791,6 +833,37 @@ mod tests {
                 output: output.to_string(),
             },
         )
+    }
+
+    #[test]
+    fn later_pass_resolves_earlier_blocker_in_resolution_ledger() {
+        let reviews = vec![
+            crate::review::PriorReview {
+                verdict: "REVISE".into(),
+                blocking_findings: vec!["validation is incomplete".into()],
+                non_blocking_findings: Vec::new(),
+                revision_feedback: Some("complete validation".into()),
+            },
+            crate::review::PriorReview {
+                verdict: "PASS".into(),
+                blocking_findings: Vec::new(),
+                non_blocking_findings: Vec::new(),
+                revision_feedback: None,
+            },
+        ];
+
+        let ledger = review_resolution_ledger(&reviews);
+
+        assert!(ledger.contains("RESOLVED prior blockers"));
+        assert!(ledger.contains("validation is incomplete"));
+        assert!(!ledger.contains("UNRESOLVED prior blockers"));
+    }
+
+    #[test]
+    fn resolution_prompt_keeps_equivalent_blockers_resolved_unless_evidence_shows_regression() {
+        let instructions = "Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression";
+
+        assert!(TASK_REVIEW_INSTRUCTIONS.contains(instructions));
     }
 
     #[test]

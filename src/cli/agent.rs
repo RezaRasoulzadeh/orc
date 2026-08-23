@@ -136,6 +136,7 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
                 quota_checked_at: None,
                 quota_source: None,
                 quota_limits: None,
+                actions: vec![registry::AgentAction::Code],
             };
             app.configure_agent(agent.clone())?;
             println!("Added agent {}", agent.id);

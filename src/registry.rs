@@ -41,6 +41,44 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const AUTOMATED: &str = "automated";
 pub const MANUAL: &str = "manual";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AgentAction {
+    Code,
+    Review,
+    Plan,
+    Lead,
+}
+
+impl AgentAction {
+    pub const fn all() -> [Self; 4] {
+        [Self::Code, Self::Review, Self::Plan, Self::Lead]
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Review => "review",
+            Self::Plan => "plan",
+            Self::Lead => "lead",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "code" | "coder" => Ok(Self::Code),
+            "review" | "reviewer" => Ok(Self::Review),
+            "plan" | "planner" => Ok(Self::Plan),
+            "lead" => Ok(Self::Lead),
+            _ => bail!("invalid agent action '{value}'; expected code, review, plan, or lead"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentActionProfile {
+    pub action: AgentAction,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct AgentConfigMetadata {
     manual_workspace_url: Option<String>,
@@ -116,6 +154,8 @@ pub struct AgentDefinition {
     pub quota_checked_at: Option<String>,
     pub quota_source: Option<String>,
     pub quota_limits: Option<QuotaLimits>,
+    #[serde(default)]
+    pub actions: Vec<AgentAction>,
 }
 
 impl AgentDefinition {
@@ -127,6 +167,10 @@ impl AgentDefinition {
 
     pub fn is_selectable(&self, required: &[String]) -> bool {
         self.enabled && self.status == AVAILABLE && self.supports(required)
+    }
+
+    pub fn supports_action(&self, action: AgentAction) -> bool {
+        self.actions.contains(&action)
     }
 }
 

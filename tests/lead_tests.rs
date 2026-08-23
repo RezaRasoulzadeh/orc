@@ -61,6 +61,7 @@ fn codex_agent(profile_path: &str) -> AgentDefinition {
         quota_checked_at: None,
         quota_source: None,
         quota_limits: None,
+        actions: vec![orc::registry::AgentAction::Code],
     }
 }
 

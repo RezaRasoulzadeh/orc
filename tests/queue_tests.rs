@@ -56,6 +56,7 @@ fn dispatch_agent(id: &str) -> AgentDefinition {
         quota_checked_at: None,
         quota_source: None,
         quota_limits: None,
+        actions: vec![registry::AgentAction::Code],
     }
 }
 
@@ -144,6 +145,7 @@ fn add_agent(
         quota_checked_at: None,
         quota_source: None,
         quota_limits: None,
+        actions: vec![registry::AgentAction::Code],
     };
     db.insert_agent(&agent).unwrap();
 }
@@ -858,6 +860,7 @@ fn queue_explain_shows_recommended_execution_template() {
         quota_checked_at: None,
         quota_source: None,
         quota_limits: None,
+        actions: vec![registry::AgentAction::Code],
     };
     db.insert_agent(&agent).unwrap();
     db.set_execution_template(

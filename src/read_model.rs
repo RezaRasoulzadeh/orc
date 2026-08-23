@@ -33,6 +33,7 @@ pub struct RunDetails {
     pub run: AgentRun,
     pub result: Option<WorkerResult>,
     pub activity: Vec<LifecycleEvent>,
+    pub validation: Option<crate::validation::ValidationReport>,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunsWorkspace {
@@ -47,17 +48,42 @@ pub fn runs_workspace(
 ) -> Result<RunsWorkspace> {
     let project = db.get_project_id()?.context("no project found in DB")?;
     let runs = db.list_agent_runs(project, limit)?;
+    let compact_runs = runs
+        .iter()
+        .cloned()
+        .map(|mut run| {
+            run.output = None;
+            run
+        })
+        .collect::<Vec<_>>();
     let details = runs
         .iter()
         .map(|run| {
+            let activity = db
+                .list_lifecycle_events_for_run(run.id, activity_limit)?
+                .into_iter()
+                .filter(|event| event.kind != "worker_output")
+                .collect();
+            let validation = db
+                .latest_validation_result_for_run(run.id)?
+                .as_deref()
+                .and_then(|payload| serde_json::from_str(payload).ok());
             Ok(RunDetails {
-                run: run.clone(),
+                run: {
+                    let mut compact = run.clone();
+                    compact.output = None;
+                    compact
+                },
                 result: db.get_worker_result(run.id)?,
-                activity: db.list_lifecycle_events_for_run(run.id, activity_limit)?,
+                activity,
+                validation,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(RunsWorkspace { runs, details })
+    Ok(RunsWorkspace {
+        runs: compact_runs,
+        details,
+    })
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCapacity {
@@ -134,9 +160,19 @@ pub fn run_details(
     let Some(run) = db.get_agent_run(id)? else {
         return Ok(None);
     };
+    let activity = db
+        .list_lifecycle_events_for_run(id, activity_limit)?
+        .into_iter()
+        .filter(|event| event.kind != "worker_output")
+        .collect();
+    let validation = db
+        .latest_validation_result_for_run(id)?
+        .as_deref()
+        .and_then(|payload| serde_json::from_str(payload).ok());
     Ok(Some(RunDetails {
         result: db.get_worker_result(id)?,
-        activity: db.list_lifecycle_events_for_run(id, activity_limit)?,
+        activity,
+        validation,
         run,
     }))
 }
@@ -207,6 +243,8 @@ mod tests {
         assert_eq!(result.input_tokens, Some(21));
         assert_eq!(result.output_tokens, Some(13));
         let workspace = runs_workspace(&db, 10, 10).unwrap();
+        assert!(workspace.runs[0].output.is_none());
+        assert!(workspace.details[0].run.output.is_none());
         assert_eq!(
             workspace.details[0].result.as_ref().unwrap().total_tokens,
             Some(34)

@@ -33,6 +33,7 @@ pub struct AgentRun {
     pub resolved_model: Option<String>,
     pub resolved_reasoning_effort: Option<ReasoningEffort>,
     pub resolution_source: String,
+    pub resolved_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -474,6 +475,7 @@ impl Database {
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
+        Self::ensure_change_evidence_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
@@ -519,6 +521,7 @@ impl Database {
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
+        Self::ensure_change_evidence_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
@@ -749,6 +752,17 @@ impl Database {
         self.list_lifecycle_events_scoped("run_id = ?1", params![run_id], limit)
     }
 
+    pub fn latest_validation_result_for_run(&self, run_id: i64) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT payload FROM lifecycle_events WHERE run_id = ?1 AND kind = 'validation_result' ORDER BY id DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn list_lifecycle_events_scoped(
         &self,
         predicate: &str,
@@ -846,6 +860,12 @@ impl Database {
                 "ALTER TABLE agent_runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'automated'",
             )?;
         }
+        if !columns.iter().any(|column| column == "resolved_profile") {
+            conn.execute(
+                "ALTER TABLE agent_runs ADD COLUMN resolved_profile TEXT",
+                [],
+            )?;
+        }
         for (name, definition) in [
             ("phase", "TEXT"),
             ("error", "TEXT"),
@@ -891,6 +911,42 @@ impl Database {
     fn ensure_worktree_metadata_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS worktree_metadata (agent_run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, branch_name TEXT NOT NULL, worktree_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
         Ok(())
+    }
+
+    fn ensure_change_evidence_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS run_change_evidence (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, evidence TEXT NOT NULL, captured_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
+        Ok(())
+    }
+
+    pub fn store_change_evidence(
+        &self,
+        run_id: i64,
+        changes: &crate::git::WorktreeChanges,
+    ) -> Result<(), DbError> {
+        let evidence = serde_json::to_string(changes)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_change_evidence (run_id, evidence) VALUES (?1, ?2)",
+            params![run_id, evidence],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_change_evidence(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<crate::git::WorktreeChanges>, DbError> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT evidence FROM run_change_evidence WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(DbError::from)
     }
 
     fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
@@ -1904,6 +1960,7 @@ impl Database {
                 None => None,
             },
             resolution_source: row.get(15)?,
+            resolved_profile: row.get(16)?,
         })
     }
 
@@ -1989,6 +2046,17 @@ impl Database {
         source: &str,
     ) -> Result<bool, DbError> {
         Ok(self.conn.execute("UPDATE agent_runs SET execution_class = ?1, resolved_model = ?2, resolved_reasoning_effort = ?3, resolution_source = ?4 WHERE id = ?5", params![class, model, effort.map(|value| value.as_str()), source, run_id])? != 0)
+    }
+
+    pub fn set_agent_run_profile(
+        &self,
+        run_id: i64,
+        profile: Option<&str>,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE agent_runs SET resolved_profile = ?1 WHERE id = ?2",
+            params![profile, run_id],
+        )? != 0)
     }
 
     pub fn update_agent_run_status_with_usage(
@@ -2089,7 +2157,7 @@ impl Database {
 
     pub fn get_agent_run(&self, run_id: i64) -> Result<Option<AgentRun>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE id = ?1",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE id = ?1",
             params![run_id], Self::agent_run_from_row).optional()?)
     }
 
@@ -2125,7 +2193,7 @@ impl Database {
 
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -2134,7 +2202,7 @@ impl Database {
 
     pub fn list_agent_runs_for_task(&self, task_id: &str) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE task_id = ?1 ORDER BY started_at DESC, id DESC",
         )?;
         Ok(stmt
             .query_map(params![task_id], Self::agent_run_from_row)?
@@ -2176,6 +2244,23 @@ impl Database {
         self.record_lifecycle_event("worker_output", None, Some(run_id), None, Some(output))
     }
 
+    pub fn list_worker_output(&self, run_id: i64) -> Result<Vec<LifecycleEvent>, DbError> {
+        let mut stmt = self.conn.prepare("SELECT id, timestamp, kind, task_id, run_id, agent_id, payload FROM lifecycle_events WHERE run_id = ?1 AND kind = 'worker_output' ORDER BY id ASC")?;
+        Ok(stmt
+            .query_map(params![run_id], |row| {
+                Ok(LifecycleEvent {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    kind: row.get(2)?,
+                    task_id: row.get(3)?,
+                    run_id: row.get(4)?,
+                    agent_id: row.get(5)?,
+                    payload: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn touch_agent_run_activity(&self, run_id: i64) -> Result<bool, DbError> {
         Ok(self.conn.execute("UPDATE agent_runs SET last_activity = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('running', 'waiting_external')", params![run_id])? != 0)
     }
@@ -2203,6 +2288,20 @@ impl Database {
             .query_row(
                 "SELECT branch_name, worktree_path FROM worktree_metadata WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn get_worktree_metadata_for_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<(String, String)>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT branch_name, worktree_path FROM worktree_metadata WHERE agent_run_id = ?1",
+                params![run_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)

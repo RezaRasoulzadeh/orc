@@ -784,6 +784,22 @@ fn run_details(
 }
 
 #[tauri::command]
+fn worker_log(
+    state: tauri::State<'_, AppState>,
+    run_id: i64,
+) -> Result<Vec<orc::storage::db::LifecycleEvent>, String> {
+    state.0.active()?.app()?.worker_log(run_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn review_run(
+    state: tauri::State<'_, AppState>,
+    run_id: i64,
+) -> Result<orc::review::ReviewSummary, String> {
+    state.0.active()?.app()?.review_run(run_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn lead_context(
     state: tauri::State<'_, AppState>,
     limit: usize,
@@ -993,11 +1009,13 @@ pub fn run() -> anyhow::Result<()> {
             project_report,
             task_details,
             review,
+            review_run,
             dispatch,
             task_action,
             runs,
             runs_workspace,
             run_details,
+            worker_log,
             lead_context,
             lead_proposals,
             invoke_lead,

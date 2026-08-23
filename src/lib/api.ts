@@ -65,15 +65,23 @@ export interface AgentRun {
   finished_at: string | null
   phase: string | null
   last_activity: string
+  error: string | null
+  execution_class: string
+  resolved_model: string | null
+  resolved_reasoning_effort: string | null
+  resolution_source: string
+  resolved_profile: string | null
 }
 export interface ManualRunContext { run: AgentRun; task: Task; task_packet: string }
 export interface ManualWorkspaceInfo { supported: boolean; url: string | null; error: string | null }
 export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null }
 export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
-export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[] }
+export interface ValidationStepResult { command: string; passed: boolean; output: string }
+export interface ValidationReport { steps: ValidationStepResult[] }
+export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[]; validation: ValidationReport | null }
 export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }
 export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: AgentRun[]; activity: LifecycleEvent[] }
-export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string } }
+export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string }; change_evidence: { files: { status: string; path: string }[]; stat: string; diff: string } | null }
 export interface PlanningRequest { protocol_version: number; kind: string; project: unknown; engineering_contract: string; objective: string; constraints: string[]; target_platforms: string[]; stack: string[]; non_goals: string[]; deliverables: string[]; definition_of_done: string[]; response_schema: unknown; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[]; current_state: unknown; full_report: ProjectReport | null }
 export interface ProjectReport { protocol_version: number; project: { name: string; repository: string; branch: string | null; commit: string | null }; engineering_contract: string; architecture: { modules: string[]; boundaries: string[]; discovery: Record<string, string> }; lifecycle: { counts: Record<string, number>; tasks: { id: string; title: string; status: string }[] }; agents: unknown[]; queue: QueueReport; recent_work: unknown[]; risks: string[]; open_questions: string[]; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[] }
 export type ProjectStatus = 'Available' | 'Missing' | 'Invalid' | 'TemporarilyUnavailable'
@@ -103,6 +111,8 @@ export const api = {
   runs: (limit: number) => invoke<AgentRun[]>('runs', { limit }),
   runsWorkspace: (limit = 50, activityLimit = 100) => invoke<RunsWorkspace>('runs_workspace', { limit, activityLimit }),
   runDetails: (runId: number, activityLimit = 100) => invoke<RunDetails | null>('run_details', { runId, activityLimit }),
+  workerLog: (runId: number) => invoke<LifecycleEvent[]>('worker_log', { runId }),
+  reviewRun: (runId: number) => invoke<ReviewSummary>('review_run', { runId }),
   leadContext: (limit = 20) => invoke<LeadContext>('lead_context', { limit }),
   leadProposals: () => invoke<LeadProposal[]>('lead_proposals'),
   invokeLead: (message: string, config?: LeadProviderConfig) => invoke<LeadResponse>('invoke_lead', { message, config }),

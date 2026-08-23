@@ -8,10 +8,7 @@ use orc::cli::task::TaskCommand;
 use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
 use orc::discovery;
 use orc::doctor::{self, CheckStatus};
-use orc::protocol::{
-    EngineeringLeadRequest, EngineeringLeadResponse, PROTOCOL_VERSION, PlanResponse,
-    PlanningRequest,
-};
+use orc::protocol::{EngineeringLeadResponse, PROTOCOL_VERSION, PlanResponse, PlanningRequest};
 use orc::registry;
 use orc::storage::Database;
 use std::process::Command as ProcessCommand;
@@ -101,6 +98,15 @@ enum Command {
         full_report: bool,
         objective: String,
     },
+    Plan {
+        objective: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
     /// Validate and atomically apply a structured plan response.
     ApplyPlan {
         path: String,
@@ -121,6 +127,12 @@ enum Command {
     },
     Ask {
         request: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
     },
     ApplyResponse {
         /// Path to JSON response file produced by the engineering lead (use - for stdin)
@@ -147,6 +159,14 @@ enum Command {
     /// Review the latest task run and its worktree changes.
     Review {
         task_id: String,
+        #[arg(long)]
+        automated: bool,
+        #[arg(long, requires = "automated")]
+        agent: Option<String>,
+        #[arg(long, requires = "automated")]
+        model: Option<String>,
+        #[arg(long, requires = "automated", value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
         /// Show the complete unified diff.
         #[arg(long, conflicts_with = "file")]
         diff: bool,
@@ -427,6 +447,25 @@ fn main() -> Result<()> {
             let mapping = db.apply_plan(project_id, &response)?;
             println!("{}", serde_json::to_string_pretty(&mapping)?);
         }
+        Command::Plan {
+            objective,
+            agent,
+            model,
+            effort,
+        } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let mut request = app.planning_request()?;
+            request.objective = objective;
+            let (_, response) = app.automated_plan(
+                &request,
+                &orc::automated::ActionOverrides {
+                    agent_id: agent,
+                    model,
+                    reasoning_effort: effort,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
         Command::Queue { explain } => match Database::open(DB_PATH) {
             Ok(db) => {
                 let report = orc::queue::compute_queue(&db).map_err(|e| anyhow::anyhow!(e))?;
@@ -496,24 +535,22 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Ask { request } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
-            if db.lead_provider_config()?.is_none() {
-                anyhow::bail!(
-                    "Lead is not configured. Configure one with `orc lead set <agent>` before running `orc ask`."
-                )
-            }
-            let project = db
-                .get_project_name()
-                .map_err(|e| anyhow::anyhow!(e))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No project found in DB. Run `orc init` to initialize repository state."
-                    )
-                })?;
-            let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
-            let lead_request = EngineeringLeadRequest::from_tasks(request, project, &tasks);
-            println!("{}", serde_json::to_string_pretty(&lead_request)?);
+        Command::Ask {
+            request,
+            agent,
+            model,
+            effort,
+        } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let (_, response) = app.automated_lead(
+                &request,
+                &orc::automated::ActionOverrides {
+                    agent_id: agent,
+                    model,
+                    reasoning_effort: effort,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::ApplyResponse { path } => {
             let data = if path == "-" {
@@ -583,9 +620,26 @@ fn main() -> Result<()> {
         }
         Command::Review {
             task_id,
+            automated,
+            agent,
+            model,
+            effort,
             diff,
             file,
         } => {
+            if automated {
+                let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+                let (_, result) = app.automated_review(
+                    &task_id,
+                    &orc::automated::ActionOverrides {
+                        agent_id: agent,
+                        model,
+                        reasoning_effort: effort,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let review = orc::review::build_review(&db, &task_id, std::path::Path::new("."))?;
             let output = match file {

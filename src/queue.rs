@@ -503,12 +503,15 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
 
                     if let Some(ref selected) = decision.selected_agent_id {
                         let selected = selected.clone();
+                        let template =
+                            db.execution_template(crate::execution::class_for_role(&task.role))?;
                         let recommended_execution = agents
                             .iter()
                             .find(|agent| agent.id == selected)
                             .map(|agent| {
-                                crate::execution::resolve(
+                                crate::execution::resolve_with_template(
                                     &task.role,
+                                    &template,
                                     agent.model.as_deref(),
                                     agent.reasoning_effort,
                                     None,

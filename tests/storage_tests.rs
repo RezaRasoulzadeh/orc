@@ -1,3 +1,4 @@
+use orc::execution::ExecutionClass;
 use orc::registry::ReasoningEffort;
 use orc::storage::{AgentRunExecution, Database, WorkerResult};
 use orc::task::{TaskPriority, TaskStatus};
@@ -48,6 +49,37 @@ fn agent_run_execution_survives_reopen() {
     assert_eq!(run.resolved_model.as_deref(), Some("configured-model"));
     assert_eq!(run.resolved_reasoning_effort, Some(ReasoningEffort::Low));
     assert_eq!(run.resolution_source, "template");
+}
+
+#[test]
+fn execution_template_survives_reopen_and_clear_restores_fallback() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    {
+        let db = Database::init(&path).unwrap();
+        db.set_execution_template(
+            ExecutionClass::Coder,
+            Some("persistent-model"),
+            Some(ReasoningEffort::Medium),
+        )
+        .unwrap();
+        assert_eq!(
+            db.execution_template(ExecutionClass::Coder)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("persistent-model")
+        );
+    }
+    let db = Database::open(&path).unwrap();
+    let template = db.execution_template(ExecutionClass::Coder).unwrap();
+    assert_eq!(template.model.as_deref(), Some("persistent-model"));
+    assert_eq!(template.reasoning_effort, Some(ReasoningEffort::Medium));
+    db.clear_execution_template(ExecutionClass::Coder).unwrap();
+    assert_eq!(
+        db.execution_template(ExecutionClass::Coder).unwrap(),
+        Default::default()
+    );
 }
 
 #[test]

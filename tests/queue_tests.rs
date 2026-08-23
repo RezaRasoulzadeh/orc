@@ -5,7 +5,10 @@ use orc::scheduler::{CandidateStatus, RejectionReason, schedule_with_busy};
 use orc::storage::{Database, DbError};
 use orc::task::{TaskPriority, TaskStatus};
 use std::collections::HashSet;
+use std::sync::Mutex;
 use tempfile::tempdir;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn dispatch_entry(id: &str) -> QueueEntry {
     QueueEntry {
@@ -832,6 +835,9 @@ fn queue_concise_and_explain_formatting() {
 
 #[test]
 fn queue_explain_shows_recommended_execution_template() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let old = std::env::var_os("ORC_CODER_MODEL");
+    unsafe { std::env::remove_var("ORC_CODER_MODEL") };
     let (_dir, db, pid) = create_test_db();
     let agent = AgentDefinition {
         id: "recommended".into(),
@@ -854,6 +860,12 @@ fn queue_explain_shows_recommended_execution_template() {
         quota_limits: None,
     };
     db.insert_agent(&agent).unwrap();
+    db.set_execution_template(
+        orc::execution::ExecutionClass::Coder,
+        Some("persistent-model"),
+        Some(registry::ReasoningEffort::Medium),
+    )
+    .unwrap();
     let task = db
         .insert_task(
             pid,
@@ -866,5 +878,11 @@ fn queue_explain_shows_recommended_execution_template() {
     let report = compute_queue(&db).unwrap();
     let explain = report.format_explain();
     assert_eq!(report.ready[0].task.id, task);
-    assert!(explain.contains("class=coder, model=agent-model, effort=low, source=template"));
+    assert!(explain.contains(
+        "class=coder, model=persistent-model, effort=medium, source=persistent-template"
+    ));
+    match old {
+        Some(value) => unsafe { std::env::set_var("ORC_CODER_MODEL", value) },
+        None => unsafe { std::env::remove_var("ORC_CODER_MODEL") },
+    }
 }

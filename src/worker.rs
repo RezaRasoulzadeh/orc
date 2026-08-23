@@ -275,6 +275,16 @@ pub trait Worker: Send + Sync {
             token_usage: None,
         })
     }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        _schema: &str,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        self.execute_with_progress_and_usage(prompt, cwd, progress)
+    }
 }
 
 /// Copilot worker implementation
@@ -381,13 +391,22 @@ impl CodexWorker {
         .collect()
     }
 
-    fn command(&self, prompt: &str, cwd: &Path) -> std::process::Command {
+    fn command_with_schema(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema_path: Option<&Path>,
+    ) -> std::process::Command {
         let mut command = std::process::Command::new("codex");
-        command.args(Self::command_args_with_execution(
-            prompt,
-            self.model.as_deref(),
-            self.reasoning_effort,
-        ));
+        let mut args =
+            Self::command_args_with_execution(prompt, self.model.as_deref(), self.reasoning_effort);
+        if let Some(path) = schema_path {
+            let prompt = args.pop().expect("Codex command includes a prompt");
+            args.push("--output-schema".into());
+            args.push(path.to_string_lossy().into_owned());
+            args.push(prompt);
+        }
+        command.args(args);
         backend::apply_profile_environment(&mut command, &self.profile_path);
         backend::configure_noninteractive(&mut command, cwd);
         command
@@ -419,8 +438,55 @@ impl Worker for CodexWorker {
         cwd: &Path,
         progress: &dyn Fn(&str),
     ) -> Result<WorkerExecution, String> {
+        self.run(prompt, cwd, None, progress)
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        use std::io::Write;
+
+        let mut path = std::env::temp_dir();
+        static SCHEMA_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SCHEMA_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.push(format!(
+            "orc-output-schema-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("failed to create Codex output schema: {error}"))?;
+        if let Err(error) = file.write_all(schema.as_bytes()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("failed to write Codex output schema: {error}"));
+        }
+        drop(file);
+        let result = self.run(prompt, cwd, Some(&path), progress);
+        let cleanup = std::fs::remove_file(&path);
+        match (result, cleanup) {
+            (Ok(execution), Ok(())) => Ok(execution),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("failed to remove Codex output schema: {error}")),
+        }
+    }
+}
+
+impl CodexWorker {
+    fn run(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema_path: Option<&Path>,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
         match run_command_with_timeout_progress(
-            self.command(prompt, cwd),
+            self.command_with_schema(prompt, cwd, schema_path),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
             progress,
         ) {
@@ -605,7 +671,7 @@ mod tests {
         let third = CodexWorker::new(PathBuf::from("/profiles/third"));
         let profile = |worker: &CodexWorker| {
             worker
-                .command("inspect", Path::new("."))
+                .command_with_schema("inspect", Path::new("."), None)
                 .get_envs()
                 .find(|(key, _)| *key == "CODEX_HOME")
                 .and_then(|(_, value)| value)
@@ -615,6 +681,28 @@ mod tests {
 
         assert_eq!(profile(&main).as_deref(), Some("/profiles/main"));
         assert_eq!(profile(&third).as_deref(), Some("/profiles/third"));
+    }
+
+    #[test]
+    fn codex_structured_command_uses_native_output_schema() {
+        let worker = CodexWorker::new(PathBuf::from("/profiles/main"));
+        let command = worker.command_with_schema(
+            "inspect",
+            Path::new("."),
+            Some(Path::new("/tmp/schema.json")),
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|values| {
+            values
+                == [
+                    "--output-schema".to_string(),
+                    "/tmp/schema.json".to_string(),
+                ]
+        }));
+        assert_eq!(args.last().map(String::as_str), Some("inspect"));
     }
 
     #[cfg(unix)]

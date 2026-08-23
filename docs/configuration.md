@@ -6,4 +6,6 @@ Validation loads the first usable configuration in this order: `.orc/validation.
 
 Runtime timeouts can be set with `ORC_WORKER_TIMEOUT_SECS`, `ORC_LEAD_TIMEOUT_SECS`, and `ORC_VALIDATION_TIMEOUT_SECS`. Agent profile, model, reasoning effort, capabilities, availability, and quota are configured with `orc agent` commands. Credentials remain owned by the provider CLI and are not copied into SQLite.
 
+Lead execution is persisted in SQLite. Use `orc lead show`, `orc lead set <agent> [--model <model>] [--effort <none|low|medium|high>]`, or `orc lead clear`. The selected agent must be an enabled automated Codex agent.
+
 Execution templates are persistent SQLite configuration for the `coder`, `reviewer`, `architect`, `researcher`, and `general` classes. Inspect, set, or reset them with `orc template list`, `orc template set <class> --model <model> --effort <none|low|medium|high>`, and `orc template clear <class>`. Resolution is deterministic: per-run overrides, persistent class template, compatible environment template, the coder low-effort compatibility default, agent configuration, then the provider default. Environment variables use `ORC_CODER_*`, `ORC_REVIEW_*` (reviewer and architect), `ORC_RESEARCH_*`, and `ORC_GENERAL_*`.

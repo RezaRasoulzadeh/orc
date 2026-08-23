@@ -2,10 +2,13 @@ use anyhow::{Context, Result, bail};
 use orc::app::OrcApp;
 use orc::events::EventSubscription;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredProject {
@@ -46,7 +49,9 @@ pub enum ProjectStatus {
     TemporarilyUnavailable,
 }
 
-fn default_project_status() -> ProjectStatus { ProjectStatus::Available }
+fn default_project_status() -> ProjectStatus {
+    ProjectStatus::Available
+}
 
 pub struct ProjectSession {
     pub project: RegisteredProject,
@@ -70,8 +75,12 @@ impl ProjectSession {
         })
     }
 
-    pub fn take_subscription(&mut self) -> (EventSubscription, Arc<AtomicBool>) {
-        (self.subscription.take().expect("session subscription"), self.cancellation.clone())
+    pub fn take_subscription(&mut self) -> Result<(EventSubscription, Arc<AtomicBool>)> {
+        let subscription = self
+            .subscription
+            .take()
+            .context("project session subscription is unavailable")?;
+        Ok((subscription, self.cancellation.clone()))
     }
 }
 
@@ -198,8 +207,18 @@ impl ProjectRegistry {
     }
 
     pub fn relocate(&mut self, id: &str, root: impl AsRef<Path>) -> Result<RegisteredProject> {
-        let root = root.as_ref().canonicalize().with_context(|| format!("canonicalize replacement project root {}", root.as_ref().display()))?;
-        let project = self.file.projects.iter_mut().find(|project| project.id == id).context("registered project not found")?;
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!(
+                "canonicalize replacement project root {}",
+                root.as_ref().display()
+            )
+        })?;
+        let project = self
+            .file
+            .projects
+            .iter_mut()
+            .find(|project| project.id == id)
+            .context("registered project not found")?;
         let identity = read_identity(&root)?;
         if identity != (project.project_id, project.project_name.clone()) {
             bail!("replacement project identity does not match registered project");
@@ -227,23 +246,60 @@ impl ProjectRegistry {
     }
 
     fn inspect(&self, id: &str) -> ProjectAvailability {
-        let path = self.file.projects.iter().find(|project| project.id == id).map(|project| project.repository_root.clone());
+        let path = self
+            .file
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .map(|project| project.repository_root.clone());
         if let Some(path) = path {
             if !path.exists() {
-                return ProjectAvailability { project_id: id.to_string(), available: false, status: ProjectStatus::Missing, error: Some(format!("repository root does not exist: {}", path.display())) };
+                return ProjectAvailability {
+                    project_id: id.to_string(),
+                    available: false,
+                    status: ProjectStatus::Missing,
+                    error: Some(format!(
+                        "repository root does not exist: {}",
+                        path.display()
+                    )),
+                };
             }
             if std::fs::metadata(&path).is_err() {
-                return ProjectAvailability { project_id: id.to_string(), available: false, status: ProjectStatus::TemporarilyUnavailable, error: Some(format!("repository root is temporarily unavailable: {}", path.display())) };
+                return ProjectAvailability {
+                    project_id: id.to_string(),
+                    available: false,
+                    status: ProjectStatus::TemporarilyUnavailable,
+                    error: Some(format!(
+                        "repository root is temporarily unavailable: {}",
+                        path.display()
+                    )),
+                };
             }
         }
         let result = self.validate(id);
         let status = match &result {
             Ok(()) => ProjectStatus::Available,
-            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == ErrorKind::NotFound) => ProjectStatus::Missing,
-            Err(error) if error.to_string().contains("identity does not match") || error.to_string().contains("database") => ProjectStatus::Invalid,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == ErrorKind::NotFound) =>
+            {
+                ProjectStatus::Missing
+            }
+            Err(error)
+                if error.to_string().contains("identity does not match")
+                    || error.to_string().contains("database") =>
+            {
+                ProjectStatus::Invalid
+            }
             Err(_) => ProjectStatus::TemporarilyUnavailable,
         };
-        ProjectAvailability { project_id: id.to_string(), available: status == ProjectStatus::Available, status, error: result.err().map(|e| e.to_string()) }
+        ProjectAvailability {
+            project_id: id.to_string(),
+            available: status == ProjectStatus::Available,
+            status,
+            error: result.err().map(|e| e.to_string()),
+        }
     }
 
     fn save(&self) -> Result<()> {
@@ -256,11 +312,20 @@ impl ProjectRegistry {
 }
 
 fn read_identity(root: &Path) -> Result<(i64, String)> {
-    if !root.is_dir() { bail!("repository root is not a directory: {}", root.display()); }
+    if !root.is_dir() {
+        bail!("repository root is not a directory: {}", root.display());
+    }
     let db = root.join(".orc/orc.db");
-    if !db.is_file() { bail!("project database not found at {}", db.display()); }
+    if !db.is_file() {
+        bail!("project database not found at {}", db.display());
+    }
     let database = orc::Database::open(&db).context("open project database")?;
-    Ok((database.get_project_id()?.context("project database has no project")?, database.get_project_name()?.unwrap_or_else(|| "orc".into())))
+    Ok((
+        database
+            .get_project_id()?
+            .context("project database has no project")?,
+        database.get_project_name()?.unwrap_or_else(|| "orc".into()),
+    ))
 }
 
 #[cfg(test)]

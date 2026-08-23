@@ -5,7 +5,10 @@ use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tauri::{Emitter, Manager};
 mod project;
 mod storage;
@@ -21,33 +24,45 @@ fn remove_project_state(
     id: &str,
 ) -> anyhow::Result<bool> {
     let removed = registry.remove(id)?;
-    if removed && session.as_ref().is_some_and(|active| active.project.id == id) {
+    if removed
+        && session
+            .as_ref()
+            .is_some_and(|active| active.project.id == id)
+    {
         *session = None;
     }
     Ok(removed)
 }
 
-struct SessionGuard<'a>(std::sync::MutexGuard<'a, Option<project::ProjectSession>>);
+struct SessionGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<project::ProjectSession>>,
+    app: *const OrcApp,
+}
 
-impl std::ops::Deref for SessionGuard<'_> {
-    type Target = OrcApp;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0.as_ref().expect("active project session").app
+impl SessionGuard<'_> {
+    fn app(&self) -> Result<&OrcApp, String> {
+        Ok(unsafe { &*self.app })
     }
 }
 
 impl SessionState {
-    fn lock(&self) -> Result<SessionGuard<'_>, String> {
-        let guard = self.0.lock().map_err(|_| "application lock poisoned".to_string())?;
-        if guard.is_none() {
-            return Err("no active project".into());
-        }
-        Ok(SessionGuard(guard))
+    fn active(&self) -> Result<SessionGuard<'_>, String> {
+        let guard = self
+            .0
+            .lock()
+            .map_err(|_| "application lock poisoned".to_string())?;
+        let app = guard
+            .as_ref()
+            .map(|session| &session.app as *const OrcApp)
+            .ok_or_else(|| "no active project".to_string())?;
+        Ok(SessionGuard { guard, app })
     }
 
     fn replace(&self, session: Option<project::ProjectSession>) -> Result<(), String> {
-        *self.0.lock().map_err(|_| "application lock poisoned".to_string())? = session;
+        *self
+            .0
+            .lock()
+            .map_err(|_| "application lock poisoned".to_string())? = session;
         Ok(())
     }
 }
@@ -92,8 +107,12 @@ fn project_availability(
     state: tauri::State<'_, RegistryState>,
     id: String,
 ) -> Result<project::ProjectAvailability, String> {
-    state.0.lock().map_err(|_| "project registry lock poisoned".to_string())?
-        .availability(&id).map_err(|error| error.to_string())
+    state
+        .0
+        .lock()
+        .map_err(|_| "project registry lock poisoned".to_string())?
+        .availability(&id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -102,14 +121,27 @@ fn relocate_project(
     id: String,
     root: String,
 ) -> Result<project::RegisteredProject, String> {
-    state.0.lock().map_err(|_| "project registry lock poisoned".to_string())?
-        .relocate(&id, root).map_err(|error| error.to_string())
+    state
+        .0
+        .lock()
+        .map_err(|_| "project registry lock poisoned".to_string())?
+        .relocate(&id, root)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn current_project(state: tauri::State<'_, AppState>) -> Result<Option<project::RegisteredProject>, String> {
-    let guard = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
-    Ok(guard.0.as_ref().map(|session| session.project.clone()))
+fn current_project(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<project::RegisteredProject>, String> {
+    let guard = state.0.active()?;
+    Ok(Some(
+        guard
+            .guard
+            .as_ref()
+            .ok_or_else(|| "no active project".to_string())?
+            .project
+            .clone(),
+    ))
 }
 
 #[tauri::command]
@@ -122,8 +154,12 @@ fn remove_project(
         .0
         .lock()
         .map_err(|_| "project registry lock poisoned".to_string())?;
-    let mut session = app_state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
-    remove_project_state(&mut registry, &mut session.0, &id).map_err(|error| error.to_string())
+    let mut session = app_state
+        .0
+        .0
+        .lock()
+        .map_err(|_| "application lock poisoned".to_string())?;
+    remove_project_state(&mut registry, &mut session, &id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -141,8 +177,12 @@ fn open_project(
         .map_err(|error| error.to_string())?;
     let mut session = project::ProjectSession::open(project).map_err(|error| error.to_string())?;
     let project_id = session.project.id.clone();
-    let (subscription, cancellation) = session.take_subscription();
-    app_state.0.replace(Some(session))
+    let (subscription, cancellation) = session
+        .take_subscription()
+        .map_err(|error| error.to_string())?;
+    app_state
+        .0
+        .replace(Some(session))
         .map(|_| spawn_event_forwarder(app_handle, project_id, subscription, cancellation))
 }
 
@@ -166,10 +206,8 @@ struct ManualWorkspaceInfo {
 
 #[tauri::command]
 fn snapshot(state: tauri::State<'_, AppState>) -> Result<DesktopSnapshot, String> {
-    let app = state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     Ok(DesktopSnapshot {
         dashboard: app.dashboard(24).map_err(|error| error.to_string())?,
         health: app.project_health().map_err(|error| error.to_string())?,
@@ -180,8 +218,8 @@ fn snapshot(state: tauri::State<'_, AppState>) -> Result<DesktopSnapshot, String
 fn tasks(state: tauri::State<'_, AppState>) -> Result<Vec<orc::task::Task>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .tasks()
         .map_err(|error| error.to_string())
 }
@@ -192,8 +230,8 @@ fn agents(
 ) -> Result<Vec<orc::registry::AgentDefinition>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .agents()
         .map_err(|error| error.to_string())
 }
@@ -205,10 +243,8 @@ fn configure_agent(
     field: String,
     value: String,
 ) -> Result<(), String> {
-    let app = state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     let changed = match field.as_str() {
         "enabled" => app.set_agent_enabled(
             &id,
@@ -238,8 +274,8 @@ fn configure_agent(
 fn sync_agent(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .sync_agent_capacity(&id)
         .map_err(|error| error.to_string())
 }
@@ -251,8 +287,8 @@ fn manual_runs(
 ) -> Result<Vec<orc::app::ManualRunContext>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .manual_runs(&agent_id)
         .map_err(|error| error.to_string())
 }
@@ -264,10 +300,8 @@ fn manual_run_action(
     run_id: i64,
     value: String,
 ) -> Result<(), String> {
-    let app = state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     match action.as_str() {
         "submit" => app.submit_manual_run(run_id, &value).map(|_| ()),
         "patch" => app.submit_patch(run_id, &value).map(|_| ()),
@@ -307,9 +341,8 @@ fn manual_workspace_info(
 ) -> ManualWorkspaceInfo {
     let result = state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())
-        .and_then(|app| workspace_url(&app, &agent_id));
+        .active()
+        .and_then(|guard| workspace_url(guard.app()?, &agent_id));
     match result {
         Ok(url) => ManualWorkspaceInfo {
             supported: true,
@@ -331,11 +364,8 @@ fn open_manual_workspace(
     agent_id: String,
 ) -> Result<(), String> {
     let url = {
-        let app = state
-            .0
-            .lock()
-            .map_err(|_| "application lock poisoned".to_string())?;
-        workspace_url(&app, &agent_id)?
+        let guard = state.0.active()?;
+        workspace_url(guard.app()?, &agent_id)?
     };
     let label = format!(
         "manual-{}",
@@ -398,7 +428,8 @@ mod project_lifecycle_tests {
         std::fs::create_dir_all(root.join(".orc")).unwrap();
         let database = orc::Database::init(root.join(".orc/orc.db")).unwrap();
         database.create_project("project").unwrap();
-        let mut registry = project::ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
+        let mut registry =
+            project::ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         registry.register(root, None).unwrap();
         (dir, registry)
     }
@@ -423,14 +454,45 @@ mod project_lifecycle_tests {
         assert!(remove_project_state(&mut registry, &mut session, &project.id).unwrap());
         assert!(session.is_none());
     }
+
+    #[test]
+    fn empty_session_returns_error_without_poisoning_lock() {
+        let state = SessionState(Mutex::new(None));
+
+        assert!(matches!(state.active(), Err(error) if error == "no active project"));
+        assert!(state.active().is_err());
+        state.replace(None).unwrap();
+    }
+
+    #[test]
+    fn session_can_open_close_and_open_again_without_poisoning_lock() {
+        let (_dir, registry) = registered_projects();
+        let project = registry.projects().pop().unwrap();
+        let state = SessionState(Mutex::new(None));
+
+        state
+            .replace(Some(
+                project::ProjectSession::open(project.clone()).unwrap(),
+            ))
+            .unwrap();
+        assert!(state.active().is_ok());
+        state.replace(None).unwrap();
+        assert!(matches!(state.active(), Err(error) if error == "no active project"));
+        state
+            .replace(Some(project::ProjectSession::open(project).unwrap()))
+            .unwrap();
+        assert!(state.active().is_ok());
+        state.replace(None).unwrap();
+        assert!(state.active().is_err());
+    }
 }
 
 #[tauri::command]
 fn queue(state: tauri::State<'_, AppState>) -> Result<orc::queue::QueueReport, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .queue()
         .map_err(|error| error.to_string())
 }
@@ -441,8 +503,8 @@ fn planning_request(
 ) -> Result<orc::protocol::PlanningRequest, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .planning_request()
         .map_err(|error| error.to_string())
 }
@@ -453,8 +515,8 @@ fn planner_validate(
 ) -> Result<orc::protocol::PlanResponse, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .validate_plan_json(&json)
         .map_err(|error| error.to_string())
 }
@@ -463,10 +525,8 @@ fn planner_apply(
     state: tauri::State<'_, AppState>,
     json: String,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let app = state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     let plan = app
         .validate_plan_json(&json)
         .map_err(|error| error.to_string())?;
@@ -478,8 +538,8 @@ fn approvals(
 ) -> Result<Vec<orc::storage::db::ApprovalRequest>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .approvals()
         .map_err(|error| error.to_string())
 }
@@ -487,8 +547,8 @@ fn approvals(
 fn resolve_approval(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .resolve_approval(id)
         .map_err(|error| error.to_string())
 }
@@ -498,8 +558,8 @@ fn project_report(
 ) -> Result<orc::protocol::ProjectReport, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .project_report()
         .map_err(|error| error.to_string())
 }
@@ -512,8 +572,8 @@ fn task_details(
 ) -> Result<Option<orc::read_model::TaskDetails>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .task_details(&task_id, activity_limit)
         .map_err(|error| error.to_string())
 }
@@ -525,8 +585,8 @@ fn review(
 ) -> Result<orc::review::ReviewSummary, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .review(&task_id)
         .map_err(|error| error.to_string())
 }
@@ -539,8 +599,8 @@ fn dispatch(
 ) -> Result<orc::review::DispatchSummary, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .dispatch(&task_id, agent_id.as_deref())
         .map_err(|error| error.to_string())
 }
@@ -553,10 +613,8 @@ fn task_action(
     reason: Option<String>,
     agent_id: Option<String>,
 ) -> Result<(), String> {
-    let app = state
-        .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?;
+    let guard = state.0.active()?;
+    let app = guard.app()?;
     match action.as_str() {
         "dispatch" => app.dispatch(&task_id, agent_id.as_deref()).map(|_| ()),
         "accept" => app.accept(&task_id),
@@ -600,8 +658,8 @@ fn runs(
 ) -> Result<Vec<orc::storage::AgentRun>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .runs(limit)
         .map_err(|error| error.to_string())
 }
@@ -614,8 +672,8 @@ fn runs_workspace(
 ) -> Result<orc::read_model::RunsWorkspace, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .runs_workspace(limit, activity_limit)
         .map_err(|error| error.to_string())
 }
@@ -628,8 +686,8 @@ fn run_details(
 ) -> Result<Option<orc::read_model::RunDetails>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .run_details(run_id, activity_limit)
         .map_err(|error| error.to_string())
 }
@@ -641,8 +699,8 @@ fn lead_context(
 ) -> Result<orc::lead::LeadContext, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .lead()
         .context(limit)
         .map_err(|error| error.to_string())
@@ -654,8 +712,8 @@ fn lead_proposals(
 ) -> Result<Vec<orc::lead::LeadProposal>, String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .lead()
         .pending_proposals()
         .map_err(|error| error.to_string())
@@ -674,8 +732,8 @@ fn invoke_lead(
     });
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .invoke_configured_lead(&message, &config, 20)
         .map_err(|error| error.to_string())
 }
@@ -684,8 +742,8 @@ fn invoke_lead(
 fn apply_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> Result<(), String> {
     state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .apply_lead_proposal(proposal_id)
         .map_err(|error| error.to_string())
 }
@@ -694,8 +752,8 @@ fn apply_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> R
 fn reject_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> Result<(), String> {
     let changed = state
         .0
-        .lock()
-        .map_err(|_| "application lock poisoned".to_string())?
+        .active()?
+        .app()?
         .lead()
         .reject_proposal(proposal_id)
         .map_err(|error| error.to_string())?;
@@ -752,7 +810,13 @@ fn spawn_event_forwarder(
                 break;
             }
             if handle
-                .emit("orc://run-event", ProjectEvent { project_id: &project_id, event })
+                .emit(
+                    "orc://run-event",
+                    ProjectEvent {
+                        project_id: &project_id,
+                        event,
+                    },
+                )
                 .is_err()
             {
                 break;

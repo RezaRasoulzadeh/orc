@@ -198,23 +198,17 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Require {
             task_id,
             capabilities,
-        } => match Database::open(db_path) {
-            Ok(db) => {
-                let changed = db
-                    .set_task_required_capabilities(&task_id, &capabilities)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                if !changed {
-                    eprintln!("Task {} not found", task_id);
-                    anyhow::bail!("task '{}' not found in DB", task_id);
-                }
-                println!(
-                    "Updated capabilities for task {}: {}",
-                    task_id,
-                    capabilities.join(", ")
-                );
+        } => {
+            let app = OrcApp::open(db_path, ".")?;
+            if !app.set_task_required_capabilities(&task_id, &capabilities)? {
+                anyhow::bail!("task '{}' not found in DB", task_id);
             }
-            Err(_) => eprintln!("No DB found. Run `orc init` to initialize repository state."),
-        },
+            println!(
+                "Updated capabilities for task {}: {}",
+                task_id,
+                capabilities.join(", ")
+            );
+        }
         TaskCommand::Cancel { task_id, reason } => {
             let app = OrcApp::open(db_path, ".")?;
             if let Err(error) = app.cancel(&task_id, reason.as_deref()) {
@@ -238,41 +232,29 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Scope { task_id, mode } => {
             let scope = TaskScopeMode::parse(&mode)
                 .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {mode}"))?;
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            if !db
-                .set_task_scope(&task_id, scope)
-                .map_err(|e| anyhow::anyhow!(e))?
-            {
+            if !OrcApp::open(db_path, ".")?.set_task_scope(&task_id, scope)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::ContextAdd { task_id, paths } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            let task = db
-                .get_task(&task_id)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .ok_or_else(|| anyhow::anyhow!("task '{task_id}' not found"))?;
-            let mut values = task.context_files;
-            values.extend(paths);
-            db.set_task_context(&task_id, &values)?;
+            if !OrcApp::open(db_path, ".")?.add_task_context(&task_id, &paths)? {
+                anyhow::bail!("task '{task_id}' not found");
+            }
         }
         TaskCommand::ExpectChange { task_id, paths } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            let task = db
-                .get_task(&task_id)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .ok_or_else(|| anyhow::anyhow!("task '{task_id}' not found"))?;
-            let mut values = task.expected_changes;
-            values.extend(paths);
-            db.set_task_expected_changes(&task_id, &values)?;
+            if !OrcApp::open(db_path, ".")?.add_expected_changes(&task_id, &paths)? {
+                anyhow::bail!("task '{task_id}' not found");
+            }
         }
         TaskCommand::ContextClear { task_id } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            db.set_task_context(&task_id, &Vec::new())?;
+            if !OrcApp::open(db_path, ".")?.clear_task_context(&task_id)? {
+                anyhow::bail!("task '{task_id}' not found");
+            }
         }
         TaskCommand::ExpectClear { task_id } => {
-            let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-            db.set_task_expected_changes(&task_id, &Vec::new())?;
+            if !OrcApp::open(db_path, ".")?.clear_expected_changes(&task_id)? {
+                anyhow::bail!("task '{task_id}' not found");
+            }
         }
         TaskCommand::Diff { task_id } => show_diff(db_path, &task_id)?,
         TaskCommand::Worktree { task_id } => show_worktree(db_path, &task_id)?,
@@ -293,32 +275,22 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Depend {
             task_id,
             dependency_id,
-        } => match Database::open(db_path) {
-            Ok(db) => {
-                db.add_task_dependency(&task_id, &dependency_id)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                println!("Added dependency: {} depends on {}", task_id, dependency_id);
-            }
-            Err(_) => eprintln!("No DB found. Run `orc init` to initialize repository state."),
-        },
+        } => {
+            OrcApp::open(db_path, ".")?.add_dependency(&task_id, &dependency_id)?;
+            println!("Added dependency: {} depends on {}", task_id, dependency_id);
+        }
         TaskCommand::Undepend {
             task_id,
             dependency_id,
-        } => match Database::open(db_path) {
-            Ok(db) => {
-                let changed = db
-                    .remove_task_dependency(&task_id, &dependency_id)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                if !changed {
-                    anyhow::bail!("dependency '{}' -> '{}' not found", task_id, dependency_id);
-                }
-                println!(
-                    "Removed dependency: {} no longer depends on {}",
-                    task_id, dependency_id
-                );
+        } => {
+            if !OrcApp::open(db_path, ".")?.remove_dependency(&task_id, &dependency_id)? {
+                anyhow::bail!("dependency '{}' -> '{}' not found", task_id, dependency_id);
             }
-            Err(_) => eprintln!("No DB found. Run `orc init` to initialize repository state."),
-        },
+            println!(
+                "Removed dependency: {} no longer depends on {}",
+                task_id, dependency_id
+            );
+        }
     }
     Ok(())
 }

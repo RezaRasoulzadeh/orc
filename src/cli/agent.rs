@@ -1,3 +1,4 @@
+use crate::app::OrcApp;
 use crate::codex_app_server::{self, CodexAppServer};
 use crate::registry::{self, AgentDefinition};
 use crate::storage::Database;
@@ -85,6 +86,7 @@ pub enum AgentCommand {
 
 pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
     let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
+    let app = OrcApp::open(db_path, ".")?;
     match command {
         AgentCommand::List => {
             print_agents(&db)?;
@@ -135,71 +137,47 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
                 quota_source: None,
                 quota_limits: None,
             };
-            db.insert_agent(&agent).map_err(|e| anyhow::anyhow!(e))?;
+            app.configure_agent(agent.clone())?;
             println!("Added agent {}", agent.id);
         }
-        AgentCommand::Enable { id } => update_agent_enabled(&db, &id, true)?,
-        AgentCommand::Disable { id } => update_agent_enabled(&db, &id, false)?,
+        AgentCommand::Enable { id } => {
+            ensure_agent_updated(app.set_agent_enabled(&id, true)?, &id)?
+        }
+        AgentCommand::Disable { id } => {
+            ensure_agent_updated(app.set_agent_enabled(&id, false)?, &id)?
+        }
         AgentCommand::Remove { id } => {
             db.archive_agent(&id).map_err(|e| anyhow::anyhow!(e))?;
             println!("Archived agent {}", id);
         }
         AgentCommand::Unavailable { id, reason } => {
-            ensure_agent_updated(
-                db.set_agent_availability(&id, registry::UNAVAILABLE, Some(&reason))
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                &id,
-            )?;
+            ensure_agent_updated(app.set_agent_availability(&id, false, Some(&reason))?, &id)?;
         }
         AgentCommand::Available { id } => {
-            ensure_agent_updated(
-                db.set_agent_availability(&id, registry::AVAILABLE, None)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                &id,
-            )?;
+            ensure_agent_updated(app.set_agent_availability(&id, true, None)?, &id)?;
         }
-        AgentCommand::Priority { id, priority } => ensure_agent_updated(
-            db.set_agent_priority(&id, priority)
-                .map_err(|e| anyhow::anyhow!(e))?,
-            &id,
-        )?,
-        AgentCommand::Profile { id, path } => ensure_agent_updated(
-            db.set_agent_profile_path(&id, &path)
-                .map_err(|e| anyhow::anyhow!(e))?,
-            &id,
-        )?,
+        AgentCommand::Priority { id, priority } => {
+            ensure_agent_updated(app.set_agent_priority(&id, priority)?, &id)?
+        }
+        AgentCommand::Profile { id, path } => {
+            ensure_agent_updated(app.set_agent_profile(&id, &path)?, &id)?
+        }
         AgentCommand::Model { id, model } => {
             ensure_codex_automated_agent(&db, &id)?;
-            ensure_agent_updated(
-                db.set_agent_model(&id, &model)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                &id,
-            )?;
+            ensure_agent_updated(app.set_agent_model(&id, &model)?, &id)?;
         }
         AgentCommand::Effort { id, effort } => {
             ensure_codex_automated_agent(&db, &id)?;
-            ensure_agent_updated(
-                db.set_agent_reasoning_effort(&id, effort)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                &id,
-            )?;
+            ensure_agent_updated(app.set_agent_effort(&id, effort)?, &id)?;
         }
         AgentCommand::Quota {
             id,
             remaining,
             reset,
-        } => ensure_agent_updated(
-            db.set_agent_quota(&id, remaining, reset.as_deref())
-                .map_err(|e| anyhow::anyhow!(e))?,
-            &id,
-        )?,
-        AgentCommand::QuotaClear { id } => ensure_agent_updated(
-            db.clear_agent_quota(&id).map_err(|e| anyhow::anyhow!(e))?,
-            &id,
-        )?,
+        } => ensure_agent_updated(app.set_agent_quota(&id, remaining, reset.as_deref())?, &id)?,
+        AgentCommand::QuotaClear { id } => ensure_agent_updated(app.clear_agent_quota(&id)?, &id)?,
         AgentCommand::QuotaReserve { remaining } => {
-            db.set_quota_reserve(remaining)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            app.set_quota_reserve(remaining)?;
             println!("Automatic dispatch quota reserve set to {remaining}%.");
         }
         AgentCommand::Sync { id } => {
@@ -288,13 +266,6 @@ fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
         anyhow::bail!("agent '{}' is not registered", id);
     }
     Ok(())
-}
-fn update_agent_enabled(db: &Database, id: &str, enabled: bool) -> Result<()> {
-    ensure_agent_updated(
-        db.set_agent_enabled(id, enabled)
-            .map_err(|e| anyhow::anyhow!(e))?,
-        id,
-    )
 }
 fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
     let agent = registry::get_agent(db, id)?;

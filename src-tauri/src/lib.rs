@@ -96,7 +96,7 @@ fn open_manual_workspace(app_handle: tauri::AppHandle, state: tauri::State<'_, A
     let url = {
         let app = state.0.lock().map_err(|_| "application lock poisoned".to_string())?;
         workspace_url(&app, &agent_id)?
-    };
+    }
     let label = format!("manual-{}", agent_id.chars().map(|character| if character.is_ascii_alphanumeric() { character } else { '-' }).collect::<String>());
     if let Some(window) = app_handle.get_webview_window(&label) {
         window.set_focus().map_err(|error| error.to_string())?;
@@ -228,7 +228,10 @@ fn reject_lead_proposal(state: tauri::State<'_, AppState>, proposal_id: i64) -> 
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let root = std::env::current_dir()?;
+    let mut root = std::env::current_dir()?;
+    if root.file_name().is_some_and(|name| name == "src-tauri") {
+        root.pop();
+    }
     let app = OrcApp::open(root.join(".orc/orc.db"), &root)?;
     tauri::Builder::default()
         .manage(AppState(Mutex::new(app)))

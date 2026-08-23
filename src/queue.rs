@@ -92,6 +92,7 @@ pub struct QueueEntry {
     pub active_agent: Option<String>,
     pub recommended_agent: Option<String>,
     pub schedule_decision: Option<ScheduleDecision>,
+    pub recommended_execution: Option<crate::execution::ExecutionResolution>,
 }
 
 /// Backwards-compatible name for Queue v1 callers.
@@ -242,6 +243,23 @@ impl QueueReport {
             for item in items {
                 out.push_str(&format!("\n{} - {}\n", item.task.id, item.task.title));
                 out.push_str(&format!("  Role:                 {}\n", item.task.role));
+                let resolution =
+                    item.recommended_execution
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            crate::execution::resolve(&item.task.role, None, None, None, None)
+                        });
+                out.push_str(&format!(
+                    "  Execution:            class={}, model={}, effort={}, source={}\n",
+                    resolution.class.as_str(),
+                    resolution.model.as_deref().unwrap_or("default"),
+                    resolution
+                        .reasoning_effort
+                        .map(|effort| effort.as_str())
+                        .unwrap_or("default"),
+                    resolution.source,
+                ));
                 out.push_str(&format!("  Persisted Status:     {}\n", item.task.status));
                 out.push_str(&format!(
                     "  Capabilities:         {}\n",
@@ -396,6 +414,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
+                    recommended_execution: None,
                 });
             }
             TaskStatus::Cancelled => {
@@ -408,6 +427,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
+                    recommended_execution: None,
                 });
             }
             TaskStatus::Review => {
@@ -420,6 +440,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent,
                     recommended_agent: None,
                     schedule_decision: None,
+                    recommended_execution: None,
                 });
             }
             TaskStatus::Active => {
@@ -432,6 +453,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent,
                     recommended_agent: None,
                     schedule_decision: None,
+                    recommended_execution: None,
                 });
             }
             TaskStatus::Blocked => {
@@ -450,6 +472,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
+                    recommended_execution: None,
                 });
             }
             TaskStatus::Backlog | TaskStatus::Ready => {
@@ -466,6 +489,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         active_agent: None,
                         recommended_agent: None,
                         schedule_decision: None,
+                        recommended_execution: None,
                     });
                 } else {
                     let decision = scheduler::schedule_with_busy_and_quota_reserve(
@@ -478,6 +502,19 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     .map_err(|e| DbError::Scheduler(e.to_string()))?;
 
                     if let Some(ref selected) = decision.selected_agent_id {
+                        let selected = selected.clone();
+                        let recommended_execution = agents
+                            .iter()
+                            .find(|agent| agent.id == selected)
+                            .map(|agent| {
+                                crate::execution::resolve(
+                                    &task.role,
+                                    agent.model.as_deref(),
+                                    agent.reasoning_effort,
+                                    None,
+                                    None,
+                                )
+                            });
                         report.ready.push(QueueItem {
                             task,
                             category: QueueCategory::Ready,
@@ -485,8 +522,9 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                             waiting_on: Vec::new(),
                             blocking_reasons: Vec::new(),
                             active_agent: None,
-                            recommended_agent: Some(selected.clone()),
+                            recommended_agent: Some(selected),
                             schedule_decision: Some(decision),
+                            recommended_execution,
                         });
                     } else {
                         let blocking_reasons = vec![BlockingReason::NoEligibleAgent {
@@ -509,6 +547,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                             active_agent: None,
                             recommended_agent: None,
                             schedule_decision: Some(decision),
+                            recommended_execution: None,
                         });
                     }
                 }

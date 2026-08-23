@@ -29,6 +29,7 @@ fn dispatch_entry(id: &str) -> QueueEntry {
         active_agent: None,
         recommended_agent: None,
         schedule_decision: None,
+        recommended_execution: None,
     }
 }
 
@@ -827,4 +828,43 @@ fn queue_concise_and_explain_formatting() {
     assert!(explain.contains("=== BLOCKED ==="));
     assert!(explain.contains(&t2));
     assert!(explain.contains(&format!("incomplete dependencies: {t1} [backlog]")));
+}
+
+#[test]
+fn queue_explain_shows_recommended_execution_template() {
+    let (_dir, db, pid) = create_test_db();
+    let agent = AgentDefinition {
+        id: "recommended".into(),
+        backend: "codex".into(),
+        display_name: "recommended".into(),
+        enabled: true,
+        priority: 100,
+        capabilities: ["code", "terminal"].into_iter().map(String::from).collect(),
+        status: registry::AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: Some("agent-model".into()),
+        reasoning_effort: Some(registry::ReasoningEffort::High),
+        config_metadata: None,
+        execution_mode: registry::AUTOMATED.into(),
+        quota_remaining_percent: None,
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+    };
+    db.insert_agent(&agent).unwrap();
+    let task = db
+        .insert_task(
+            pid,
+            "developer task",
+            "objective",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let report = compute_queue(&db).unwrap();
+    let explain = report.format_explain();
+    assert_eq!(report.ready[0].task.id, task);
+    assert!(explain.contains("class=coder, model=agent-model, effort=low, source=template"));
 }

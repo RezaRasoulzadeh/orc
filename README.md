@@ -62,6 +62,6 @@ Architecture or other worker decisions requiring approval are listed with `orc a
 
 `orc status` gives a compact project/task view, `orc queue --explain` explains scheduler state, `orc runs` shows run status, phase, elapsed time, activity, output, and timestamps, `orc report` emits structured project state, and `orc doctor` checks operational health. Orc preserves this state in SQLite and does not silently discard invalid protocol responses or corrupted state.
 
-## v0.2 release gate
+## v0.2.2 release gate
 
-The provider-independent v0.2 acceptance coverage uses a clean temporary project and exercises planning, agent registration, safe lifecycle transitions, persistent execution-template resolution, deterministic queue explanations, manual dispatch and submission, failed-run recovery, review and acceptance, Lead configuration and human-gated proposals, approvals, reopen persistence, and operator-facing output. It uses test doubles and manual runs, so it does not require a live AI provider.
+The provider-independent v0.2.2 acceptance coverage exercises project registration, switching, relocation, re-import persistence, manifest-relative startup, human-gated planning/review/Lead actions, malformed-output rejection, action profiles, explicit overrides, and persisted execution metadata. It uses test doubles and manual runs, so it does not require a live AI provider. The v0.3 visual redesign is not part of this release.

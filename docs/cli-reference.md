@@ -1,6 +1,6 @@
 # CLI reference
 
-Run `orc --help` for the installed command surface. The main commands are:
+Run `orc --help` for the installed v0.2.2 command surface. Automated planning, review, and Lead responses are read-only until a human explicitly validates/applies or resolves the result; review never accepts or merges work. Malformed structured output fails without mutation.
 
 - Project/state: `init`, `adopt`, `discovery-request`, `apply-discovery`, `status`, `report`, `doctor`.
 - Planning/Lead: `plan-request`, `apply-plan`, `ask`, `apply-response`, `lead show|set|clear`.

@@ -113,9 +113,8 @@ impl ProjectRegistry {
         let project = self.file.projects.iter().find(|project| project.id == id);
         let result = match project {
             Some(project) => self.inspect(&project.id),
-            None => Err(anyhow::anyhow!("registered project '{id}' not found")),
+            None => bail!("registered project '{id}' not found"),
         };
-        let result = result?;
         Ok(ProjectAvailability {
             project_id: id.to_string(),
             available: result.status == ProjectStatus::Available,
@@ -274,7 +273,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join(".orc")).unwrap();
-        orc::Database::init(root.join(".orc/orc.db")).unwrap();
+        let database = orc::Database::init(root.join(".orc/orc.db")).unwrap();
+        database.create_project("Demo").unwrap();
         let path = dir.path().join("registry.json");
         let mut registry = ProjectRegistry::open(&path).unwrap();
         let first = registry.register(&root, Some("Demo".into())).unwrap();
@@ -290,7 +290,8 @@ mod tests {
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join(".orc")).unwrap();
         let database_path = root.join(".orc/orc.db");
-        orc::Database::init(&database_path).unwrap();
+        let database = orc::Database::init(&database_path).unwrap();
+        database.create_project("Demo").unwrap();
         let database_before = std::fs::read(&database_path).unwrap();
         let path = dir.path().join("registry.json");
         let mut registry = ProjectRegistry::open(&path).unwrap();

@@ -264,7 +264,7 @@ onUnmounted(() => { stopRunEvents?.() })
     <aside class="sidebar">
       <div class="brand"><span class="mark">+</span><span>ORC</span><small>LOCAL OPS</small></div>
       <nav aria-label="Primary navigation">
-        <button v-for="section in sections" :key="section" :class="{ active: active === section }" @click="active = section; section === 'Lead' && refreshLead(); section === 'Agents' && refreshAgents(); ['Planner','Approvals','Reports','Project','Settings'].includes(section) && refreshControl(section)">
+        <button v-if="activeProject" v-for="section in sections" :key="section" :class="{ active: active === section }" @click="active = section; section === 'Lead' && refreshLead(); section === 'Agents' && refreshAgents(); ['Planner','Approvals','Reports','Project','Settings'].includes(section) && refreshControl(section)">
           <span class="nav-index">{{ String(sections.indexOf(section) + 1).padStart(2, '0') }}</span>{{ section }}
         </button>
       </nav>
@@ -284,8 +284,8 @@ onUnmounted(() => { stopRunEvents?.() })
         </form>
       </UiModal>
       <div v-if="mutationError" class="notice" role="alert">{{ mutationError }}</div>
-      <div v-else-if="error" class="notice" role="alert">Unable to load project state: {{ error }} <button class="text-button" :disabled="loading" @click="refreshSnapshot">TRY AGAIN</button></div>
-      <template v-else>
+      <div v-else-if="activeProject && error" class="notice" role="alert">Unable to load project state: {{ error }} <button class="text-button" :disabled="loading" @click="refreshSnapshot">TRY AGAIN</button></div>
+      <template v-else-if="activeProject">
       <div v-if="notice" class="success-notice" role="status">{{ notice }} <button aria-label="Dismiss notification" @click="notice = ''">×</button></div>
       <div v-if="loading" class="loading-bar" role="status">Refreshing project state…</div>
       <section v-if="active === 'Dashboard'" class="dashboard">
@@ -308,7 +308,7 @@ onUnmounted(() => { stopRunEvents?.() })
       </template>
       </div>
     </main>
-    <button v-if="active !== 'Lead'" class="lead-fab" @click="leadPanel = !leadPanel; refreshLead()">LEAD</button><aside v-if="leadPanel" class="lead-panel"><div class="panel-head"><h3>LEAD</h3><button class="text-button" @click="leadPanel = false">CLOSE</button></div><p>Ask about the current project from any screen.</p><div v-if="leadError" class="notice compact">{{ leadError }}</div><form class="lead-composer compact" @submit.prevent="sendLead(panelMessage, 'panel')"><textarea v-model="panelMessage" aria-label="Message the Lead" placeholder="Ask the Lead…" rows="3" :disabled="leadLoading"></textarea><button class="apply-button" type="submit" :disabled="leadLoading || !panelMessage.trim()">{{ leadLoading ? 'SENDING…' : 'SEND' }}</button></form><button class="text-button open-lead" @click="active = 'Lead'; leadPanel = false; refreshLead()">OPEN WORKSPACE →</button></aside>
+    <button v-if="activeProject && active !== 'Lead'" class="lead-fab" @click="leadPanel = !leadPanel; refreshLead()">LEAD</button><aside v-if="activeProject && leadPanel" class="lead-panel"><div class="panel-head"><h3>LEAD</h3><button class="text-button" @click="leadPanel = false">CLOSE</button></div><p>Ask about the current project from any screen.</p><div v-if="leadError" class="notice compact">{{ leadError }}</div><form class="lead-composer compact" @submit.prevent="sendLead(panelMessage, 'panel')"><textarea v-model="panelMessage" aria-label="Message the Lead" placeholder="Ask the Lead…" rows="3" :disabled="leadLoading"></textarea><button class="apply-button" type="submit" :disabled="leadLoading || !panelMessage.trim()">{{ leadLoading ? 'SENDING…' : 'SEND' }}</button></form><button class="text-button open-lead" @click="active = 'Lead'; leadPanel = false; refreshLead()">OPEN WORKSPACE →</button></aside>
   </div>
   <UiModal :open="taskModal" title="Create task" @close="taskModal = false"><form @submit.prevent="createTask"><label>Title<input v-model="newTaskTitle" required autofocus /></label><label>Objective<textarea v-model="newTaskObjective" required rows="4" /></label><label>Role<input v-model="newTaskRole" /></label><div class="lead-actions"><UiButton type="button" @click="taskModal = false">CANCEL</UiButton><UiButton variant="primary" type="submit">CREATE TASK</UiButton></div></form></UiModal>
   <UiModal :open="agentModal" title="Register agent" @close="agentModal = false"><form @submit.prevent="createAgent"><label>Agent ID<input v-model="newAgentId" required autofocus /></label><label>Display name<input v-model="newAgentDisplayName" /></label><label>Backend<select v-model="newAgentBackend"><option value="codex">codex</option><option value="copilot">copilot</option><option value="antigravity">antigravity</option></select></label><label>Execution mode<select v-model="newAgentMode"><option value="automated">automated</option><option value="manual">manual</option></select></label><label>Priority<input v-model="newAgentPriority" type="number" /></label><label>Capabilities<input v-model="newAgentCapabilities" placeholder="comma,separated" /></label><label>Profile path<input v-model="newAgentProfile" /></label><div class="lead-actions"><UiButton type="button" @click="agentModal = false">CANCEL</UiButton><UiButton variant="primary" type="submit">REGISTER AGENT</UiButton></div></form></UiModal>

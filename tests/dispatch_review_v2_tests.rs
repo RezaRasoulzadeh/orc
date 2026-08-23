@@ -185,6 +185,14 @@ fn no_change_and_validation_failure_block_task() {
         db.get_task(&task2).unwrap().unwrap().status,
         TaskStatus::Blocked
     );
+    let run_id = db.list_agent_runs_for_task(&task2).unwrap()[0].id;
+    let validation = db
+        .list_lifecycle_events_for_run(run_id, 20)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "validation_result")
+        .unwrap();
+    assert!(validation.payload.unwrap().contains("\"passed\":false"));
 }
 
 #[test]

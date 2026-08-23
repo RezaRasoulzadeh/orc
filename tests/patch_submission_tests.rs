@@ -405,6 +405,17 @@ new file mode 100644
     let run = db.get_agent_run(run_id).unwrap().unwrap();
     assert_eq!(run.status, "failed");
     assert!(run.output.unwrap().contains("Validation:\n  cargo test"));
+    let events = db.list_lifecycle_events_for_run(run_id, 20).unwrap();
+    let validation = events
+        .iter()
+        .find(|event| event.kind == "validation_result")
+        .unwrap();
+    assert!(validation.payload.as_deref().unwrap().contains("steps"));
+    let changes = events
+        .iter()
+        .find(|event| event.kind == "change_evidence")
+        .unwrap();
+    assert!(changes.payload.as_deref().unwrap().contains("applied.txt"));
 
     // Task status must be blocked (not review)
     let task = db.get_task(&task_id).unwrap().unwrap();

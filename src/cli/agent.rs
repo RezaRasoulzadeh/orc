@@ -36,6 +36,9 @@ pub enum AgentCommand {
     Remove {
         id: String,
     },
+    Purge {
+        id: String,
+    },
     Unavailable {
         id: String,
         reason: String,
@@ -150,6 +153,10 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
         AgentCommand::Remove { id } => {
             db.archive_agent(&id).map_err(|e| anyhow::anyhow!(e))?;
             println!("Archived agent {}", id);
+        }
+        AgentCommand::Purge { id } => {
+            app.purge_agent(&id)?;
+            println!("Purged agent {}", id);
         }
         AgentCommand::Unavailable { id, reason } => {
             ensure_agent_updated(app.set_agent_availability(&id, false, Some(&reason))?, &id)?;

@@ -540,6 +540,47 @@ impl OrcApp {
     pub fn remove_agent(&self, id: &str) -> Result<()> {
         self.db.archive_agent(id).map_err(anyhow::Error::from)
     }
+    pub fn purge_agent(&self, id: &str) -> Result<()> {
+        self.db.purge_agent(id).map_err(anyhow::Error::from)
+    }
+    pub fn purge_task(&self, id: &str, force: bool) -> Result<()> {
+        self.db.validate_task_purge(id, force)?;
+        let path = self.db.get_worktree_metadata(id)?.map(|(_, path)| path);
+        let expected = crate::git::worktree_path_for_task(id);
+        let absolute = self.repo_path.join(&expected);
+        if let Some(path) = &path {
+            if std::path::Path::new(path) != expected {
+                anyhow::bail!(
+                    "refusing to purge task '{}' with unsafe worktree path '{}', expected '{}'",
+                    id,
+                    path,
+                    expected.display()
+                );
+            }
+            if !force
+                && absolute.exists()
+                && crate::git::worktree_has_meaningful_changes(&absolute)?
+            {
+                anyhow::bail!(
+                    "task '{}' worktree contains meaningful changes; use --force to purge",
+                    id
+                );
+            }
+        } else if !force
+            && absolute.exists()
+            && crate::git::worktree_has_meaningful_changes(&absolute)?
+        {
+            anyhow::bail!(
+                "task '{}' worktree contains meaningful changes; use --force to purge",
+                id
+            );
+        }
+        if absolute.exists() && (force || path.is_some()) {
+            crate::git::remove_worktree(&self.repo_path, &expected)?;
+        }
+        self.db.purge_task(id, force)?;
+        Ok(())
+    }
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool> {
         let result = self.db.set_agent_priority(id, priority)?;
         Ok(result)

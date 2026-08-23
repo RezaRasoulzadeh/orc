@@ -4,6 +4,8 @@ Orc v0.2.2 is a local, operator-controlled orchestrator for AI-assisted engineer
 
 Orc orchestrates external AI providers; it is not an AI model or provider. Provider credentials remain with the provider's own CLI or service. Orc does not silently plan, dispatch, apply patches, merge work, or mutate project state on an AI provider's behalf.
 
+`agent remove` archives an agent and task cancellation preserves task history. `agent purge ID` and `task purge TASK_ID` are irreversible operations: agent purge removes the registered agent while preserving historical run attribution, and task purge removes task-owned state and, when safe, its canonical worktree. Active or waiting runs always prevent purge.
+
 ## Core concepts
 
 An Orc project is an adopted Git repository. Tasks are durable units of work with an objective, role, priority, dependencies, required capabilities, scope, context files, and expected changes. Agents are registered workers with a backend, automated or manual execution mode, capabilities, priority, availability, and optional provider configuration.

@@ -149,6 +149,16 @@ pub enum DbError {
     AgentHasActiveRun(String),
     #[error("agent '{0}' is already archived")]
     AgentAlreadyArchived(String),
+    #[error("agent '{0}' not found")]
+    AgentNotFound(String),
+    #[error("agent '{0}' cannot be purged while it has an active run")]
+    AgentPurgeActiveRun(String),
+    #[error("task '{0}' cannot be purged while it has an active run")]
+    TaskPurgeActiveRun(String),
+    #[error("task '{0}' is not terminal")]
+    TaskPurgeNotTerminal(String),
+    #[error("task '{0}' has dependent tasks: {1}")]
+    TaskPurgeHasDependents(String, String),
 }
 
 pub struct Database {
@@ -1234,6 +1244,34 @@ impl Database {
         Ok(())
     }
 
+    pub fn purge_agent(&self, id: &str) -> Result<(), DbError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(DbError::AgentNotFound(id.to_owned()));
+        }
+        let active: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1 AND status IN ('running', 'waiting_external'))", [id], |r| r.get(0))?;
+        if active {
+            return Err(DbError::AgentPurgeActiveRun(id.to_owned()));
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn
+                .execute("DELETE FROM lead_provider_config WHERE agent_id = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM agents WHERE id = ?1", [id])?;
+            self.conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool, DbError> {
         Ok(self.conn.execute(
             "UPDATE agents SET priority = ?1 WHERE id = ?2",
@@ -2147,6 +2185,54 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn validate_task_purge(&self, id: &str, force: bool) -> Result<(), DbError> {
+        let task = self
+            .get_task(id)?
+            .ok_or_else(|| DbError::TaskNotFound(id.to_owned()))?;
+        let active: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('running', 'waiting_external'))", [id], |r| r.get(0))?;
+        if active {
+            return Err(DbError::TaskPurgeActiveRun(id.to_owned()));
+        }
+        if !force && !task.status.is_terminal() {
+            return Err(DbError::TaskPurgeNotTerminal(id.to_owned()));
+        }
+        let dependents = self.list_task_dependents(id)?;
+        if !force && !dependents.is_empty() {
+            return Err(DbError::TaskPurgeHasDependents(
+                id.to_owned(),
+                dependents.join(", "),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn purge_task(&self, id: &str, force: bool) -> Result<Option<String>, DbError> {
+        self.validate_task_purge(id, force)?;
+        let path = self.get_worktree_metadata(id)?.map(|(_, path)| path);
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            if force {
+                self.conn.execute(
+                    "DELETE FROM task_dependencies WHERE task_id = ?1 OR depends_on = ?1",
+                    [id],
+                )?;
+            }
+            self.conn
+                .execute("DELETE FROM lifecycle_events WHERE task_id = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM decisions WHERE task_id = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM agent_runs WHERE task_id = ?1", [id])?;
+            self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+            self.conn.execute_batch("COMMIT")?;
+            Ok(path)
+        })();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     pub fn add_task_dependency(&self, task_id: &str, depends_on: &str) -> Result<(), DbError> {

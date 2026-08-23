@@ -110,7 +110,8 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 
 | Command | Description |
 |---|---|
-| `orc review <TASK_ID> [--automated] [--agent] [--model] [--effort] [--diff \| --file PATH]` | Review a task's latest run and worktree changes. |
+| `orc review <TASK_ID> [--automated] [--agent] [--model] [--effort] [--diff \| --file PATH]` | Review a task contract, latest run, and worktree changes. |
+| `orc project-review <TASK_ID> [--agent] [--model] [--effort]` | Run an unrestricted project-wide audit using captured task evidence. |
 | `orc revise <TASK_ID> <FEEDBACK> [--agent]` | Redispatch a reviewed task using feedback. |
 
 ### Agents

@@ -203,6 +203,11 @@ Reviews the latest run for a task and its worktree changes. Review never accepts
 - `--agent AGENT` — agent override for the automated review (requires `--automated`).
 - `--model MODEL` — model override for the automated review (requires `--automated`).
 - `--effort EFFORT` — reasoning-effort override for the automated review (requires `--automated`).
+- Task-scoped automated review verifies the task contract; unrelated and pre-existing findings are non-blocking.
+
+### `orc project-review TASK_ID [options]`
+
+Runs an unrestricted project-wide automated audit using the task's captured evidence. It may report broader architecture, latent defects, technical debt, missing tests, and adjacent concerns.
 - `--diff` — show the complete unified diff (conflicts with `--file`).
 - `--file PATH` — show the unified diff for one changed file only (conflicts with `--diff`).
 

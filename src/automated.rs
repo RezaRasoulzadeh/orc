@@ -222,8 +222,8 @@ fn schema(action: AgentAction) -> String {
     let value = match action {
         AgentAction::Review => serde_json::json!({
             "type":"object","additionalProperties":false,
-            "properties":{"verdict":{"type":"string"},"findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]}},
-            "required":["verdict","findings","severity","revision_feedback"]
+            "properties":{"verdict":{"type":"string"},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]}},
+            "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback"]
         }),
         AgentAction::Plan => plan,
         AgentAction::Lead => serde_json::json!({
@@ -246,6 +246,10 @@ pub struct ReviewResult {
     pub verdict: String,
     #[serde(default)]
     pub findings: Vec<String>,
+    #[serde(default)]
+    pub blocking_findings: Vec<String>,
+    #[serde(default)]
+    pub non_blocking_findings: Vec<String>,
     #[serde(default)]
     pub severity: Option<String>,
     #[serde(default)]
@@ -338,10 +342,34 @@ pub fn run_review(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
 ) -> Result<(i64, ReviewResult)> {
+    run_review_mode(db, summary, overrides, backend, false)
+}
+
+pub fn run_project_review(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+) -> Result<(i64, ReviewResult)> {
+    run_review_mode(db, summary, overrides, backend, true)
+}
+
+fn run_review_mode(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+    project_review: bool,
+) -> Result<(i64, ReviewResult)> {
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
     let run = start_run(db, AgentAction::Review, &resolved)?;
+    let instructions = if project_review {
+        "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
+    } else {
+        "Perform a task-scoped contract review, not an unrestricted project audit. Compare the task title, objective, context files, expected changes, dependencies, role/capabilities, task instructions, submitted diff, and validation results. Only a finding that materially prevents this task from being complete, correct, safe, or non-regressive is blocking; pre-existing defects and unrelated improvements are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction, unsafe implementation, or substantial redesign."
+    };
     let prompt = format!(
-        "Review this completed task. Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
         serde_json::to_string(summary)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -351,6 +379,27 @@ pub fn run_review(
                 |result| {
                     if result.verdict.trim().is_empty() {
                         bail!("review verdict must not be empty")
+                    }
+                    let mut result = result;
+                    if result.blocking_findings.is_empty()
+                        && result.non_blocking_findings.is_empty()
+                        && (result.verdict.eq_ignore_ascii_case("revise")
+                            || result.verdict.eq_ignore_ascii_case("reject"))
+                        && !result.findings.is_empty()
+                    {
+                        result.blocking_findings = result.findings.clone();
+                    }
+                    if !result.blocking_findings.is_empty()
+                        && result.verdict.eq_ignore_ascii_case("pass")
+                    {
+                        result.verdict = "REVISE".into();
+                    }
+                    if !project_review
+                        && result.blocking_findings.is_empty()
+                        && (result.verdict.eq_ignore_ascii_case("revise")
+                            || result.verdict.eq_ignore_ascii_case("reject"))
+                    {
+                        result.verdict = "PASS".into();
                     }
                     Ok(result)
                 },
@@ -521,6 +570,7 @@ mod tests {
 
     struct FakeBackend {
         calls: RefCell<Vec<Invocation>>,
+        output: String,
     }
 
     impl ActionBackend for FakeBackend {
@@ -560,7 +610,11 @@ mod tests {
                 AgentAction::Code => unreachable!(),
             };
             Ok(ActionExecution {
-                output: output.to_string(),
+                output: if action == AgentAction::Review {
+                    self.output.clone()
+                } else {
+                    output.to_string()
+                },
                 token_usage: Some(TokenUsage {
                     total_tokens: 30,
                     input_tokens: Some(20),
@@ -629,6 +683,15 @@ mod tests {
         let app = crate::app::OrcApp::open(&db_path, directory.path()).unwrap();
         let backend = FakeBackend {
             calls: RefCell::new(Vec::new()),
+            output: serde_json::json!({
+                "verdict": "revise",
+                "findings": ["missing coverage"],
+                "blocking_findings": [],
+                "non_blocking_findings": [],
+                "severity": "medium",
+                "revision_feedback": "add a test"
+            })
+            .to_string(),
         };
         let request = app.planning_request().unwrap();
         app.automated_plan_with_backend(&request, &ActionOverrides::default(), &backend)
@@ -674,6 +737,93 @@ mod tests {
                 .unwrap()
                 .is_some_and(|result| result.total_tokens == Some(30))
         }));
+    }
+
+    fn review_fixture(output: serde_json::Value) -> (Database, ReviewSummary, FakeBackend) {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("orc.db");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("project").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        db.insert_agent(&agent()).unwrap();
+        let task = db.get_task(&task).unwrap().unwrap();
+        let summary = ReviewSummary {
+            task,
+            run: None,
+            result: None,
+            worktree_path: None,
+            changes: crate::git::WorktreeChanges::default(),
+            change_evidence: None,
+        };
+        (
+            db,
+            summary,
+            FakeBackend {
+                calls: RefCell::new(Vec::new()),
+                output: output.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn task_review_passes_with_non_blocking_findings() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "REVISE",
+            "findings": ["unrelated project defect"],
+            "blocking_findings": [],
+            "non_blocking_findings": ["unrelated project defect"],
+            "severity": "low",
+            "revision_feedback": null
+        }));
+        let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
+            .unwrap()
+            .1;
+        assert_eq!(result.verdict, "PASS");
+        assert_eq!(result.non_blocking_findings.len(), 1);
+    }
+
+    #[test]
+    fn task_review_keeps_in_scope_and_regression_findings_blocking() {
+        for finding in ["missing expected change", "regression introduced by task"] {
+            let (db, summary, backend) = review_fixture(serde_json::json!({
+                "verdict": "REVISE",
+                "findings": [finding],
+                "blocking_findings": [finding],
+                "non_blocking_findings": [],
+                "severity": "high",
+                "revision_feedback": finding
+            }));
+            let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
+                .unwrap()
+                .1;
+            assert_eq!(result.verdict, "REVISE");
+            assert_eq!(result.blocking_findings, vec![finding]);
+        }
+    }
+
+    #[test]
+    fn project_review_can_report_broader_findings() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "REVISE",
+            "findings": ["architectural debt"],
+            "blocking_findings": [],
+            "non_blocking_findings": ["architectural debt"],
+            "severity": "low",
+            "revision_feedback": null
+        }));
+        let result = run_project_review(&db, &summary, &ActionOverrides::default(), &backend)
+            .unwrap()
+            .1;
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(result.non_blocking_findings, vec!["architectural debt"]);
     }
 
     #[test]

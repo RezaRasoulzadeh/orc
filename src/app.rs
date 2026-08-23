@@ -474,6 +474,15 @@ impl OrcApp {
         let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
         self.automated_review_with_backend(task_id, overrides, &backend)
     }
+    pub fn automated_project_review_with_backend(
+        &self,
+        task_id: &str,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<(i64, crate::automated::ReviewResult)> {
+        let summary = self.review(task_id)?;
+        crate::automated::run_project_review(&self.db, &summary, overrides, backend)
+    }
     pub fn requeue(&self, task_id: &str) -> Result<()> {
         self.db.requeue_task(
             task_id,

@@ -200,6 +200,8 @@ impl ActionBackend for ReviewBackend {
             output: serde_json::to_string(&ReviewResult {
                 verdict: "accept".into(),
                 findings: Vec::new(),
+                blocking_findings: Vec::new(),
+                non_blocking_findings: Vec::new(),
                 severity: None,
                 revision_feedback: None,
             })?,

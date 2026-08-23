@@ -1,7 +1,12 @@
 use std::fs;
 use std::process::Command;
 
+use anyhow::Result;
+use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewResult};
+use orc::registry::{AgentAction, AgentDefinition, ReasoningEffort};
 use orc::storage::Database;
+use orc::task::TaskPriority;
+use orc::worker::TokenUsage;
 use tempfile::tempdir;
 
 #[test]
@@ -83,6 +88,169 @@ fn codex_add_profile_and_profile_update_persist() {
             .as_deref(),
         Some("/profiles/updated-third")
     );
+}
+
+#[test]
+fn agent_actions_can_be_added_removed_and_reopened() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+    assert!(
+        orc_command(
+            directory.path(),
+            &[
+                "agent",
+                "add",
+                "multi",
+                "--backend",
+                "codex",
+                "--capability",
+                "code",
+                "--capability",
+                "terminal",
+                "--action",
+                "review",
+                "--action",
+                "plan"
+            ]
+        )
+        .status
+        .success()
+    );
+    let show = orc_command(directory.path(), &["agent", "show", "multi"]);
+    let show_text = String::from_utf8_lossy(&show.stdout);
+    assert!(show_text.contains("Capabilities:        code, terminal"));
+    assert!(show_text.contains("Actions:             plan, review"));
+    let actions = orc_command(directory.path(), &["agent", "actions", "multi"]);
+    let actions_text = String::from_utf8_lossy(&actions.stdout);
+    assert!(actions.status.success());
+    assert!(actions_text.contains("plan\tmodel=-\teffort=-"));
+    assert!(actions_text.contains("review\tmodel=-\teffort=-"));
+    assert!(
+        orc_command(
+            directory.path(),
+            &["agent", "action-remove", "multi", "review"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        orc_command(directory.path(), &["agent", "action-add", "multi", "lead"])
+            .status
+            .success()
+    );
+    let db = Database::open(directory.path().join(".orc/orc.db")).unwrap();
+    let agent = db.get_agent("multi").unwrap().unwrap();
+    assert_eq!(
+        agent.actions,
+        vec![
+            orc::registry::AgentAction::Lead,
+            orc::registry::AgentAction::Plan
+        ]
+    );
+    drop(db);
+    let reopened = Database::open(directory.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened.get_agent("multi").unwrap().unwrap().actions,
+        agent.actions
+    );
+}
+
+#[test]
+fn agent_add_defaults_to_code_and_final_action_cannot_be_removed() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+    assert!(
+        orc_command(
+            directory.path(),
+            &["agent", "add", "default", "--backend", "codex"]
+        )
+        .status
+        .success()
+    );
+
+    let db = Database::open(directory.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        db.get_agent("default").unwrap().unwrap().actions,
+        vec![AgentAction::Code]
+    );
+    drop(db);
+
+    let remove = orc_command(
+        directory.path(),
+        &["agent", "action-remove", "default", "code"],
+    );
+    assert!(!remove.status.success());
+    assert!(String::from_utf8_lossy(&remove.stderr).contains("final supported action"));
+}
+
+struct ReviewBackend;
+
+impl ActionBackend for ReviewBackend {
+    fn invoke(
+        &self,
+        agent: &AgentDefinition,
+        action: AgentAction,
+        _input: &str,
+        _model: Option<&str>,
+        _effort: Option<ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        assert_eq!(agent.id, "reviewer");
+        assert_eq!(action, AgentAction::Review);
+        Ok(ActionExecution {
+            output: serde_json::to_string(&ReviewResult {
+                verdict: "accept".into(),
+                findings: Vec::new(),
+                severity: None,
+                revision_feedback: None,
+            })?,
+            token_usage: Some(TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                total_tokens: 2,
+            }),
+        })
+    }
+}
+
+#[test]
+fn cli_configured_review_action_is_selected_for_automated_review() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+    assert!(
+        orc_command(
+            directory.path(),
+            &[
+                "agent",
+                "add",
+                "reviewer",
+                "--backend",
+                "codex",
+                "--action",
+                "review",
+            ],
+        )
+        .status
+        .success()
+    );
+    let db_path = directory.path().join(".orc/orc.db");
+    let db = Database::open(&db_path).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let task = db
+        .insert_task(
+            project,
+            "Review selection",
+            "Select the CLI-configured reviewer",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    drop(db);
+
+    let app = orc::app::OrcApp::open(&db_path, directory.path()).unwrap();
+    let (_, result) = app
+        .automated_review_with_backend(&task, &ActionOverrides::default(), &ReviewBackend)
+        .unwrap();
+    assert_eq!(result.verdict, "accept");
 }
 
 #[test]

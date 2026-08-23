@@ -391,6 +391,9 @@ impl OrcApp {
         let result = self.db.set_agent_enabled(id, enabled)?;
         Ok(result)
     }
+    pub fn remove_agent(&self, id: &str) -> Result<()> {
+        self.db.archive_agent(id).map_err(anyhow::Error::from)
+    }
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool> {
         let result = self.db.set_agent_priority(id, priority)?;
         Ok(result)

@@ -69,6 +69,60 @@ fn registry_persists_multiple_profiles_and_reopens() {
 }
 
 #[test]
+fn archived_agent_is_persisted_excluded_and_cannot_be_archived_twice() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    db.insert_agent(&agent("retired", 100, registry::AVAILABLE))
+        .unwrap();
+
+    db.archive_agent("retired").unwrap();
+    let archived = db.get_agent("retired").unwrap().unwrap();
+    assert_eq!(archived.status, "archived");
+    assert!(!archived.enabled);
+    assert!(registry::select_agent(&db.list_agents().unwrap(), &[]).is_err());
+    assert!(matches!(
+        db.archive_agent("retired"),
+        Err(orc::storage::db::DbError::AgentAlreadyArchived(id)) if id == "retired"
+    ));
+
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened.get_agent("retired").unwrap().unwrap().status,
+        "archived"
+    );
+}
+
+#[test]
+fn agent_with_active_run_cannot_be_archived() {
+    let dir = tempdir().unwrap();
+    let db = Database::init(dir.path().join("orc.db")).unwrap();
+    let project_id = db.create_project("test").unwrap();
+    db.insert_agent(&agent("busy", 100, registry::AVAILABLE))
+        .unwrap();
+    let task_id = db
+        .insert_task(
+            project_id,
+            "Task",
+            "Objective",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    db.create_agent_run(project_id, &task_id, "busy").unwrap();
+
+    assert!(matches!(
+        db.archive_agent("busy"),
+        Err(orc::storage::db::DbError::AgentHasActiveRun(id)) if id == "busy"
+    ));
+    assert_eq!(
+        db.get_agent("busy").unwrap().unwrap().status,
+        registry::AVAILABLE
+    );
+}
+
+#[test]
 fn codex_execution_defaults_persist_and_are_independent_per_agent() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("orc.db");

@@ -141,9 +141,10 @@ fn open_project(
         .mark_opened(&id)
         .map_err(|error| error.to_string())?;
     let mut session = project::ProjectSession::open(project).map_err(|error| error.to_string())?;
+    let project_id = session.project.id.clone();
     let (subscription, cancellation) = session.take_subscription();
     app_state.0.replace(Some(session))
-        .map(|_| spawn_event_forwarder(app_handle, subscription, cancellation))
+        .map(|_| spawn_event_forwarder(app_handle, project_id, subscription, cancellation))
 }
 
 #[tauri::command]
@@ -740,6 +741,7 @@ fn dirs_path(_: &tauri::Config) -> anyhow::Result<PathBuf> {
 
 fn spawn_event_forwarder(
     handle: tauri::AppHandle,
+    project_id: String,
     subscription: orc::events::EventSubscription,
     cancellation: Arc<AtomicBool>,
 ) {
@@ -748,11 +750,20 @@ fn spawn_event_forwarder(
             if cancellation.load(Ordering::Acquire) {
                 break;
             }
-            if handle.emit("orc://run-event", event).is_err() {
+            if handle
+                .emit("orc://run-event", ProjectEvent { project_id: &project_id, event })
+                .is_err()
+            {
                 break;
             }
         }
     });
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectEvent<'a> {
+    project_id: &'a str,
+    event: orc::events::AppEvent,
 }
 
 #[cfg(test)]

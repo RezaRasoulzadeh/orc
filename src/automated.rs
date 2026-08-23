@@ -222,8 +222,8 @@ fn schema(action: AgentAction) -> String {
     let value = match action {
         AgentAction::Review => serde_json::json!({
             "type":"object","additionalProperties":false,
-            "properties":{"verdict":{"type":"string"},"findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]}},
-            "required":["verdict","findings","severity","revision_feedback"]
+            "properties":{"verdict":{"type":"string"},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]}},
+            "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback"]
         }),
         AgentAction::Plan => plan,
         AgentAction::Lead => serde_json::json!({
@@ -246,6 +246,10 @@ pub struct ReviewResult {
     pub verdict: String,
     #[serde(default)]
     pub findings: Vec<String>,
+    #[serde(default)]
+    pub blocking_findings: Vec<String>,
+    #[serde(default)]
+    pub non_blocking_findings: Vec<String>,
     #[serde(default)]
     pub severity: Option<String>,
     #[serde(default)]
@@ -338,10 +342,34 @@ pub fn run_review(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
 ) -> Result<(i64, ReviewResult)> {
+    run_review_mode(db, summary, overrides, backend, false)
+}
+
+pub fn run_project_review(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+) -> Result<(i64, ReviewResult)> {
+    run_review_mode(db, summary, overrides, backend, true)
+}
+
+fn run_review_mode(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+    project_review: bool,
+) -> Result<(i64, ReviewResult)> {
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
     let run = start_run(db, AgentAction::Review, &resolved)?;
+    let instructions = if project_review {
+        "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
+    } else {
+        "Perform a task-scoped contract review, not an unrestricted project audit. Compare the task title, objective, context files, expected changes, dependencies, role/capabilities, task instructions, submitted diff, and validation results. Only a finding that materially prevents this task from being complete, correct, safe, or non-regressive is blocking; pre-existing defects and unrelated improvements are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction, unsafe implementation, or substantial redesign."
+    };
     let prompt = format!(
-        "Review this completed task. Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\n{}",
         serde_json::to_string(summary)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -351,6 +379,27 @@ pub fn run_review(
                 |result| {
                     if result.verdict.trim().is_empty() {
                         bail!("review verdict must not be empty")
+                    }
+                    let mut result = result;
+                    if result.blocking_findings.is_empty()
+                        && result.non_blocking_findings.is_empty()
+                        && (result.verdict.eq_ignore_ascii_case("revise")
+                            || result.verdict.eq_ignore_ascii_case("reject"))
+                        && !result.findings.is_empty()
+                    {
+                        result.blocking_findings = result.findings.clone();
+                    }
+                    if !result.blocking_findings.is_empty()
+                        && result.verdict.eq_ignore_ascii_case("pass")
+                    {
+                        result.verdict = "REVISE".into();
+                    }
+                    if !project_review
+                        && result.blocking_findings.is_empty()
+                        && (result.verdict.eq_ignore_ascii_case("revise")
+                            || result.verdict.eq_ignore_ascii_case("reject"))
+                    {
+                        result.verdict = "PASS".into();
                     }
                     Ok(result)
                 },

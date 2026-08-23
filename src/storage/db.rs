@@ -460,6 +460,7 @@ impl Database {
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
+        Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         Ok(Self {
@@ -479,6 +480,7 @@ impl Database {
         Self::configure(&conn)?;
         Self::ensure_registry_schema(&conn)?;
         Self::ensure_lead_tables(&conn)?;
+        Self::ensure_lead_provider_config_table(&conn)?;
         Ok(Self {
             conn,
             lifecycle_sink: None,
@@ -513,6 +515,57 @@ impl Database {
 
     fn ensure_execution_templates_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS execution_templates (class TEXT PRIMARY KEY, model TEXT, reasoning_effort TEXT)")?;
+        Ok(())
+    }
+
+    fn ensure_lead_provider_config_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), agent_id TEXT NOT NULL, model TEXT, reasoning_effort TEXT)")?;
+        Ok(())
+    }
+
+    pub fn lead_provider_config(&self) -> Result<Option<crate::lead::LeadProviderConfig>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT agent_id, model, reasoning_effort FROM lead_provider_config WHERE id = 1",
+                [],
+                |row| {
+                    let effort = row
+                        .get::<_, Option<String>>(2)?
+                        .map(|value| {
+                            ReasoningEffort::parse(&value).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        error.to_string(),
+                                    )),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    Ok(crate::lead::LeadProviderConfig {
+                        agent_id: row.get(0)?,
+                        model: row.get(1)?,
+                        reasoning_effort: effort,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn set_lead_provider_config(
+        &self,
+        config: &crate::lead::LeadProviderConfig,
+    ) -> Result<(), DbError> {
+        self.conn.execute("INSERT INTO lead_provider_config (id, agent_id, model, reasoning_effort) VALUES (1, ?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET agent_id = excluded.agent_id, model = excluded.model, reasoning_effort = excluded.reasoning_effort", params![config.agent_id, config.model, config.reasoning_effort.map(|value| value.as_str())])?;
+        Ok(())
+    }
+
+    pub fn clear_lead_provider_config(&self) -> Result<(), DbError> {
+        self.conn
+            .execute("DELETE FROM lead_provider_config WHERE id = 1", [])?;
         Ok(())
     }
 

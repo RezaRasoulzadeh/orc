@@ -49,10 +49,23 @@ impl OrcApp {
         config: &crate::lead::LeadProviderConfig,
         context_limit: usize,
     ) -> Result<crate::lead::LeadResponse> {
-        let agent = self
-            .db
-            .get_agent(&config.agent_id)?
-            .with_context(|| format!("Lead provider agent '{}' not found", config.agent_id))?;
+        let agent = self.db.get_agent(&config.agent_id)?.with_context(|| {
+            format!(
+                "configured Lead agent '{}' is unavailable: agent does not exist",
+                config.agent_id
+            )
+        })?;
+        if !agent.enabled || agent.status != registry::AVAILABLE {
+            anyhow::bail!(
+                "configured Lead agent '{}' is unavailable{}",
+                agent.id,
+                agent
+                    .unavailable_reason
+                    .as_deref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            );
+        }
         let backend = crate::lead::CodexLeadBackend::from_agent(
             &agent,
             &self.repo_path,
@@ -61,6 +74,34 @@ impl OrcApp {
         )
         .map_err(anyhow::Error::msg)?;
         self.lead().invoke(message, &backend, context_limit)
+    }
+    pub fn invoke_persisted_lead(
+        &self,
+        message: &str,
+        context_limit: usize,
+    ) -> Result<crate::lead::LeadResponse> {
+        let config = self.lead_provider_config()?.ok_or_else(|| anyhow::anyhow!("Lead is not configured. Configure one with `orc lead set <agent>` before running `orc ask`."))?;
+        self.invoke_configured_lead(message, &config, context_limit)
+    }
+    pub fn lead_provider_config(&self) -> Result<Option<crate::lead::LeadProviderConfig>> {
+        Ok(self.db.lead_provider_config()?)
+    }
+    pub fn set_lead_provider_config(&self, config: crate::lead::LeadProviderConfig) -> Result<()> {
+        let agent = self
+            .db
+            .get_agent(&config.agent_id)?
+            .with_context(|| format!("Lead agent '{}' does not exist", config.agent_id))?;
+        if agent.execution_mode != registry::AUTOMATED || agent.backend != "codex" {
+            anyhow::bail!(
+                "Lead agent '{}' is not compatible with Lead execution",
+                config.agent_id
+            );
+        }
+        self.db.set_lead_provider_config(&config)?;
+        Ok(())
+    }
+    pub fn clear_lead_provider_config(&self) -> Result<()> {
+        Ok(self.db.clear_lead_provider_config()?)
     }
     pub fn recover_lead_proposal(&self, proposal_id: i64) -> Result<()> {
         if !self.lead().recover_proposal(proposal_id)? {

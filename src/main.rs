@@ -186,6 +186,10 @@ enum Command {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+    Lead {
+        #[command(subcommand)]
+        command: LeadCommand,
+    },
     Ask {
         request: String,
     },
@@ -281,6 +285,19 @@ enum TemplateCommand {
 enum ApprovalCommand {
     List,
     Resolve { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum LeadCommand {
+    Show,
+    Set {
+        agent: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
+    Clear,
 }
 
 fn main() -> Result<()> {
@@ -520,8 +537,43 @@ fn main() -> Result<()> {
                 TemplateCommand::Clear { class } => db.clear_execution_template(class)?,
             }
         }
+        Command::Lead { command } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            match command {
+                LeadCommand::Show => match app.lead_provider_config()? {
+                    Some(config) => println!(
+                        "agent={} model={} effort={}",
+                        config.agent_id,
+                        config.model.as_deref().unwrap_or("-"),
+                        config.reasoning_effort.map(|v| v.as_str()).unwrap_or("-")
+                    ),
+                    None => println!("Lead is not configured."),
+                },
+                LeadCommand::Set {
+                    agent,
+                    model,
+                    effort,
+                } => {
+                    app.set_lead_provider_config(orc::lead::LeadProviderConfig {
+                        agent_id: agent,
+                        model,
+                        reasoning_effort: effort,
+                    })?;
+                    println!("Configured Lead provider.");
+                }
+                LeadCommand::Clear => {
+                    app.clear_lead_provider_config()?;
+                    println!("Cleared Lead provider configuration.");
+                }
+            }
+        }
         Command::Ask { request } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            if db.lead_provider_config()?.is_none() {
+                anyhow::bail!(
+                    "Lead is not configured. Configure one with `orc lead set <agent>` before running `orc ask`."
+                )
+            }
             let project = db
                 .get_project_name()
                 .map_err(|e| anyhow::anyhow!(e))?

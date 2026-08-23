@@ -548,25 +548,49 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn session_can_open_close_and_open_again_without_poisoning_lock() {
-        let (_dir, registry) = registered_projects();
-        let project = registry.projects().pop().unwrap();
+    fn desktop_startup_without_active_project_uses_picker_contract() {
+        let app = include_str!("../../src/App.vue");
         let state = SessionState(Mutex::new(None));
 
+        assert!(state.0.lock().unwrap().is_none());
+        assert!(app.contains("<ProjectPicker v-if=\"!activeProject\""));
+        assert!(app.contains("if (activeProject.value) { await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }"));
+        assert!(app.contains("v-else-if=\"activeProject && error\""));
+        assert!(!app.contains(
+            "v-else-if=\"error\" class=\"notice\" role=\"alert\">Unable to load project state"
+        ));
+    }
+
+    #[test]
+    fn registered_project_opens_initializes_closes_and_returns_to_picker_state() {
+        let (_dir, mut registry) = registered_projects();
+        let registered = registry.projects().pop().unwrap();
+        let state = SessionState(Mutex::new(None));
+
+        assert!(state.0.lock().unwrap().is_none());
+        let project = registry.mark_opened(&registered.id).unwrap();
         state
             .replace(Some(
                 project::ProjectSession::open(project.clone()).unwrap(),
             ))
             .unwrap();
-        assert!(state.active().is_ok());
+        {
+            let active = state.active().unwrap();
+            assert_eq!(
+                active.app().unwrap().dashboard(24).unwrap().project_name,
+                project.project_name
+            );
+            assert!(active.app().unwrap().project_health().is_ok());
+        }
         state.replace(None).unwrap();
         assert!(matches!(state.active(), Err(error) if error == "no active project"));
-        state
-            .replace(Some(project::ProjectSession::open(project).unwrap()))
-            .unwrap();
-        assert!(state.active().is_ok());
-        state.replace(None).unwrap();
-        assert!(state.active().is_err());
+        assert_eq!(registry.projects().len(), 1);
+        assert_eq!(registry.projects()[0].id, registered.id);
+
+        let app = include_str!("../../src/App.vue");
+        assert!(app.contains("async function openPickerProject() { resetProjectState(); await refreshProjects(); active.value = 'Dashboard'; error.value = ''; await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }"));
+        assert!(app.contains("async function confirmCloseProject() { try { await api.closeProject(); resetProjectState(); activeProject.value = null; closeConfirmation.value = false; await refreshProjects()"));
+        assert!(app.contains("function resetProjectState()"));
     }
 }
 

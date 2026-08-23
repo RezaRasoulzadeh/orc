@@ -51,6 +51,7 @@ export type LeadProposalKind =
 export interface LeadProposal { id: number; proposal: LeadProposalKind; status: 'pending' | 'applying' | 'applied' | 'rejected'; created_at: string; applying_at: string | null; resolved_at: string | null }
 export interface LeadContext { project_id: number; project_name: string; repository_path: string; state: unknown; tasks: Task[]; runs: AgentRun[]; approvals: unknown[]; turns: LeadTurn[]; proposals: LeadProposal[]; queue: QueueReport }
 export interface LeadProviderConfig { agent_id: string; model?: string | null; reasoning_effort?: 'None' | 'Low' | 'Medium' | 'High' | null }
+export interface ExecutionTemplate { model: string | null; reasoning_effort: 'None' | 'Low' | 'Medium' | 'High' | null }
 export interface LeadResponse { turn: LeadTurn; proposals: LeadProposal[] }
 export interface AgentRun {
   id: number
@@ -107,6 +108,12 @@ export const api = {
   invokeLead: (message: string, config?: LeadProviderConfig) => invoke<LeadResponse>('invoke_lead', { message, config }),
   applyLeadProposal: (proposalId: number) => invoke<void>('apply_lead_proposal', { proposalId }),
   rejectLeadProposal: (proposalId: number) => invoke<void>('reject_lead_proposal', { proposalId }),
+  leadProviderConfig: () => invoke<LeadProviderConfig | null>('lead_provider_config'),
+  setLeadProvider: (config: LeadProviderConfig) => invoke<void>('set_lead_provider', { config }),
+  clearLeadProvider: () => invoke<void>('clear_lead_provider'),
+  executionTemplate: (className: string) => invoke<ExecutionTemplate>('execution_template', { class: className }),
+  setExecutionTemplate: (className: string, model: string | null, effort: string | null) => invoke<void>('set_execution_template', { class: className, model, effort }),
+  automatedPlan: (objective: string) => invoke<void>('automated_plan', { objective }),
   planningRequest: () => invoke<PlanningRequest>('planning_request'),
   plannerValidate: (json: string) => invoke<PlanResponse>('planner_validate', { json }),
   plannerApply: (json: string) => invoke<Record<string, string>>('planner_apply', { json }),

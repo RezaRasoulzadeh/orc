@@ -1500,22 +1500,36 @@ impl Database {
                     |row| row.get(0),
                 )
                 .optional()?;
-            match status.as_deref() {
-                Some("active") => {}
+            let status = match status.as_deref() {
+                Some(status @ ("active" | "blocked")) => status,
                 Some(_) => return Err(DbError::TaskNotActive(id.into())),
                 None => return Err(DbError::TaskNotFound(id.into())),
-            }
-            let run_id: Option<i64> = self.conn.query_row(
+            };
+            let active_run_id: Option<i64> = self.conn.query_row(
                 "SELECT id FROM agent_runs WHERE task_id = ?1 AND status IN ('running', 'waiting_external') ORDER BY started_at DESC, id DESC LIMIT 1",
                 params![id], |row| row.get(0),
             ).optional()?;
-            let run_id = run_id.ok_or_else(|| DbError::NoRecoverableRun(id.into()))?;
+            if status == "active" {
+                let run_id = active_run_id.ok_or_else(|| DbError::NoRecoverableRun(id.into()))?;
+                self.conn.execute(
+                    "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+                    params![reason, run_id],
+                )?;
+            } else {
+                if active_run_id.is_some() {
+                    return Err(DbError::TaskNotActive(id.into()));
+                }
+                let failed_run_exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status = 'failed')",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if !failed_run_exists {
+                    return Err(DbError::NoRecoverableRun(id.into()));
+                }
+            }
             self.conn.execute(
-                "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
-                params![reason, run_id],
-            )?;
-            self.conn.execute(
-                "UPDATE tasks SET status = 'backlog', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'active'",
+                "UPDATE tasks SET status = 'backlog', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('active', 'blocked')",
                 params![id],
             )?;
             Ok::<_, DbError>(())

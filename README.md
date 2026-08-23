@@ -35,18 +35,118 @@ orc queue --explain
 
 Register an agent with `orc agent add`, inspect eligibility with `orc schedule TASK_ID --explain`, and dispatch with `orc dispatch TASK_ID` or `orc dispatch-queue --concurrency 2`. Use `orc --help` and the [complete CLI reference](docs/cli-reference.md) for exact options and command-specific usage.
 
-## Command families
+## CLI commands
 
-- Project and health: `init`, `adopt`, `discovery-request`, `apply-discovery`, `status`, `report`, `doctor`.
-- Planning and Lead: `plan-request`, `apply-plan`, `plan`, `ask`, `apply-response`, and `lead show|set|clear`.
-- Tasks and queue: `task ...`, `queue`, and deterministic `schedule`.
-- Agents and configuration: `agents` and `agent ...` for registration, enablement, availability, capabilities, profiles, model, effort, priority, and quota.
-- Execution: `dispatch`, `dispatch-queue`, `runs`, and `run submit|submit-patch|fail`.
-- Review and lifecycle: `review`, `revise`, `task diff|worktree|accept|reject|cancel|requeue`.
-- Approvals: `approvals list|resolve`.
-- Persistent execution templates: `template list|set|clear`.
+The tables below cover every `orc` command. Flags are summarized; see the [complete CLI reference](docs/cli-reference.md) for every argument, default, and constraint, or run `orc <command> --help`.
 
-The [CLI reference](docs/cli-reference.md) is exhaustive; this overview intentionally omits the full option list.
+### Project and health
+
+| Command | Description |
+|---|---|
+| `orc init` | Initialize the Orc SQLite database in the current repository. |
+| `orc adopt` | Adopt the current Git repository: record identity and write the engineering contract. |
+| `orc discovery-request` | Emit a read-only repository discovery request as JSON. |
+| `orc apply-discovery <PATH\|->` | Apply a structured discovery response to project state. |
+| `orc doctor` | Diagnose project and agent health without consuming model quota. |
+| `orc status` | Print project name and a one-line summary of every task. |
+| `orc report [--full]` | Emit a structured project report JSON for a manual planner. |
+
+### Planning and Engineering Lead
+
+| Command | Description |
+|---|---|
+| `orc plan-request <OBJECTIVE> [--full-report]` | Emit a read-only planning request JSON for an objective. |
+| `orc apply-plan <PATH\|->` | Validate and atomically apply a plan response, creating tasks. |
+| `orc plan <OBJECTIVE> [--agent] [--model] [--effort]` | Run an automated planning action and print the plan response. |
+| `orc ask <REQUEST> [--agent] [--model] [--effort]` | Address a request to the Engineering Lead. |
+| `orc apply-response <PATH\|->` | Validate and persist an Engineering Lead response. |
+| `orc lead show` | Show the configured Engineering Lead agent. |
+| `orc lead set <AGENT> [--model] [--effort]` | Configure the Engineering Lead agent. |
+| `orc lead clear` | Clear the configured Engineering Lead. |
+
+### Tasks
+
+| Command | Description |
+|---|---|
+| `orc task create <TITLE> <OBJECTIVE> [options]` | Create a task (`--role`, `--priority`, `--capability`, `--scope`, `--context`, `--expect`, `--depends-on`). |
+| `orc task list` | List all tasks. |
+| `orc task show <TASK_ID>` | Show full task detail. |
+| `orc task require <TASK_ID> <CAPABILITY>...` | Set required capabilities for a task. |
+| `orc task scope <TASK_ID> <MODE>` | Set a task's worktree scope mode. |
+| `orc task context-add <TASK_ID> <PATH>...` | Add context file paths to a task. |
+| `orc task context-clear <TASK_ID>` | Clear a task's context files. |
+| `orc task expect-change <TASK_ID> <PATH>...` | Add expected-change paths to a task. |
+| `orc task expect-clear <TASK_ID>` | Clear a task's expected changes. |
+| `orc task diff <TASK_ID>` | Show the unified diff for a task's worktree. |
+| `orc task worktree <TASK_ID>` | Show a task's worktree branch and path. |
+| `orc task accept <TASK_ID>` | Integrate a reviewed task's branch and mark it done. |
+| `orc task reject <TASK_ID> [REASON]` | Reject a reviewed task, preserving its worktree. |
+| `orc task cancel <TASK_ID> [REASON]` | Cancel a task, preserving its worktree. |
+| `orc task requeue <TASK_ID>` | Return an interrupted or failed task to the queue. |
+| `orc task depend <TASK_ID> <DEPENDENCY_ID>` | Add a task dependency. |
+| `orc task undepend <TASK_ID> <DEPENDENCY_ID>` | Remove a task dependency. |
+
+### Queue and scheduling
+
+| Command | Description |
+|---|---|
+| `orc queue [--explain]` | Show the deterministic task queue, optionally with readiness explanations. |
+| `orc schedule <TASK_ID> [--explain] [--mode automated\|manual]` | Evaluate deterministic agent selection without dispatching. |
+
+### Dispatch and runs
+
+| Command | Description |
+|---|---|
+| `orc dispatch <TASK_ID> [--agent] [--model] [--effort]` | Dispatch a task using a selected agent. |
+| `orc dispatch-queue [--concurrency N\|auto]` | Dispatch all ready automated tasks concurrently (default `1`). |
+| `orc runs [TASK_ID]` | List agent runs, optionally filtered by task. |
+| `orc run submit <RUN_ID> [--file PATH]` | Submit output for a waiting manual run. |
+| `orc run submit-patch <RUN_ID> <PATCH_FILE\|->` | Submit and validate a Git patch for a manual run. |
+| `orc run fail <RUN_ID> [REASON]` | Mark a manual run failed, moving its task to blocked. |
+
+### Review and revision
+
+| Command | Description |
+|---|---|
+| `orc review <TASK_ID> [--automated] [--agent] [--model] [--effort] [--diff \| --file PATH]` | Review a task's latest run and worktree changes. |
+| `orc revise <TASK_ID> <FEEDBACK> [--agent]` | Redispatch a reviewed task using feedback. |
+
+### Agents
+
+| Command | Description |
+|---|---|
+| `orc agents [--sync]` | List registered agents, optionally syncing quota first. |
+| `orc agent list` | List registered agents. |
+| `orc agent add <ID> --backend NAME [options]` | Register an agent (`--priority`, `--capability`, `--display-name`, `--profile`, `--model`, `--effort`, `--mode`). |
+| `orc agent enable <ID>` / `disable <ID>` | Enable or disable an agent. |
+| `orc agent remove <ID>` | Archive an agent. |
+| `orc agent available <ID>` / `unavailable <ID> <REASON>` | Mark an agent available or unavailable. |
+| `orc agent priority <ID> <PRIORITY>` | Set an agent's selection priority. |
+| `orc agent profile <ID> <PATH>` | Set an agent's configuration profile directory. |
+| `orc agent model <ID> <MODEL>` | Set an agent's model (automated Codex agents only). |
+| `orc agent effort <ID> <EFFORT>` | Set an agent's reasoning effort (automated Codex agents only). |
+| `orc agent quota <ID> --remaining N [--reset TS]` | Manually set an agent's quota state. |
+| `orc agent quota-clear <ID>` | Clear an agent's manually set quota. |
+| `orc agent quota-reserve <REMAINING>` | Set the global automatic-dispatch quota reserve. |
+| `orc agent sync <ID>` | Synchronize quota through the provider's protocol. |
+| `orc agent show <ID>` | Show full agent detail. |
+
+### Execution templates
+
+| Command | Description |
+|---|---|
+| `orc template list` | List the model/effort template for every execution class. |
+| `orc template set <CLASS> [--model] [--effort]` | Set the persistent template for a class (`coder`, `reviewer`, `architect`, `researcher`, `general`). |
+| `orc template clear <CLASS>` | Clear the persistent template for a class. |
+
+### Approvals
+
+| Command | Description |
+|---|---|
+| `orc approvals list` | List unresolved approval requests. |
+| `orc approvals resolve <ID>` | Resolve an approval request. |
+
+The [CLI reference](docs/cli-reference.md) documents every flag, default value, and constraint (e.g. which options require `--automated`, which conflict, and which are Codex-only) in full detail.
 
 ## Agents, profiles, models, and effort
 

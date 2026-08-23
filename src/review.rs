@@ -120,7 +120,10 @@ fn format_review_with_diff_text(summary: &ReviewSummary, diff: &str) -> String {
                 out.push_str(&format!("Failure    {category}\n"));
             }
             if let Some(duration_ms) = result.duration_ms {
-                out.push_str(&format!("Duration   {duration_ms} ms\n"));
+                out.push_str(&format!(
+                    "Duration   {}\n",
+                    crate::format::duration(duration_ms / 1000)
+                ));
             }
         }
         if let Some(output) = &run.output

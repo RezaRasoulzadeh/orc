@@ -26,7 +26,7 @@ pub enum TaskCommand {
         depends_on: Vec<String>,
     },
     List,
-    /// Recover an interrupted active task and return it to the queue.
+    /// Recover an interrupted active task or failed blocked task and return it to the queue.
     Requeue {
         task_id: String,
     },

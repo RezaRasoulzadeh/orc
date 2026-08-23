@@ -244,16 +244,14 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
                 agent
                     .quota_reset_at
                     .as_deref()
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "-".into())
+                    .map_or_else(|| "-".into(), crate::format::timestamp)
             );
             println!(
                 "Quota checked:       {}",
                 agent
                     .quota_checked_at
                     .as_deref()
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "-".into())
+                    .map_or_else(|| "-".into(), crate::format::timestamp)
             );
             println!(
                 "Quota source:        {}",
@@ -267,7 +265,7 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
                     println!(
                         "Individual limit:   {}% remaining, reset {}",
                         limit.remaining_percent,
-                        format_timestamp(&limit.reset_at.to_string())
+                        crate::format::timestamp(&limit.reset_at.to_string())
                     );
                 }
             }
@@ -306,9 +304,6 @@ fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-fn format_timestamp(value: &str) -> String {
-    value.to_owned()
 }
 fn print_agents(db: &Database) -> Result<()> {
     for a in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {

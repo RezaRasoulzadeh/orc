@@ -15,7 +15,6 @@ use orc::protocol::{
 use orc::registry;
 use orc::storage::Database;
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
 const DB_PATH: &str = ".orc/orc.db";
 
 fn parse_reasoning_effort(value: &str) -> Result<registry::ReasoningEffort, String> {
@@ -62,76 +61,6 @@ fn git_identity(root: &std::path::Path, command: &str) -> Result<Option<String>>
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     Ok((!value.is_empty()).then_some(value))
-}
-
-fn format_timestamp(value: &str) -> String {
-    let Ok(timestamp) = value.parse::<i64>() else {
-        return value.to_owned();
-    };
-    let date = ProcessCommand::new("date")
-        .args(["-d", &format!("@{timestamp}"), "+%Y-%m-%d %H:%M:%S %Z"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|date| !date.is_empty())
-        .unwrap_or_else(|| value.to_owned());
-    format!("{date} ({})", format_relative_duration(timestamp))
-}
-
-fn format_relative_duration(timestamp: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default();
-    let difference = timestamp.saturating_sub(now);
-    let future = difference >= 0;
-    let seconds = difference.unsigned_abs();
-    let (amount, unit) = if seconds < 60 {
-        (seconds, "s")
-    } else if seconds < 3_600 {
-        (seconds / 60, "m")
-    } else if seconds < 86_400 {
-        (seconds / 3_600, "h")
-    } else {
-        (seconds / 86_400, "d")
-    };
-    if future {
-        format!("in {amount}{unit}")
-    } else {
-        format!("{amount}{unit} ago")
-    }
-}
-
-fn format_elapsed(started_at: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs() as i64)
-        .unwrap_or_default();
-    let started = ProcessCommand::new("date")
-        .args(["-d", started_at, "+%s"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse::<i64>()
-                .ok()
-        });
-    started.map_or_else(
-        || "unknown".to_owned(),
-        |value| format_duration(now.saturating_sub(value)),
-    )
-}
-
-fn format_duration(seconds: i64) -> String {
-    format!(
-        "{}h {:02}m {:02}s",
-        seconds / 3600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
 }
 
 #[derive(Parser)]
@@ -770,14 +699,14 @@ fn main() -> Result<()> {
                         );
                         if run.status == "running" {
                             println!("  Phase:    {}", run.phase.as_deref().unwrap_or("unknown"));
-                            println!("  Elapsed:  {}", format_elapsed(&run.started_at));
-                            println!("  Activity: {}", run.last_activity);
+                            println!("  Elapsed:  {}", orc::format::elapsed(&run.started_at));
+                            println!("  Activity: {}", orc::format::timestamp(&run.last_activity));
                         }
                         if let Some(finished) = run.finished_at {
-                            println!("  Started:  {}", run.started_at);
-                            println!("  Finished: {}", finished);
+                            println!("  Started:  {}", orc::format::timestamp(&run.started_at));
+                            println!("  Finished: {}", orc::format::timestamp(&finished));
                         } else {
-                            println!("  Started: {}", run.started_at);
+                            println!("  Started: {}", orc::format::timestamp(&run.started_at));
                         }
                         if let Some(output) = run.output {
                             println!("  Output: {}", output);
@@ -860,7 +789,7 @@ fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
         "  reset: {}",
         snapshot
             .reset_at
-            .map(|value| format_timestamp(&value.to_string()))
+            .map(|value| orc::format::timestamp(&value.to_string()))
             .unwrap_or_else(|| "unknown".to_owned())
     );
     println!("  effective limit: {}", snapshot.limits.effective);
@@ -878,7 +807,7 @@ fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
                 .unwrap_or_else(|| "unknown".into()),
             limit
                 .reset_at
-                .map(|value| format_timestamp(&value.to_string()))
+                .map(|value| orc::format::timestamp(&value.to_string()))
                 .unwrap_or_else(|| "unknown".into())
         ),
         None => println!("{label:<20} -"),
@@ -909,7 +838,7 @@ fn print_agents(db: &Database) -> Result<()> {
             agent
                 .quota_reset_at
                 .as_deref()
-                .map(format_timestamp)
+                .map(orc::format::timestamp)
                 .unwrap_or_else(|| "-".into())
         );
     }
@@ -935,8 +864,10 @@ fn print_doctor(report: &doctor::DoctorReport) {
     } else {
         for task in &report.active_tasks {
             println!(
-                "  {}  run: {}  started_at: {}",
-                task.task_id, task.run_status, task.started_at
+                "  {}  run: {}  started: {}",
+                task.task_id,
+                task.run_status,
+                orc::format::timestamp(&task.started_at)
             );
         }
     }

@@ -990,7 +990,7 @@ pub fn run() -> anyhow::Result<()> {
     let app_data = tauri::Config::default();
     let registry_path = dirs_path(&app_data)?;
     let registry = project::ProjectRegistry::open(&registry_path)?;
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     builder
         .manage(AppState(SessionState(Mutex::new(None))))
         .manage(RegistryState(Mutex::new(registry)))

@@ -3,5 +3,5 @@
   "identifier": "main-window",
   "description": "Permissions for the privileged Orc application window.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 
 export type TaskStatus = 'backlog' | 'ready' | 'active' | 'review' | 'blocked' | 'done' | 'cancelled'
 
@@ -88,6 +89,7 @@ export type ProjectStatus = 'Available' | 'Missing' | 'Invalid' | 'TemporarilyUn
 export interface RegisteredProject { id: string; display_name: string; repository_root: string; project_id: number; project_name: string; last_opened_at: number | null; available: boolean; status: ProjectStatus }
 
 export const api = {
+  selectDirectory: async (defaultPath?: string) => open({ directory: true, multiple: false, defaultPath }) as Promise<string | null>,
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
   agents: () => invoke<AgentDefinition[]>('agents'),

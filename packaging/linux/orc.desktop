@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Orc
+Comment=Local AI engineering orchestrator
+Exec=orc --ui
+Icon=orc
+Terminal=false
+Categories=Development;

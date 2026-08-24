@@ -6,6 +6,7 @@ use orc::cli::agent::AgentCommand;
 use orc::cli::run::RunCommand;
 use orc::cli::task::TaskCommand;
 use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
+use orc::desktop;
 use orc::discovery;
 use orc::doctor::{self, CheckStatus};
 use orc::protocol::{EngineeringLeadResponse, PROTOCOL_VERSION, PlanResponse, PlanningRequest};
@@ -63,8 +64,11 @@ fn git_identity(root: &std::path::Path, command: &str) -> Result<Option<String>>
 #[derive(Parser)]
 #[command(name = "orc", version, about = "Local AI engineering orchestrator")]
 struct Cli {
+    /// Launch the installed desktop application and return immediately.
+    #[arg(long)]
+    ui: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -262,7 +266,21 @@ enum LeadCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    run(cli)
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if cli.ui {
+        if cli.command.is_some() {
+            anyhow::bail!("--ui cannot be used with a CLI command");
+        }
+        return desktop::launch_desktop(&desktop::DetachedDesktopProcess);
+    }
+
+    match cli
+        .command
+        .ok_or_else(|| anyhow::anyhow!("a command is required unless --ui is used"))?
+    {
         Command::Init => {
             // initialize sqlite DB
             let db = Database::init(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
@@ -968,5 +986,31 @@ fn print_check(check: &doctor::Check) {
             println!("  {:<20} UNAVAILABLE: {reason}{detail}", check.name)
         }
         CheckStatus::Failed(reason) => println!("  {:<20} FAILED: {reason}{detail}", check.name),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_ui_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["orc", "--ui"]).unwrap();
+        assert!(cli.ui);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn preserves_existing_subcommands() {
+        let cli = Cli::try_parse_from(["orc", "status"]).unwrap();
+        assert!(!cli.ui);
+        assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn rejects_ui_with_a_subcommand() {
+        let cli = Cli::try_parse_from(["orc", "--ui", "status"]).unwrap();
+        let error = run(cli).unwrap_err().to_string();
+        assert!(error.contains("--ui cannot be used with a CLI command"));
     }
 }

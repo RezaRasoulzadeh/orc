@@ -14,6 +14,7 @@ const sections = ['Dashboard', 'Tasks', 'Runs', 'Agents', 'Lead', 'Planner', 'Ap
 const active = ref('Dashboard')
 const snapshot = ref<DesktopSnapshot | null>(null)
 const error = ref('')
+const snapshotError = ref('')
 const mutationError = ref('')
 const loading = ref(false)
 const notice = ref('')
@@ -171,10 +172,10 @@ async function submitTaskAction(action: string, suppliedReason?: string, supplie
   } finally { if (ownsPendingState) mutationLoading.value = false
   }
 }
-async function refreshSnapshot() { if (!activeProject.value) return; loading.value = true; error.value = ''; try { snapshot.value = await api.snapshot() } catch (err: unknown) { snapshot.value = null; error.value = friendlyError(err); throw err } finally { loading.value = false } }
+async function refreshSnapshot(initialLoad: boolean | Event = false) { if (!activeProject.value) return; const initial = initialLoad === true; loading.value = true; if (initial) error.value = ''; snapshotError.value = ''; try { snapshot.value = await api.snapshot() } catch (err: unknown) { const message = friendlyError(err); if (initial) error.value = message; else snapshotError.value = message; throw err } finally { loading.value = false } }
 async function refreshProjects() { try { projects.value = await api.registeredProjects(); activeProject.value = await api.currentProject() } catch (err: unknown) { error.value = friendlyError(err) } }
-function resetProjectState() { runRequestToken.value++; workerLogRequestToken.value++; snapshot.value = null; report.value = null; runsWorkspace.value = null; selectedRun.value = null; selectedRunDetails.value = null; selectedRunReview.value = null; selectedWorkerLog.value = []; workerLogCache.value = {}; workerLogDirty.value = {}; workerLogOpen.value = false; workerLogLoading.value = false; workerLogError.value = ''; lead.value = null; proposals.value = []; leadPanel.value = false; leadMessage.value = ''; panelMessage.value = ''; planning.value = null; planningObjective.value = ''; plan.value = null; planJson.value = ''; approvalList.value = []; taskDetails.value = null; taskReview.value = null; agentList.value = []; manualRuns.value = []; workspaceInfo.value = null; selectedTask.value = null; selectedAgent.value = null; taskFilter.value = 'all'; taskModal.value = false; newTaskTitle.value = ''; newTaskObjective.value = ''; newTaskRole.value = 'developer'; agentModal.value = false; agentArchiveModal.value = false; newAgentId.value = ''; newAgentDisplayName.value = ''; newAgentBackend.value = 'codex'; newAgentMode.value = 'automated'; newAgentPriority.value = '0'; newAgentCapabilities.value = ''; newAgentProfile.value = ''; error.value = ''; mutationError.value = ''; notice.value = ''; loading.value = false; taskError.value = ''; runError.value = ''; agentError.value = ''; leadError.value = ''; controlError.value = ''; taskActionModal.value = null; confirmationModal.value = null; agentEditModal.value = null; mutationLoading.value = false; leadLoading.value = false; selectedManualRunId.value = null; manualValue.value = ''; closeConfirmation.value = false }
-async function loadProjectWorkspace() { if (!activeProject.value) return; active.value = 'Dashboard'; error.value = ''; await refreshSnapshot(); await refreshRuns(); await refreshControl('Project') }
+function resetProjectState() { runRequestToken.value++; workerLogRequestToken.value++; snapshot.value = null; snapshotError.value = ''; report.value = null; runsWorkspace.value = null; selectedRun.value = null; selectedRunDetails.value = null; selectedRunReview.value = null; selectedWorkerLog.value = []; workerLogCache.value = {}; workerLogDirty.value = {}; workerLogOpen.value = false; workerLogLoading.value = false; workerLogError.value = ''; lead.value = null; proposals.value = []; leadPanel.value = false; leadMessage.value = ''; panelMessage.value = ''; planning.value = null; planningObjective.value = ''; plan.value = null; planJson.value = ''; approvalList.value = []; taskDetails.value = null; taskReview.value = null; agentList.value = []; manualRuns.value = []; workspaceInfo.value = null; selectedTask.value = null; selectedAgent.value = null; taskFilter.value = 'all'; taskModal.value = false; newTaskTitle.value = ''; newTaskObjective.value = ''; newTaskRole.value = 'developer'; agentModal.value = false; agentArchiveModal.value = false; newAgentId.value = ''; newAgentDisplayName.value = ''; newAgentBackend.value = 'codex'; newAgentMode.value = 'automated'; newAgentPriority.value = '0'; newAgentCapabilities.value = ''; newAgentProfile.value = ''; error.value = ''; mutationError.value = ''; notice.value = ''; loading.value = false; taskError.value = ''; runError.value = ''; agentError.value = ''; leadError.value = ''; controlError.value = ''; taskActionModal.value = null; confirmationModal.value = null; agentEditModal.value = null; mutationLoading.value = false; leadLoading.value = false; selectedManualRunId.value = null; manualValue.value = ''; closeConfirmation.value = false }
+async function loadProjectWorkspace() { if (!activeProject.value) return; active.value = 'Dashboard'; error.value = ''; await refreshSnapshot(true); await refreshRuns(); await refreshControl('Project') }
 const projectRuntime = new ProjectRuntime(api, { resetWorkspace: resetProjectState, setActiveProject: project => { activeProject.value = project }, loadWorkspace: loadProjectWorkspace })
 async function importPickerProject(root: string, displayName?: string) { await projectRuntime.importProject(root, displayName); await refreshProjects() }
 async function adoptPickerProject(root: string, displayName?: string) { await projectRuntime.adoptProject(root, displayName); await refreshProjects() }
@@ -187,14 +188,44 @@ async function dispatchReady() {
   if (mutationLoading.value) return
   confirmationModal.value = { title: 'Dispatch work', message: `Dispatch ${ready[0].task.title}?`, action: async () => { await api.dispatch(ready[0].task.id); await refreshSnapshot(); notice.value = 'Work dispatched.' } }
 }
-async function refreshRuns() { if (!activeProject.value) return; const token = ++runRequestToken.value; const project = activeProject.value.project_id; try { const workspace = await api.runsWorkspace(); if (token !== runRequestToken.value || project !== (activeProject.value?.project_id ?? null)) return; runsWorkspace.value = workspace; const next = selectedRun.value != null && workspace.runs.some(run => run.id === selectedRun.value) ? selectedRun.value : workspace.runs[0]?.id ?? null; if (next != null) await selectRun(next); else { selectedRun.value = null; selectedRunDetails.value = null; selectedRunReview.value = null } runError.value = '' } catch (err: unknown) { if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null)) runError.value = friendlyError(err) } }
+async function performRunRefresh(project: number) {
+  const token = ++runRequestToken.value
+  try {
+    const workspace = await api.runsWorkspace(50, 0)
+    if (token !== runRequestToken.value || project !== (activeProject.value?.project_id ?? null)) return
+    runsWorkspace.value = workspace
+    const next = selectedRun.value != null && workspace.runs.some(run => run.id === selectedRun.value) ? selectedRun.value : workspace.runs[0]?.id ?? null
+    if (next != null) await selectRun(next)
+    else { selectedRun.value = null; selectedRunDetails.value = null; selectedRunReview.value = null }
+    runError.value = ''
+  } catch (err: unknown) {
+    if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null)) runError.value = friendlyError(err)
+  }
+}
+let runRefreshPromise: Promise<void> | null = null
+let runRefreshProject: number | null = null
+let runRefreshFollowup = false
+async function refreshRuns() {
+  if (!activeProject.value) return
+  const project = activeProject.value.project_id
+  if (runRefreshPromise && runRefreshProject === project) { runRefreshFollowup = true; return runRefreshPromise }
+  const refresh = performRunRefresh(project)
+  runRefreshPromise = refresh
+  runRefreshProject = project
+  try { await refresh } finally {
+    if (runRefreshPromise !== refresh) return
+    runRefreshPromise = null
+    runRefreshProject = null
+    if (runRefreshFollowup) { runRefreshFollowup = false; await refreshRuns() }
+  }
+}
 async function openRuns() { active.value = 'Runs'; await refreshRuns() }
 async function loadWorkerLog(id: number, force = false) { if (!force && !workerLogDirty.value[id] && workerLogCache.value[id]) { selectedWorkerLog.value = workerLogCache.value[id]; return } const token = ++workerLogRequestToken.value; const project = activeProject.value?.project_id ?? null; workerLogLoading.value = true; workerLogError.value = ''; try { const log = await api.workerLog(id); if (token === workerLogRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) { workerLogCache.value[id] = log; workerLogDirty.value[id] = false; selectedWorkerLog.value = log } } catch (err: unknown) { if (token === workerLogRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) workerLogError.value = friendlyError(err) } finally { if (token === workerLogRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) workerLogLoading.value = false } }
 async function toggleWorkerLog(event: Event) { workerLogOpen.value = (event.target as HTMLDetailsElement).open; if (workerLogOpen.value && selectedRun.value != null) await loadWorkerLog(selectedRun.value) }
 async function refreshWorkerLog() { if (selectedRun.value != null) await loadWorkerLog(selectedRun.value, true) }
 async function selectRun(id: number) { const token = ++runRequestToken.value; workerLogRequestToken.value++; selectedWorkerLog.value = workerLogDirty.value[id] ? [] : workerLogCache.value[id] ?? []; workerLogOpen.value = false; workerLogLoading.value = false; workerLogError.value = ''; const project = activeProject.value?.project_id ?? null; selectedRun.value = id; selectedRunDetails.value = null; selectedRunReview.value = null; const run = runsWorkspace.value?.runs.find(item => item.id === id); if (!run) return; try { const detail = await api.runDetails(id); if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) selectedRunDetails.value = detail } catch (err: unknown) { if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) runError.value = friendlyError(err) } if (!run.task_id) return; try { const review = await api.reviewRun(id); if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) selectedRunReview.value = review } catch (err: unknown) { if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === id) runError.value = friendlyError(err) } }
 function applyWorkerOutput(event: import('./lib/api').LifecycleEvent) { if (event.run_id == null) return; const log = workerLogCache.value[event.run_id]; if (log) { if (!log.some(item => item.id === event.id)) workerLogCache.value[event.run_id] = [...log, event].sort((a, b) => a.id - b.id) } else workerLogDirty.value[event.run_id] = true; if (selectedRun.value === event.run_id && workerLogOpen.value && workerLogCache.value[event.run_id]) selectedWorkerLog.value = workerLogCache.value[event.run_id] }
-function handleRunEvent(event: { project_id: string; event: { type: string; event: import('./lib/api').LifecycleEvent } }) { if (event.project_id !== activeProject.value?.id) return; const lifecycle = event.event.event; if (event.event.type === 'worker_output') applyWorkerOutput(lifecycle); else if (active.value === 'Runs') { const selected = selectedRun.value; const project = activeProject.value?.project_id ?? null; void refreshRuns().then(async () => { if (selected == null || lifecycle.run_id !== selected || project !== (activeProject.value?.project_id ?? null)) return; const token = runRequestToken.value; try { const detail = await api.runDetails(selected); const review = lifecycle.task_id ? await api.reviewRun(selected) : null; if (token === runRequestToken.value && project === (activeProject.value?.project_id ?? null) && selectedRun.value === selected) { selectedRunDetails.value = detail; selectedRunReview.value = review } } catch (err: unknown) { if (token === runRequestToken.value) runError.value = friendlyError(err) } }) } }
+function handleRunEvent(event: { project_id: string; event: { type: string; event: import('./lib/api').LifecycleEvent } }) { if (event.project_id !== activeProject.value?.id) return; const lifecycle = event.event.event; if (event.event.type === 'worker_output') applyWorkerOutput(lifecycle); else if (active.value === 'Runs') scheduleRunRefresh() }
 function canRecover(run: AgentRun) { if (run.status !== 'failed' || !run.task_id) return false; const entry = queue.value?.active.find(item => item.task.id === run.task_id) ?? queue.value?.blocked.find(item => item.task.id === run.task_id); return entry?.task.status === 'active' || entry?.task.status === 'blocked' }
 async function recoverRun() { const run = selectedDetail.value?.run; if (!run || !canRecover(run)) return; confirmationModal.value = { title: 'Recover run', message: `Requeue task ${run.task_id} for recovery?`, action: async () => { await api.taskAction('requeue', run.task_id!); await refreshRuns(); await refreshSnapshot() } } }
 function formatTime(value: string | null) { return formatTimestamp(value) }
@@ -247,7 +278,7 @@ async function sendLead(message: string, source: 'workspace' | 'panel') {
 function useQuickAction(action: string) { void sendLead(quickActions[action], 'workspace') }
 async function resolveProposal(proposal: LeadProposal, action: 'apply' | 'reject') { confirmationModal.value = { title: `${action} Lead proposal`, message: `Are you sure you want to ${action} this proposal?`, action: async () => { action === 'apply' ? await api.applyLeadProposal(proposal.id) : await api.rejectLeadProposal(proposal.id); await refreshLead() } } }
 async function refreshControl(section: string) { if (!activeProject.value) return; try { controlError.value = ''; if (section === 'Planner') { planning.value = await api.planningRequest(); planningObjective.value = planning.value.objective } if (section === 'Approvals') approvalList.value = await api.approvals(); if (section === 'Reports' || section === 'Project') report.value = await api.projectReport(); if (section === 'Settings') { await refreshAgents(); leadConfig.value = await api.leadProviderConfig(); const template = await api.executionTemplate(templateClass.value); templateModel.value = template.model ?? ''; templateEffort.value = template.reasoning_effort ?? '' } } catch (err: unknown) { controlError.value = friendlyError(err) } }
-async function runPlanner() { if (!planningObjective.value.trim()) return; try { await api.automatedPlan(planningObjective.value.trim()); const workspace = await api.runsWorkspace(); const output = [...workspace.runs].find(run => run.output?.trim().startsWith('{') && run.output.includes('"tasks"'))?.output; if (!output) throw new Error('Planner completed without a readable PlanResponse. Inspect the run output in Runs.'); planJson.value = output; plan.value = await api.plannerValidate(output); controlError.value = 'Planner completed. Review the generated plan before validating and applying it.' } catch (err: unknown) { controlError.value = friendlyError(err) } }
+async function runPlanner() { if (!planningObjective.value.trim()) return; try { await api.automatedPlan(planningObjective.value.trim()); const workspace = await api.runsWorkspace(50, 0); const output = [...workspace.runs].find(run => run.output?.trim().startsWith('{') && run.output.includes('"tasks"'))?.output; if (!output) throw new Error('Planner completed without a readable PlanResponse. Inspect the run output in Runs.'); planJson.value = output; plan.value = await api.plannerValidate(output); controlError.value = 'Planner completed. Review the generated plan before validating and applying it.' } catch (err: unknown) { controlError.value = friendlyError(err) } }
 async function saveLeadConfig(agentId: string) { try { await api.setLeadProvider({ agent_id: agentId }); leadConfig.value = await api.leadProviderConfig() } catch (err: unknown) { controlError.value = friendlyError(err) } }
 async function clearLeadConfig() { try { await api.clearLeadProvider(); leadConfig.value = null; controlError.value = 'Lead provider cleared.' } catch (err: unknown) { controlError.value = friendlyError(err) } }
 async function saveTemplate() { try { await api.setExecutionTemplate(templateClass.value, templateModel.value || null, templateEffort.value || null); controlError.value = 'Execution template saved.' } catch (err: unknown) { controlError.value = friendlyError(err) } }
@@ -257,6 +288,13 @@ async function resolveApprovalItem(item: ApprovalRequest) { confirmationModal.va
 async function confirmAction() { if (!confirmationModal.value || mutationLoading.value) return; const action = confirmationModal.value.action; confirmationModal.value = null; mutationError.value = ''; mutationLoading.value = true; try { await action() } catch (err: unknown) { mutationError.value = friendlyError(err) } finally { mutationLoading.value = false } }
 
 let stopRunEvents: (() => void) | null = null
+let runRefreshScheduled = false
+function scheduleRunRefresh() {
+  if (runRefreshPromise) { runRefreshFollowup = true; return }
+  if (runRefreshScheduled) return
+  runRefreshScheduled = true
+  queueMicrotask(() => { runRefreshScheduled = false; void refreshRuns() })
+}
 onMounted(async () => {
   try { await projectRuntime.start(); projects.value = await api.registeredProjects() } catch (err: unknown) { error.value = friendlyError(err) }
   stopRunEvents = await listen<{ project_id: string; event: { type: string; event: import('./lib/api').LifecycleEvent } }>('orc://run-event', event => handleRunEvent(event.payload))
@@ -289,9 +327,10 @@ onUnmounted(() => { stopRunEvents?.() })
         </form>
       </UiModal>
       <div v-if="mutationError" class="notice" role="alert">{{ mutationError }}</div>
-      <div v-else-if="activeProject && error" class="notice" role="alert">Unable to load project state: {{ error }} <button class="text-button" :disabled="loading" @click="refreshSnapshot">TRY AGAIN</button></div>
+      <div v-else-if="activeProject && error" class="notice" role="alert">Unable to load project state: {{ error }} <button class="text-button" :disabled="loading" @click="refreshSnapshot(true)">TRY AGAIN</button></div>
       <template v-else-if="activeProject">
       <div v-if="notice" class="success-notice" role="status">{{ notice }} <button aria-label="Dismiss notification" @click="notice = ''">×</button></div>
+      <div v-if="snapshotError" class="notice snapshot-refresh-error" role="alert">Unable to refresh project state: {{ snapshotError }} <button class="text-button" :disabled="loading" @click="refreshSnapshot()">TRY AGAIN</button></div>
       <div v-if="loading" class="loading-bar" role="status">Refreshing project state…</div>
       <section v-if="active === 'Dashboard'" class="dashboard">
         <div class="intro"><div><span class="eyebrow">PROJECT / {{ snapshot?.dashboard.project_name || 'CURRENT PROJECT' }}</span><h2>Operational control surface</h2><p>Monitor work, dispatch agents, and review results.</p></div><span class="timestamp">{{ healthLabel }} · {{ new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</span></div>

@@ -14,11 +14,13 @@ Project-local state lives under `.orc/`. The authoritative database is `.orc/orc
 
 ## Installation and initialization
 
-Install Rust stable, Cargo, and Git. From an Orc checkout, install the CLI with:
+Install Rust stable, Cargo, Git, Node.js, and the native Tauri prerequisites. From an Orc checkout, install the CLI and packaged desktop application with:
 
 ```bash
-cargo install --path .
+./scripts/install.sh
 ```
+
+On Windows, run `powershell -ExecutionPolicy Bypass -File scripts/install.ps1`. `orc --ui` launches the installed packaged desktop application and returns immediately. See the [desktop installation guide](docs/desktop.md) for system-wide Linux installation, upgrades, uninstall steps, and artifact validation.
 
 Run `orc init` in the repository Orc should manage, then `orc adopt` to record its Git identity and engineering contract. Automated Codex workers and the configured Lead additionally require an installed and authenticated `codex` CLI. Manual workers and provider-independent acceptance tests do not require a live AI provider.
 

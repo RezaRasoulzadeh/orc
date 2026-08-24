@@ -2,6 +2,8 @@ commands = [
   "npm run typecheck",
   "npm run build",
   "npm test",
+  "npm run tauri:build",
+  "npm run validate:package",
   "cargo fmt --check",
   "cargo clippy --all-targets -- -D warnings",
   "cargo test",

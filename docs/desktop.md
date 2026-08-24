@@ -1,6 +1,34 @@
 # Desktop application
 
-The desktop application is a Tauri shell with a Vue interface. Build the frontend with `npm install && npm run build`, then use the Tauri CLI for the platform package. It opens an adopted project and exposes dashboard, queue, tasks, agents, runs, review, planning, Lead, approvals, and manual-run actions through the Rust application service.
+The desktop application is a Tauri shell with a Vue interface. Build the frontend with `npm install && npm run build`, then use `cargo tauri build` for the platform package. It opens an adopted project and exposes dashboard, queue, tasks, agents, runs, review, planning, Lead, approvals, and manual-run actions through the Rust application service.
+
+## Installation and launcher
+
+Install both artifacts from a release build. `orc --ui` checks beside the CLI first, followed by these supported locations:
+
+- Linux: beside the CLI, `$HOME/.local/lib/orc/orc-desktop`, `/usr/local/lib/orc/orc-desktop`, or `/usr/lib/orc/orc-desktop`.
+- macOS: `/Applications/Orc.app/Contents/MacOS/orc-desktop` or the corresponding per-user Applications path.
+- Windows: `%LOCALAPPDATA%\\Programs\\Orc\\orc-desktop.exe`.
+
+Run `orc --ui` to start the installed desktop application. It detaches the process, gives it no standard input/output/error, and returns to the terminal immediately. It never runs Vite or a Tauri development server. If the desktop package is missing, the error lists the searched locations and gives an installation action.
+
+The supported Linux and macOS user install builds release artifacts, validates that Tauri produced an installable package, and installs both components:
+
+```sh
+./scripts/install.sh
+```
+
+The default Linux prefix is `$HOME/.local`: the CLI goes to `$HOME/.local/bin`, the desktop executable to `$HOME/.local/lib/orc`, and the application-menu entry and icon to `$HOME/.local/share`. For a system-style install, run `sudo env PREFIX=/usr ./scripts/install.sh`; this installs the exact `/usr/bin` and `/usr/lib/orc` layout searched by the launcher. `PREFIX=/usr/local` is also supported. Ensure the chosen `bin` directory is on `PATH`. On macOS, the CLI is installed under `$HOME/.local/bin` and the application bundle under `$HOME/Applications`.
+
+On Windows, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+```
+
+This installs both executables under `%LOCALAPPDATA%\Programs\Orc` and adds that directory to the user `PATH`. Re-run the same installer from a newer checkout to upgrade. Uninstall with `./scripts/install.sh --uninstall` or `powershell -ExecutionPolicy Bypass -File scripts/install.ps1 --uninstall`. Project databases are not removed.
+
+Release validation uses `npm run tauri:build` followed by `npm run validate:package`. The build selects deterministic native bundle formats (`deb` and `rpm`, `app` and `dmg`, or `msi` and NSIS), and validation fails unless both the release desktop executable and a native Tauri installer or application bundle exist under `src-tauri/target/release`.
 
 The desktop and CLI share SQLite state; refresh or reopen the project after CLI changes when needed. Desktop actions still follow the same human review and mutation boundaries as the CLI.
 

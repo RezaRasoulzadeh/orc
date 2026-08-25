@@ -358,6 +358,191 @@ fn worker_result_persists_once_per_run_across_reopen() {
     );
 }
 
+fn lineage_fixture(force: bool) -> (tempfile::TempDir, Database, String, i64, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("purge").unwrap();
+    let task = db
+        .insert_task(project, "purge", "purge", "developer", TaskPriority::Normal)
+        .unwrap();
+    let dependency = db
+        .insert_task(
+            project,
+            "dependency",
+            "dependency",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    db.add_task_dependency(&task, &dependency).unwrap();
+    let run_id = db.create_agent_run(project, &task, "agent").unwrap();
+    db.insert_worker_result(&WorkerResult {
+        run_id,
+        outcome: "success".into(),
+        failure_category: None,
+        duration_ms: Some(100),
+        metadata: Some("{\"fixture\":true}".into()),
+        total_tokens: Some(10),
+        input_tokens: Some(8),
+        output_tokens: Some(2),
+    })
+    .unwrap();
+    db.update_agent_run_status(run_id, "completed", Some("done"))
+        .unwrap();
+    db.store_change_evidence(
+        run_id,
+        &orc::git::WorktreeChanges {
+            files: vec![],
+            stat: "evidence".into(),
+            diff: String::new(),
+        },
+    )
+    .unwrap();
+    db.record_lifecycle_event("task_event", Some(&task), None, None, None)
+        .unwrap();
+    db.record_lifecycle_event("run_event", None, Some(run_id), None, None)
+        .unwrap();
+    db.store_worktree_metadata(run_id, &task, "branch", ".orc/worktrees/purge")
+        .unwrap();
+    db.insert_decision(project, Some(&task), "decision")
+        .unwrap();
+    db.update_task_status(&task, TaskStatus::Cancelled).unwrap();
+    if force {
+        let dependent = db
+            .insert_task(
+                project,
+                "dependent",
+                "dependent",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        db.add_task_dependency(&dependent, &task).unwrap();
+        (dir, db, task, run_id, dependent)
+    } else {
+        (dir, db, task, run_id, dependency)
+    }
+}
+
+#[test]
+fn normal_task_purge_removes_complete_run_lineage_and_owned_edges() {
+    let (dir, db, task, run_id, dependency) = lineage_fixture(false);
+    assert!(db.get_worker_result(run_id).unwrap().is_some());
+    db.purge_task(&task, false).unwrap();
+    let raw = Connection::open(dir.path().join("orc.db")).unwrap();
+    for (table, column, value) in [
+        ("tasks", "id", task.as_str()),
+        ("agent_runs", "id", &run_id.to_string()),
+    ] {
+        assert_eq!(
+            raw.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [value],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    for table in [
+        "worker_results",
+        "run_change_evidence",
+        "lifecycle_events",
+        "worktree_metadata",
+        "decisions",
+    ] {
+        assert_eq!(
+            raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 OR depends_on = ?1",
+            [&task],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM task_dependencies WHERE depends_on = ?1",
+            [&dependency],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn forced_task_purge_removes_dependent_edges_and_complete_lineage() {
+    let (dir, db, task, run_id, dependent) = lineage_fixture(true);
+    db.purge_task(&task, true).unwrap();
+    let raw = Connection::open(dir.path().join("orc.db")).unwrap();
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", [&task], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE id = ?1",
+            [run_id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    for table in [
+        "worker_results",
+        "run_change_evidence",
+        "lifecycle_events",
+        "worktree_metadata",
+        "decisions",
+    ] {
+        assert_eq!(
+            raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 OR depends_on = ?1",
+            [&task],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+            [&dependent],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn dependent_task_protection_remains_without_force() {
+    let (_dir, db, task, _run_id, dependent) = lineage_fixture(true);
+    let error = db.purge_task(&task, false).unwrap_err().to_string();
+    assert!(error.contains(&dependent));
+    assert!(db.get_task(&task).unwrap().is_some());
+}
+
 #[test]
 fn invalid_enum_data_is_an_error() {
     let dir = tempdir().unwrap();

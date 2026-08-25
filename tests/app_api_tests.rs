@@ -2,6 +2,7 @@ use orc::app::OrcApp;
 use orc::protocol::{PROTOCOL_VERSION, PlanResponse, PlannedTask};
 use orc::storage::Database;
 use orc::task::TaskPriority;
+use rusqlite::Connection;
 use std::sync::mpsc::TryRecvError;
 use tempfile::tempdir;
 
@@ -160,4 +161,33 @@ fn persisted_history_reconstructs_without_subscriber() {
         "backlog"
     );
     assert!(!reopened.lifecycle_events(10).unwrap().is_empty());
+}
+
+#[test]
+fn failed_database_purge_does_not_remove_task_worktree() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("state.sqlite");
+    let db = Database::init(&database).unwrap();
+    let project = db.create_project("purge-lock").unwrap();
+    let task = db
+        .insert_task(project, "purge", "purge", "developer", TaskPriority::Normal)
+        .unwrap();
+    db.update_task_status(&task, orc::task::TaskStatus::Cancelled)
+        .unwrap();
+    let run = db.create_agent_run(project, &task, "agent").unwrap();
+    db.update_agent_run_status(run, "completed", Some("done"))
+        .unwrap();
+    db.store_worktree_metadata(run, &task, "branch", ".orc/worktrees/purge")
+        .unwrap();
+    let worktree = directory
+        .path()
+        .join(orc::git::worktree_path_for_task(&task));
+    std::fs::create_dir_all(&worktree).unwrap();
+    let app = OrcApp::open(&database, directory.path()).unwrap();
+    let lock = Connection::open(&database).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    assert!(app.purge_task(&task, true).is_err());
+    assert!(worktree.exists());
+    assert!(app.task(&task).unwrap().is_some());
+    lock.execute_batch("ROLLBACK").unwrap();
 }

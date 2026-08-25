@@ -75,7 +75,7 @@ impl ValidationRunner for SystemValidationRunner {
                 format!("{}\nFallback {}:\n{}", first.1, fallback_command, retry.1),
                 retry.0,
                 Some(fallback_command),
-                (!retry.0).then_some(ValidationFailureClassification::Implementation),
+                (!retry.0).then(|| classify_failure(&retry.1)),
             ));
         }
         Ok(step(command, first.1, false, None, Some(classification)))
@@ -131,6 +131,8 @@ fn classify_failure(output: &str) -> ValidationFailureClassification {
         "timed out",
         "failed to spawn",
         "failed waiting",
+        "offline mode",
+        "no space left on device",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

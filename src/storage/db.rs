@@ -2334,14 +2334,26 @@ impl Database {
         let path = self.get_worktree_metadata(id)?.map(|(_, path)| path);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            if force {
-                self.conn.execute(
-                    "DELETE FROM task_dependencies WHERE task_id = ?1 OR depends_on = ?1",
-                    [id],
-                )?;
-            }
             self.conn
-                .execute("DELETE FROM lifecycle_events WHERE task_id = ?1", [id])?;
+                .execute("DELETE FROM task_dependencies WHERE task_id = ?1", [id])?;
+            if force {
+                self.conn
+                    .execute("DELETE FROM task_dependencies WHERE depends_on = ?1", [id])?;
+            }
+            self.conn.execute(
+                "DELETE FROM worker_results WHERE run_id IN (SELECT id FROM agent_runs WHERE task_id = ?1)",
+                [id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM run_change_evidence WHERE run_id IN (SELECT id FROM agent_runs WHERE task_id = ?1)",
+                [id],
+            )?;
+            self.conn
+                .execute("DELETE FROM lifecycle_events WHERE task_id = ?1 OR run_id IN (SELECT id FROM agent_runs WHERE task_id = ?1)", [id])?;
+            self.conn.execute(
+                "DELETE FROM worktree_metadata WHERE task_id = ?1 OR agent_run_id IN (SELECT id FROM agent_runs WHERE task_id = ?1)",
+                [id],
+            )?;
             self.conn
                 .execute("DELETE FROM decisions WHERE task_id = ?1", [id])?;
             self.conn

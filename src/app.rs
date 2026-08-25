@@ -627,10 +627,16 @@ impl OrcApp {
                 id
             );
         }
-        if absolute.exists() && (force || path.is_some()) {
-            crate::git::remove_worktree(&self.repo_path, &expected)?;
-        }
         self.db.purge_task(id, force)?;
+        if absolute.exists() && (force || path.is_some()) {
+            crate::git::remove_worktree(&self.repo_path, &expected).map_err(|error| {
+                anyhow::anyhow!(
+                    "task '{}' was purged from persisted state, but worktree cleanup failed: {}",
+                    id,
+                    error
+                )
+            })?;
+        }
         Ok(())
     }
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool> {

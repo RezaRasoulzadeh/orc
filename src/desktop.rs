@@ -66,6 +66,10 @@ fn configure_detachment(command: &mut Command, detached: bool) {
 
 pub fn desktop_executable_path(current_exe: &Path) -> Result<PathBuf> {
     let candidates = desktop_executable_candidates(current_exe);
+    resolve_desktop_executable(&candidates)
+}
+
+fn resolve_desktop_executable(candidates: &[PathBuf]) -> Result<PathBuf> {
     candidates
         .iter()
         .find(|candidate| candidate.is_file())
@@ -166,7 +170,7 @@ mod tests {
 
     #[test]
     fn missing_desktop_error_is_actionable() {
-        let error = desktop_executable_path(Path::new("/missing/orc"))
+        let error = resolve_desktop_executable(&[PathBuf::from("/missing/orc-desktop")])
             .unwrap_err()
             .to_string();
         assert!(error.contains("desktop is not installed"));
@@ -226,11 +230,22 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(200));
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !result.exists() && Instant::now() < deadline {
+        let fields = loop {
+            if let Ok(values) = std::fs::read_to_string(&result) {
+                let fields = values
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if fields.len() == 2 {
+                    break fields;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached process did not write session data"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let values = std::fs::read_to_string(result).unwrap();
-        let fields = values.split_whitespace().collect::<Vec<_>>();
+        };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0], fields[1]);
     }

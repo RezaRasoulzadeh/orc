@@ -14,6 +14,16 @@ pub struct ValidationStepResult {
     pub command: String,
     pub passed: bool,
     pub output: String,
+    #[serde(default)]
+    pub failure_classification: Option<ValidationFailureClassification>,
+    #[serde(default)]
+    pub fallback_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationFailureClassification {
+    Implementation,
+    Infrastructure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,35 +60,95 @@ pub struct SystemValidationRunner;
 
 impl ValidationRunner for SystemValidationRunner {
     fn run(&self, command: &str, working_dir: &Path) -> Result<ValidationStepResult> {
-        let mut process = Command::new("sh");
-        process.arg("-c").arg(command).current_dir(working_dir);
-        let output = run_command_with_timeout(
-            process,
-            configured_timeout("ORC_VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT),
-        )
-        .map_err(|error| anyhow::anyhow!("validation command '{command}' failed: {error}"))
-        .with_context(|| format!("failed to execute validation command: {command}"))?;
-
-        let passed = output.status.success();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut combined = String::new();
-        if !stdout.trim().is_empty() {
-            combined.push_str(stdout.trim());
+        let first = execute(command, working_dir);
+        if first.0 {
+            return Ok(step(command, first.1, true, None, None));
         }
-        if !stderr.trim().is_empty() {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(stderr.trim());
+        let classification = classify_failure(&first.1);
+        let fallback = (classification == ValidationFailureClassification::Infrastructure)
+            .then(|| cargo_offline_command(command))
+            .flatten();
+        if let Some(fallback_command) = fallback.clone() {
+            let retry = execute(&fallback_command, working_dir);
+            return Ok(step(
+                command,
+                format!("{}\nFallback {}:\n{}", first.1, fallback_command, retry.1),
+                retry.0,
+                Some(fallback_command),
+                (!retry.0).then(|| classify_failure(&retry.1)),
+            ));
         }
-
-        Ok(ValidationStepResult {
-            command: command.to_string(),
-            passed,
-            output: combined,
-        })
+        Ok(step(command, first.1, false, None, Some(classification)))
     }
+}
+
+fn execute(command: &str, working_dir: &Path) -> (bool, String) {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command).current_dir(working_dir);
+    let output = match run_command_with_timeout(
+        process,
+        configured_timeout("ORC_VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT),
+    ) {
+        Ok(output) => output,
+        Err(error) => return (false, error),
+    };
+    let passed = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let output = [stdout, stderr]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (passed, output)
+}
+
+fn step(
+    command: &str,
+    output: String,
+    passed: bool,
+    fallback_command: Option<String>,
+    classification: Option<ValidationFailureClassification>,
+) -> ValidationStepResult {
+    ValidationStepResult {
+        command: command.to_string(),
+        passed,
+        output,
+        failure_classification: classification,
+        fallback_command,
+    }
+}
+
+fn classify_failure(output: &str) -> ValidationFailureClassification {
+    let lower = output.to_ascii_lowercase();
+    if [
+        "could not resolve",
+        "failed to download",
+        "crates.io",
+        "registry",
+        "network",
+        "dns",
+        "timed out",
+        "failed to spawn",
+        "failed waiting",
+        "offline mode",
+        "no space left on device",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        ValidationFailureClassification::Infrastructure
+    } else {
+        ValidationFailureClassification::Implementation
+    }
+}
+
+fn cargo_offline_command(command: &str) -> Option<String> {
+    let (prefix, rest) = command.split_once("cargo")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) || rest.contains("--offline") {
+        return None;
+    }
+    Some(format!("{prefix}cargo --offline{rest}"))
 }
 
 pub fn run_validation_pipeline(
@@ -287,6 +357,9 @@ pub mod test_helpers {
                 command: command.to_string(),
                 passed,
                 output,
+                failure_classification: (!passed)
+                    .then_some(ValidationFailureClassification::Implementation),
+                fallback_command: None,
             })
         }
     }
@@ -366,5 +439,26 @@ commands = [
         assert!(report.steps[0].passed);
         assert!(!report.steps[1].passed);
         assert_eq!(runner.executed_commands(), commands);
+    }
+
+    #[test]
+    fn cargo_offline_fallback_preserves_manifest_arguments() {
+        assert_eq!(
+            cargo_offline_command("cargo test --manifest-path crates/app/Cargo.toml --lib"),
+            Some("cargo --offline test --manifest-path crates/app/Cargo.toml --lib".into())
+        );
+        assert_eq!(cargo_offline_command("cargo test --offline"), None);
+    }
+
+    #[test]
+    fn failures_are_classified_without_fallback_for_implementation_errors() {
+        assert_eq!(
+            classify_failure("test foo failed: assertion failed"),
+            ValidationFailureClassification::Implementation
+        );
+        assert_eq!(
+            classify_failure("failed to download from crates.io: network error"),
+            ValidationFailureClassification::Infrastructure
+        );
     }
 }

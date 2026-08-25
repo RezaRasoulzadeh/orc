@@ -12,8 +12,12 @@ pub struct ValidationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationStepResult {
     pub command: String,
+    pub category: ValidationCategory,
     pub passed: bool,
-    pub output: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<i32>,
+    pub diagnostics: Option<String>,
     #[serde(default)]
     pub failure_classification: Option<ValidationFailureClassification>,
     #[serde(default)]
@@ -23,6 +27,18 @@ pub struct ValidationStepResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationFailureClassification {
     Implementation,
+    Infrastructure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCategory {
+    Success,
+    Formatting,
+    Lint,
+    Compilation,
+    Test,
+    Timeout,
     Infrastructure,
 }
 
@@ -41,14 +57,60 @@ impl ValidationReport {
         for step in &self.steps {
             let status = if step.passed { "PASS" } else { "FAIL" };
             out.push_str(&format!("  {:<40} {}\n", step.command, status));
-            if !step.passed && !step.output.is_empty() {
+            let output = step.output();
+            if !step.passed && !output.is_empty() {
                 out.push_str("    Output:\n");
-                for line in step.output.lines() {
+                for line in output.lines() {
                     out.push_str(&format!("      {}\n", line));
                 }
             }
         }
         out
+    }
+
+    pub fn is_infrastructure_failure(&self) -> bool {
+        self.steps
+            .last()
+            .is_some_and(ValidationStepResult::is_infrastructure_failure)
+    }
+
+    pub fn infrastructure_failure(command: &str, diagnostics: String) -> Self {
+        Self {
+            steps: vec![ValidationStepResult {
+                command: command.to_owned(),
+                category: ValidationCategory::Infrastructure,
+                passed: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_status: None,
+                diagnostics: Some(diagnostics),
+                failure_classification: Some(ValidationFailureClassification::Infrastructure),
+                fallback_command: None,
+            }],
+        }
+    }
+}
+
+impl ValidationStepResult {
+    pub fn output(&self) -> String {
+        [
+            Some(self.stdout.as_str()),
+            Some(self.stderr.as_str()),
+            self.diagnostics.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    pub fn is_infrastructure_failure(&self) -> bool {
+        matches!(
+            self.category,
+            ValidationCategory::Timeout | ValidationCategory::Infrastructure
+        )
     }
 }
 
@@ -61,28 +123,51 @@ pub struct SystemValidationRunner;
 impl ValidationRunner for SystemValidationRunner {
     fn run(&self, command: &str, working_dir: &Path) -> Result<ValidationStepResult> {
         let first = execute(command, working_dir);
-        if first.0 {
-            return Ok(step(command, first.1, true, None, None));
+        if first.passed {
+            return Ok(step(command, first, None, None));
         }
-        let classification = classify_failure(&first.1);
+        let classification = classify_failure(&first.output());
         let fallback = (classification == ValidationFailureClassification::Infrastructure)
             .then(|| cargo_offline_command(command))
             .flatten();
         if let Some(fallback_command) = fallback.clone() {
             let retry = execute(&fallback_command, working_dir);
-            return Ok(step(
-                command,
-                format!("{}\nFallback {}:\n{}", first.1, fallback_command, retry.1),
-                retry.0,
-                Some(fallback_command),
-                (!retry.0).then(|| classify_failure(&retry.1)),
-            ));
+            let retry_classification = (!retry.passed).then(|| classify_failure(&retry.output()));
+            let mut result = step(command, retry, Some(fallback_command), retry_classification);
+            let initial_output = first.output();
+            if !initial_output.is_empty() {
+                result.diagnostics = Some(format!("Initial attempt failed:\n{initial_output}"));
+            }
+            return Ok(result);
         }
-        Ok(step(command, first.1, false, None, Some(classification)))
+        Ok(step(command, first, None, Some(classification)))
     }
 }
 
-fn execute(command: &str, working_dir: &Path) -> (bool, String) {
+struct ExecutionResult {
+    passed: bool,
+    stdout: String,
+    stderr: String,
+    exit_status: Option<i32>,
+    diagnostics: Option<String>,
+}
+
+impl ExecutionResult {
+    fn output(&self) -> String {
+        [
+            Some(self.stdout.as_str()),
+            Some(self.stderr.as_str()),
+            self.diagnostics.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+}
+
+fn execute(command: &str, working_dir: &Path) -> ExecutionResult {
     let mut process = Command::new("sh");
     process.arg("-c").arg(command).current_dir(working_dir);
     let output = match run_command_with_timeout(
@@ -90,30 +175,62 @@ fn execute(command: &str, working_dir: &Path) -> (bool, String) {
         configured_timeout("ORC_VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT),
     ) {
         Ok(output) => output,
-        Err(error) => return (false, error),
+        Err(error) => {
+            return ExecutionResult {
+                passed: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_status: None,
+                diagnostics: Some(error),
+            };
+        }
     };
     let passed = output.status.success();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let output = [stdout, stderr]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (passed, output)
+    ExecutionResult {
+        passed,
+        stdout,
+        stderr,
+        exit_status: output.status.code(),
+        diagnostics: None,
+    }
 }
 
 fn step(
     command: &str,
-    output: String,
-    passed: bool,
+    execution: ExecutionResult,
     fallback_command: Option<String>,
     classification: Option<ValidationFailureClassification>,
 ) -> ValidationStepResult {
+    let category = if !execution.passed
+        && execution
+            .diagnostics
+            .as_deref()
+            .is_some_and(|diagnostics| diagnostics.contains("timed out"))
+    {
+        ValidationCategory::Timeout
+    } else if !execution.passed
+        && execution.diagnostics.is_some()
+        && classification == Some(ValidationFailureClassification::Infrastructure)
+    {
+        ValidationCategory::Infrastructure
+    } else {
+        classify_validation(
+            command,
+            &execution.stdout,
+            &execution.stderr,
+            execution.passed,
+        )
+    };
     ValidationStepResult {
         command: command.to_string(),
-        passed,
-        output,
+        category,
+        passed: execution.passed,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        exit_status: execution.exit_status,
+        diagnostics: execution.diagnostics,
         failure_classification: classification,
         fallback_command,
     }
@@ -149,6 +266,47 @@ fn cargo_offline_command(command: &str) -> Option<String> {
         return None;
     }
     Some(format!("{prefix}cargo --offline{rest}"))
+}
+
+fn classify_validation(
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    passed: bool,
+) -> ValidationCategory {
+    if passed {
+        return ValidationCategory::Success;
+    }
+    let command = command.to_ascii_lowercase();
+    let diagnostics = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if infrastructure_diagnostics(&diagnostics) {
+        ValidationCategory::Infrastructure
+    } else if command.contains("fmt") || command.contains("format") {
+        ValidationCategory::Formatting
+    } else if command.contains("clippy") || command.contains("lint") {
+        ValidationCategory::Lint
+    } else if command.contains("test") || command.contains("pytest") {
+        ValidationCategory::Test
+    } else {
+        ValidationCategory::Compilation
+    }
+}
+
+fn infrastructure_diagnostics(diagnostics: &str) -> bool {
+    [
+        "failed to download",
+        "failed to fetch",
+        "could not resolve host",
+        "connection timed out",
+        "connection reset",
+        "network failure",
+        "spurious network error",
+        "failed to get successful http response",
+        "temporary failure in name resolution",
+        "registry index",
+    ]
+    .iter()
+    .any(|pattern| diagnostics.contains(pattern))
 }
 
 pub fn run_validation_pipeline(
@@ -355,8 +513,16 @@ pub mod test_helpers {
             };
             Ok(ValidationStepResult {
                 command: command.to_string(),
+                category: if passed {
+                    ValidationCategory::Success
+                } else {
+                    classify_validation(command, "", &output, false)
+                },
                 passed,
-                output,
+                stdout: String::new(),
+                stderr: output,
+                exit_status: Some(if passed { 0 } else { 1 }),
+                diagnostics: None,
                 failure_classification: (!passed)
                     .then_some(ValidationFailureClassification::Implementation),
                 fallback_command: None,
@@ -460,5 +626,28 @@ commands = [
             classify_failure("failed to download from crates.io: network error"),
             ValidationFailureClassification::Infrastructure
         );
+    }
+
+    #[test]
+    fn system_runner_preserves_streams_status_and_classifies_failures() {
+        let runner = SystemValidationRunner;
+        let result = runner
+            .run(
+                "printf 'standard output'; printf 'format error' >&2; exit 7 # fmt",
+                Path::new("."),
+            )
+            .unwrap();
+        assert_eq!(result.category, ValidationCategory::Formatting);
+        assert_eq!(result.stdout, "standard output");
+        assert_eq!(result.stderr, "format error");
+        assert_eq!(result.exit_status, Some(7));
+
+        let result = runner
+            .run(
+                "printf 'spurious network error: registry unavailable' >&2; exit 1",
+                Path::new("."),
+            )
+            .unwrap();
+        assert_eq!(result.category, ValidationCategory::Infrastructure);
     }
 }

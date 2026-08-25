@@ -40,7 +40,7 @@ pub use state::*;
 pub use storage::Database;
 pub use task::*;
 pub use validation::{
-    SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
-    ValidationStepResult, run_validation_pipeline,
+    SystemValidationRunner, ValidationCategory, ValidationConfig, ValidationReport,
+    ValidationRunner, ValidationStepResult, run_validation_pipeline,
 };
 pub use worker::*;

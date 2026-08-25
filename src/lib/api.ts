@@ -77,7 +77,8 @@ export interface ManualRunContext { run: AgentRun; task: Task; task_packet: stri
 export interface ManualWorkspaceInfo { supported: boolean; url: string | null; error: string | null }
 export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null }
 export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
-export interface ValidationStepResult { command: string; passed: boolean; output: string }
+export type ValidationCategory = 'success' | 'formatting' | 'lint' | 'compilation' | 'test' | 'timeout' | 'infrastructure'
+export interface ValidationStepResult { command: string; category: ValidationCategory; passed: boolean; stdout: string; stderr: string; exit_status: number | null; diagnostics: string | null }
 export interface ValidationReport { steps: ValidationStepResult[] }
 export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[]; validation: ValidationReport | null }
 export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }

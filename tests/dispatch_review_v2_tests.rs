@@ -5,9 +5,14 @@ use orc::review;
 use orc::storage::Database;
 use orc::task::{TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
+use orc::validation::{
+    ValidationCategory, ValidationFailureClassification, ValidationRunner, ValidationStepResult,
+};
 use orc::worker::{Worker, WorkerOutcome};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 struct WritingWorker;
@@ -35,6 +40,83 @@ impl Worker for ConflictingWorker {
     fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         std::fs::write(cwd.join("README.md"), "task version\n").map_err(|e| e.to_string())?;
         Ok((WorkerOutcome::Success, Some("changed README".into())))
+    }
+}
+
+struct RepairWorker {
+    calls: Mutex<Vec<(String, std::path::PathBuf)>>,
+}
+
+impl RepairWorker {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Worker for RepairWorker {
+    fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push((prompt.to_owned(), cwd.to_owned()));
+        let content = if calls.len() == 1 {
+            "needs repair\n"
+        } else {
+            "repaired\n"
+        };
+        std::fs::write(cwd.join("feature.txt"), content).map_err(|error| error.to_string())?;
+        Ok((
+            WorkerOutcome::Success,
+            Some(format!("worker call {}", calls.len())),
+        ))
+    }
+}
+
+struct SequenceValidationRunner {
+    results: Mutex<VecDeque<ValidationStepResult>>,
+    directories: Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl SequenceValidationRunner {
+    fn new(results: Vec<ValidationStepResult>) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            directories: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ValidationRunner for SequenceValidationRunner {
+    fn run(&self, _: &str, working_dir: &Path) -> anyhow::Result<ValidationStepResult> {
+        self.directories
+            .lock()
+            .unwrap()
+            .push(working_dir.to_owned());
+        Ok(self.results.lock().unwrap().pop_front().unwrap())
+    }
+}
+
+fn validation_result(category: ValidationCategory, diagnostics: &str) -> ValidationStepResult {
+    let passed = category == ValidationCategory::Success;
+    ValidationStepResult {
+        command: "check".to_owned(),
+        category,
+        passed,
+        stdout: if passed { "ok" } else { "partial output" }.to_owned(),
+        stderr: if passed { "" } else { "exact stderr" }.to_owned(),
+        exit_status: Some(if passed { 0 } else { 1 }),
+        diagnostics: (!diagnostics.is_empty()).then(|| diagnostics.to_owned()),
+        failure_classification: (!passed).then_some(
+            if matches!(
+                category,
+                ValidationCategory::Timeout | ValidationCategory::Infrastructure
+            ) {
+                ValidationFailureClassification::Infrastructure
+            } else {
+                ValidationFailureClassification::Implementation
+            },
+        ),
+        fallback_command: None,
     }
 }
 
@@ -193,6 +275,134 @@ fn no_change_and_validation_failure_block_task() {
         .find(|event| event.kind == "validation_result")
         .unwrap();
     assert!(validation.payload.unwrap().contains("\"passed\":false"));
+}
+
+#[test]
+fn validation_failure_repairs_in_same_worktree_and_persists_diagnostics() {
+    let (dir, db, task) = setup();
+    let db_path = dir.path().join(".orc/orc.db");
+    let worker = RepairWorker::new();
+    let runner = SequenceValidationRunner::new(vec![
+        validation_result(ValidationCategory::Test, "test assertion failed"),
+        validation_result(ValidationCategory::Success, ""),
+    ]);
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        db_path.to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap();
+    let calls = worker.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert!(calls[1].0.contains("test assertion failed"));
+    assert!(calls[1].0.contains("exact stderr"));
+    assert!(calls[1].0.contains("Preserve valid existing work"));
+    assert_eq!(
+        std::fs::read_to_string(calls[1].1.join("feature.txt")).unwrap(),
+        "repaired\n"
+    );
+    assert_eq!(summary.run_status, "completed");
+    let events = db
+        .list_lifecycle_events_for_run(summary.run_id, 30)
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "validation_attempt")
+            .count(),
+        2
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "validation_result"
+            && event.payload.as_deref().is_some_and(|payload| {
+                payload.contains("test assertion failed") && payload.contains("exact stderr")
+            })
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "validation_repair_started")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn validation_repair_is_bounded_and_infrastructure_only_retries_validation() {
+    let (dir, db, task) = setup();
+    let db_path = dir.path().join(".orc/orc.db");
+    let worker = RepairWorker::new();
+    let runner = SequenceValidationRunner::new(
+        (0..4)
+            .map(|_| validation_result(ValidationCategory::Lint, "lint failed"))
+            .collect(),
+    );
+    assert!(
+        dispatch_with_worker_and_db_as_with_runner(
+            &task,
+            &worker,
+            db_path.to_str().unwrap(),
+            dir.path(),
+            "fake",
+            &runner,
+        )
+        .is_err()
+    );
+    assert_eq!(worker.calls.lock().unwrap().len(), 4);
+    let run_id = db.list_agent_runs_for_task(&task).unwrap()[0].id;
+    let events = db.list_lifecycle_events_for_run(run_id, 40).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "validation_repair_completed")
+            .count(),
+        3
+    );
+
+    let task = db
+        .insert_task(
+            db.get_project_id().unwrap().unwrap(),
+            "Infrastructure validation",
+            "change",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let worker = RepairWorker::new();
+    let runner = SequenceValidationRunner::new(vec![
+        validation_result(ValidationCategory::Infrastructure, "registry unavailable"),
+        validation_result(ValidationCategory::Infrastructure, "registry unavailable"),
+        validation_result(ValidationCategory::Success, ""),
+    ]);
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        db_path.to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(worker.calls.lock().unwrap().len(), 1);
+    let events = db
+        .list_lifecycle_events_for_run(summary.run_id, 30)
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "validation_attempt")
+            .count(),
+        3
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "validation_repair_started")
+    );
 }
 
 #[test]

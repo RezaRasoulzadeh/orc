@@ -333,12 +333,12 @@ pub fn dispatch_with_worker_on_db(
     }) {
         Ok(execution) => {
             let outcome = execution.outcome;
-            let output = execution.output;
-            let token_usage = execution.token_usage;
+            let mut output = execution.output;
+            let mut token_usage = execution.token_usage;
             match outcome {
                 WorkerOutcome::Success => {
                     progress("worker completed");
-                    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+                    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
                         Ok(changes) => changes,
                         Err(error) => {
                             let output = format!(
@@ -480,6 +480,14 @@ pub fn dispatch_with_worker_on_db(
                             db.update_task_status(task_id, TaskStatus::Blocked)?;
                             anyhow::bail!(message);
                         }
+                        if execution.output.is_some() {
+                            output = execution.output;
+                        }
+                        if execution.token_usage.is_some() {
+                            token_usage = execution.token_usage;
+                        }
+                        changes = git::inspect_worktree(&worktree_dir, repo_path)
+                            .context("failed to inspect worktree after validation repair")?;
                         let reports = run_validation_with_retries(
                             validation_runner,
                             &validation_config.commands,

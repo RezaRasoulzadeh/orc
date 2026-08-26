@@ -512,13 +512,26 @@ impl OrcApp {
         Ok(())
     }
     pub fn dispatch(&self, task_id: &str, agent_id: Option<&str>) -> Result<DispatchSummary> {
-        let result = agent::dispatch_selected_with_db_and_repo(
+        self.dispatch_cancellable(
+            task_id,
+            agent_id,
+            &crate::worker::CancellationControl::new(),
+        )
+    }
+    pub fn dispatch_cancellable(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        cancellation: &crate::worker::CancellationControl,
+    ) -> Result<DispatchSummary> {
+        let result = agent::dispatch_selected_with_db_and_repo_cancellable(
             &self.db,
             &self.repo_path,
             task_id,
             agent_id,
             None,
             None,
+            Some(cancellation),
         )?;
         Ok(result)
     }

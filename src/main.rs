@@ -269,16 +269,27 @@ fn main() -> Result<()> {
     run(cli)
 }
 
-fn run(cli: Cli) -> Result<()> {
-    if cli.ui {
-        if cli.command.is_some() {
-            anyhow::bail!("--ui cannot be used with a CLI command");
-        }
-        return desktop::launch_desktop(&desktop::DetachedDesktopProcess);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRoute {
+    Interactive,
+    OneShot,
+    Desktop,
+}
 
-    if cli.command.is_none() {
-        return orc::interactive::run();
+fn entry_route(cli: &Cli) -> Result<EntryRoute> {
+    match (cli.ui, cli.command.is_some()) {
+        (true, true) => anyhow::bail!("--ui cannot be used with a CLI command"),
+        (true, false) => Ok(EntryRoute::Desktop),
+        (false, false) => Ok(EntryRoute::Interactive),
+        (false, true) => Ok(EntryRoute::OneShot),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    match entry_route(&cli)? {
+        EntryRoute::Desktop => return desktop::launch_desktop(&desktop::DetachedDesktopProcess),
+        EntryRoute::Interactive => return orc::interactive::run(),
+        EntryRoute::OneShot => {}
     }
 
     match cli
@@ -997,6 +1008,38 @@ fn print_check(check: &doctor::Check) {
 mod cli_tests {
     use super::*;
 
+    fn command_variant(command: &Command) -> &'static str {
+        match command {
+            Command::Init => "Init",
+            Command::Adopt => "Adopt",
+            Command::DiscoveryRequest => "DiscoveryRequest",
+            Command::ApplyDiscovery { .. } => "ApplyDiscovery",
+            Command::Agents { .. } => "Agents",
+            Command::Doctor => "Doctor",
+            Command::Status => "Status",
+            Command::Report { .. } => "Report",
+            Command::PlanRequest { .. } => "PlanRequest",
+            Command::Plan { .. } => "Plan",
+            Command::ApplyPlan { .. } => "ApplyPlan",
+            Command::Queue { .. } => "Queue",
+            Command::Template { .. } => "Template",
+            Command::Lead { .. } => "Lead",
+            Command::Ask { .. } => "Ask",
+            Command::ApplyResponse { .. } => "ApplyResponse",
+            Command::Dispatch { .. } => "Dispatch",
+            Command::DispatchQueue { .. } => "DispatchQueue",
+            Command::Review { .. } => "Review",
+            Command::ProjectReview { .. } => "ProjectReview",
+            Command::Revise { .. } => "Revise",
+            Command::Schedule { .. } => "Schedule",
+            Command::Agent { .. } => "Agent",
+            Command::Task { .. } => "Task",
+            Command::Runs { .. } => "Runs",
+            Command::Approvals { .. } => "Approvals",
+            Command::Run { .. } => "Run",
+        }
+    }
+
     #[test]
     fn parses_ui_without_a_subcommand() {
         let cli = Cli::try_parse_from(["orc", "--ui"]).unwrap();
@@ -1016,5 +1059,126 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["orc", "--ui", "status"]).unwrap();
         let error = run(cli).unwrap_err().to_string();
         assert!(error.contains("--ui cannot be used with a CLI command"));
+    }
+
+    #[test]
+    fn every_explicit_command_routes_one_shot_without_entering_interactive_mode() {
+        let cases: &[(&[&str], EntryRoute, Option<&str>)] = &[
+            (&["orc"], EntryRoute::Interactive, None),
+            (&["orc", "--ui"], EntryRoute::Desktop, None),
+            (&["orc", "init"], EntryRoute::OneShot, Some("Init")),
+            (&["orc", "adopt"], EntryRoute::OneShot, Some("Adopt")),
+            (
+                &["orc", "discovery-request"],
+                EntryRoute::OneShot,
+                Some("DiscoveryRequest"),
+            ),
+            (
+                &["orc", "apply-discovery", "discovery.json"],
+                EntryRoute::OneShot,
+                Some("ApplyDiscovery"),
+            ),
+            (&["orc", "agents"], EntryRoute::OneShot, Some("Agents")),
+            (&["orc", "doctor"], EntryRoute::OneShot, Some("Doctor")),
+            (&["orc", "status"], EntryRoute::OneShot, Some("Status")),
+            (&["orc", "report"], EntryRoute::OneShot, Some("Report")),
+            (
+                &["orc", "plan-request", "ship it"],
+                EntryRoute::OneShot,
+                Some("PlanRequest"),
+            ),
+            (
+                &["orc", "plan", "ship it"],
+                EntryRoute::OneShot,
+                Some("Plan"),
+            ),
+            (
+                &["orc", "apply-plan", "plan.json"],
+                EntryRoute::OneShot,
+                Some("ApplyPlan"),
+            ),
+            (&["orc", "queue"], EntryRoute::OneShot, Some("Queue")),
+            (
+                &["orc", "template", "list"],
+                EntryRoute::OneShot,
+                Some("Template"),
+            ),
+            (&["orc", "lead", "show"], EntryRoute::OneShot, Some("Lead")),
+            (&["orc", "ask", "help"], EntryRoute::OneShot, Some("Ask")),
+            (
+                &["orc", "apply-response", "response.json"],
+                EntryRoute::OneShot,
+                Some("ApplyResponse"),
+            ),
+            (
+                &["orc", "dispatch", "T-0001"],
+                EntryRoute::OneShot,
+                Some("Dispatch"),
+            ),
+            (
+                &["orc", "dispatch-queue"],
+                EntryRoute::OneShot,
+                Some("DispatchQueue"),
+            ),
+            (
+                &["orc", "review", "T-0001"],
+                EntryRoute::OneShot,
+                Some("Review"),
+            ),
+            (
+                &["orc", "project-review", "T-0001"],
+                EntryRoute::OneShot,
+                Some("ProjectReview"),
+            ),
+            (
+                &["orc", "revise", "T-0001", "address feedback"],
+                EntryRoute::OneShot,
+                Some("Revise"),
+            ),
+            (
+                &["orc", "schedule", "T-0001"],
+                EntryRoute::OneShot,
+                Some("Schedule"),
+            ),
+            (
+                &["orc", "agent", "list"],
+                EntryRoute::OneShot,
+                Some("Agent"),
+            ),
+            (&["orc", "task", "list"], EntryRoute::OneShot, Some("Task")),
+            (&["orc", "runs"], EntryRoute::OneShot, Some("Runs")),
+            (
+                &["orc", "approvals", "list"],
+                EntryRoute::OneShot,
+                Some("Approvals"),
+            ),
+            (
+                &["orc", "run", "fail", "1"],
+                EntryRoute::OneShot,
+                Some("Run"),
+            ),
+        ];
+
+        let covered_commands = cases
+            .iter()
+            .filter_map(|(_, _, command)| *command)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(covered_commands.len(), 27);
+
+        for &(arguments, expected_route, expected_command) in cases {
+            let cli = Cli::try_parse_from(arguments).unwrap_or_else(|error| {
+                panic!("failed to parse {arguments:?}: {error}");
+            });
+            assert_eq!(
+                entry_route(&cli).unwrap(),
+                expected_route,
+                "unexpected route for {arguments:?}"
+            );
+            assert_eq!(
+                cli.command.as_ref().map(command_variant),
+                expected_command,
+                "unexpected command variant for {arguments:?}"
+            );
+        }
     }
 }

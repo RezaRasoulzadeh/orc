@@ -9,6 +9,21 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Default)]
+pub struct CancellationControl(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancellationControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 use crate::backend;
 use crate::registry::ReasoningEffort;
 
@@ -46,7 +61,7 @@ pub fn configured_timeout(name: &str, default: Duration) -> Duration {
 }
 
 pub fn run_command_with_timeout(command: Command, timeout: Duration) -> Result<Output, String> {
-    run_command_with_timeout_progress(command, timeout, |_| {})
+    run_command_with_timeout_progress_and_cancel(command, timeout, None, |_| {})
 }
 
 pub fn run_command_with_timeout_progress(
@@ -54,13 +69,38 @@ pub fn run_command_with_timeout_progress(
     timeout: Duration,
     progress: impl Fn(&str),
 ) -> Result<Output, String> {
-    run_command_with_timeout_progress_and_stdin(command, timeout, None, progress)
+    run_command_with_timeout_progress_and_stdin_cancel(command, timeout, None, None, progress)
 }
 
 pub fn run_command_with_timeout_progress_and_stdin(
+    command: Command,
+    timeout: Duration,
+    stdin: Option<&[u8]>,
+    progress: impl Fn(&str),
+) -> Result<Output, String> {
+    run_command_with_timeout_progress_and_stdin_cancel(command, timeout, stdin, None, progress)
+}
+
+pub fn run_command_with_timeout_progress_and_cancel(
+    command: Command,
+    timeout: Duration,
+    cancellation: Option<&CancellationControl>,
+    progress: impl Fn(&str),
+) -> Result<Output, String> {
+    run_command_with_timeout_progress_and_stdin_cancel(
+        command,
+        timeout,
+        None,
+        cancellation,
+        progress,
+    )
+}
+
+pub fn run_command_with_timeout_progress_and_stdin_cancel(
     mut command: Command,
     timeout: Duration,
     stdin: Option<&[u8]>,
+    cancellation: Option<&CancellationControl>,
     progress: impl Fn(&str),
 ) -> Result<Output, String> {
     #[cfg(unix)]
@@ -125,6 +165,18 @@ pub fn run_command_with_timeout_progress_and_stdin(
     };
     let started = Instant::now();
     loop {
+        if cancellation.is_some_and(CancellationControl::is_cancelled) {
+            #[cfg(unix)]
+            unsafe {
+                kill(-(child.id() as i32), SIGTERM);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            return Err("execution cancelled at process boundary".into());
+        }
         while let Ok((stream, bytes)) = receiver.try_recv() {
             let done = bytes.is_empty();
             receive(stream, bytes);
@@ -296,6 +348,16 @@ pub trait Worker: Send + Sync {
         })
     }
 
+    fn execute_with_progress_and_usage_cancellable(
+        &self,
+        _prompt: &str,
+        _cwd: &Path,
+        _progress: &dyn Fn(&str),
+        _cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        Err("worker does not support cooperative cancellation".into())
+    }
+
     fn execute_structured_with_progress_and_usage(
         &self,
         prompt: &str,
@@ -321,9 +383,7 @@ impl Worker for CopilotWorker {
         cwd: &Path,
         progress: &dyn Fn(&str),
     ) -> Result<(WorkerOutcome, Option<String>), String> {
-        use std::process::Command;
-
-        let mut cmd = Command::new("copilot");
+        let mut cmd = std::process::Command::new("copilot");
         cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
         backend::configure_noninteractive(&mut cmd, cwd);
 
@@ -353,6 +413,39 @@ impl Worker for CopilotWorker {
                 e
             )),
         }
+    }
+
+    fn execute_with_progress_and_usage_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+        cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        let mut cmd = Command::new("copilot");
+        cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
+        backend::configure_noninteractive(&mut cmd, cwd);
+        let output = run_command_with_timeout_progress_and_cancel(
+            cmd,
+            configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            Some(cancellation),
+            progress,
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "Copilot exited with non-zero status: {}",
+                output
+                    .status
+                    .code()
+                    .map_or("unknown".into(), |code| code.to_string())
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: (!text.is_empty()).then_some(text),
+            token_usage: None,
+        })
     }
 }
 
@@ -461,6 +554,16 @@ impl Worker for CodexWorker {
         self.run(prompt, cwd, None, progress)
     }
 
+    fn execute_with_progress_and_usage_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+        cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        self.run_cancellable(prompt, cwd, None, progress, Some(cancellation))
+    }
+
     fn execute_structured_with_progress_and_usage(
         &self,
         prompt: &str,
@@ -505,10 +608,22 @@ impl CodexWorker {
         schema_path: Option<&Path>,
         progress: &dyn Fn(&str),
     ) -> Result<WorkerExecution, String> {
-        match run_command_with_timeout_progress_and_stdin(
+        self.run_cancellable(prompt, cwd, schema_path, progress, None)
+    }
+
+    fn run_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema_path: Option<&Path>,
+        progress: &dyn Fn(&str),
+        cancellation: Option<&CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        match run_command_with_timeout_progress_and_stdin_cancel(
             self.command_with_schema(prompt, cwd, schema_path),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
             Some(prompt.as_bytes()),
+            cancellation,
             progress,
         ) {
             Ok(output) if output.status.success() => {
@@ -696,6 +811,46 @@ impl Worker for AntigravityWorker {
                 "failed to spawn 'agy' executable; ensure it is installed and on PATH: {error}"
             )),
         }
+    }
+
+    fn execute_with_progress_and_usage_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        progress: &dyn Fn(&str),
+        cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        let mut command = std::process::Command::new("agy");
+        command.args(Self::command_args(prompt));
+        backend::configure_noninteractive(&mut command, cwd);
+        let output = run_command_with_timeout_progress_and_cancel(
+            command,
+            configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
+            Some(cancellation),
+            progress,
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "Antigravity exited with non-zero status: {}",
+                output
+                    .status
+                    .code()
+                    .map_or("unknown".into(), |code| code.to_string())
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = match (stdout.is_empty(), stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => stdout.into_owned(),
+            (true, false) => stderr.into_owned(),
+            (false, false) => format!("{stdout}\n{stderr}"),
+        };
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: (!text.is_empty()).then_some(text),
+            token_usage: None,
+        })
     }
 }
 

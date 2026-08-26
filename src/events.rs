@@ -72,4 +72,10 @@ impl EventSubscription {
     pub fn try_recv(&self) -> Result<AppEvent, mpsc::TryRecvError> {
         self.receiver.try_recv()
     }
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<AppEvent, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
 }

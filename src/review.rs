@@ -83,6 +83,7 @@ pub struct PriorReview {
     pub non_blocking_findings: Vec<String>,
     pub revision_feedback: Option<String>,
     pub validation_evidence: Option<String>,
+    pub blockers: Vec<crate::storage::db::ReviewBlockerRecord>,
 }
 
 pub fn build_review(
@@ -144,6 +145,10 @@ pub fn build_review(
                 non_blocking_findings: result.non_blocking_findings,
                 revision_feedback: result.revision_feedback,
                 validation_evidence: db.latest_validation_result_for_run(value.id).ok().flatten(),
+                blockers: db
+                    .review_blocker_observations(value.id)
+                    .ok()
+                    .unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
@@ -206,6 +211,7 @@ pub fn build_review_for_run(
         non_blocking_findings: review_result.non_blocking_findings,
         revision_feedback: review_result.revision_feedback,
         validation_evidence: validation_evidence.clone(),
+        blockers: db.review_blocker_observations(run.id)?,
     };
     Ok(ReviewSummary {
         task,
@@ -303,6 +309,12 @@ fn format_review_with_diff_text(summary: &ReviewSummary, diff: &str) -> String {
             for finding in findings {
                 out.push_str(&format!("{label}   {finding}\n"));
             }
+        }
+        for blocker in &review.blockers {
+            out.push_str(&format!(
+                "Blocker {} [{}] {}\n",
+                blocker.blocker_id, blocker.status, blocker.finding
+            ));
         }
         if let Some(feedback) = &review.revision_feedback {
             out.push_str(&format!("Revision   {feedback}\n"));

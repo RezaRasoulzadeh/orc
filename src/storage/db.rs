@@ -227,6 +227,22 @@ pub struct WorkerResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewBlockerRecord {
+    pub task_id: String,
+    pub blocker_id: String,
+    pub run_id: i64,
+    pub requirement_ref: String,
+    pub evidence: String,
+    pub severity: String,
+    pub acceptance_condition: String,
+    pub status: String,
+    pub finding: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub blocker_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleEvent {
     pub id: i64,
     pub timestamp: String,
@@ -684,6 +700,7 @@ impl Database {
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
+        Self::ensure_review_blockers_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
@@ -735,6 +752,7 @@ impl Database {
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_change_evidence_table(conn)?;
+        Self::ensure_review_blockers_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
@@ -1222,6 +1240,96 @@ impl Database {
 
     fn ensure_change_evidence_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS run_change_evidence (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, evidence TEXT NOT NULL, captured_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
+        Ok(())
+    }
+
+    fn ensure_review_blockers_table(conn: &Connection) -> Result<(), DbError> {
+        let old = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_blockers'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .is_some();
+        if old {
+            let pk = conn
+                .prepare("PRAGMA table_info(review_blockers)")?
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if pk.iter().filter(|(_, p)| *p > 0).count() == 2 {
+                conn.execute_batch(
+                    "ALTER TABLE review_blockers RENAME TO review_blocker_ledger_legacy",
+                )?;
+            }
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS review_blocker_ledger (task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, blocker_id TEXT NOT NULL, run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE, blocker_key TEXT NOT NULL DEFAULT '', requirement_ref TEXT NOT NULL, evidence TEXT NOT NULL, severity TEXT NOT NULL, acceptance_condition TEXT NOT NULL, status TEXT NOT NULL, finding TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), last_seen TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), PRIMARY KEY(task_id, blocker_id)); CREATE TABLE IF NOT EXISTS review_blocker_observations (task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, blocker_id TEXT NOT NULL, run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE, blocker_key TEXT NOT NULL DEFAULT '', requirement_ref TEXT NOT NULL, evidence TEXT NOT NULL, severity TEXT NOT NULL, acceptance_condition TEXT NOT NULL, status TEXT NOT NULL, finding TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), last_seen TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), PRIMARY KEY(run_id, blocker_id));")?;
+        if conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_blocker_ledger_legacy'", [], |_| Ok(true)).optional()?.is_some() {
+            conn.execute_batch("INSERT OR IGNORE INTO review_blocker_ledger SELECT task_id, blocker_id, run_id, '', requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen, updated_at FROM review_blocker_ledger_legacy; INSERT OR IGNORE INTO review_blocker_observations SELECT task_id, blocker_id, run_id, '', requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen FROM review_blocker_ledger_legacy;")?;
+        }
+        Ok(())
+    }
+
+    pub fn review_blocker_ledger(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ReviewBlockerRecord>, DbError> {
+        let mut stmt = self.conn.prepare("SELECT task_id, blocker_id, run_id, requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen, blocker_key FROM review_blocker_ledger WHERE task_id=?1 ORDER BY first_seen, blocker_id")?;
+        Ok(stmt
+            .query_map([task_id], |r| {
+                Ok(ReviewBlockerRecord {
+                    task_id: r.get(0)?,
+                    blocker_id: r.get(1)?,
+                    run_id: r.get(2)?,
+                    requirement_ref: r.get(3)?,
+                    evidence: r.get(4)?,
+                    severity: r.get(5)?,
+                    acceptance_condition: r.get(6)?,
+                    status: r.get(7)?,
+                    finding: r.get(8)?,
+                    first_seen: r.get(9)?,
+                    last_seen: r.get(10)?,
+                    blocker_key: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn review_blocker_observations(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<ReviewBlockerRecord>, DbError> {
+        let mut stmt = self.conn.prepare("SELECT task_id, blocker_id, run_id, requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen, blocker_key FROM review_blocker_observations WHERE run_id=?1 ORDER BY blocker_id")?;
+        Ok(stmt
+            .query_map([run_id], |r| {
+                Ok(ReviewBlockerRecord {
+                    task_id: r.get(0)?,
+                    blocker_id: r.get(1)?,
+                    run_id: r.get(2)?,
+                    requirement_ref: r.get(3)?,
+                    evidence: r.get(4)?,
+                    severity: r.get(5)?,
+                    acceptance_condition: r.get(6)?,
+                    status: r.get(7)?,
+                    finding: r.get(8)?,
+                    first_seen: r.get(9)?,
+                    last_seen: r.get(10)?,
+                    blocker_key: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn store_review_blockers(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        blockers: &[crate::automated::ReviewBlocker],
+    ) -> Result<(), DbError> {
+        for blocker in blockers {
+            self.conn.execute("INSERT OR IGNORE INTO review_blocker_observations (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
+            self.conn.execute("INSERT INTO review_blocker_ledger (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(task_id, blocker_id) DO UPDATE SET run_id=excluded.run_id, blocker_key=excluded.blocker_key, status=excluded.status, evidence=excluded.evidence, requirement_ref=excluded.requirement_ref, acceptance_condition=excluded.acceptance_condition, finding=excluded.finding, last_seen=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
+        }
         Ok(())
     }
 

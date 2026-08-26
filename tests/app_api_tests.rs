@@ -86,6 +86,7 @@ fn review_result(label: &str, verdict: &str) -> ReviewResult {
         blocking_findings: vec![format!("blocking-{label}")],
         non_blocking_findings: vec![format!("non-blocking-{label}")],
         revision_feedback: Some(format!("feedback-{label}")),
+        blockers: Vec::new(),
     }
 }
 
@@ -116,6 +117,7 @@ impl ActionBackend for CountingReviewBackend {
                 non_blocking_findings: Vec::new(),
                 severity: None,
                 revision_feedback: None,
+                blockers: Vec::new(),
             })?,
             token_usage: None,
         })

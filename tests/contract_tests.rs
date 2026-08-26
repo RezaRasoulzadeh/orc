@@ -15,6 +15,28 @@ fn contract_loading_succeeds() {
 }
 
 #[test]
+fn default_contract_covers_constitutional_requirements() {
+    let contract = orc::contract::DEFAULT_ENGINEERING_CONTRACT;
+    for requirement in [
+        "existing Orc application, orchestration, and shared core APIs",
+        "deterministic behavioral tests",
+        "provider-independent",
+        "foreign keys",
+        "transactions",
+        "Migrations must be incremental",
+        "unsafe `Send`/`Sync` ownership hacks",
+        "Linux, macOS, and Windows",
+        "exact revision",
+        "cargo clippy --all-targets -- -D warnings",
+    ] {
+        assert!(
+            contract.contains(requirement),
+            "missing requirement: {requirement}"
+        );
+    }
+}
+
+#[test]
 fn missing_contract_produces_error() {
     let dir = tempdir().unwrap();
     let contract_path = dir.path().join("nonexistent.md");

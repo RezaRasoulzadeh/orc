@@ -4,8 +4,6 @@ use std::process::Command;
 
 use crate::storage::Database;
 
-const ENGINEERING_TEMPLATE: &str =
-    "# Engineering Contract\n\nDefine the repository's engineering rules here.\n";
 const PROJECT_TEMPLATE: &str =
     "# Project\n\nThis document is populated by `orc apply-discovery`.\n";
 const ARCHITECTURE_TEMPLATE: &str =
@@ -71,7 +69,10 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
 }
 
 pub fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
-    ensure_contract_file(&orc_dir.join("engineering.md"), ENGINEERING_TEMPLATE)?;
+    ensure_contract_file(
+        &orc_dir.join("engineering.md"),
+        crate::contract::DEFAULT_ENGINEERING_CONTRACT,
+    )?;
     ensure_file(&orc_dir.join("project.md"), PROJECT_TEMPLATE)?;
     ensure_file(&orc_dir.join("architecture.md"), ARCHITECTURE_TEMPLATE)?;
     ensure_file(&orc_dir.join("roadmap.md"), ROADMAP_TEMPLATE)?;

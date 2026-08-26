@@ -139,73 +139,42 @@ impl QueueReport {
     pub fn format_concise(&self) -> String {
         let mut sections = Vec::new();
 
-        if !self.ready.is_empty() {
-            let mut s = String::from("READY\n");
-            for item in &self.ready {
-                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
+        let categories = [
+            ("CANCELLED", &self.cancelled),
+            ("DONE", &self.done),
+            ("BACKLOG", &self.backlog),
+            ("REVIEW", &self.review),
+            ("ACTIVE", &self.active),
+            ("BLOCKED", &self.blocked),
+            ("READY", &self.ready),
+        ];
+        for (name, items) in categories {
+            if items.is_empty() {
+                continue;
             }
-            sections.push(s);
-        }
-
-        if !self.blocked.is_empty() {
-            let mut s = String::from("BLOCKED\n");
-            for item in &self.blocked {
-                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
-                if !item.waiting_on.is_empty() {
-                    s.push_str(&format!(
-                        "        waiting on: {}\n",
-                        item.waiting_on.join(", ")
-                    ));
-                } else if !item.blocking_reasons.is_empty() {
-                    let reasons = item
-                        .blocking_reasons
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    s.push_str(&format!("        blocked: {reasons}\n"));
+            let mut s = format!("{name}\n");
+            for item in items {
+                let target = match name {
+                    "ACTIVE" | "REVIEW" => item.active_agent.as_deref().unwrap_or(&item.task.title),
+                    _ => &item.task.title,
+                };
+                s.push_str(&format!("{:<7} {}\n", item.task.id, target));
+                if name == "BLOCKED" {
+                    if !item.waiting_on.is_empty() {
+                        s.push_str(&format!(
+                            "        waiting on: {}\n",
+                            item.waiting_on.join(", ")
+                        ));
+                    } else if !item.blocking_reasons.is_empty() {
+                        let reasons = item
+                            .blocking_reasons
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        s.push_str(&format!("        blocked: {reasons}\n"));
+                    }
                 }
-            }
-            sections.push(s);
-        }
-
-        if !self.active.is_empty() {
-            let mut s = String::from("ACTIVE\n");
-            for item in &self.active {
-                let target = item.active_agent.as_deref().unwrap_or(&item.task.title);
-                s.push_str(&format!("{:<7} {}\n", item.task.id, target));
-            }
-            sections.push(s);
-        }
-
-        if !self.review.is_empty() {
-            let mut s = String::from("REVIEW\n");
-            for item in &self.review {
-                let target = item.active_agent.as_deref().unwrap_or(&item.task.title);
-                s.push_str(&format!("{:<7} {}\n", item.task.id, target));
-            }
-            sections.push(s);
-        }
-
-        if !self.backlog.is_empty() {
-            let mut s = String::from("BACKLOG\n");
-            for item in &self.backlog {
-                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
-            }
-            sections.push(s);
-        }
-
-        if !self.done.is_empty() {
-            let mut s = String::from("DONE\n");
-            for item in &self.done {
-                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
-            }
-            sections.push(s);
-        }
-        if !self.cancelled.is_empty() {
-            let mut s = String::from("CANCELLED\n");
-            for item in &self.cancelled {
-                s.push_str(&format!("{:<7} {}\n", item.task.id, item.task.title));
             }
             sections.push(s);
         }
@@ -220,13 +189,13 @@ impl QueueReport {
     pub fn format_explain(&self) -> String {
         let mut out = String::new();
         let categories = [
-            (QueueCategory::Ready, &self.ready),
-            (QueueCategory::Blocked, &self.blocked),
-            (QueueCategory::Active, &self.active),
-            (QueueCategory::Review, &self.review),
-            (QueueCategory::Backlog, &self.backlog),
-            (QueueCategory::Done, &self.done),
             (QueueCategory::Cancelled, &self.cancelled),
+            (QueueCategory::Done, &self.done),
+            (QueueCategory::Backlog, &self.backlog),
+            (QueueCategory::Review, &self.review),
+            (QueueCategory::Active, &self.active),
+            (QueueCategory::Blocked, &self.blocked),
+            (QueueCategory::Ready, &self.ready),
         ];
 
         let mut first_cat = true;

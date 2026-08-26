@@ -222,8 +222,8 @@ fn schema(action: AgentAction) -> String {
     let value = match action {
         AgentAction::Review => serde_json::json!({
             "type":"object","additionalProperties":false,
-            "properties":{"verdict":{"type":"string"},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]}},
-            "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback"]
+            "properties":{"verdict":{"type":"string"},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]},"blockers":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"prior_blocker_id":{"type":["string","null"]},"blocker_key":{"type":"string","minLength":1},"requirement_ref":{"type":"string"},"evidence":{"type":"string"},"severity":{"type":"string","enum":["low","medium","high","critical","unspecified"]},"acceptance_condition":{"type":"string"},"status":{"type":"string","enum":["new","unresolved","resolved","regression"]},"finding":{"type":"string"}},"required":["id","prior_blocker_id","blocker_key","requirement_ref","evidence","severity","acceptance_condition","status","finding"]}}},
+            "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback","blockers"]
         }),
         AgentAction::Plan => plan,
         AgentAction::Lead => serde_json::json!({
@@ -254,6 +254,139 @@ pub struct ReviewResult {
     pub severity: Option<String>,
     #[serde(default)]
     pub revision_feedback: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<ReviewBlocker>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewBlocker {
+    pub id: String,
+    #[serde(default)]
+    pub prior_blocker_id: Option<String>,
+    pub blocker_key: String,
+    pub requirement_ref: String,
+    pub evidence: String,
+    pub severity: String,
+    pub acceptance_condition: String,
+    pub status: String,
+    pub finding: String,
+}
+
+impl ReviewResult {
+    fn validate_structured_blockers(&self) -> Result<()> {
+        for blocker in &self.blockers {
+            if blocker.blocker_key.trim().is_empty() {
+                bail!("review blockers require a non-empty blocker_key")
+            }
+            if !matches!(
+                blocker.status.as_str(),
+                "new" | "unresolved" | "resolved" | "regression"
+            ) {
+                bail!("review blocker has invalid status '{}'", blocker.status)
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn blocker_id(finding: &str) -> String {
+    let normalized = finding
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut hash: u64 = 14695981039346656037;
+    for byte in normalized.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+    }
+    format!("BLK-{hash:016x}")
+}
+
+pub fn structured_blocker_id(
+    requirement_ref: &str,
+    acceptance_condition: &str,
+    finding: &str,
+) -> String {
+    let key = [requirement_ref, acceptance_condition]
+        .iter()
+        .map(|s| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
+    if key.is_empty() {
+        blocker_id(finding)
+    } else {
+        blocker_id(&key)
+    }
+}
+
+fn normalize_blockers(result: &mut ReviewResult) {
+    if result.blockers.is_empty() {
+        result.blockers = result
+            .blocking_findings
+            .iter()
+            .map(|finding| ReviewBlocker {
+                id: structured_blocker_id(
+                    "",
+                    &result.revision_feedback.clone().unwrap_or_default(),
+                    finding,
+                ),
+                prior_blocker_id: None,
+                blocker_key: structured_blocker_key(
+                    "",
+                    &result.revision_feedback.clone().unwrap_or_default(),
+                    finding,
+                ),
+                requirement_ref: String::new(),
+                evidence: finding.clone(),
+                severity: result
+                    .severity
+                    .clone()
+                    .unwrap_or_else(|| "unspecified".into()),
+                acceptance_condition: result.revision_feedback.clone().unwrap_or_else(|| {
+                    "Address the finding and provide evidence it is resolved.".into()
+                }),
+                status: "new".into(),
+                finding: finding.clone(),
+            })
+            .collect();
+    }
+    result.blocking_findings = result
+        .blockers
+        .iter()
+        .filter(|b| b.status != "resolved")
+        .map(|b| b.finding.clone())
+        .collect();
+}
+
+fn structured_blocker_key(
+    requirement_ref: &str,
+    acceptance_condition: &str,
+    finding: &str,
+) -> String {
+    let key = [requirement_ref, acceptance_condition, finding]
+        .iter()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
+    if key.is_empty() {
+        "legacy-blocker".into()
+    } else {
+        key
+    }
 }
 
 fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
@@ -263,11 +396,35 @@ fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
     for review in reviews {
-        if review.verdict.eq_ignore_ascii_case("pass") {
-            resolved.append(&mut unresolved);
-        } else {
-            unresolved.extend(review.blocking_findings.iter().cloned());
+        for blocker in &review.blockers {
+            let entry = format!(
+                "{} | key={} | requirement={} | acceptance={} | status={}",
+                blocker.blocker_id,
+                blocker.blocker_key,
+                blocker.requirement_ref,
+                blocker.acceptance_condition,
+                blocker.status
+            );
+            if blocker.status == "resolved" {
+                resolved.push(entry);
+            } else {
+                unresolved.push(entry);
+            }
         }
+    }
+    // Compatibility for historical review rows created before the structured ledger existed.
+    if resolved.is_empty() && unresolved.is_empty() {
+        let mut legacy_unresolved = Vec::new();
+        let mut legacy_resolved = Vec::new();
+        for review in reviews {
+            if review.verdict.eq_ignore_ascii_case("pass") {
+                legacy_resolved.append(&mut legacy_unresolved);
+                continue;
+            }
+            legacy_unresolved.extend(review.blocking_findings.iter().cloned());
+        }
+        resolved = legacy_resolved;
+        unresolved = legacy_unresolved;
     }
     let mut ledger = String::new();
     if !resolved.is_empty() {
@@ -424,7 +581,7 @@ fn run_review_mode(
         review_resolution_ledger(&summary.prior_reviews)
     };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null}}. Do not accept or merge the task.\nResolution ledger:\n{history}\nReview packet:\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Do not accept or merge the task.\nCurrent blocker ledger (IDs are authoritative):\n{history}\nReview packet:\n{}",
         serde_json::to_string(summary)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -462,6 +619,55 @@ fn run_review_mode(
                     if result.verdict.eq_ignore_ascii_case("pass") {
                         result.blocking_findings.clear();
                     }
+                    normalize_blockers(&mut result);
+                    result.validate_structured_blockers()?;
+                    let prior = db.review_blocker_ledger(&summary.task.id)?;
+                    let mut referenced = std::collections::HashSet::new();
+                    for blocker in &mut result.blockers {
+                        if let Some(prior_id) = blocker.prior_blocker_id.as_deref() {
+                            let old = prior.iter().find(|old| old.blocker_id == prior_id)
+                                .ok_or_else(|| anyhow::anyhow!("prior_blocker_id '{prior_id}' does not belong to task '{}'", summary.task.id))?;
+                            if !referenced.insert(prior_id.to_owned()) {
+                                bail!("prior_blocker_id '{prior_id}' is referenced by duplicate findings")
+                            }
+                            blocker.id = old.blocker_id.clone();
+                            blocker.status = if old.status == "resolved" {
+                                "regression"
+                            } else {
+                                "unresolved"
+                            }
+                            .into();
+                        } else {
+                            blocker.id = if blocker.blocker_key.trim().is_empty() {
+                                structured_blocker_id(
+                                    &blocker.requirement_ref,
+                                    &blocker.acceptance_condition,
+                                    &blocker.finding,
+                                )
+                            } else {
+                                blocker_id(&blocker.blocker_key)
+                            };
+                            blocker.status = "new".into();
+                        }
+                    }
+                    if result.verdict.eq_ignore_ascii_case("pass") {
+                        let resolved =
+                            prior
+                                .iter()
+                                .filter(|old| old.status != "resolved")
+                                .map(|old| ReviewBlocker {
+                                    id: old.blocker_id.clone(),
+                                    prior_blocker_id: Some(old.blocker_id.clone()),
+                                    blocker_key: old.blocker_key.clone(),
+                                    requirement_ref: old.requirement_ref.clone(),
+                                    evidence: "No blocking finding in the current review.".into(),
+                                    severity: old.severity.clone(),
+                                    acceptance_condition: old.acceptance_condition.clone(),
+                                    status: "resolved".into(),
+                                    finding: old.finding.clone(),
+                                });
+                        result.blockers.extend(resolved);
+                    }
                     Ok(result)
                 },
             );
@@ -473,6 +679,9 @@ fn run_review_mode(
                         Some(&execution.output),
                         execution.token_usage,
                     )?;
+                    if !project_review {
+                        db.store_review_blockers(&summary.task.id, run, &result.blockers)?;
+                    }
                     Ok((run, result))
                 }
                 Err(error) => {
@@ -628,6 +837,15 @@ mod tests {
     use crate::registry::{AUTOMATED, AVAILABLE};
     use crate::task::TaskPriority;
     use tempfile::tempdir;
+
+    #[test]
+    fn blocker_ids_are_stable_across_whitespace_and_case_rephrasing() {
+        assert_eq!(
+            blocker_id("Missing   validation evidence"),
+            blocker_id("missing validation evidence")
+        );
+        assert!(blocker_id("missing validation evidence").starts_with("BLK-"));
+    }
 
     type Invocation = (AgentAction, Option<String>, Option<ReasoningEffort>);
 
@@ -853,6 +1071,7 @@ mod tests {
                 severity: None,
                 findings: vec![],
                 validation_evidence: None,
+                blockers: Vec::new(),
                 verdict: "REVISE".into(),
                 blocking_findings: vec!["validation is incomplete".into()],
                 non_blocking_findings: Vec::new(),
@@ -869,6 +1088,7 @@ mod tests {
                 severity: None,
                 findings: vec![],
                 validation_evidence: None,
+                blockers: Vec::new(),
                 verdict: "PASS".into(),
                 blocking_findings: Vec::new(),
                 non_blocking_findings: Vec::new(),

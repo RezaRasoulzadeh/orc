@@ -227,6 +227,7 @@ impl ActionBackend for ReviewBackend {
                 non_blocking_findings: Vec::new(),
                 severity: None,
                 revision_feedback: None,
+                blockers: Vec::new(),
             })?,
             token_usage: Some(TokenUsage {
                 input_tokens: Some(1),

@@ -86,7 +86,7 @@ const manualValue = ref('')
 const selectedAgentDefinition = computed(() => agentList.value.find(agent => agent.id === selectedAgent.value) ?? null)
 const selectedManualRun = computed(() => manualRuns.value.find(item => item.run.id === selectedManualRunId.value) ?? null)
 const queue = computed(() => snapshot.value?.dashboard.queue)
-const queueCategories = ['cancelled', 'done', 'ready', 'blocked', 'backlog', 'review', 'active'] as const satisfies ReadonlyArray<keyof QueueReport>
+const queueCategories = ['cancelled', 'done', 'blocked', 'backlog', 'ready', 'review', 'active'] as const satisfies ReadonlyArray<keyof QueueReport>
 const filteredTasks = computed<QueueEntry[]>(() => {
   if (!queue.value) return []
   if (taskFilter.value === 'all') return queueCategories.flatMap(category => queue.value?.[category] ?? [])

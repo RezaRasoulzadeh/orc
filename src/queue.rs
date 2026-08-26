@@ -124,9 +124,9 @@ impl QueueReport {
         let mut items = Vec::new();
         items.extend(&self.cancelled);
         items.extend(&self.done);
-        items.extend(&self.ready);
         items.extend(&self.blocked);
         items.extend(&self.backlog);
+        items.extend(&self.ready);
         items.extend(&self.review);
         items.extend(&self.active);
         items
@@ -142,9 +142,9 @@ impl QueueReport {
         let categories = [
             ("CANCELLED", &self.cancelled),
             ("DONE", &self.done),
-            ("READY", &self.ready),
             ("BLOCKED", &self.blocked),
             ("BACKLOG", &self.backlog),
+            ("READY", &self.ready),
             ("REVIEW", &self.review),
             ("ACTIVE", &self.active),
         ];
@@ -191,9 +191,9 @@ impl QueueReport {
         let categories = [
             (QueueCategory::Cancelled, &self.cancelled),
             (QueueCategory::Done, &self.done),
-            (QueueCategory::Ready, &self.ready),
             (QueueCategory::Blocked, &self.blocked),
             (QueueCategory::Backlog, &self.backlog),
+            (QueueCategory::Ready, &self.ready),
             (QueueCategory::Review, &self.review),
             (QueueCategory::Active, &self.active),
         ];

@@ -836,6 +836,46 @@ fn queue_concise_and_explain_formatting() {
 }
 
 #[test]
+fn queue_display_sections_are_reversed_without_reordering_items() {
+    let report = orc::queue::QueueReport {
+        ready: vec![dispatch_entry("ready-1"), dispatch_entry("ready-2")],
+        blocked: vec![dispatch_entry("blocked")],
+        active: vec![dispatch_entry("active")],
+        review: vec![dispatch_entry("review")],
+        backlog: vec![dispatch_entry("backlog")],
+        done: vec![dispatch_entry("done")],
+        cancelled: vec![dispatch_entry("cancelled")],
+    };
+
+    let concise = report.format_concise();
+    let concise_sections = [
+        "CANCELLED",
+        "DONE",
+        "BACKLOG",
+        "REVIEW",
+        "ACTIVE",
+        "BLOCKED",
+        "READY",
+    ]
+    .map(|section| concise.find(section).unwrap());
+    assert!(concise_sections.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(concise.find("ready-1").unwrap() < concise.find("ready-2").unwrap());
+
+    let explain = report.format_explain();
+    let explain_sections = [
+        "CANCELLED",
+        "DONE",
+        "BACKLOG",
+        "REVIEW",
+        "ACTIVE",
+        "BLOCKED",
+        "READY",
+    ]
+    .map(|section| explain.find(&format!("=== {section} ===")).unwrap());
+    assert!(explain_sections.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
 fn queue_explain_shows_recommended_execution_template() {
     let _guard = ENV_LOCK.lock().unwrap();
     let old = std::env::var_os("ORC_CODER_MODEL");

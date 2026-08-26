@@ -247,6 +247,26 @@ pub fn dispatch_with_worker_on_db(
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
 ) -> Result<DispatchSummary> {
+    dispatch_with_worker_on_db_cancellable(
+        task_id,
+        worker,
+        db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        None,
+    )
+}
+
+pub fn dispatch_with_worker_on_db_cancellable(
+    task_id: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    cancellation: Option<&crate::worker::CancellationControl>,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
@@ -328,9 +348,17 @@ pub fn dispatch_with_worker_on_db(
     let worktree_dir = repo_path.join(&worktree_path);
     progress("worker spawned");
     progress("worker running");
-    match worker.execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| {
-        worker_output(line);
-    }) {
+    let execution = match cancellation {
+        Some(cancellation) => worker.execute_with_progress_and_usage_cancellable(
+            &prompt,
+            &worktree_dir,
+            &|line| worker_output(line),
+            cancellation,
+        ),
+        None => worker
+            .execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| worker_output(line)),
+    };
+    match execution {
         Ok(execution) => {
             let outcome = execution.outcome;
             let mut output = execution.output;
@@ -580,6 +608,15 @@ pub fn dispatch_with_worker_on_db(
             }
         }
         Err(spawn_error) => {
+            if cancellation.is_some_and(crate::worker::CancellationControl::is_cancelled) {
+                db.update_agent_run_status(
+                    run_id,
+                    "cancelled",
+                    Some("execution cancelled at a safe boundary"),
+                )?;
+                db.update_task_status(task_id, TaskStatus::Cancelled)?;
+                anyhow::bail!("execution cancelled at a safe boundary");
+            }
             // Spawn failed, mark run as failed and task as blocked
             db.update_agent_run_status(run_id, "failed", Some(&spawn_error))
                 .with_context(|| "failed to update agent run status after spawn failure")?;
@@ -864,6 +901,26 @@ pub fn dispatch_selected_with_db_and_repo(
     model_override: Option<String>,
     effort_override: Option<crate::registry::ReasoningEffort>,
 ) -> Result<DispatchSummary> {
+    dispatch_selected_with_db_and_repo_cancellable(
+        db,
+        repo_path,
+        task_id,
+        requested_agent,
+        model_override,
+        effort_override,
+        None,
+    )
+}
+
+pub fn dispatch_selected_with_db_and_repo_cancellable(
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    task_id: &str,
+    requested_agent: Option<&str>,
+    model_override: Option<String>,
+    effort_override: Option<crate::registry::ReasoningEffort>,
+    cancellation: Option<&crate::worker::CancellationControl>,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let task = db
         .get_task(task_id)?
@@ -931,13 +988,14 @@ pub fn dispatch_selected_with_db_and_repo(
     let reasoning_effort = resolution.reasoning_effort;
     let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
         .map_err(anyhow::Error::msg)?;
-    let mut summary = dispatch_with_worker_on_db(
+    let mut summary = dispatch_with_worker_on_db_cancellable(
         task_id,
         worker.as_ref(),
         db,
         repo_path,
         &agent.id,
         &SystemValidationRunner,
+        cancellation,
     )?;
     db.set_agent_run_execution(
         summary.run_id,

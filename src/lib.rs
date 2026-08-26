@@ -20,6 +20,7 @@ pub mod queue;
 pub mod read_model;
 pub mod registry;
 pub mod review;
+pub mod runtime;
 pub mod scheduler;
 pub mod state;
 pub mod storage;

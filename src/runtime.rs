@@ -1,3 +1,11 @@
+//! Provider-independent request/event runtime for the interactive session.
+//!
+//! The terminal stack (`rustyline` plus `dialoguer`) belongs at the
+//! presentation edge.  This module deliberately exposes only requests,
+//! cancellation, and live events, allowing an external printer to refresh
+//! status without taking ownership of editable input or duplicating Orc
+//! application logic.
+
 use crate::app::OrcApp;
 use crate::events::AppEvent;
 use crate::queue::QueueReport;
@@ -93,8 +101,8 @@ struct Envelope {
 
 pub struct Runtime {
     requests: mpsc::Sender<Envelope>,
-    events: mpsc::Receiver<RuntimeEvent>,
-    next_id: u64,
+    events: std::sync::Mutex<mpsc::Receiver<RuntimeEvent>>,
+    next_id: std::sync::Mutex<u64>,
 }
 
 impl Runtime {
@@ -108,14 +116,15 @@ impl Runtime {
             .spawn(move || owner(incoming, outgoing, db_path, repo_path))?;
         Ok(Self {
             requests,
-            events,
-            next_id: 0,
+            events: std::sync::Mutex::new(events),
+            next_id: std::sync::Mutex::new(0),
         })
     }
 
-    pub fn submit(&mut self, request: RuntimeRequest) -> Result<(OperationId, Cancellation)> {
-        self.next_id += 1;
-        let id = OperationId(self.next_id);
+    pub fn submit(&self, request: RuntimeRequest) -> Result<(OperationId, Cancellation)> {
+        let mut next_id = self.next_id.lock().expect("runtime id lock");
+        *next_id += 1;
+        let id = OperationId(*next_id);
         let cancellation = Cancellation {
             control: crate::worker::CancellationControl::new(),
         };
@@ -130,10 +139,10 @@ impl Runtime {
     }
 
     pub fn recv(&self) -> Result<RuntimeEvent, mpsc::RecvError> {
-        self.events.recv()
+        self.events.lock().expect("runtime event lock").recv()
     }
     pub fn try_recv(&self) -> Result<RuntimeEvent, mpsc::TryRecvError> {
-        self.events.try_recv()
+        self.events.lock().expect("runtime event lock").try_recv()
     }
 
     pub fn cancel(&self, cancellation: &Cancellation) {
@@ -375,10 +384,10 @@ mod tests {
     fn operation_ids_are_unique_and_cancellation_is_shared() {
         let (sender, _receiver) = mpsc::channel();
         let (_outgoing, events) = mpsc::channel();
-        let mut runtime = Runtime {
+        let runtime = Runtime {
             requests: sender,
-            events,
-            next_id: 0,
+            events: std::sync::Mutex::new(events),
+            next_id: std::sync::Mutex::new(0),
         };
         let (first, cancellation) = runtime.submit(RuntimeRequest::Tasks).unwrap();
         let (second, _) = runtime.submit(RuntimeRequest::Queue).unwrap();
@@ -403,7 +412,7 @@ mod tests {
 
     #[test]
     fn requests_and_results_keep_their_operation_ids() {
-        let (_directory, mut runtime) = runtime();
+        let (_directory, runtime) = runtime();
         let (first, _) = runtime.submit(RuntimeRequest::Tasks).unwrap();
         let first_events = events_until(&runtime, first);
         let (second, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
@@ -428,7 +437,7 @@ mod tests {
 
     #[test]
     fn startup_context_supports_empty_and_active_projects() {
-        let (directory, mut runtime) = runtime();
+        let (directory, runtime) = runtime();
         let (empty_id, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         let empty = events_until(&runtime, empty_id);
         assert!(empty.iter().any(|event| matches!(event, RuntimeEvent::Context(id, context) if *id == empty_id && context.project.is_none())));
@@ -442,7 +451,7 @@ mod tests {
 
     #[test]
     fn application_errors_are_structured_and_session_can_continue() {
-        let (_directory, mut runtime) = runtime();
+        let (_directory, runtime) = runtime();
         let (bad_id, _) = runtime
             .submit(RuntimeRequest::DispatchCandidates("missing".into()))
             .unwrap();
@@ -458,7 +467,7 @@ mod tests {
 
     #[test]
     fn unsupported_cancellation_is_an_error_not_a_false_cancelled_event() {
-        let (_directory, mut runtime) = runtime();
+        let (_directory, runtime) = runtime();
         let (id, cancellation) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         cancellation.request();
         let events = events_until(&runtime, id);
@@ -477,10 +486,10 @@ mod tests {
         let (requests, incoming) = mpsc::channel();
         drop(incoming);
         let (_events_sender, events) = mpsc::channel();
-        let mut runtime = Runtime {
+        let runtime = Runtime {
             requests,
-            events,
-            next_id: 0,
+            events: std::sync::Mutex::new(events),
+            next_id: std::sync::Mutex::new(0),
         };
 
         let error = match runtime.submit(RuntimeRequest::Tasks) {

@@ -798,20 +798,6 @@ pub fn revise_with_worker_on_db(
         progress("worker failed");
         return fail(format!("Worker failed: {error}"));
     }
-    let handoff = match crate::automated::validate_revision_handoff(
-        &revision_contract,
-        output.as_deref().unwrap_or_default(),
-    ) {
-        Ok(value) => value,
-        Err(error) => return fail(format!("Invalid revision handoff: {error:#}")),
-    };
-    db.record_lifecycle_event(
-        "revision_handoff",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&serde_json::to_string(&handoff)?),
-    )?;
     progress("worker completed");
     let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(changes) => changes,
@@ -844,6 +830,22 @@ pub fn revise_with_worker_on_db(
         Some(run_id),
         Some(agent_id),
         Some(&validation_evidence),
+    )?;
+    let handoff = match crate::automated::validate_revision_handoff_with_evidence(
+        &revision_contract,
+        output.as_deref().unwrap_or_default(),
+        Some(&changes),
+        Some(&validation_evidence),
+    ) {
+        Ok(value) => value,
+        Err(error) => return fail(format!("Invalid revision handoff: {error:#}")),
+    };
+    db.record_lifecycle_event(
+        "revision_handoff",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&serde_json::to_string(&handoff)?),
     )?;
     let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
     if !report.is_success() {
@@ -1270,8 +1272,15 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
             &reviews,
             source_review_id,
         )?;
-        let handoff = crate::automated::validate_revision_handoff(&contract, output)
-            .context("invalid revision handoff")?;
+        let changes = db.get_change_evidence(run_id)?;
+        let validation = db.latest_validation_result_for_run(run_id)?;
+        let handoff = crate::automated::validate_revision_handoff_with_evidence(
+            &contract,
+            output,
+            changes.as_ref(),
+            validation.as_deref(),
+        )
+        .context("invalid revision handoff")?;
         db.record_lifecycle_event(
             "revision_handoff",
             Some(&task_id),

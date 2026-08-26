@@ -302,6 +302,18 @@ pub fn validate_revision_handoff(
     contract: &RevisionContract,
     output: &str,
 ) -> Result<RevisionHandoff> {
+    validate_revision_handoff_with_evidence(contract, output, None, None)
+}
+
+/// Validate a revision handoff against evidence captured for this revision.
+/// The optional arguments retain compatibility for callers which only need the
+/// legacy empty-contract behavior; active blocker claims require both records.
+pub fn validate_revision_handoff_with_evidence(
+    contract: &RevisionContract,
+    output: &str,
+    changes: Option<&crate::git::WorktreeChanges>,
+    validation_payload: Option<&str>,
+) -> Result<RevisionHandoff> {
     let active_count = contract.unresolved.len() + contract.regressions.len();
     // Preserve the legacy one-shot revision path when the authoritative ledger
     // contains no active blocker work. There is no claim to validate in that case.
@@ -324,11 +336,99 @@ pub fn validate_revision_handoff(
                 claim.blocker_id
             );
         }
-        if claim.implementation_summary.trim().is_empty()
-            || claim.validation_evidence.trim().is_empty()
-        {
+        let blocker = contract
+            .unresolved
+            .iter()
+            .chain(contract.regressions.iter())
+            .find(|b| b.blocker_id == claim.blocker_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown blocker ID '{}'", claim.blocker_id))?;
+        if claim.implementation_summary.trim().is_empty() {
             bail!(
                 "revision handoff claim '{}' is missing implementation or validation evidence",
+                claim.blocker_id
+            );
+        }
+        if claim.validation_evidence.trim().is_empty() {
+            bail!(
+                "revision handoff claim '{}' is missing implementation or validation evidence",
+                claim.blocker_id
+            );
+        }
+        if claim.status == "addressed" && claim.changed_files.is_empty() {
+            bail!(
+                "revision handoff claim '{}' is vacuous: addressed blockers require changed files",
+                claim.blocker_id
+            );
+        }
+        if claim
+            .changed_files
+            .iter()
+            .any(|path| path.trim().is_empty() || path.trim() == "[]")
+        {
+            bail!(
+                "revision handoff claim '{}' contains placeholder changed files",
+                claim.blocker_id
+            );
+        }
+        if is_vacuous_text(&claim.validation_evidence) {
+            bail!(
+                "revision handoff claim '{}' contains placeholder validation evidence",
+                claim.blocker_id
+            );
+        }
+        let changes = changes.context("active revision claims require current change evidence")?;
+        let actual_paths: std::collections::BTreeSet<&str> = changes
+            .files
+            .iter()
+            .flat_map(|file| {
+                if file.status.starts_with('R') || file.status.starts_with('C') {
+                    file.path
+                        .split_once(" -> ")
+                        .into_iter()
+                        .flat_map(|(a, b)| [a, b])
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![file.path.as_str()]
+                }
+            })
+            .collect();
+        if claim
+            .changed_files
+            .iter()
+            .any(|path| !actual_paths.contains(path.as_str()))
+        {
+            bail!(
+                "revision handoff claim '{}' contains a file not changed in this revision",
+                claim.blocker_id
+            );
+        }
+        let validation = validation_payload
+            .context("active revision claims require current validation evidence")?;
+        let report: crate::validation::ValidationReport = serde_json::from_str(validation)
+            .context("current revision validation evidence is not structured")?;
+        if !report.is_success() {
+            bail!(
+                "revision handoff claim '{}' is supported by failed validation",
+                claim.blocker_id
+            );
+        }
+        if !claim.changed_files.iter().any(|path| {
+            claim.implementation_summary.contains(path) || claim.validation_evidence.contains(path)
+        }) && !claim
+            .implementation_summary
+            .to_ascii_lowercase()
+            .contains(&blocker.acceptance_condition.to_ascii_lowercase())
+        {
+            bail!(
+                "revision handoff claim '{}' is not tied to its changed files or acceptance condition",
+                claim.blocker_id
+            );
+        }
+        if !claim.validation_evidence.contains("command")
+            || !claim.validation_evidence.contains("passed")
+        {
+            bail!(
+                "revision handoff claim '{}' lacks concrete validation evidence",
                 claim.blocker_id
             );
         }
@@ -349,6 +449,27 @@ pub fn validate_revision_handoff(
         bail!("revision handoff is missing one or more active blocker claims");
     }
     Ok(handoff)
+}
+
+fn is_vacuous_text(value: &str) -> bool {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.is_empty()
+        || [
+            "done",
+            "fixed",
+            "implemented",
+            "tests pass",
+            "n/a",
+            "none",
+            "todo",
+            "tbd",
+            "not tested",
+        ]
+        .contains(&normalized.as_str())
 }
 
 pub fn build_revision_contract_from_db(
@@ -683,7 +804,7 @@ fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
     ledger
 }
 
-const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, persisted structured validation evidence, and review history; worker narrative is not validation evidence. On a revision, evaluate prior blockers first using the resolution ledger: a blocker from a prior review whose later review classified it resolved, or whose later PASS had no blocking findings, is RESOLVED and must not be reported as blocking again. Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression, and explain that evidence. Clearly distinguish RESOLVED from UNRESOLVED prior blockers in your findings. Do not restate equivalent findings. A blocker must identify an explicit requirement, concrete current evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. If required commands are outside the persisted project validation pipeline, report that accurately rather than requesting fabricated evidence. Keep blocking findings to at most 5. Code quality, polish, preferences, extra tests, and unrelated defects are non-blocking. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation.";
+const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, persisted structured validation evidence, and review history; worker narrative is not validation evidence. On a revision, verify every unresolved blocker against the current implementation and fresh evidence before considering a broad review. Check each resolved blocker for regression; Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression, and explain that evidence. Clearly distinguish RESOLVED from UNRESOLVED prior blockers in your findings. Do not restate equivalent findings. Reject vacuous or placeholder tests, assertions, changed-file lists, and validation claims: a test must exercise the production behavior and an assertion must observe its outcome, not merely name a requirement or duplicate a constant. A blocker must identify an explicit requirement, concrete current evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. If required commands are outside the persisted project validation pipeline, report that accurately rather than requesting fabricated evidence. Keep blocking findings to at most 5. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation. Escalate to a full review only after blocker verification passes, or when the architecture changed materially.";
 
 fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> Result<i64> {
     let project_id = db.get_project_id()?.context("no project found in DB")?;
@@ -1080,6 +1201,51 @@ mod tests {
             blocker_id("missing validation evidence")
         );
         assert!(blocker_id("missing validation evidence").starts_with("BLK-"));
+    }
+
+    fn handoff_contract() -> RevisionContract {
+        RevisionContract {
+            unresolved: vec![crate::storage::db::ReviewBlockerRecord {
+                task_id: "T-1".into(),
+                blocker_id: "BLK-1".into(),
+                run_id: 1,
+                requirement_ref: "R1".into(),
+                evidence: "missing behavior".into(),
+                severity: "high".into(),
+                acceptance_condition: "behavior works".into(),
+                status: "unresolved".into(),
+                finding: "missing behavior".into(),
+                first_seen: String::new(),
+                last_seen: String::new(),
+                blocker_key: "missing behavior".into(),
+            }],
+            regressions: Vec::new(),
+            regression_constraints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn addressed_handoff_rejects_vacuous_claim_without_changed_files() {
+        let output = serde_json::json!({"claims": [{
+            "blocker_id": "BLK-1", "status": "addressed",
+            "implementation_summary": "fixed it", "changed_files": [],
+            "validation_evidence": "cargo test passed", "unresolved_risk": null
+        }]})
+        .to_string();
+        let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
+        assert!(error.to_string().contains("changed files"));
+    }
+
+    #[test]
+    fn handoff_rejects_placeholder_validation_evidence() {
+        let output = serde_json::json!({"claims": [{
+            "blocker_id": "BLK-1", "status": "addressed",
+            "implementation_summary": "fixed it", "changed_files": ["src/lib.rs"],
+            "validation_evidence": "not tested", "unresolved_risk": null
+        }]})
+        .to_string();
+        let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
+        assert!(error.to_string().contains("placeholder validation"));
     }
 
     type Invocation = (AgentAction, Option<String>, Option<ReasoningEffort>);

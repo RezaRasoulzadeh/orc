@@ -1,6 +1,6 @@
 //! Interactive session: rustyline owns terminal mechanics and dialoguer owns
 //! confirmations/selections; Orc owns parsing and Runtime orchestration.
-use crate::runtime::{Runtime, RuntimeEvent, RuntimeRequest, RuntimeValue, render_event};
+use crate::runtime::{Runtime, RuntimeEvent, RuntimeRequest, RuntimeValue};
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Select};
 use rustyline::error::ReadlineError;
@@ -10,6 +10,138 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Provider-independent instructions for an interactive presentation.
+/// These values contain no terminal or dialoguer details and can therefore be
+/// rendered by a terminal, desktop, or test presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presentation {
+    Message(String),
+    Status(String),
+    Progress {
+        label: String,
+        current: Option<u64>,
+        total: Option<u64>,
+    },
+    Activity(String),
+    Success(String),
+    Warning(String),
+    Error {
+        message: String,
+        details: Option<String>,
+    },
+    Confirmation {
+        prompt: String,
+        default: bool,
+    },
+    SingleChoice {
+        prompt: String,
+        options: Vec<String>,
+    },
+    MultiChoice {
+        prompt: String,
+        options: Vec<String>,
+    },
+    PendingDecision {
+        id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
+    Summary {
+        subject: String,
+        lines: Vec<String>,
+    },
+}
+
+pub fn render_presentation(presentation: &Presentation) -> String {
+    match presentation {
+        Presentation::Message(text) => format!("{text}\n"),
+        Presentation::Status(text) => format!("status: {text}\n"),
+        Presentation::Progress {
+            label,
+            current,
+            total,
+        } => match (current, total) {
+            (Some(current), Some(total)) => format!("progress: {label} ({current}/{total})\n"),
+            _ => format!("progress: {label}\n"),
+        },
+        Presentation::Activity(text) => format!("activity: {text}\n"),
+        Presentation::Success(text) => format!("success: {text}\n"),
+        Presentation::Warning(text) => format!("warning: {text}\n"),
+        Presentation::Error { message, details } => match details {
+            Some(details) => format!("error: {message}: {details}\n"),
+            None => format!("error: {message}\n"),
+        },
+        Presentation::Confirmation { prompt, .. } => format!("confirm: {prompt}\n"),
+        Presentation::SingleChoice { prompt, options }
+        | Presentation::MultiChoice { prompt, options }
+        | Presentation::PendingDecision {
+            prompt, options, ..
+        } => {
+            format!("{prompt} [{}]\n", options.join(", "))
+        }
+        Presentation::Summary { subject, lines } => {
+            if lines.is_empty() {
+                format!("{subject}\n")
+            } else {
+                format!("{subject}\n{}\n", lines.join("\n"))
+            }
+        }
+    }
+}
+
+/// Maps runtime facts to presentation instructions without changing runtime
+/// state or embedding terminal concerns in orchestration.
+pub fn presentation_for_event(event: &RuntimeEvent) -> Presentation {
+    match event {
+        RuntimeEvent::Context(_, context) => Presentation::Status(format!(
+            "project: {}",
+            context.project.as_deref().unwrap_or("none")
+        )),
+        RuntimeEvent::Started(id) => Presentation::Activity(format!("operation {} started", id.0)),
+        RuntimeEvent::Lifecycle(_, event) => Presentation::Progress {
+            label: match event {
+                crate::events::AppEvent::WorkerOutput(event) => {
+                    format!("worker: {}", event.payload.as_deref().unwrap_or("output"))
+                }
+                crate::events::AppEvent::RunPhaseChanged(event) => {
+                    format!("phase: {}", event.payload.as_deref().unwrap_or("changed"))
+                }
+                _ => "application state changed".into(),
+            },
+            current: None,
+            total: None,
+        },
+        RuntimeEvent::Completed(_, value) => Presentation::Success(runtime_value_text(value)),
+        RuntimeEvent::Failed(_, error) => Presentation::Error {
+            message: error.clone(),
+            details: None,
+        },
+        RuntimeEvent::Cancelled(_) => Presentation::Warning("operation cancelled".into()),
+    }
+}
+
+fn runtime_value_text(value: &RuntimeValue) -> String {
+    match value {
+        RuntimeValue::Status(v) => v.clone(),
+        RuntimeValue::Tasks(v) => format!("{} task(s)", v.len()),
+        RuntimeValue::Task(v) => {
+            if v.is_some() {
+                "task found".into()
+            } else {
+                "task not found".into()
+            }
+        }
+        RuntimeValue::Queue(v) => format!("{} queued task(s)", v.all_items().len()),
+        RuntimeValue::Runs(v) => format!("{} run(s)", v.len()),
+        RuntimeValue::Agents(v) => format!("{} agent(s)", v.len()),
+        RuntimeValue::AgentCandidates { agents, .. } => {
+            format!("{} eligible agent(s)", agents.len())
+        }
+        RuntimeValue::Dispatch(_) => "dispatch submitted".into(),
+        RuntimeValue::Cancelled(_) => "task cancellation applied".into(),
+    }
+}
 
 pub fn parse_arguments(line: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
@@ -195,7 +327,7 @@ fn run_session<
                 let _ = event_printer
                     .lock()
                     .expect("printer lock")
-                    .emit(render_event(&event));
+                    .emit(render_presentation(&presentation_for_event(&event)));
                 if done {
                     let _ = done_tx.send(event.clone());
                     let current_id = {
@@ -1027,5 +1159,43 @@ mod tests {
     #[test]
     fn run_session_quit_shuts_down_and_joins_event_pump() {
         assert_explicit_shutdown("quit");
+    }
+
+    #[test]
+    fn presentation_primitives_render_deterministically() {
+        assert_eq!(
+            render_presentation(&Presentation::Progress {
+                label: "validation".into(),
+                current: Some(2),
+                total: Some(3),
+            }),
+            "progress: validation (2/3)\n"
+        );
+        assert_eq!(
+            render_presentation(&Presentation::Error {
+                message: "decision failed".into(),
+                details: Some("missing reviewer".into()),
+            }),
+            "error: decision failed: missing reviewer\n"
+        );
+        assert_eq!(
+            render_presentation(&Presentation::Summary {
+                subject: "run summary".into(),
+                lines: vec!["status: completed".into()],
+            }),
+            "run summary\nstatus: completed\n"
+        );
+    }
+
+    #[test]
+    fn runtime_events_map_to_semantic_presentations() {
+        let event = RuntimeEvent::Failed(crate::runtime::OperationId(1), "bad input".into());
+        assert_eq!(
+            presentation_for_event(&event),
+            Presentation::Error {
+                message: "bad input".into(),
+                details: None
+            }
+        );
     }
 }

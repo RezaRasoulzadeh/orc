@@ -185,6 +185,29 @@ fn agent_add_defaults_to_code_and_final_action_cannot_be_removed() {
 
 struct ReviewBackend;
 
+#[test]
+fn init_creates_engineering_contract_when_missing() {
+    let directory = tempdir().unwrap();
+    let output = orc_command(directory.path(), &["init"]);
+    assert!(output.status.success());
+    let contract = directory.path().join(".orc/engineering.md");
+    assert!(contract.is_file());
+    assert!(!std::fs::read_to_string(contract).unwrap().is_empty());
+}
+
+#[test]
+fn init_preserves_existing_engineering_contract() {
+    let directory = tempdir().unwrap();
+    let contract = directory.path().join(".orc/engineering.md");
+    std::fs::create_dir_all(contract.parent().unwrap()).unwrap();
+    let custom = "# CUSTOM_INIT_CONTRACT\nKeep this exact content.\n";
+    std::fs::write(&contract, custom).unwrap();
+
+    let output = orc_command(directory.path(), &["init"]);
+    assert!(output.status.success());
+    assert_eq!(std::fs::read_to_string(contract).unwrap(), custom);
+}
+
 impl ActionBackend for ReviewBackend {
     fn invoke(
         &self,

@@ -22,7 +22,7 @@ Install Rust stable, Cargo, Git, Node.js, and the native Tauri prerequisites. Fr
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File scripts/install.ps1`. `orc --ui` launches the installed packaged desktop application and returns immediately. See the [desktop installation guide](docs/desktop.md) for system-wide Linux installation, upgrades, uninstall steps, and artifact validation.
 
-Run `orc init` in the repository Orc should manage, then `orc adopt` to record its Git identity and engineering contract. Automated Codex workers and the configured Lead additionally require an installed and authenticated `codex` CLI. Manual workers and provider-independent acceptance tests do not require a live AI provider.
+Run `orc init` to create local Orc state, then `orc adopt` to bring the existing Git repository under Orc management. The desktop Import action only remembers an already adopted project; it does not create project state. See [project lifecycle and ownership](docs/project-lifecycle.md) for the document, source-control, and runtime-state rules. Automated Codex workers and the configured Lead additionally require an installed and authenticated `codex` CLI. Manual workers and provider-independent acceptance tests do not require a live AI provider.
 
 ## Verified quick start
 

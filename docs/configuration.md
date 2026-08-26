@@ -1,6 +1,6 @@
 # Configuration
 
-Project files live under `.orc/`: `orc.db` is authoritative state; `engineering.md` is the worker contract; discovery may create `project.md`, `architecture.md`, and `roadmap.md`; `worktrees/` contains isolated task checkouts.
+Project lifecycle and ownership are defined in [Project lifecycle and ownership](project-lifecycle.md). In brief, committed project documents live under `.orc/`, while `orc.db` and its WAL files are authoritative but untracked Orc runtime state; `worktrees/` contains untracked isolated task checkouts. `.orc/engineering.md` is project-owned and is automatically loaded by coder execution.
 
 Validation loads the first usable configuration in this order: `.orc/validation.toml`, `.orc/validation.json`, commands extracted from `.orc/engineering.md`, then the defaults `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 

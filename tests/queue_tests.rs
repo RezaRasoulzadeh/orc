@@ -898,13 +898,31 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
         cancelled: vec![dispatch_entry("cancelled")],
     };
 
+    assert_eq!(
+        report
+            .all_items()
+            .into_iter()
+            .map(|entry| entry.task.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "cancelled",
+            "done",
+            "blocked",
+            "backlog",
+            "ready-1",
+            "ready-2",
+            "review",
+            "active"
+        ]
+    );
+
     let concise = report.format_concise();
     let concise_sections = [
         "CANCELLED",
         "DONE",
-        "READY",
         "BLOCKED",
         "BACKLOG",
+        "READY",
         "REVIEW",
         "ACTIVE",
     ]
@@ -916,9 +934,9 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
     let explain_sections = [
         "CANCELLED",
         "DONE",
-        "READY",
         "BLOCKED",
         "BACKLOG",
+        "READY",
         "REVIEW",
         "ACTIVE",
     ]

@@ -64,14 +64,25 @@ pub struct ReviewSummary {
     pub change_evidence: Option<WorktreeChanges>,
     pub validation_evidence: Option<String>,
     pub prior_reviews: Vec<PriorReview>,
+    pub automated_reviews: Vec<PriorReview>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PriorReview {
+    pub run_id: i64,
+    pub agent: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<crate::registry::ReasoningEffort>,
     pub verdict: String,
+    pub severity: Option<String>,
+    pub findings: Vec<String>,
     pub blocking_findings: Vec<String>,
     pub non_blocking_findings: Vec<String>,
     pub revision_feedback: Option<String>,
+    pub validation_evidence: Option<String>,
 }
 
 pub fn build_review(
@@ -112,11 +123,30 @@ pub fn build_review(
         .filter(|value| value.execution_class == "review")
         .collect::<Vec<_>>();
     review_runs.sort_by_key(|value| value.id);
-    let prior_reviews = review_runs
+    let automated_reviews = review_runs
         .into_iter()
-        .filter_map(|value| value.output.as_deref())
-        .filter_map(|output| serde_json::from_str::<PriorReview>(output).ok())
-        .collect();
+        .filter_map(|value| {
+            let result =
+                serde_json::from_str::<crate::automated::ReviewResult>(value.output.as_deref()?)
+                    .ok()?;
+            Some(PriorReview {
+                run_id: value.id,
+                agent: value.agent.clone(),
+                status: value.status.clone(),
+                started_at: value.started_at.clone(),
+                finished_at: value.finished_at.clone(),
+                model: value.resolved_model.clone(),
+                reasoning_effort: value.resolved_reasoning_effort,
+                verdict: result.verdict,
+                severity: result.severity,
+                findings: result.findings,
+                blocking_findings: result.blocking_findings,
+                non_blocking_findings: result.non_blocking_findings,
+                revision_feedback: result.revision_feedback,
+                validation_evidence: db.latest_validation_result_for_run(value.id).ok().flatten(),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(ReviewSummary {
         task,
         run,
@@ -125,7 +155,8 @@ pub fn build_review(
         changes,
         change_evidence,
         validation_evidence,
-        prior_reviews,
+        prior_reviews: automated_reviews.clone(),
+        automated_reviews,
     })
 }
 
@@ -141,6 +172,9 @@ pub fn build_review_for_run(
         .task_id
         .as_deref()
         .context("run has no associated task")?;
+    if run.execution_class != "review" {
+        anyhow::bail!("run {run_id} is not an automated review run")
+    }
     let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{task_id}' not found"))?;
@@ -151,6 +185,28 @@ pub fn build_review_for_run(
     let changes = WorktreeChanges::default();
     let change_evidence = db.get_change_evidence(run_id)?;
     let validation_evidence = db.latest_validation_result_for_run(run_id)?;
+    let result_json = run
+        .output
+        .as_deref()
+        .context("automated review run has no persisted result")?;
+    let review_result = serde_json::from_str::<crate::automated::ReviewResult>(result_json)
+        .with_context(|| format!("automated review run {run_id} has invalid persisted result"))?;
+    let automated_review = PriorReview {
+        run_id: run.id,
+        agent: run.agent.clone(),
+        status: run.status.clone(),
+        started_at: run.started_at.clone(),
+        finished_at: run.finished_at.clone(),
+        model: run.resolved_model.clone(),
+        reasoning_effort: run.resolved_reasoning_effort,
+        verdict: review_result.verdict,
+        severity: review_result.severity,
+        findings: review_result.findings,
+        blocking_findings: review_result.blocking_findings,
+        non_blocking_findings: review_result.non_blocking_findings,
+        revision_feedback: review_result.revision_feedback,
+        validation_evidence: validation_evidence.clone(),
+    };
     Ok(ReviewSummary {
         task,
         run: Some(run),
@@ -159,8 +215,24 @@ pub fn build_review_for_run(
         changes,
         change_evidence,
         validation_evidence,
-        prior_reviews: Vec::new(),
+        prior_reviews: vec![automated_review.clone()],
+        automated_reviews: vec![automated_review],
     })
+}
+
+pub fn build_review_for_task_run(
+    db: &crate::storage::Database,
+    task_id: &str,
+    run_id: i64,
+    repo: &Path,
+) -> Result<ReviewSummary> {
+    let run = db
+        .get_agent_run(run_id)?
+        .with_context(|| format!("automated review run {run_id} not found for task '{task_id}'"))?;
+    if run.task_id.as_deref() != Some(task_id) {
+        anyhow::bail!("automated review run {run_id} does not belong to task '{task_id}'")
+    }
+    build_review_for_run(db, run_id, repo)
 }
 
 pub fn format_review(summary: &ReviewSummary) -> String {
@@ -215,6 +287,32 @@ fn format_review_with_diff_text(summary: &ReviewSummary, diff: &str) -> String {
         "\nChanges\n{}\n",
         format_changes(&summary.changes)
     ));
+    if let Some(review) = summary.automated_reviews.last() {
+        out.push_str(&format!(
+            "\nAutomated review #{}\nReviewer   {}\nVerdict    {}\nStatus     {}\n",
+            review.run_id, review.agent, review.verdict, review.status
+        ));
+        if let Some(severity) = &review.severity {
+            out.push_str(&format!("Severity   {severity}\n"));
+        }
+        for (label, findings) in [
+            ("Finding", &review.findings),
+            ("Blocking", &review.blocking_findings),
+            ("Non-blocking", &review.non_blocking_findings),
+        ] {
+            for finding in findings {
+                out.push_str(&format!("{label}   {finding}\n"));
+            }
+        }
+        if let Some(feedback) = &review.revision_feedback {
+            out.push_str(&format!("Revision   {feedback}\n"));
+        }
+        if let Some(validation) = &review.validation_evidence {
+            out.push_str(&format!("Validation evidence\n{validation}\n"));
+        }
+    } else {
+        out.push_str("\nAutomated review  None persisted\n");
+    }
     if !diff.is_empty() {
         out.push_str(&format!("\nDiff\n{diff}"));
     }
@@ -317,6 +415,43 @@ mod tests {
 
         assert_eq!(summary.prior_reviews[0].verdict, "REVISE");
         assert_eq!(summary.prior_reviews[1].verdict, "PASS");
+    }
+
+    #[test]
+    fn selected_review_hydrates_persisted_result_and_validation_evidence() {
+        let (directory, db, task_id, project_id) = fixture();
+        let run = create_run(&db, project_id, &task_id, "review");
+        let output = serde_json::json!({
+            "verdict": "REVISE",
+            "severity": "high",
+            "findings": ["missing test"],
+            "blocking_findings": ["missing test"],
+            "non_blocking_findings": ["documentation"],
+            "revision_feedback": "add coverage"
+        });
+        db.update_agent_run_status(run, "completed", Some(&output.to_string()))
+            .unwrap();
+        let validation =
+            r#"{"steps":[{"command":"cargo test","passed":false,"output":"failure"}]}"#;
+        db.record_lifecycle_event(
+            "validation_result",
+            Some(&task_id),
+            Some(run),
+            Some("agent"),
+            Some(validation),
+        )
+        .unwrap();
+
+        let summary = build_review_for_run(&db, run, directory.path()).unwrap();
+        let review = &summary.automated_reviews[0];
+        assert_eq!(review.run_id, run);
+        assert_eq!(review.verdict, "REVISE");
+        assert_eq!(review.severity.as_deref(), Some("high"));
+        assert_eq!(review.findings, vec!["missing test"]);
+        assert_eq!(review.blocking_findings, vec!["missing test"]);
+        assert_eq!(review.non_blocking_findings, vec!["documentation"]);
+        assert_eq!(review.revision_feedback.as_deref(), Some("add coverage"));
+        assert_eq!(review.validation_evidence.as_deref(), Some(validation));
     }
 
     #[test]

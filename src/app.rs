@@ -5,7 +5,7 @@ use crate::agent;
 use crate::protocol::{PlanResponse, PlanningProjectState, ProjectReport};
 use crate::queue::{QueueReport, compute_queue};
 use crate::registry::{self, AgentDefinition};
-use crate::review::{DispatchSummary, ReviewSummary, build_review};
+use crate::review::{DispatchSummary, PriorReview, ReviewSummary, build_review};
 use crate::storage::db::ApprovalRequest;
 use crate::storage::{AgentRun, Database};
 use crate::task::{CreateTaskInput, Task, TaskScopeMode};
@@ -456,6 +456,12 @@ impl OrcApp {
     }
     pub fn review(&self, task_id: &str) -> Result<ReviewSummary> {
         build_review(&self.db, task_id, &self.repo_path)
+    }
+    pub fn review_history(&self, task_id: &str) -> Result<Vec<PriorReview>> {
+        Ok(self.review(task_id)?.automated_reviews)
+    }
+    pub fn review_for_run(&self, task_id: &str, run_id: i64) -> Result<ReviewSummary> {
+        crate::review::build_review_for_task_run(&self.db, task_id, run_id, &self.repo_path)
     }
     pub fn automated_review_with_backend(
         &self,

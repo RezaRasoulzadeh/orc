@@ -23,10 +23,10 @@ Launches the installed desktop application and returns immediately. Cannot be co
 ## Project and health
 
 ### `orc init`
-Initializes the Orc SQLite database at `.orc/orc.db` in the current directory. Creates the project record if one does not already exist. Safe to run once per repository.
+Bootstraps Orc local state by initializing the SQLite database at `.orc/orc.db` in the current directory and creating the project record if one does not already exist. It does not require Git and does not itself adopt a repository. Safe to run repeatedly; existing project documents and the engineering contract are preserved.
 
 ### `orc adopt`
-Adopts the existing Git repository in the current directory: records its Git identity and writes the engineering contract (`.orc/engineering.md`). Requires `orc init` to have been run first, and requires the current directory to be a Git repository.
+Brings the existing Git repository in the current directory under Orc management. It requires a Git repository, initializes local Orc state if needed, creates missing project documents, and preserves every existing project document, including `.orc/engineering.md`. Adoption is idempotent. It does not install Orc or modify source files.
 
 ### `orc discovery-request`
 Emits a read-only repository discovery request as JSON to stdout. This request is meant to be handed to a planner/agent that inspects the repository and returns a structured discovery response — the command itself does not scan the repository or mutate state.

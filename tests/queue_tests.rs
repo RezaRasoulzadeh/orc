@@ -836,7 +836,7 @@ fn queue_concise_and_explain_formatting() {
 }
 
 #[test]
-fn queue_display_sections_are_reversed_without_reordering_items() {
+fn queue_display_sections_follow_requested_order_without_reordering_items() {
     let report = orc::queue::QueueReport {
         ready: vec![dispatch_entry("ready-1"), dispatch_entry("ready-2")],
         blocked: vec![dispatch_entry("blocked")],
@@ -851,11 +851,11 @@ fn queue_display_sections_are_reversed_without_reordering_items() {
     let concise_sections = [
         "CANCELLED",
         "DONE",
+        "READY",
+        "BLOCKED",
         "BACKLOG",
         "REVIEW",
         "ACTIVE",
-        "BLOCKED",
-        "READY",
     ]
     .map(|section| concise.find(section).unwrap());
     assert!(concise_sections.windows(2).all(|pair| pair[0] < pair[1]));
@@ -865,11 +865,11 @@ fn queue_display_sections_are_reversed_without_reordering_items() {
     let explain_sections = [
         "CANCELLED",
         "DONE",
+        "READY",
+        "BLOCKED",
         "BACKLOG",
         "REVIEW",
         "ACTIVE",
-        "BLOCKED",
-        "READY",
     ]
     .map(|section| explain.find(&format!("=== {section} ===")).unwrap());
     assert!(explain_sections.windows(2).all(|pair| pair[0] < pair[1]));

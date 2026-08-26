@@ -690,6 +690,12 @@ pub fn revise_with_worker_on_db(
             task.status
         );
     };
+    let revision_contract = crate::automated::build_revision_contract_from_db(
+        db,
+        task_id,
+        &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
+        source_review_id,
+    )?;
     let (_, worktree_path) = db
         .get_worktree_metadata(task_id)?
         .context("task has no worktree")?;
@@ -745,8 +751,9 @@ pub fn revise_with_worker_on_db(
     };
     progress("revision/worker starting");
     let prompt = format!(
-        "{}\n\n## Review feedback\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
+        "{}\n\n{}\n\n## Review feedback (compatibility context)\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
         build_worker_prompt(&contract, &project_name, &task),
+        crate::automated::format_revision_contract(&revision_contract),
         feedback
     );
     let fail = |message: String| -> Result<DispatchSummary> {
@@ -791,6 +798,20 @@ pub fn revise_with_worker_on_db(
         progress("worker failed");
         return fail(format!("Worker failed: {error}"));
     }
+    let handoff = match crate::automated::validate_revision_handoff(
+        &revision_contract,
+        output.as_deref().unwrap_or_default(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return fail(format!("Invalid revision handoff: {error:#}")),
+    };
+    db.record_lifecycle_event(
+        "revision_handoff",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&serde_json::to_string(&handoff)?),
+    )?;
     progress("worker completed");
     let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(changes) => changes,
@@ -873,6 +894,12 @@ pub fn revise_manual(
             task.status
         );
     };
+    let revision_contract = crate::automated::build_revision_contract_from_db(
+        db,
+        task_id,
+        &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
+        source_review_id,
+    )?;
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
     let _run_finalizer = db.run_finalizer(run_id);
@@ -882,8 +909,9 @@ pub fn revise_manual(
         anyhow::bail!("revision review was consumed before execution started");
     }
     println!(
-        "\n{}\n\n## Review feedback\n\n{}",
+        "\n{}\n\n{}\n\n## Review feedback\n\n{}",
         build_manual_packet(&contract, &project, &task, &agent.id),
+        crate::automated::format_revision_contract(&revision_contract),
         feedback
     );
     Ok(())
@@ -1233,7 +1261,26 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
     if run.execution_mode != registry::MANUAL || run.status != "waiting_external" {
         anyhow::bail!("run {} is not a waiting manual run", run_id);
     }
-    let task_id = db.complete_manual_run(run_id, output)?;
+    let task_id = run.task_id.clone().context("manual run has no task")?;
+    if let Some(source_review_id) = db.source_review_run_id(run_id)? {
+        let reviews = crate::review::build_review(db, &task_id, Path::new("."))?.prior_reviews;
+        let contract = crate::automated::build_revision_contract_from_db(
+            db,
+            &task_id,
+            &reviews,
+            source_review_id,
+        )?;
+        let handoff = crate::automated::validate_revision_handoff(&contract, output)
+            .context("invalid revision handoff")?;
+        db.record_lifecycle_event(
+            "revision_handoff",
+            Some(&task_id),
+            Some(run_id),
+            Some(&run.agent),
+            Some(&serde_json::to_string(&handoff)?),
+        )?;
+    }
+    db.complete_manual_run(run_id, output)?;
     db.update_task_status(&task_id, TaskStatus::Review)?;
     Ok(task_id)
 }

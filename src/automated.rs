@@ -273,6 +273,241 @@ pub struct ReviewBlocker {
     pub finding: String,
 }
 
+/// The actionable work contract handed from a review to a revision worker.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevisionContract {
+    pub unresolved: Vec<crate::storage::db::ReviewBlockerRecord>,
+    pub regressions: Vec<crate::storage::db::ReviewBlockerRecord>,
+    pub regression_constraints: Vec<crate::storage::db::ReviewBlockerRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionClaim {
+    pub blocker_id: String,
+    pub status: String,
+    pub implementation_summary: String,
+    pub changed_files: Vec<String>,
+    pub validation_evidence: String,
+    pub unresolved_risk: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionHandoff {
+    pub claims: Vec<RevisionClaim>,
+}
+
+pub fn validate_revision_handoff(
+    contract: &RevisionContract,
+    output: &str,
+) -> Result<RevisionHandoff> {
+    let active_count = contract.unresolved.len() + contract.regressions.len();
+    // Preserve the legacy one-shot revision path when the authoritative ledger
+    // contains no active blocker work. There is no claim to validate in that case.
+    if active_count == 0 {
+        return Ok(RevisionHandoff { claims: Vec::new() });
+    }
+    let handoff: RevisionHandoff = serde_json::from_str(output)
+        .context("revision worker did not return a structured handoff")?;
+    let required: std::collections::BTreeSet<_> = contract
+        .unresolved
+        .iter()
+        .chain(contract.regressions.iter())
+        .map(|b| b.blocker_id.as_str())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for claim in &handoff.claims {
+        if !matches!(claim.status.as_str(), "addressed" | "unresolved") {
+            bail!(
+                "revision handoff claim '{}' has invalid status",
+                claim.blocker_id
+            );
+        }
+        if claim.implementation_summary.trim().is_empty()
+            || claim.validation_evidence.trim().is_empty()
+        {
+            bail!(
+                "revision handoff claim '{}' is missing implementation or validation evidence",
+                claim.blocker_id
+            );
+        }
+        if !required.contains(claim.blocker_id.as_str()) {
+            bail!(
+                "revision handoff contains unknown blocker ID '{}'",
+                claim.blocker_id
+            );
+        }
+        if !seen.insert(claim.blocker_id.as_str()) {
+            bail!(
+                "revision handoff contains duplicate blocker ID '{}'",
+                claim.blocker_id
+            );
+        }
+    }
+    if seen != required {
+        bail!("revision handoff is missing one or more active blocker claims");
+    }
+    Ok(handoff)
+}
+
+pub fn build_revision_contract_from_db(
+    db: &crate::storage::Database,
+    task_id: &str,
+    reviews: &[crate::review::PriorReview],
+    source_review_id: i64,
+) -> Result<RevisionContract> {
+    let source = reviews
+        .iter()
+        .find(|r| r.run_id == source_review_id)
+        .context("source review not found")?;
+    let ledger = db.review_blocker_ledger(task_id)?;
+    let source_ids: std::collections::BTreeSet<_> = source
+        .blockers
+        .iter()
+        .map(|b| b.blocker_id.as_str())
+        .collect();
+    let mut unresolved = Vec::new();
+    let mut regressions = Vec::new();
+    let mut constraints = Vec::new();
+    for record in ledger {
+        if source_ids.contains(record.blocker_id.as_str()) {
+            match record.status.as_str() {
+                "resolved" => constraints.push(record),
+                "regression" => regressions.push(record),
+                _ => unresolved.push(record),
+            }
+        }
+    }
+    // Legacy reviews without a persisted structured ledger retain compatibility.
+    if ledger_is_empty_for_source(db, task_id, &source_ids)? {
+        unresolved = source
+            .blockers
+            .iter()
+            .filter(|b| b.status != "resolved")
+            .cloned()
+            .collect();
+    }
+    Ok(RevisionContract {
+        unresolved,
+        regressions,
+        regression_constraints: constraints,
+    })
+}
+
+fn ledger_is_empty_for_source(
+    db: &crate::storage::Database,
+    task_id: &str,
+    ids: &std::collections::BTreeSet<&str>,
+) -> Result<bool> {
+    Ok(ids.is_empty()
+        || db
+            .review_blocker_ledger(task_id)?
+            .iter()
+            .all(|b| !ids.contains(b.blocker_id.as_str())))
+}
+
+pub fn build_revision_contract(
+    reviews: &[crate::review::PriorReview],
+    source_review_id: i64,
+) -> RevisionContract {
+    let source = reviews
+        .iter()
+        .find(|review| review.run_id == source_review_id);
+    let source_ids: std::collections::BTreeSet<String> = source
+        .into_iter()
+        .flat_map(|review| review.blockers.iter().map(|b| b.blocker_id.clone()))
+        .collect();
+    let mut ledger = std::collections::BTreeMap::new();
+    for review in reviews {
+        for blocker in &review.blockers {
+            if source_ids.contains(&blocker.blocker_id) {
+                ledger.insert(blocker.blocker_id.clone(), blocker.clone());
+            }
+        }
+        if review.verdict == "PASS" && review.run_id > source_review_id {
+            for record in ledger.values_mut() {
+                record.status = "resolved".into();
+            }
+        }
+    }
+    if ledger.is_empty()
+        && let Some(review) = source
+    {
+        for finding in &review.blocking_findings {
+            let record = crate::storage::db::ReviewBlockerRecord {
+                task_id: String::new(),
+                blocker_id: blocker_id(finding),
+                run_id: review.run_id,
+                requirement_ref: String::new(),
+                evidence: finding.clone(),
+                severity: review
+                    .severity
+                    .clone()
+                    .unwrap_or_else(|| "unspecified".into()),
+                acceptance_condition: review.revision_feedback.clone().unwrap_or_else(|| {
+                    "Address the finding and provide evidence it is resolved.".into()
+                }),
+                status: "unresolved".into(),
+                finding: finding.clone(),
+                first_seen: String::new(),
+                last_seen: String::new(),
+                blocker_key: finding.clone(),
+            };
+            ledger.insert(record.blocker_id.clone(), record);
+        }
+    }
+    let mut unresolved = Vec::new();
+    let mut regressions = Vec::new();
+    let mut regression_constraints = Vec::new();
+    for record in ledger.into_values() {
+        match record.status.as_str() {
+            "resolved" => regression_constraints.push(record),
+            "regression" => regressions.push(record),
+            _ => unresolved.push(record),
+        }
+    }
+    RevisionContract {
+        unresolved,
+        regressions,
+        regression_constraints,
+    }
+}
+
+pub fn format_revision_contract(contract: &RevisionContract) -> String {
+    let mut out = String::from("## Revision contract\n\n");
+    out.push_str("### Unresolved blockers (implement and prove each)\n");
+    if contract.unresolved.is_empty() {
+        out.push_str("- None recorded; verify the supplied review feedback.\n");
+    }
+    for blocker in &contract.unresolved {
+        out.push_str(&format!(
+            "- {} | requirement: {} | acceptance: {} | finding: {}\n  Evidence required: {}\n",
+            blocker.blocker_id,
+            blocker.requirement_ref,
+            blocker.acceptance_condition,
+            blocker.finding,
+            blocker.evidence
+        ));
+    }
+    out.push_str("### Resolved blockers (regression constraints; do not reimplement)\n");
+    if contract.regression_constraints.is_empty() {
+        out.push_str("- None recorded.\n");
+    }
+    for blocker in &contract.regression_constraints {
+        out.push_str(&format!("- {} | acceptance: {} | preserve the resolved behavior unless current evidence proves regression\n", blocker.blocker_id, blocker.acceptance_condition));
+    }
+    out.push_str("### Regressions (implement and prove each)\n");
+    for blocker in &contract.regressions {
+        out.push_str(&format!(
+            "- {} | acceptance: {} | finding: {}\n",
+            blocker.blocker_id, blocker.acceptance_condition, blocker.finding
+        ));
+    }
+    out.push_str("\n### Required handoff\nReturn JSON {\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. Keep changes focused.");
+    out
+}
+
 impl ReviewResult {
     fn validate_structured_blockers(&self) -> Result<()> {
         for blocker in &self.blockers {

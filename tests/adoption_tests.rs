@@ -1,4 +1,5 @@
 use orc::adoption;
+use orc::contract::DEFAULT_ENGINEERING_CONTRACT;
 use orc::discovery;
 use orc::protocol::{
     DiscoveryArchitecture, DiscoveryEngineering, DiscoveryProject, DiscoveryState,
@@ -59,6 +60,18 @@ fn adopt_initializes_existing_git_repository() {
     assert_eq!(
         db.get_project_name().unwrap().as_deref(),
         Some("sample-project")
+    );
+}
+
+#[test]
+fn adopt_writes_the_maintained_engineering_contract_when_missing() {
+    let (_dir, repo) = git_repo();
+
+    adoption::adopt(&repo).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
+        DEFAULT_ENGINEERING_CONTRACT
     );
 }
 

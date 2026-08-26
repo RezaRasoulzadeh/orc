@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+pub const DEFAULT_ENGINEERING_CONTRACT: &str = include_str!("../.orc/engineering.md");
+
 /// Load the engineering contract from the specified path.
 /// Returns the contract contents as a string.
 pub fn load_contract<P: AsRef<Path>>(path: P) -> Result<String> {

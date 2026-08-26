@@ -504,46 +504,28 @@ pub fn schedule_with_busy_and_quota_reserve(
 }
 
 pub fn validate_override(agent: &AgentDefinition, task: &Task) -> Result<()> {
-    if !agent.enabled {
-        bail!("agent '{}' is disabled", agent.id);
-    }
-    if agent.status != registry::AVAILABLE {
-        let reason = agent
-            .unavailable_reason
-            .as_deref()
-            .unwrap_or("no reason provided");
-        bail!("agent '{}' is unavailable: {}", agent.id, reason);
-    }
-    if registry::validate_backend(&agent.backend).is_err() {
+    validate_override_with_constraints(agent, task, &HashSet::new(), 0)
+}
+
+pub fn validate_override_with_constraints(
+    agent: &AgentDefinition,
+    task: &Task,
+    busy_agents: &HashSet<String>,
+    quota_reserve: i64,
+) -> Result<()> {
+    let evaluation = evaluate_candidate_with_busy_and_quota_reserve(
+        agent,
+        task,
+        None,
+        busy_agents,
+        quota_reserve,
+    );
+    if let CandidateStatus::Rejected(reason) = evaluation.status {
         bail!(
-            "agent '{}' has unsupported backend '{}'",
+            "agent '{}' is not eligible: {}",
             agent.id,
-            agent.backend
+            reason.description()
         );
-    }
-    if !is_backend_mode_supported(&agent.backend, &agent.execution_mode) {
-        bail!(
-            "agent '{}' has unsupported execution mode '{}' for backend '{}'",
-            agent.id,
-            agent.execution_mode,
-            agent.backend
-        );
-    }
-    let required = task.required_capabilities();
-    let missing: Vec<String> = required
-        .iter()
-        .filter(|cap| !agent.capabilities.contains(cap))
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        bail!(
-            "agent '{}' lacks required capabilities: {}",
-            agent.id,
-            missing.join(", ")
-        );
-    }
-    if agent.quota_remaining_percent == Some(0) {
-        bail!("agent '{}' has exhausted quota (0% remaining)", agent.id);
     }
     Ok(())
 }

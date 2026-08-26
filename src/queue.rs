@@ -537,3 +537,25 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
 
     Ok(report)
 }
+
+/// Enforce the same task-level readiness used by the queue before dispatch.
+/// Agent selection/validation remains the scheduler's responsibility.
+pub fn ensure_dispatchable(db: &Database, task_id: &str) -> Result<(), DbError> {
+    let report = compute_queue(db)?;
+    let entry = report
+        .find_item(task_id)
+        .ok_or_else(|| DbError::TaskNotFound(task_id.to_string()))?;
+    if entry.category != QueueCategory::Ready {
+        return Err(DbError::Scheduler(format!(
+            "task '{}' is not dispatchable: {}",
+            task_id,
+            entry
+                .blocking_reasons
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+    Ok(())
+}

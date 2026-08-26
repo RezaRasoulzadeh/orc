@@ -206,6 +206,10 @@ fn setup() -> (TempDir, Database, String) {
     let db_path = dir.path().join(".orc/orc.db");
     let db = Database::init(&db_path).unwrap();
     let project = db.create_project("test").unwrap();
+    let mut eligible_agent = automated_agent("scheduler-eligible", vec![AgentAction::Code]);
+    eligible_agent.backend = "codex".into();
+    eligible_agent.capabilities = vec!["code".into(), "terminal".into()];
+    db.insert_agent(&eligible_agent).unwrap();
     let task = db
         .insert_task(
             project,

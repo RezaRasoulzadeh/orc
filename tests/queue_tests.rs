@@ -184,6 +184,57 @@ fn task_with_no_dependencies_can_become_ready() {
 }
 
 #[test]
+fn dispatch_eligibility_rejects_dependency_and_persisted_blocks() {
+    let (_dir, db, pid) = create_test_db();
+    add_agent(
+        &db,
+        "codex-main",
+        "codex",
+        "automated",
+        100,
+        vec!["code", "terminal"],
+    );
+    let dependency = db
+        .insert_task(
+            pid,
+            "Prerequisite",
+            "finish first",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let dependent = db
+        .insert_task(
+            pid,
+            "Dependent",
+            "wait for prerequisite",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    db.add_task_dependency(&dependent, &dependency).unwrap();
+    assert!(
+        compute_queue(&db)
+            .unwrap()
+            .blocked
+            .iter()
+            .any(|entry| entry.task.id == dependent)
+    );
+    assert!(orc::queue::ensure_dispatchable(&db, &dependent).is_err());
+
+    db.update_task_status(&dependent, TaskStatus::Blocked)
+        .unwrap();
+    assert!(orc::queue::ensure_dispatchable(&db, &dependent).is_err());
+
+    db.update_task_status(&dependent, TaskStatus::Backlog)
+        .unwrap();
+    assert!(orc::queue::ensure_dispatchable(&db, &dependent).is_err());
+    db.update_task_status(&dependency, TaskStatus::Done)
+        .unwrap();
+    assert!(orc::queue::ensure_dispatchable(&db, &dependent).is_ok());
+}
+
+#[test]
 fn cancelled_task_is_explicit_and_not_ready() {
     let (_dir, db, pid) = create_test_db();
     add_agent(

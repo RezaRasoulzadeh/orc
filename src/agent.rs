@@ -298,6 +298,10 @@ pub fn dispatch_with_worker_on_db_cancellable(
     if task.status == TaskStatus::Cancelled {
         anyhow::bail!("Task {} is cancelled; cannot dispatch", task_id);
     }
+    // Injecting a worker only controls execution after the task has passed the
+    // same queue eligibility policy used by every other dispatch path.
+    crate::queue::ensure_dispatchable(db, task_id)
+        .map_err(|e| anyhow::anyhow!("dispatch eligibility check failed: {e}"))?;
 
     // Set task status to active
     db.update_task_status(task_id, TaskStatus::Active)
@@ -925,12 +929,20 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
+    crate::queue::ensure_dispatchable(db, task_id)
+        .map_err(|e| anyhow::anyhow!("dispatch eligibility check failed: {e}"))?;
     let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
     let agent = if let Some(agent_id) = requested_agent {
         let agent = registry::get_agent(db, agent_id)?;
-        crate::scheduler::validate_override(&agent, &task)?;
+        let busy_agents = db.list_busy_agents()?.into_iter().collect();
+        crate::scheduler::validate_override_with_constraints(
+            &agent,
+            &task,
+            &busy_agents,
+            db.quota_reserve()?,
+        )?;
         agent
     } else {
         let agents = db.list_agents()?;

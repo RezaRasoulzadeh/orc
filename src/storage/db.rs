@@ -15,6 +15,176 @@ fn priority_string(priority: TaskPriority) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod reservation_lifecycle_tests {
+    use super::*;
+    use crate::task::TaskPriority;
+    use tempfile::{TempDir, tempdir};
+
+    fn fixture() -> (TempDir, std::path::PathBuf, Database, i64, String) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("orc.db");
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("reservation tests").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        (directory, path, db, project, task)
+    }
+
+    fn assert_terminal_releases(status: &str) {
+        let (_directory, _path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+        db.update_agent_run_status(run, status, Some(status))
+            .unwrap();
+        assert!(db.list_busy_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_marks_agent_busy_while_run_active() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.create_agent_run(project, &task, "codex-main").unwrap();
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+    }
+
+    #[test]
+    fn successful_dispatch_releases_agent() {
+        assert_terminal_releases("completed");
+    }
+    #[test]
+    fn failed_dispatch_releases_agent() {
+        assert_terminal_releases("failed");
+    }
+    #[test]
+    fn no_changes_releases_agent() {
+        assert_terminal_releases("no_changes");
+    }
+    #[test]
+    fn timeout_releases_agent() {
+        assert_terminal_releases("timeout");
+    }
+    #[test]
+    fn cancelled_execution_releases_agent() {
+        assert_terminal_releases("cancelled");
+    }
+    #[test]
+    fn automated_review_releases_agent_after_completion() {
+        assert_terminal_releases("completed");
+    }
+    #[test]
+    fn automated_review_releases_agent_after_failure() {
+        assert_terminal_releases("failed");
+    }
+
+    #[test]
+    fn revision_releases_agent_after_completion_and_failure() {
+        assert_terminal_releases("completed");
+        assert_terminal_releases("failed");
+    }
+
+    #[test]
+    fn validation_repair_releases_agent() {
+        assert_terminal_releases("failed");
+    }
+
+    #[test]
+    fn stale_busy_state_is_reconciled_after_reopen() {
+        let (_directory, path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.conn
+            .execute(
+                "UPDATE execution_reservations SET owner_pid = 2147483647 WHERE run_id = ?1",
+                [run],
+            )
+            .unwrap();
+        drop(db);
+        let reopened = Database::open(path).unwrap();
+        assert!(reopened.list_busy_agents().unwrap().is_empty());
+        assert_eq!(
+            reopened.get_agent_run(run).unwrap().unwrap().status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn real_non_terminal_run_remains_busy_after_reconcile() {
+        let (_directory, path, db, project, task) = fixture();
+        db.create_agent_run(project, &task, "codex-main").unwrap();
+        drop(db);
+        let reopened = Database::open(path).unwrap();
+        assert_eq!(reopened.list_busy_agents().unwrap(), vec!["codex-main"]);
+    }
+
+    #[test]
+    fn historical_task_assignment_does_not_make_agent_busy() {
+        let (_directory, _path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.update_agent_run_status(run, "completed", None).unwrap();
+        db.update_task_status(&task, TaskStatus::Review).unwrap();
+        assert!(db.list_busy_agents().unwrap().is_empty());
+        db.update_task_status(&task, TaskStatus::Blocked).unwrap();
+        assert!(db.list_busy_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manually_unavailable_agent_stays_unavailable_after_execution_cleanup() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.conn.execute(
+            "INSERT INTO agents(id, backend, display_name, enabled, priority, capabilities, status) VALUES ('codex-main', 'codex', 'Codex', 1, 1, '[]', 'unavailable')",
+            [],
+        ).unwrap();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.update_agent_run_status(run, "completed", None).unwrap();
+        assert_eq!(
+            db.get_agent("codex-main").unwrap().unwrap().status,
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn two_sequential_jobs_can_reuse_same_agent() {
+        let (_directory, _path, db, project, first) = fixture();
+        let one = db.create_agent_run(project, &first, "codex-main").unwrap();
+        db.update_agent_run_status(one, "completed", None).unwrap();
+        let second = db
+            .insert_task(
+                project,
+                "second",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        assert!(db.create_agent_run(project, &second, "codex-main").is_ok());
+    }
+
+    #[test]
+    fn simultaneous_execution_protection() {
+        let (_directory, _path, db, project, first) = fixture();
+        db.create_agent_run(project, &first, "codex-main").unwrap();
+        let second = db
+            .insert_task(
+                project,
+                "second",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        assert!(matches!(
+            db.create_agent_run(project, &second, "codex-main"),
+            Err(DbError::AgentHasActiveRun(agent)) if agent == "codex-main"
+        ));
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRun {
     pub id: i64,
@@ -168,7 +338,44 @@ pub struct Database {
     lifecycle_sink: Option<std::sync::Arc<dyn Fn(LifecycleEvent) + Send + Sync>>,
 }
 
+/// Last-resort cleanup for automated execution paths. Normal completion uses
+/// the explicit terminal status APIs; dropping this guard only terminalizes a
+/// run that is still active because an early `?`, panic unwind, or callback
+/// error escaped the normal finalization boundary.
+pub struct RunFinalizer<'a> {
+    db: &'a Database,
+    run_id: i64,
+}
+
+impl Drop for RunFinalizer<'_> {
+    fn drop(&mut self) {
+        let _ = self.db.abandon_agent_run(
+            self.run_id,
+            "execution ended without recording a terminal outcome",
+        );
+    }
+}
+
 impl Database {
+    pub fn run_finalizer(&self, run_id: i64) -> RunFinalizer<'_> {
+        RunFinalizer { db: self, run_id }
+    }
+
+    fn abandon_agent_run(&self, run_id: i64, reason: &str) -> Result<bool, DbError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE agent_runs SET status = 'failed', error = ?1, output = COALESCE(output, ?1), finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+            params![reason, run_id],
+        )?;
+        if changed != 0 {
+            transaction.execute(
+                "DELETE FROM execution_reservations WHERE run_id = ?1",
+                [run_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
     pub fn project_report(
         &self,
         project_id: i64,
@@ -472,6 +679,7 @@ impl Database {
         Self::ensure_execution_templates_table(&conn)?;
         Self::ensure_agent_actions_table(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
+        Self::ensure_execution_reservations_table(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
@@ -480,10 +688,12 @@ impl Database {
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
-        Ok(Self {
+        let db = Self {
             conn,
             lifecycle_sink: None,
-        })
+        };
+        db.reconcile_execution_reservations()?;
+        Ok(db)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
@@ -498,10 +708,12 @@ impl Database {
         Self::ensure_registry_schema(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
-        Ok(Self {
+        let db = Self {
             conn,
             lifecycle_sink: None,
-        })
+        };
+        db.reconcile_execution_reservations()?;
+        Ok(db)
     }
 
     fn configure(conn: &Connection) -> Result<(), DbError> {
@@ -518,6 +730,7 @@ impl Database {
         Self::ensure_execution_templates_table(conn)?;
         Self::ensure_agent_actions_table(conn)?;
         Self::ensure_agent_run_columns(conn)?;
+        Self::ensure_execution_reservations_table(conn)?;
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
@@ -525,6 +738,100 @@ impl Database {
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
+    }
+
+    fn ensure_execution_reservations_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS execution_reservations (
+                agent_id TEXT PRIMARY KEY,
+                run_id INTEGER NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
+                owner_pid INTEGER,
+                acquired_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )?;
+        Ok(())
+    }
+
+    fn process_is_alive(pid: i64) -> bool {
+        if pid == i64::from(std::process::id()) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::path::Path::new("/proc").join(pid.to_string()).exists()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On platforms without a portable process probe, retain the reservation.
+            true
+        }
+    }
+
+    /// Repairs reservations left by older Orc versions or an execution process
+    /// that exited without reaching the shared run-finalization boundary.
+    pub fn reconcile_execution_reservations(&self) -> Result<usize, DbError> {
+        let mut repaired = 0;
+        let reservations = self
+            .conn
+            .prepare("SELECT agent_id, run_id, owner_pid FROM execution_reservations")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (agent, run, owner_pid) in reservations {
+            let run_state: Option<(String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT status, execution_mode FROM agent_runs WHERE id = ?1 AND agent = ?2",
+                    params![run, agent],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let active = run_state.as_ref().is_some_and(|(status, _)| {
+                matches!(status.as_str(), "running" | "waiting_external")
+            });
+            let orphaned = match (owner_pid, run_state.as_ref()) {
+                (Some(pid), _) => !Self::process_is_alive(pid),
+                (None, Some((status, mode))) => {
+                    mode != crate::registry::MANUAL || status != "waiting_external"
+                }
+                (None, None) => true,
+            };
+            if !active || orphaned {
+                if orphaned {
+                    self.conn.execute(
+                        "UPDATE agent_runs SET status = 'failed', error = 'execution interrupted before completion', output = COALESCE(output, 'execution interrupted before completion'), finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('running', 'waiting_external')",
+                        [run],
+                    )?;
+                }
+                repaired += self.conn.execute(
+                    "DELETE FROM execution_reservations WHERE agent_id = ?1 AND run_id = ?2",
+                    params![agent, run],
+                )?;
+            }
+        }
+
+        // Manual waiting-external work intentionally survives Orc processes.
+        repaired += self.conn.execute(
+            "INSERT OR IGNORE INTO execution_reservations(agent_id, run_id, owner_pid)
+             SELECT agent, id, NULL FROM agent_runs
+             WHERE execution_mode = 'manual' AND status = 'waiting_external'
+               AND NOT EXISTS (SELECT 1 FROM execution_reservations r WHERE r.run_id = agent_runs.id)",
+            [],
+        )?;
+        // A pre-reservation automated row cannot have a live owner. Terminalize it
+        // once during migration instead of allowing it to reserve an agent forever.
+        repaired += self.conn.execute(
+            "UPDATE agent_runs SET status = 'failed', error = 'execution interrupted before reservation tracking', output = COALESCE(output, 'execution interrupted before reservation tracking'), finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP
+             WHERE execution_mode = 'automated' AND status IN ('running', 'waiting_external')
+               AND NOT EXISTS (SELECT 1 FROM execution_reservations r WHERE r.run_id = agent_runs.id)",
+            [],
+        )?;
+        Ok(repaired)
     }
 
     fn ensure_lifecycle_events_table(conn: &Connection) -> Result<(), DbError> {
@@ -1865,10 +2172,22 @@ impl Database {
     }
 
     pub fn cancel_task(&self, id: &str, reason: Option<&str>) -> Result<bool, DbError> {
-        let changed = self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE tasks SET status = 'cancelled', cancellation_reason = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status != 'done' AND status != 'cancelled'",
             params![reason, id],
         )?;
+        if changed != 0 {
+            transaction.execute(
+                "UPDATE agent_runs SET status = 'cancelled', output = COALESCE(?1, 'task cancelled'), finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE task_id = ?2 AND status IN ('running', 'waiting_external')",
+                params![reason, id],
+            )?;
+            transaction.execute(
+                "DELETE FROM execution_reservations WHERE run_id IN (SELECT id FROM agent_runs WHERE task_id = ?1 AND status = 'cancelled')",
+                [id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(changed != 0)
     }
 
@@ -2002,16 +2321,29 @@ impl Database {
         execution_mode: &str,
         execution: AgentRunExecution<'_>,
     ) -> Result<i64, DbError> {
-        self.conn.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)", params![project_id, task_id, agent, execution_mode, execution.class, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
-        let id = self.conn.last_insert_rowid();
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', CURRENT_TIMESTAMP, 'starting', CURRENT_TIMESTAMP)", params![project_id, task_id, agent, execution_mode, execution.class, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
+        let id = transaction.last_insert_rowid();
+        let owner_pid =
+            (execution_mode == crate::registry::AUTOMATED).then_some(i64::from(std::process::id()));
+        if transaction.execute(
+            "INSERT INTO execution_reservations(agent_id, run_id, owner_pid) VALUES (?1, ?2, ?3)",
+            params![agent, id, owner_pid],
+        ).is_err() {
+            return Err(DbError::AgentHasActiveRun(agent.to_owned()));
+        }
+        transaction.commit()?;
         let agent_id = agent.to_owned();
-        self.record_lifecycle_event(
+        if let Err(error) = self.record_lifecycle_event(
             "dispatch_start",
             Some(task_id),
             Some(id),
             Some(&agent_id),
             None,
-        )?;
+        ) {
+            let _ = self.update_agent_run_failure(id, None, &error.to_string(), None);
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -2023,9 +2355,26 @@ impl Database {
         agent: &str,
         execution: AgentRunExecution<'_>,
     ) -> Result<i64, DbError> {
-        self.conn.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, 'automated', ?4, ?5, ?6, ?7, 'running', CURRENT_TIMESTAMP, ?4, CURRENT_TIMESTAMP)", params![project_id, task_id, agent, action, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
-        let id = self.conn.last_insert_rowid();
-        self.record_lifecycle_event("action_start", None, Some(id), Some(agent), Some(action))?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("INSERT INTO agent_runs (project_id, task_id, agent, execution_mode, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, status, started_at, phase, last_activity) VALUES (?1, ?2, ?3, 'automated', ?4, ?5, ?6, ?7, 'running', CURRENT_TIMESTAMP, ?4, CURRENT_TIMESTAMP)", params![project_id, task_id, agent, action, execution.model, execution.effort.map(|e| e.as_str()), execution.source])?;
+        let id = transaction.last_insert_rowid();
+        if transaction.execute(
+            "INSERT INTO execution_reservations(agent_id, run_id, owner_pid) VALUES (?1, ?2, ?3)",
+            params![agent, id, i64::from(std::process::id())],
+        ).is_err() {
+            return Err(DbError::AgentHasActiveRun(agent.to_owned()));
+        }
+        transaction.commit()?;
+        if let Err(error) = self.record_lifecycle_event(
+            "action_start",
+            task_id,
+            Some(id),
+            Some(agent),
+            Some(action),
+        ) {
+            let _ = self.update_agent_run_failure(id, None, &error.to_string(), None);
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -2067,10 +2416,18 @@ impl Database {
         output: Option<&str>,
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<bool, DbError> {
-        let changed = self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE agent_runs SET status = ?1, output = ?2, error = CASE WHEN ?1 = 'failed' THEN error ELSE NULL END, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
             params![status, output, run_id],
         )?;
+        if !matches!(status, "running" | "waiting_external") {
+            transaction.execute(
+                "DELETE FROM execution_reservations WHERE run_id = ?1",
+                [run_id],
+            )?;
+        }
+        transaction.commit()?;
         if changed != 0 && matches!(status, "completed" | "failed" | "no_changes") {
             self.record_worker_result(run_id, status, output, token_usage)?;
         }
@@ -2084,10 +2441,16 @@ impl Database {
         error: &str,
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<bool, DbError> {
-        let changed = self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE agent_runs SET status = 'failed', output = ?1, error = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
             params![raw_output, error, run_id],
         )?;
+        transaction.execute(
+            "DELETE FROM execution_reservations WHERE run_id = ?1",
+            [run_id],
+        )?;
+        transaction.commit()?;
         if changed != 0 {
             self.record_worker_result(run_id, "failed", Some(error), token_usage)?;
         }
@@ -2168,12 +2531,18 @@ impl Database {
             params![run_id],
             |row| row.get(0),
         )?;
-        let changed = self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE agent_runs SET status = 'completed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status = 'waiting_external'",
             params![output, run_id])?;
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
+        transaction.execute(
+            "DELETE FROM execution_reservations WHERE run_id = ?1",
+            [run_id],
+        )?;
+        transaction.commit()?;
         self.record_worker_result(run_id, "completed", Some(output), None)?;
         Ok(task_id)
     }
@@ -2182,12 +2551,18 @@ impl Database {
         let task_id: String = self.conn.query_row(
             "SELECT task_id FROM agent_runs WHERE id = ?1 AND status IN ('running', 'waiting_external')",
             params![run_id], |row| row.get(0))?;
-        let changed = self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
             params![reason, run_id])?;
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
+        transaction.execute(
+            "DELETE FROM execution_reservations WHERE run_id = ?1",
+            [run_id],
+        )?;
+        transaction.commit()?;
         self.record_worker_result(run_id, "failed", Some(reason), None)?;
         Ok(task_id)
     }
@@ -2211,7 +2586,11 @@ impl Database {
     }
 
     pub fn list_busy_agents(&self) -> Result<Vec<String>, DbError> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT agent FROM agent_runs WHERE status IN ('running', 'waiting_external') ORDER BY agent")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT r.agent_id FROM execution_reservations r
+             JOIN agent_runs run ON run.id = r.run_id AND run.agent = r.agent_id
+             WHERE run.status IN ('running', 'waiting_external') ORDER BY r.agent_id",
+        )?;
         Ok(stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)

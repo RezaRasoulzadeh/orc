@@ -466,6 +466,8 @@ mod tests {
             Some(r#"{"steps":[{"command":"cargo test","passed":true,"output":""}]}"#),
         )
         .unwrap();
+        db.update_agent_run_status(older, "completed", None)
+            .unwrap();
         let newest = create_run(&db, project_id, &task_id, "code");
         db.record_lifecycle_event(
             "validation_result",
@@ -484,6 +486,8 @@ mod tests {
             Some(expected),
         )
         .unwrap();
+        db.update_agent_run_status(newest, "completed", None)
+            .unwrap();
         let review = create_run(&db, project_id, &task_id, "review");
         db.update_agent_run_status(review, "completed", Some(r#"{"verdict":"PASS","blocking_findings":[],"non_blocking_findings":[],"revision_feedback":null}"#)).unwrap();
 

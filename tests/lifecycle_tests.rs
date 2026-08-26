@@ -583,6 +583,8 @@ fn scoped_lifecycle_limits_are_applied_after_scoping() {
         )
         .unwrap();
     let target_run = db.create_agent_run(project, &target, "agent").unwrap();
+    db.update_agent_run_status(target_run, "completed", None)
+        .unwrap();
     let other_run = db.create_agent_run(project, &other, "agent").unwrap();
     db.record_lifecycle_event("other", Some(&other), Some(other_run), None, None)
         .unwrap();

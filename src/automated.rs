@@ -412,6 +412,7 @@ fn run_review_mode(
             source: "action",
         },
     )?;
+    let _run_finalizer = db.run_finalizer(run);
     let instructions = if project_review {
         "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
     } else {
@@ -501,6 +502,7 @@ pub fn run_plan(
     request.validate()?;
     let (agent, resolved) = resolve_action(db, AgentAction::Plan, overrides)?;
     let run = start_run(db, AgentAction::Plan, &resolved)?;
+    let _run_finalizer = db.run_finalizer(run);
     let prompt = format!(
         "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state.\n{}",
         serde_json::to_string(request)?
@@ -583,6 +585,7 @@ pub fn run_lead(
 ) -> Result<(i64, LeadResponse)> {
     let (agent, resolved) = resolve_action(db, AgentAction::Lead, overrides)?;
     let run = start_run(db, AgentAction::Lead, &resolved)?;
+    let _run_finalizer = db.run_finalizer(run);
     let adapter = LeadActionAdapter {
         db,
         run,

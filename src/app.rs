@@ -411,6 +411,10 @@ impl OrcApp {
     pub fn agents(&self) -> Result<Vec<AgentDefinition>> {
         Ok(self.db.list_agents()?)
     }
+
+    pub fn busy_agents(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self.db.list_busy_agents()?.into_iter().collect())
+    }
     pub fn manual_runs(&self, agent_id: &str) -> Result<Vec<ManualRunContext>> {
         let agent = registry::get_agent(&self.db, agent_id)?;
         if agent.execution_mode != registry::MANUAL {

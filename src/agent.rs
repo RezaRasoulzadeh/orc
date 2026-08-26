@@ -311,6 +311,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let run_id = db
         .create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)
         .with_context(|| "failed to create agent run")?;
+    let _run_finalizer = db.run_finalizer(run_id);
 
     // Create a worktree for the task
     let (branch_name, worktree_path) = match git::ensure_worktree(task_id, repo_path) {
@@ -715,6 +716,7 @@ pub fn revise_with_worker_on_db(
             source: &resolution.source,
         },
     )?;
+    let _run_finalizer = db.run_finalizer(run_id);
     db.record_lifecycle_event(
         "review_revision",
         Some(task_id),
@@ -946,7 +948,14 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
         agent
     } else {
         let agents = db.list_agents()?;
-        let decision = crate::scheduler::schedule(&task, &agents, None)?;
+        let busy_agents = db.list_busy_agents()?.into_iter().collect();
+        let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
+            &task,
+            &agents,
+            None,
+            &busy_agents,
+            db.quota_reserve()?,
+        )?;
         let selected_id = decision.selected_agent_id.ok_or_else(|| {
             anyhow::anyhow!(
                 "no eligible agent found for task '{}': {}",

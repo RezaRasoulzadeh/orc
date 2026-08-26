@@ -268,7 +268,8 @@ fn execute(
         RuntimeRequest::DispatchCandidates(task_id) => {
             let task = app.task(task_id)?.context("task not found")?;
             let agents = app.agents()?;
-            let decision = crate::scheduler::schedule(&task, &agents, None)?;
+            let decision =
+                crate::scheduler::schedule_with_busy(&task, &agents, None, &app.busy_agents()?)?;
             let eligible = decision
                 .candidates
                 .into_iter()

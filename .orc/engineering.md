@@ -38,8 +38,10 @@ Do not implement the conflicting architectural change without approval.
 - Persistent project state comes from SQLite unless an existing architecture explicitly defines otherwise.
 - Do not place raw SQL outside storage.
 - Provider-specific behavior belongs behind worker/backend abstractions.
+- Shared application behavior remains provider-independent.
 - Terminal/UI presentation must remain separate from orchestration and application logic.
-- Shared behavior belongs in shared application/core APIs rather than being duplicated by CLI,
+- Shared behavior belongs in existing Orc application, orchestration, and shared core APIs rather
+  than being duplicated by CLI,
   desktop, workers, reviewers, repair paths, or other frontends.
 - Do not introduce hidden global mutable state.
 - Respect ownership and thread-safety boundaries. Do not use unsafe `Send`/`Sync` implementations
@@ -178,6 +180,8 @@ validation actually executed.
 
 ## 10. Persistence and lifecycle safety
 
+- Preserve foreign keys and use transactions for multi-step mutations.
+- Migrations must be incremental and preserve existing data.
 - Preserve foreign-key integrity.
 - Treat persisted run, worker, validation, review, lifecycle, change-evidence, and worktree records
   as related lineage rather than isolated rows.
@@ -206,6 +210,7 @@ Orc targets Linux, macOS, and Windows.
 - Prefer established cross-platform libraries for non-domain platform infrastructure when appropriate.
 - Do not claim cross-platform support based solely on validation from one platform.
 - Avoid platform-specific shell assumptions in core behavior.
+- Do not use unsafe `Send`/`Sync` ownership hacks.
 
 
 ## 13. Dependencies
@@ -277,6 +282,7 @@ Every coding worker must report:
 - validation commands actually run and their results;
 - unresolved risks or limitations;
 - architectural decisions requiring approval.
+- Validation evidence must identify the exact revision tested.
 
 If an architectural decision is required, include:
 

@@ -113,7 +113,7 @@ impl Runtime {
         })
     }
 
-    pub fn submit(&mut self, request: RuntimeRequest) -> (OperationId, Cancellation) {
+    pub fn submit(&mut self, request: RuntimeRequest) -> Result<(OperationId, Cancellation)> {
         self.next_id += 1;
         let id = OperationId(self.next_id);
         let cancellation = Cancellation {
@@ -125,8 +125,8 @@ impl Runtime {
                 request,
                 cancellation: cancellation.clone(),
             })
-            .expect("application owner thread exited");
-        (id, cancellation)
+            .context("submit runtime request")?;
+        Ok((id, cancellation))
     }
 
     pub fn recv(&self) -> Result<RuntimeEvent, mpsc::RecvError> {
@@ -380,8 +380,8 @@ mod tests {
             events,
             next_id: 0,
         };
-        let (first, cancellation) = runtime.submit(RuntimeRequest::Tasks);
-        let (second, _) = runtime.submit(RuntimeRequest::Queue);
+        let (first, cancellation) = runtime.submit(RuntimeRequest::Tasks).unwrap();
+        let (second, _) = runtime.submit(RuntimeRequest::Queue).unwrap();
         assert_eq!(first, OperationId(1));
         assert_eq!(second, OperationId(2));
         assert!(!cancellation.is_requested());
@@ -404,9 +404,9 @@ mod tests {
     #[test]
     fn requests_and_results_keep_their_operation_ids() {
         let (_directory, mut runtime) = runtime();
-        let (first, _) = runtime.submit(RuntimeRequest::Tasks);
+        let (first, _) = runtime.submit(RuntimeRequest::Tasks).unwrap();
         let first_events = events_until(&runtime, first);
-        let (second, _) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (second, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         let second_events = events_until(&runtime, second);
         assert!(
             first_events
@@ -429,13 +429,13 @@ mod tests {
     #[test]
     fn startup_context_supports_empty_and_active_projects() {
         let (directory, mut runtime) = runtime();
-        let (empty_id, _) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (empty_id, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         let empty = events_until(&runtime, empty_id);
         assert!(empty.iter().any(|event| matches!(event, RuntimeEvent::Context(id, context) if *id == empty_id && context.project.is_none())));
 
         let database = Database::init(directory.path().join("orc.db")).unwrap();
         database.create_project("acceptance-project").unwrap();
-        let (active_id, _) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (active_id, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         let active = events_until(&runtime, active_id);
         assert!(active.iter().any(|event| matches!(event, RuntimeEvent::Context(id, context) if *id == active_id && context.project.as_deref() == Some("acceptance-project"))));
     }
@@ -443,12 +443,14 @@ mod tests {
     #[test]
     fn application_errors_are_structured_and_session_can_continue() {
         let (_directory, mut runtime) = runtime();
-        let (bad_id, _) = runtime.submit(RuntimeRequest::DispatchCandidates("missing".into()));
+        let (bad_id, _) = runtime
+            .submit(RuntimeRequest::DispatchCandidates("missing".into()))
+            .unwrap();
         let bad = events_until(&runtime, bad_id);
         assert!(
             matches!(bad.last(), Some(RuntimeEvent::Failed(id, message)) if *id == bad_id && !message.is_empty())
         );
-        let (good_id, _) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (good_id, _) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         assert!(
             matches!(events_until(&runtime, good_id).last(), Some(RuntimeEvent::Completed(id, _)) if *id == good_id)
         );
@@ -457,7 +459,7 @@ mod tests {
     #[test]
     fn unsupported_cancellation_is_an_error_not_a_false_cancelled_event() {
         let (_directory, mut runtime) = runtime();
-        let (id, cancellation) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (id, cancellation) = runtime.submit(RuntimeRequest::ProjectStatus).unwrap();
         cancellation.request();
         let events = events_until(&runtime, id);
         assert!(
@@ -468,6 +470,25 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::Cancelled(event_id) if *event_id == id))
         );
+    }
+
+    #[test]
+    fn submit_reports_disconnected_owner_without_panicking() {
+        let (requests, incoming) = mpsc::channel();
+        drop(incoming);
+        let (_events_sender, events) = mpsc::channel();
+        let mut runtime = Runtime {
+            requests,
+            events,
+            next_id: 0,
+        };
+
+        let error = match runtime.submit(RuntimeRequest::Tasks) {
+            Ok(_) => panic!("disconnected owner unexpectedly accepted request"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("submit runtime request"));
     }
 
     #[test]

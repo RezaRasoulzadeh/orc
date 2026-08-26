@@ -29,7 +29,7 @@ pub trait RuntimePort {
     fn submit(
         &mut self,
         request: RuntimeRequest,
-    ) -> (crate::runtime::OperationId, crate::runtime::Cancellation);
+    ) -> Result<(crate::runtime::OperationId, crate::runtime::Cancellation)>;
     fn recv(&self) -> Result<RuntimeEvent, std::sync::mpsc::RecvError>;
     fn try_recv(&self) -> Result<RuntimeEvent, std::sync::mpsc::TryRecvError>;
     fn cancel(&self, cancellation: &crate::runtime::Cancellation);
@@ -39,7 +39,7 @@ impl RuntimePort for Runtime {
     fn submit(
         &mut self,
         request: RuntimeRequest,
-    ) -> (crate::runtime::OperationId, crate::runtime::Cancellation) {
+    ) -> Result<(crate::runtime::OperationId, crate::runtime::Cancellation)> {
         Runtime::submit(self, request)
     }
     fn recv(&self) -> Result<RuntimeEvent, std::sync::mpsc::RecvError> {
@@ -442,7 +442,7 @@ pub struct Editor<T, R = Runtime> {
     selection: Option<(String, Vec<String>, usize)>,
 }
 
-impl<T: Terminal> Editor<T, Runtime> {
+impl<T: Terminal, R> Editor<T, R> {
     pub fn new(terminal: T) -> Self {
         Self {
             terminal,
@@ -457,17 +457,6 @@ impl<T: Terminal> Editor<T, Runtime> {
 }
 
 impl<T: Terminal, R: RuntimePort> Editor<T, R> {
-    pub fn new_with_runtime(terminal: T, runtime: R) -> Self {
-        Self {
-            terminal,
-            history: Vec::new(),
-            history_pos: None,
-            prompt: "orc> ".into(),
-            runtime: Some(runtime),
-            confirmation: None,
-            selection: None,
-        }
-    }
     pub fn with_runtime(mut self, runtime: R) -> Self {
         self.runtime = Some(runtime);
         self
@@ -504,7 +493,7 @@ impl<T: Terminal, R: RuntimePort> Editor<T, R> {
                                 .submit(RuntimeRequest::Dispatch {
                                     task_id: task_id.clone(),
                                     agent_id: Some(agents[0].clone()),
-                                });
+                                })?;
                             active = Some((next, cancellation));
                         } else {
                             self.selection = Some((task_id.clone(), agents.clone(), 0));
@@ -548,7 +537,7 @@ impl<T: Terminal, R: RuntimePort> Editor<T, R> {
                             .submit(RuntimeRequest::Dispatch {
                                 task_id,
                                 agent_id: Some(agents[selected].clone()),
-                            });
+                            })?;
                         active = Some((id, cancellation));
                         self.selection = None;
                         self.terminal
@@ -568,7 +557,7 @@ impl<T: Terminal, R: RuntimePort> Editor<T, R> {
                         self.confirmation = None;
                         if let Some(runtime) = self.runtime.as_mut() {
                             let (id, cancellation) =
-                                runtime.submit(RuntimeRequest::CancelTask(task_id));
+                                runtime.submit(RuntimeRequest::CancelTask(task_id))?;
                             active = Some((id, cancellation));
                             self.terminal
                                 .print("confirmed; cancellation submitted\r\n")?;
@@ -697,13 +686,13 @@ impl<T: Terminal, R: RuntimePort> Editor<T, R> {
                             self.confirmation = args.get(1).cloned();
                             self.terminal.print("confirm task cancellation? [y/N] ")?;
                         } else if args.len() == 2 && args[0] == "dispatch" {
-                            let (id, cancellation) =
-                                runtime.submit(RuntimeRequest::DispatchCandidates(args[1].clone()));
+                            let (id, cancellation) = runtime
+                                .submit(RuntimeRequest::DispatchCandidates(args[1].clone()))?;
                             active = Some((id, cancellation));
                             self.terminal
                                 .print(&format!("operation {} submitted\r\n", id.0))?;
                         } else if let Some(request) = runtime_request(&args) {
-                            let (id, cancellation) = runtime.submit(request);
+                            let (id, cancellation) = runtime.submit(request)?;
                             active = Some((id, cancellation));
                             self.terminal
                                 .print(&format!("operation {} submitted\r\n", id.0))?;
@@ -720,7 +709,7 @@ impl<T: Terminal, R: RuntimePort> Editor<T, R> {
     }
     fn refresh_context(&mut self) -> Result<()> {
         let runtime = self.runtime.as_mut().context("runtime unavailable")?;
-        let (id, _) = runtime.submit(RuntimeRequest::ProjectStatus);
+        let (id, _) = runtime.submit(RuntimeRequest::ProjectStatus)?;
         loop {
             let event = runtime.recv().context("runtime event stream closed")?;
             if matches!(&event, RuntimeEvent::Context(event_id, _) if *event_id == id) {
@@ -873,7 +862,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(
             editor
@@ -905,7 +894,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.starts_with("orc> "));
     }
@@ -925,7 +914,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.contains("render:abc:2;"));
         assert!(editor.terminal.output.contains("render:ab:2;"));
@@ -955,7 +944,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.contains("render:a:1;"));
         assert!(editor.terminal.output.contains("render:x:1;"));
@@ -979,7 +968,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.contains("^C\r\norc> "));
         assert!(editor.terminal.output.ends_with("render:quit:4;\r\n"));
@@ -1004,7 +993,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.contains("\x1b[2J\x1b[H"));
         assert_eq!(editor.terminal.output.matches("orc> ").count(), 2);
@@ -1020,7 +1009,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert_eq!(editor.terminal.output.matches("orc> ").count(), 1);
     }
@@ -1091,7 +1080,7 @@ mod tests {
             timed_keys: Vec::new(),
             output: String::new(),
         };
-        let mut editor = Editor::new(terminal);
+        let mut editor = Editor::<_, Runtime>::new(terminal);
         editor.run().unwrap();
         assert!(editor.terminal.output.contains("render:ac:1;"));
         assert!(editor.terminal.output.contains("render:ac:2;"));
@@ -1278,7 +1267,7 @@ mod tests {
     }
 
     impl RuntimePort for FakeRuntime {
-        fn submit(&mut self, request: RuntimeRequest) -> (OperationId, Cancellation) {
+        fn submit(&mut self, request: RuntimeRequest) -> Result<(OperationId, Cancellation)> {
             let mut state = self.state.borrow_mut();
             let plan = state.plans.pop_front().expect("unexpected runtime request");
             assert_eq!(request, plan.expected);
@@ -1304,7 +1293,7 @@ mod tests {
             );
             drop(state);
             self.release_ready();
-            (id, cancellation)
+            Ok((id, cancellation))
         }
 
         fn recv(&self) -> Result<RuntimeEvent, std::sync::mpsc::RecvError> {
@@ -1361,7 +1350,7 @@ mod tests {
             timed_keys,
             output: String::new(),
         };
-        let mut editor = Editor::new_with_runtime(terminal, runtime);
+        let mut editor = Editor::new(terminal).with_runtime(runtime);
         editor.run().unwrap();
         assert!(state.borrow().plans.is_empty());
         (editor.terminal.output, state)

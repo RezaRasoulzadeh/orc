@@ -70,8 +70,8 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
-    ensure_file(&orc_dir.join("engineering.md"), ENGINEERING_TEMPLATE)?;
+pub fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
+    ensure_contract_file(&orc_dir.join("engineering.md"), ENGINEERING_TEMPLATE)?;
     ensure_file(&orc_dir.join("project.md"), PROJECT_TEMPLATE)?;
     ensure_file(&orc_dir.join("architecture.md"), ARCHITECTURE_TEMPLATE)?;
     ensure_file(&orc_dir.join("roadmap.md"), ROADMAP_TEMPLATE)?;
@@ -86,6 +86,18 @@ fn ensure_file(path: &Path, contents: &str) -> Result<()> {
         if std::fs::metadata(path)?.len() != 0 {
             return Ok(());
         }
+    }
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_contract_file(path: &Path, contents: &str) -> Result<()> {
+    if path.exists() {
+        if !path.is_file() {
+            bail!("{} exists but is not a file", path.display());
+        }
+        return Ok(());
     }
     std::fs::write(path, contents)
         .with_context(|| format!("failed to write {}", path.display()))?;

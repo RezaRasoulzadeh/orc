@@ -82,6 +82,42 @@ fn adopt_does_not_overwrite_existing_project_docs() {
 }
 
 #[test]
+fn adopt_does_not_overwrite_existing_engineering_contract() {
+    let (_dir, repo) = git_repo();
+    std::fs::create_dir_all(repo.join(".orc")).unwrap();
+    std::fs::write(
+        repo.join(".orc/engineering.md"),
+        "# User-owned engineering contract\n",
+    )
+    .unwrap();
+    adoption::adopt(&repo).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
+        "# User-owned engineering contract\n"
+    );
+}
+
+#[test]
+fn adoption_preserves_empty_engineering_contract_but_populates_empty_project_doc() {
+    let (_dir, repo) = git_repo();
+    std::fs::create_dir_all(repo.join(".orc")).unwrap();
+    std::fs::write(repo.join(".orc/engineering.md"), "").unwrap();
+    std::fs::write(repo.join(".orc/project.md"), "").unwrap();
+
+    adoption::adopt(&repo).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
+        ""
+    );
+    assert!(
+        std::fs::read_to_string(repo.join(".orc/project.md"))
+            .unwrap()
+            .contains("# Project")
+    );
+}
+
+#[test]
 fn discovery_request_is_json_and_read_only() {
     let (_dir, repo) = git_repo();
     adoption::adopt(&repo).unwrap();

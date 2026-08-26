@@ -299,6 +299,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Init => {
             // initialize sqlite DB
             let db = Database::init(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            adoption::ensure_adoption_files(std::path::Path::new(".orc"))?;
             let pid = match db.get_project_id().map_err(|e| anyhow::anyhow!(e))? {
                 Some(id) => id,
                 None => db.create_project("orc").map_err(|e| anyhow::anyhow!(e))?,

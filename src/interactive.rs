@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use dialoguer::{Confirm, Select};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -380,21 +381,44 @@ fn run_session<
     })
 }
 
+fn editor_with_history(history_path: &Path) -> Result<DefaultEditor> {
+    let mut editor = DefaultEditor::new().context("create interactive editor")?;
+    if history_path.exists() {
+        editor
+            .load_history(history_path)
+            .context("load interactive history")?;
+    }
+    Ok(editor)
+}
+
+fn save_editor_history(editor: &mut DefaultEditor, history_path: &Path) -> Result<()> {
+    editor
+        .save_history(history_path)
+        .context("save interactive history")?;
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let runtime = Runtime::open(".orc/orc.db", ".")?;
-    let mut editor = DefaultEditor::new().context("create interactive editor")?;
+    let history_path = Path::new(".orc/history");
+    let mut editor = editor_with_history(history_path)?;
     let printer = Arc::new(Mutex::new(
         editor
             .create_external_printer()
             .context("create event printer")?,
     ));
-    run_session(&runtime, &mut editor, printer, &mut DialoguerDialogs)
+    let result = run_session(&runtime, &mut editor, printer, &mut DialoguerDialogs);
+    if result.is_ok() {
+        save_editor_history(&mut editor, history_path)?;
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use tempfile::tempdir;
 
     struct ScriptInput(VecDeque<std::result::Result<String, ReadlineError>>);
     impl SessionInput for ScriptInput {
@@ -536,6 +560,88 @@ mod tests {
                 task_id: "T-1".into(),
                 agent_id: None
             })
+        );
+    }
+
+    #[test]
+    fn history_startup_without_file_uses_empty_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history");
+
+        let editor = editor_with_history(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(editor.history().iter().next().is_none());
+    }
+
+    #[test]
+    fn history_startup_loads_existing_entries_in_order() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history");
+        let mut writer = editor_with_history(&path).unwrap();
+        writer.add_history_entry("first").unwrap();
+        writer.add_history_entry("second").unwrap();
+        save_editor_history(&mut writer, &path).unwrap();
+
+        let editor = editor_with_history(&path).unwrap();
+
+        assert_eq!(
+            editor.history().iter().collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn history_save_persists_commands_added_to_session_editor() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history");
+        let mut editor = editor_with_history(&path).unwrap();
+        SessionInput::add_history(&mut editor, "status").unwrap();
+        SessionInput::add_history(&mut editor, "tasks --unicode café").unwrap();
+
+        save_editor_history(&mut editor, &path).unwrap();
+        let reopened = editor_with_history(&path).unwrap();
+
+        assert_eq!(
+            reopened.history().iter().collect::<Vec<_>>(),
+            ["status", "tasks --unicode café",]
+        );
+    }
+
+    #[test]
+    fn history_round_trip_restores_entries_after_session_close() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history");
+        {
+            let mut session = editor_with_history(&path).unwrap();
+            SessionInput::add_history(&mut session, "dispatch T-0001").unwrap();
+            save_editor_history(&mut session, &path).unwrap();
+        }
+
+        let reopened = editor_with_history(&path).unwrap();
+
+        assert_eq!(
+            reopened.history().iter().collect::<Vec<_>>(),
+            ["dispatch T-0001"]
+        );
+    }
+
+    #[test]
+    fn history_save_preserves_existing_entries_and_appends_new_commands() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history");
+        let mut editor = editor_with_history(&path).unwrap();
+        SessionInput::add_history(&mut editor, "old command").unwrap();
+        save_editor_history(&mut editor, &path).unwrap();
+
+        let mut session = editor_with_history(&path).unwrap();
+        SessionInput::add_history(&mut session, "new command").unwrap();
+        save_editor_history(&mut session, &path).unwrap();
+        let reopened = editor_with_history(&path).unwrap();
+
+        assert_eq!(
+            reopened.history().iter().collect::<Vec<_>>(),
+            ["old command", "new command"]
         );
     }
 

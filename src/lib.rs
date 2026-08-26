@@ -13,6 +13,7 @@ pub mod events;
 pub mod execution;
 pub mod format;
 pub mod git;
+pub mod interactive;
 pub mod lead;
 pub mod protocol;
 pub mod queue;

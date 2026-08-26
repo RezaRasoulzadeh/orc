@@ -277,6 +277,10 @@ fn run(cli: Cli) -> Result<()> {
         return desktop::launch_desktop(&desktop::DetachedDesktopProcess);
     }
 
+    if cli.command.is_none() {
+        return orc::interactive::run();
+    }
+
     match cli
         .command
         .ok_or_else(|| anyhow::anyhow!("a command is required unless --ui is used"))?

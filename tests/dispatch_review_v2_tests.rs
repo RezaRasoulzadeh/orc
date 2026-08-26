@@ -1,14 +1,14 @@
 use anyhow::Result;
 use orc::agent::{
     accept_task, dispatch_with_worker_and_db_as_with_runner, reject_task,
-    revise_with_worker_and_db_as_with_runner,
+    revise_with_worker_and_db_as_with_runner, revise_with_worker_on_db,
 };
 use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides};
 use orc::git;
 use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
 use orc::review;
-use orc::storage::Database;
+use orc::storage::{AgentRunExecution, Database};
 use orc::task::{TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
 use orc::validation::{
@@ -38,6 +38,13 @@ struct NoChangeWorker;
 impl Worker for NoChangeWorker {
     fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         Ok((WorkerOutcome::Success, None))
+    }
+}
+
+struct StartupFailureWorker;
+impl Worker for StartupFailureWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        Err("startup failed".into())
     }
 }
 
@@ -222,6 +229,275 @@ fn setup() -> (TempDir, Database, String) {
     (dir, db, task)
 }
 
+fn seed_actionable_revision_review(db: &Database, task: &str) {
+    let project = db.get_project_id().unwrap().unwrap();
+    let run = db
+        .create_agent_run_with_execution(
+            project,
+            task,
+            "fake",
+            "automated",
+            AgentRunExecution {
+                class: "review",
+                model: None,
+                effort: None,
+                source: "test",
+            },
+        )
+        .unwrap();
+    db.update_agent_run_status(
+        run,
+        "completed",
+        Some(r#"{"verdict":"REVISE","revision_feedback":"test feedback"}"#),
+    )
+    .unwrap();
+}
+
+fn revision_fixture() -> (TempDir, Database, String, i64) {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    seed_actionable_revision_review(&db, &task);
+    let review_id = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.execution_class == "review")
+        .unwrap()
+        .id;
+    (dir, db, task, review_id)
+}
+
+#[test]
+fn blocked_task_with_actionable_revise_review_can_revise() {
+    let (dir, db, task, _) = revision_fixture();
+    db.update_task_status(&task, TaskStatus::Blocked).unwrap();
+    revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn blocked_task_without_actionable_review_cannot_revise() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
+    db.update_task_status(&task, TaskStatus::Blocked).unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "retry",
+            &WritingWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn latest_pass_supersedes_older_revise() {
+    let (_, db, task, _) = revision_fixture();
+    let project = db.get_project_id().unwrap().unwrap();
+    let pass = db
+        .create_agent_run_with_execution(
+            project,
+            &task,
+            "fake",
+            AUTOMATED,
+            AgentRunExecution {
+                class: "review",
+                model: None,
+                effort: None,
+                source: "test",
+            },
+        )
+        .unwrap();
+    db.update_agent_run_status(pass, "completed", Some(r#"{"verdict":"PASS"}"#))
+        .unwrap();
+    assert!(db.actionable_revision_review(&task).unwrap().is_none());
+}
+
+#[test]
+fn successful_revision_start_consumes_and_links_source_review() {
+    let (dir, db, task, review_id) = revision_fixture();
+    let summary = revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(db.actionable_revision_review(&task).unwrap(), None);
+    let run = db.get_agent_run(summary.run_id).unwrap().unwrap();
+    assert_eq!(run.id, summary.run_id);
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
+}
+
+#[test]
+fn failed_revision_start_preserves_review_actionability() {
+    let (dir, db, task, _) = revision_fixture();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "retry",
+            &StartupFailureWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+    assert!(db.actionable_revision_review(&task).unwrap().is_some());
+}
+
+#[test]
+fn restart_preserves_actionable_review() {
+    let (dir, db, task, _) = revision_fixture();
+    let path = dir.path().join(".orc/orc.db");
+    drop(db);
+    assert!(
+        Database::open(&path)
+            .unwrap()
+            .actionable_revision_review(&task)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn restart_preserves_consumed_revision_linkage() {
+    let (dir, db, task, review_id) = revision_fixture();
+    let summary = revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    drop(db);
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
+}
+
+#[test]
+fn terminal_task_cannot_revise_with_historical_revise_review() {
+    let (dir, db, task, _) = revision_fixture();
+    db.update_task_status(&task, TaskStatus::Done).unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "retry",
+            &WritingWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn newer_revise_review_becomes_actionable_after_prior_consumption() {
+    let (dir, db, task, _) = revision_fixture();
+    revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    seed_actionable_revision_review(&db, &task);
+    assert!(db.actionable_revision_review(&task).unwrap().is_some());
+}
+
+#[test]
+fn consumed_review_cannot_be_reused_twice() {
+    let (dir, db, task, _) = revision_fixture();
+    revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "retry",
+            &WritingWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn accept_preserves_review_history_and_closes_revision() {
+    let (dir, db, task, review_id) = revision_fixture();
+    accept_task(&db, &task, dir.path()).unwrap();
+    assert!(db.get_agent_run(review_id).unwrap().is_some());
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Done
+    );
+}
+
+#[test]
+fn cancel_preserves_review_history_and_closes_revision() {
+    let (dir, db, task, review_id) = revision_fixture();
+    OrcApp::open(dir.path().join(".orc/orc.db"), dir.path())
+        .unwrap()
+        .cancel(&task, Some("operator cancelled"))
+        .unwrap();
+    assert!(db.get_agent_run(review_id).unwrap().is_some());
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Cancelled
+    );
+}
+
 fn automated_agent(id: &str, actions: Vec<AgentAction>) -> AgentDefinition {
     AgentDefinition {
         id: id.into(),
@@ -328,6 +604,8 @@ fn revision_worker_includes_current_engineering_contract() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+
+    seed_actionable_revision_review(&db, &task);
 
     revise_with_worker_and_db_as_with_runner(
         &task,
@@ -437,6 +715,7 @@ fn contract_is_reloaded_at_execution_time() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+    seed_actionable_revision_review(&db, &task);
     std::fs::write(dir.path().join(".orc/engineering.md"), "CONTRACT_B").unwrap();
 
     revise_with_worker_and_db_as_with_runner(

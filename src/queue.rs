@@ -122,13 +122,13 @@ impl QueueReport {
 
     pub fn all_items(&self) -> Vec<&QueueEntry> {
         let mut items = Vec::new();
+        items.extend(&self.cancelled);
+        items.extend(&self.done);
         items.extend(&self.ready);
         items.extend(&self.blocked);
-        items.extend(&self.active);
-        items.extend(&self.review);
         items.extend(&self.backlog);
-        items.extend(&self.done);
-        items.extend(&self.cancelled);
+        items.extend(&self.review);
+        items.extend(&self.active);
         items
     }
 
@@ -142,11 +142,11 @@ impl QueueReport {
         let categories = [
             ("CANCELLED", &self.cancelled),
             ("DONE", &self.done),
+            ("READY", &self.ready),
+            ("BLOCKED", &self.blocked),
             ("BACKLOG", &self.backlog),
             ("REVIEW", &self.review),
             ("ACTIVE", &self.active),
-            ("BLOCKED", &self.blocked),
-            ("READY", &self.ready),
         ];
         for (name, items) in categories {
             if items.is_empty() {
@@ -191,11 +191,11 @@ impl QueueReport {
         let categories = [
             (QueueCategory::Cancelled, &self.cancelled),
             (QueueCategory::Done, &self.done),
+            (QueueCategory::Ready, &self.ready),
+            (QueueCategory::Blocked, &self.blocked),
             (QueueCategory::Backlog, &self.backlog),
             (QueueCategory::Review, &self.review),
             (QueueCategory::Active, &self.active),
-            (QueueCategory::Blocked, &self.blocked),
-            (QueueCategory::Ready, &self.ready),
         ];
 
         let mut first_cat = true;

@@ -824,6 +824,7 @@ mod tests {
             change_evidence: None,
             validation_evidence: None,
             prior_reviews: Vec::new(),
+            automated_reviews: Vec::new(),
         };
         (
             db,
@@ -839,12 +840,32 @@ mod tests {
     fn later_pass_resolves_earlier_blocker_in_resolution_ledger() {
         let reviews = vec![
             crate::review::PriorReview {
+                run_id: 1,
+                agent: "reviewer".into(),
+                status: "completed".into(),
+                started_at: "".into(),
+                finished_at: None,
+                model: None,
+                reasoning_effort: None,
+                severity: None,
+                findings: vec![],
+                validation_evidence: None,
                 verdict: "REVISE".into(),
                 blocking_findings: vec!["validation is incomplete".into()],
                 non_blocking_findings: Vec::new(),
                 revision_feedback: Some("complete validation".into()),
             },
             crate::review::PriorReview {
+                run_id: 2,
+                agent: "reviewer".into(),
+                status: "completed".into(),
+                started_at: "".into(),
+                finished_at: None,
+                model: None,
+                reasoning_effort: None,
+                severity: None,
+                findings: vec![],
+                validation_evidence: None,
                 verdict: "PASS".into(),
                 blocking_findings: Vec::new(),
                 non_blocking_findings: Vec::new(),

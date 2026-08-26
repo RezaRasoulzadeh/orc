@@ -177,6 +177,15 @@ enum Command {
         /// Show the unified diff for one changed file.
         #[arg(long, conflicts_with = "diff")]
         file: Option<String>,
+        /// Emit the persisted automated review history as JSON.
+        #[arg(long, conflicts_with_all = ["diff", "file", "review_id", "full"])]
+        history: bool,
+        /// Inspect one persisted automated review run by ID.
+        #[arg(long, conflicts_with_all = ["diff", "file", "history", "full"])]
+        review_id: Option<i64>,
+        /// Emit the complete persisted review read model as JSON.
+        #[arg(long, conflicts_with_all = ["diff", "file", "history", "review_id"])]
+        full: bool,
     },
     /// Run an unrestricted project-wide review using a task's captured evidence.
     ProjectReview {
@@ -670,6 +679,9 @@ fn run(cli: Cli) -> Result<()> {
             effort,
             diff,
             file,
+            history,
+            review_id,
+            full,
         } => {
             if automated {
                 let app = orc::app::OrcApp::open(DB_PATH, ".")?;
@@ -684,8 +696,24 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
-            let review = orc::review::build_review(&db, &task_id, std::path::Path::new("."))?;
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            if let Some(run_id) = review_id {
+                let review = app.review_for_run(&task_id, run_id)?;
+                println!("{}", serde_json::to_string_pretty(&review)?);
+                return Ok(());
+            }
+            if history {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&app.review_history(&task_id)?)?
+                );
+                return Ok(());
+            }
+            let review = app.review(&task_id)?;
+            if full {
+                println!("{}", serde_json::to_string_pretty(&review)?);
+                return Ok(());
+            }
             let output = match file {
                 Some(path) => orc::review::format_review_file(&review, &path)?,
                 None => orc::review::format_review_with_diff(

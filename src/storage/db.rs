@@ -1181,6 +1181,8 @@ impl Database {
             ("resolved_model", "TEXT"),
             ("resolved_reasoning_effort", "TEXT"),
             ("resolution_source", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("review_consumed", "INTEGER NOT NULL DEFAULT 0"),
+            ("source_review_run_id", "INTEGER REFERENCES agent_runs(id)"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!(
@@ -2376,6 +2378,87 @@ impl Database {
             return Err(error);
         }
         Ok(id)
+    }
+
+    pub fn actionable_revision_review(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(i64, String)>, DbError> {
+        let value = self.conn.query_row(
+            "SELECT id, output FROM agent_runs WHERE task_id = ?1 AND execution_class = 'review' AND status = 'completed' AND review_consumed = 0 ORDER BY id DESC LIMIT 1",
+            [task_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        ).optional()?;
+        Ok(value.and_then(|(id, output)| {
+            let json = serde_json::from_str::<serde_json::Value>(output.as_deref()?).ok()?;
+            json.get("verdict")?
+                .as_str()?
+                .eq_ignore_ascii_case("revise")
+                .then(|| {
+                    (
+                        id,
+                        json.get("revision_feedback")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+        }))
+    }
+
+    pub fn link_revision_to_review(
+        &self,
+        revision_run_id: i64,
+        review_run_id: i64,
+    ) -> Result<bool, DbError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE agent_runs
+             SET source_review_run_id = ?1
+             WHERE id = ?2
+               AND source_review_run_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM agent_runs review
+                   WHERE review.id = ?1
+                     AND review.task_id = agent_runs.task_id
+                     AND review.execution_class = 'review'
+                     AND review.status = 'completed'
+                     AND review.review_consumed = 0
+               )",
+            params![review_run_id, revision_run_id],
+        )?;
+        if changed != 0 {
+            let consumed = transaction.execute(
+                "UPDATE agent_runs SET review_consumed = 1
+                 WHERE id = ?1 AND review_consumed = 0",
+                [review_run_id],
+            )?;
+            if consumed == 0 {
+                transaction.rollback()?;
+                return Ok(false);
+            }
+        }
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
+
+    /// Records that a revision has crossed its execution-start boundary.
+    ///
+    /// The linkage and consumption are one persistent transition so a review
+    /// cannot be consumed without the revision run also identifying it.
+    pub fn start_revision_execution(
+        &self,
+        revision_run_id: i64,
+        review_run_id: i64,
+    ) -> Result<bool, DbError> {
+        self.link_revision_to_review(revision_run_id, review_run_id)
+    }
+
+    pub fn source_review_run_id(&self, revision_run_id: i64) -> Result<Option<i64>, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT source_review_run_id FROM agent_runs WHERE id = ?1",
+            [revision_run_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn update_agent_run_status(

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use orc::agent::{
     RevisionExecutionOverrides, accept_task, dispatch_with_worker_and_db_as_with_runner,
-    reject_task, revise_manual, revise_with_worker_and_db_as_with_runner,
+    reject_task, revise_manual, revise_with_factory_and_db_as_with_runner,
+    revise_with_worker_and_db_as_with_runner,
     revise_with_worker_and_db_as_with_runner_with_overrides, revise_with_worker_on_db,
 };
 use orc::app::OrcApp;
@@ -65,6 +66,15 @@ struct CapturingWorker {
     calls: Mutex<Vec<String>>,
     fail_first: bool,
     blocker_id: String,
+}
+
+type ReceivedExecutionConfig =
+    std::sync::Arc<Mutex<Option<(Option<String>, Option<ReasoningEffort>)>>>;
+
+struct ExecutionConfigCapturingWorker {
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    received: ReceivedExecutionConfig,
 }
 
 struct QueuedReviewBackend {
@@ -144,6 +154,38 @@ impl Worker for CapturingWorker {
                             "test_names": []
                         }],
                         "validation_evidence": "command check passed acceptance is exact; exact acceptance survives", "unresolved_risk": null
+                    }]
+                })
+                .to_string(),
+            ),
+        ))
+    }
+}
+
+impl Worker for ExecutionConfigCapturingWorker {
+    fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        *self.received.lock().unwrap() = Some((self.model.clone(), self.effort));
+        std::fs::write(
+            cwd.join("captured-config.txt"),
+            "revision worker executed\n",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((
+            WorkerOutcome::Success,
+            Some(
+                serde_json::json!({
+                    "claims": [{
+                        "blocker_id": "BLK-production",
+                        "status": "addressed",
+                        "implementation_summary": "worker received execution overrides",
+                        "changed_files": ["captured-config.txt"],
+                        "evidence": [{
+                            "changed_file": "captured-config.txt",
+                            "validation_command": "check",
+                            "test_names": []
+                        }],
+                        "validation_evidence": "worker executed",
+                        "unresolved_risk": null
                     }]
                 })
                 .to_string(),
@@ -1076,11 +1118,11 @@ fn production_revise_without_feedback_consumes_persisted_contract() {
 #[test]
 fn production_revise_applies_model_and_effort_overrides_to_run_resolution() {
     let (dir, db, task, _) = production_contract_fixture();
-    let worker = CapturingWorker::with_blocker_id("BLK-production");
-    revise_with_worker_and_db_as_with_runner_with_overrides(
+    let received = std::sync::Arc::new(Mutex::new(None));
+    let worker_received = received.clone();
+    revise_with_factory_and_db_as_with_runner(
         &task,
-        "",
-        &worker,
+        "use the requested revision settings",
         dir.path().join(".orc/orc.db").to_str().unwrap(),
         dir.path(),
         "fake",
@@ -1088,6 +1130,13 @@ fn production_revise_applies_model_and_effort_overrides_to_run_resolution() {
         &RevisionExecutionOverrides {
             model: Some("revision-model".into()),
             effort: Some(ReasoningEffort::High),
+        },
+        move |_, model, effort| {
+            Ok(Box::new(ExecutionConfigCapturingWorker {
+                model,
+                effort,
+                received: worker_received,
+            }))
         },
     )
     .unwrap();
@@ -1100,6 +1149,46 @@ fn production_revise_applies_model_and_effort_overrides_to_run_resolution() {
     assert_eq!(run.resolved_model.as_deref(), Some("revision-model"));
     assert_eq!(run.resolved_reasoning_effort, Some(ReasoningEffort::High));
     assert!(run.resolution_source.contains("override"));
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some((Some("revision-model".into()), Some(ReasoningEffort::High),))
+    );
+}
+
+#[test]
+fn production_revise_without_overrides_preserves_agent_defaults_in_run_resolution() {
+    let (dir, db, task, _) = production_contract_fixture();
+    db.set_agent_model("fake", "configured-revision-model")
+        .unwrap();
+    db.set_agent_reasoning_effort("fake", ReasoningEffort::Low)
+        .unwrap();
+    let worker = CapturingWorker::with_blocker_id("BLK-defaults");
+
+    revise_with_worker_and_db_as_with_runner_with_overrides(
+        &task,
+        "",
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+        &RevisionExecutionOverrides {
+            model: None,
+            effort: None,
+        },
+    )
+    .unwrap();
+    let run = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.agent == "fake" && run.execution_class != "review")
+        .unwrap();
+    assert_eq!(
+        run.resolved_model.as_deref(),
+        Some("configured-revision-model")
+    );
+    assert_eq!(run.resolved_reasoning_effort, Some(ReasoningEffort::Low));
 }
 
 #[test]

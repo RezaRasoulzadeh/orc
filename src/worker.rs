@@ -315,6 +315,10 @@ const SIGKILL: i32 = 9;
 /// Trait for task execution backends.
 /// Implementations are responsible for executing a task and returning the outcome.
 pub trait Worker: Send + Sync {
+    /// Provider execution settings selected for this worker, when applicable.
+    fn execution_configuration(&self) -> (Option<&str>, Option<ReasoningEffort>) {
+        (None, None)
+    }
     /// Provider environment required to execute this worker, if any.
     fn configured_environment(&self) -> Option<(&'static str, &Path)> {
         None
@@ -527,6 +531,9 @@ impl CodexWorker {
 }
 
 impl Worker for CodexWorker {
+    fn execution_configuration(&self) -> (Option<&str>, Option<ReasoningEffort>) {
+        (self.model.as_deref(), self.reasoning_effort)
+    }
     fn configured_environment(&self) -> Option<(&'static str, &Path)> {
         Some(("CODEX_HOME", &self.profile_path))
     }

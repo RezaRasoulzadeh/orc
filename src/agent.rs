@@ -669,6 +669,60 @@ pub fn revise_with_worker_and_db_as_with_runner(
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "keeps the CLI revision seam explicit"
+)]
+pub fn revise_with_factory_and_db_as_with_runner<F>(
+    task_id: &str,
+    feedback: &str,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+    factory: F,
+) -> Result<DispatchSummary>
+where
+    F: FnOnce(
+        &AgentDefinition,
+        Option<String>,
+        Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String>,
+{
+    let db = Database::open(db_path)?;
+    let task = db.get_task(task_id)?.context("task not found")?;
+    let agent = db
+        .list_agents()?
+        .into_iter()
+        .find(|candidate| candidate.id == agent_id)
+        .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
+    let resolution = crate::execution::resolve_with_template(
+        &task.role,
+        &db.execution_template(crate::execution::class_for_role(&task.role))?,
+        agent.model.as_deref(),
+        agent.reasoning_effort,
+        overrides.model.clone(),
+        overrides.effort,
+    );
+    let worker = factory(
+        &agent,
+        resolution.model.clone(),
+        resolution.reasoning_effort,
+    )
+    .map_err(anyhow::Error::msg)?;
+    revise_with_worker_on_db_with_overrides(
+        task_id,
+        feedback,
+        worker.as_ref(),
+        &db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        overrides,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "keeps the revision helper parallel to the existing worker API"
 )]
 pub fn revise_with_worker_and_db_as_with_runner_with_overrides(

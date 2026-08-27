@@ -222,11 +222,13 @@ Runs an unrestricted project-wide automated audit using the task's captured evid
 - `--model MODEL` — model override for this run (automated Codex agents only).
 - `--effort EFFORT` — reasoning-effort override for this run (automated Codex agents only).
 
-### `orc revise TASK_ID FEEDBACK [--agent AGENT]`
+### `orc revise TASK_ID [FEEDBACK] [--agent AGENT] [--model MODEL] [--effort EFFORT]`
 Revises a reviewed task using review feedback, redispatching it.
 - `TASK_ID` — task to revise.
-- `FEEDBACK` — free-text feedback to send back to the worker.
+- `FEEDBACK` — optional free-text feedback to send back to the worker; when omitted, the persisted review contract is used.
 - `--agent AGENT` — explicit agent override for the revision run.
+- `--model MODEL` — model override for an automated revision run.
+- `--effort EFFORT` — reasoning-effort override for an automated revision run (`none`, `low`, `medium`, or `high`).
 
 ## Agents
 
@@ -390,7 +392,7 @@ orc run fail <RUN_ID> [REASON]
 
 orc review <TASK_ID> [--automated] [--agent ID] [--model NAME] [--effort LEVEL] [--diff | --file PATH]
 orc project-review <TASK_ID> [--agent ID] [--model NAME] [--effort LEVEL]
-orc revise <TASK_ID> <FEEDBACK> [--agent ID]
+orc revise <TASK_ID> [FEEDBACK] [--agent ID] [--model NAME] [--effort LEVEL]
 
 orc agents [--sync]
 orc agent list

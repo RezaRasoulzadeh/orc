@@ -61,6 +61,16 @@ fn git_identity(root: &std::path::Path, command: &str) -> Result<Option<String>>
     Ok((!value.is_empty()).then_some(value))
 }
 
+fn lead_decision_json<T: serde::Serialize>(decision: T) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(decision)?;
+    if let Some(details) = value.get_mut("details")
+        && let Some(serialized) = details.as_str()
+    {
+        *details = serde_json::from_str(serialized)?;
+    }
+    Ok(value)
+}
+
 #[derive(Parser)]
 #[command(name = "orc", version, about = "Local AI engineering orchestrator")]
 struct Cli {
@@ -270,6 +280,8 @@ enum LeadCommand {
         request: String,
     },
     Pending,
+    /// Show all persisted Lead decisions without changing workflow state.
+    History,
     Consume,
     Show,
     Set {
@@ -589,8 +601,20 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 LeadCommand::Pending => println!(
                     "{}",
-                    serde_json::to_string_pretty(&app.pending_lead_decision()?)?
+                    serde_json::to_string_pretty(
+                        &app.pending_lead_decision()?
+                            .map(lead_decision_json)
+                            .transpose()?
+                    )?
                 ),
+                LeadCommand::History => {
+                    let decisions = app
+                        .lead_decisions()?
+                        .into_iter()
+                        .map(lead_decision_json)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    println!("{}", serde_json::to_string_pretty(&decisions)?)
+                }
                 LeadCommand::Consume => println!(
                     "{}",
                     serde_json::to_string_pretty(&app.consume_pending_lead_decision()?)?

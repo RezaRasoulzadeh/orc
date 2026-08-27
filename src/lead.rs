@@ -47,6 +47,9 @@ pub struct LeadDecision {
 pub struct PersistedLeadDecision {
     pub id: i64,
     pub run_id: Option<i64>,
+    pub created_at: String,
+    pub source_request: String,
+    pub summary: String,
     pub kind: LeadDecisionKind,
     pub details: String,
     pub snapshot: Option<String>,
@@ -333,8 +336,12 @@ impl<'a> LeadService<'a> {
                 project_id,
                 &decision.kind,
                 &decision.details,
-                &snapshot,
-                run_id,
+                crate::storage::db::LeadDecisionMetadata {
+                    snapshot: &snapshot,
+                    run_id,
+                    source_request: message,
+                    summary: &response.message,
+                },
             )?;
         }
         let mut proposals = Vec::new();

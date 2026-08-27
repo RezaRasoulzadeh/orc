@@ -6,6 +6,13 @@ use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::{io, path::Path};
 
+pub struct LeadDecisionMetadata<'a> {
+    pub snapshot: &'a str,
+    pub run_id: Option<i64>,
+    pub source_request: &'a str,
+    pub summary: &'a str,
+}
+
 fn priority_string(priority: TaskPriority) -> &'static str {
     match priority {
         TaskPriority::Low => "low",
@@ -1536,7 +1543,7 @@ impl Database {
     }
 
     fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT, snapshot TEXT, run_id INTEGER);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT, snapshot TEXT, run_id INTEGER, source_request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '');")?;
         let columns = conn
             .prepare("PRAGMA table_info(lead_decisions)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -1558,6 +1565,18 @@ impl Database {
         }
         if !columns.iter().any(|column| column == "run_id") {
             conn.execute("ALTER TABLE lead_decisions ADD COLUMN run_id INTEGER", [])?;
+        }
+        if !columns.iter().any(|column| column == "source_request") {
+            conn.execute(
+                "ALTER TABLE lead_decisions ADD COLUMN source_request TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "summary") {
+            conn.execute(
+                "ALTER TABLE lead_decisions ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
         }
         let legacy = {
             let mut statement = conn.prepare("SELECT id, kind, proposal FROM lead_decisions")?;
@@ -1595,13 +1614,12 @@ impl Database {
         project_id: i64,
         kind: &crate::lead::LeadDecisionKind,
         details: &serde_json::Value,
-        snapshot: &str,
-        run_id: Option<i64>,
+        metadata: LeadDecisionMetadata<'_>,
     ) -> Result<i64, DbError> {
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute("UPDATE lead_decisions SET status = 'superseded', resolved_at = CURRENT_TIMESTAMP WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')", params![project_id])?;
         let payload = serde_json::to_string(details)?;
-        transaction.execute("INSERT INTO lead_decisions (project_id, kind, proposal, snapshot, run_id) VALUES (?1, ?2, ?3, ?4, ?5)", params![project_id, lead_decision_kind(*kind), payload, snapshot, run_id])?;
+        transaction.execute("INSERT INTO lead_decisions (project_id, kind, proposal, snapshot, run_id, source_request, summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id, lead_decision_kind(*kind), payload, metadata.snapshot, metadata.run_id, metadata.source_request, metadata.summary])?;
         let id = transaction.last_insert_rowid();
         transaction.commit()?;
         Ok(id)
@@ -1611,9 +1629,9 @@ impl Database {
         &self,
         project_id: i64,
     ) -> Result<Option<crate::lead::PersistedLeadDecision>, DbError> {
-        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
+        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
             let status: String = r.get(4)?;
-            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status })
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status })
         }).optional()?)
     }
 
@@ -1622,7 +1640,7 @@ impl Database {
         project_id: i64,
     ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, kind, proposal, snapshot, status, run_id FROM lead_decisions
+            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary FROM lead_decisions
              WHERE project_id = ?1 AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')
              ORDER BY id ASC",
         )?;
@@ -1631,6 +1649,9 @@ impl Database {
             Ok(crate::lead::PersistedLeadDecision {
                 id: r.get(0)?,
                 run_id: r.get(5)?,
+                created_at: r.get(6)?,
+                source_request: r.get(7)?,
+                summary: r.get(8)?,
                 kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?,
                 details: r.get(2)?,
                 snapshot: r.get(3)?,

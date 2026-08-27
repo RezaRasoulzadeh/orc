@@ -36,7 +36,12 @@ fn task(title: &str) -> PlannedTask {
         capabilities: Vec::new(),
         scope_mode: None,
         context_files: Vec::new(),
-        expected_changes: Vec::new(),
+        expected_changes: vec!["src/lib.rs".into()],
+        unchanged: vec!["unrelated behavior".into()],
+        acceptance_criteria: vec!["behavior works".into()],
+        required_tests: vec!["production path test".into()],
+        validation: vec!["cargo test".into()],
+        execution_hints: Default::default(),
     }
 }
 
@@ -112,7 +117,12 @@ fn v02_shared_api_covers_planning_approvals_reports_agents_and_manual_runs() {
                 capabilities: vec![],
                 scope_mode: None,
                 context_files: vec![],
-                expected_changes: vec![],
+                expected_changes: vec!["src/lib.rs".into()],
+                unchanged: vec!["unrelated behavior".into()],
+                acceptance_criteria: vec!["behavior works".into()],
+                required_tests: vec!["production path test".into()],
+                validation: vec!["cargo test".into()],
+                execution_hints: Default::default(),
             },
         ],
     };

@@ -134,6 +134,11 @@ impl PlanResponseSchema {
                 "scope_mode",
                 "context_files",
                 "expected_changes",
+                "unchanged",
+                "acceptance_criteria",
+                "required_tests",
+                "validation",
+                "execution_hints",
                 "depends_on",
             ]
             .into_iter()
@@ -150,26 +155,69 @@ pub struct PlanResponse {
     pub assumptions: Vec<String>,
     pub risks: Vec<String>,
     pub questions: Vec<String>,
-    pub tasks: Vec<PlannedTask>,
+    pub tasks: Vec<TaskProposal>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PlannedTask {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskProposal {
     pub local_id: String,
     pub title: String,
     pub objective: String,
     pub role: String,
     pub priority: TaskPriority,
-    #[serde(default)]
     #[serde(alias = "dependencies")]
     pub depends_on: Vec<String>,
-    #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(default)]
     pub scope_mode: Option<TaskScopeMode>,
-    #[serde(default)]
     pub context_files: Vec<String>,
-    #[serde(default)]
     pub expected_changes: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub required_tests: Vec<String>,
+    pub validation: Vec<String>,
+    pub execution_hints: ExecutionHints,
+}
+
+/// Compatibility name for callers of the v1 planning API.
+pub type PlannedTask = TaskProposal;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionHints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl TaskProposal {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("local_id", &self.local_id),
+            ("title", &self.title),
+            ("objective", &self.objective),
+            ("role", &self.role),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("task proposal {name} must not be empty")
+            }
+        }
+        for (name, values) in [
+            ("expected_changes", &self.expected_changes),
+            ("unchanged", &self.unchanged),
+            ("acceptance_criteria", &self.acceptance_criteria),
+            ("required_tests", &self.required_tests),
+            ("validation", &self.validation),
+        ] {
+            if values.is_empty() {
+                anyhow::bail!("task proposal '{}' must not be empty", self.local_id)
+            }
+            if values.iter().any(|value| value.trim().is_empty()) {
+                anyhow::bail!("task proposal {name} contains an empty requirement")
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PlanningRequest {
@@ -194,13 +242,7 @@ impl PlanResponse {
             anyhow::bail!("plan task IDs must be unique")
         }
         for task in &self.tasks {
-            if task.local_id.trim().is_empty()
-                || task.title.trim().is_empty()
-                || task.objective.trim().is_empty()
-                || task.role.trim().is_empty()
-            {
-                anyhow::bail!("plan tasks require local_id, title, objective, and role")
-            }
+            task.validate()?;
             if matches!(
                 task.scope_mode,
                 Some(TaskScopeMode::Focused | TaskScopeMode::Module)
@@ -240,7 +282,7 @@ impl PlanResponse {
         }
         fn visit(
             id: &str,
-            tasks: &std::collections::HashMap<&str, &PlannedTask>,
+            tasks: &std::collections::HashMap<&str, &TaskProposal>,
             visiting: &mut std::collections::HashSet<String>,
             visited: &mut std::collections::HashSet<String>,
         ) -> bool {
@@ -275,6 +317,64 @@ impl PlanResponse {
             anyhow::bail!("plan dependencies contain a cycle")
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal() -> TaskProposal {
+        TaskProposal {
+            local_id: "one".into(),
+            title: "One behavior".into(),
+            objective: "Do one thing".into(),
+            role: "developer".into(),
+            priority: TaskPriority::Normal,
+            depends_on: vec![],
+            capabilities: vec!["code".into()],
+            scope_mode: Some(TaskScopeMode::Focused),
+            context_files: vec!["src/lib.rs".into()],
+            expected_changes: vec!["src/lib.rs".into()],
+            unchanged: vec!["CLI behavior".into()],
+            acceptance_criteria: vec!["works".into()],
+            required_tests: vec!["production test".into()],
+            validation: vec!["cargo test".into()],
+            execution_hints: ExecutionHints {
+                class: Some("code".into()),
+                model: Some("x".into()),
+                effort: Some("low".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn task_proposal_round_trips_and_validates() {
+        let value = proposal();
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<TaskProposal>(&json).unwrap(), value);
+        assert!(value.validate().is_ok());
+    }
+
+    #[test]
+    fn incomplete_task_proposals_are_rejected() {
+        let mut value = proposal();
+        value.acceptance_criteria.clear();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn task_proposal_missing_contract_field_is_rejected_during_deserialization() {
+        let mut json = serde_json::to_value(proposal()).unwrap();
+        json.as_object_mut().unwrap().remove("acceptance_criteria");
+        assert!(serde_json::from_value::<TaskProposal>(json).is_err());
+    }
+
+    #[test]
+    fn task_proposal_without_expected_changes_is_rejected() {
+        let mut value = proposal();
+        value.expected_changes.clear();
+        assert!(value.validate().is_err());
     }
 }
 

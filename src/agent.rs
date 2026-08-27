@@ -766,21 +766,21 @@ pub fn revise_with_worker_on_db(
         anyhow::bail!("{message}")
     };
     progress("worker running");
-    let execution = match worker.execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| {
-        worker_output(line);
-    }) {
+    let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
+        .context("failed to capture pre-revision change evidence")?;
+    let handoff_schema = crate::automated::revision_handoff_schema();
+    let execution = match worker.execute_structured_with_progress_and_usage(
+        &prompt,
+        &worktree_dir,
+        &handoff_schema,
+        &|line| worker_output(line),
+    ) {
         Ok(result) => result,
         Err(error) => {
             progress("worker failed");
             return fail(error);
         }
     };
-    // Returning an execution means the worker/provider successfully crossed
-    // the start boundary. An Err above is still a pre-start failure and must
-    // leave the review available for retry.
-    if !db.start_revision_execution(run_id, source_review_id)? {
-        anyhow::bail!("revision review was consumed before execution started");
-    }
     let outcome = execution.outcome;
     let output = execution.output;
     let token_usage = execution.token_usage;
@@ -800,7 +800,7 @@ pub fn revise_with_worker_on_db(
     }
     progress("worker completed");
     let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
-        Ok(changes) => changes,
+        Ok(changes) => git::changes_since(&baseline_changes, &changes),
         Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
     };
     if changes.files.is_empty() {
@@ -831,15 +831,35 @@ pub fn revise_with_worker_on_db(
         Some(agent_id),
         Some(&validation_evidence),
     )?;
+    let revision_validation_evidence =
+        serde_json::to_string(&crate::automated::RevisionValidationEvidence {
+            evidence_id: format!("revision-validation-{run_id}"),
+            worktree_fingerprint: crate::automated::revision_worktree_fingerprint(&changes),
+            report: report.clone(),
+        })?;
+    db.record_lifecycle_event(
+        "revision_validation_evidence",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&revision_validation_evidence),
+    )?;
     let handoff = match crate::automated::validate_revision_handoff_with_evidence(
         &revision_contract,
         output.as_deref().unwrap_or_default(),
         Some(&changes),
-        Some(&validation_evidence),
+        Some(&revision_validation_evidence),
     ) {
         Ok(value) => value,
         Err(error) => return fail(format!("Invalid revision handoff: {error:#}")),
     };
+    // A provider result is not a completed revision execution until its
+    // structured handoff has passed the authoritative blocker validator.
+    // Consume and link the source review atomically at that boundary so a bad
+    // handoff remains retryable without losing worktree or validation evidence.
+    if !db.start_revision_execution(run_id, source_review_id)? {
+        return fail("Revision review was consumed before handoff completion.".into());
+    }
     db.record_lifecycle_event(
         "revision_handoff",
         Some(task_id),
@@ -1273,7 +1293,7 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
             source_review_id,
         )?;
         let changes = db.get_change_evidence(run_id)?;
-        let validation = db.latest_validation_result_for_run(run_id)?;
+        let validation = db.latest_revision_validation_evidence_for_run(run_id)?;
         let handoff = crate::automated::validate_revision_handoff_with_evidence(
             &contract,
             output,

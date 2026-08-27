@@ -17,6 +17,63 @@ pub struct WorktreeChanges {
     pub diff: String,
 }
 
+/// Return only paths whose patch changed between two inspections. This makes
+/// revision evidence attempt-local even when the task worktree already carries
+/// implementation changes from an earlier run.
+pub fn changes_since(before: &WorktreeChanges, after: &WorktreeChanges) -> WorktreeChanges {
+    let before_patches = patches_by_path(before);
+    let after_patches = patches_by_path(after);
+    let files = after
+        .files
+        .iter()
+        .filter(|file| {
+            before_patches.get(file.path.as_str()) != after_patches.get(file.path.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let diff = after
+        .diff
+        .split("diff --git ")
+        .skip(1)
+        .filter(|section| {
+            paths.iter().any(|path| {
+                section.lines().next().is_some_and(|header| {
+                    header.contains(&format!("a/{path}")) || header.contains(&format!("b/{path}"))
+                })
+            })
+        })
+        .map(|section| format!("diff --git {section}"))
+        .collect::<String>();
+    WorktreeChanges {
+        files,
+        stat: after.stat.clone(),
+        diff,
+    }
+}
+
+fn patches_by_path(changes: &WorktreeChanges) -> std::collections::BTreeMap<&str, &str> {
+    let mut result = std::collections::BTreeMap::new();
+    for file in &changes.files {
+        let patch = changes
+            .diff
+            .split("diff --git ")
+            .skip(1)
+            .find(|section| {
+                section.lines().next().is_some_and(|header| {
+                    header.contains(&format!("a/{}", file.path))
+                        || header.contains(&format!("b/{}", file.path))
+                })
+            })
+            .unwrap_or_default();
+        result.insert(file.path.as_str(), patch);
+    }
+    result
+}
+
 pub fn is_runtime_artifact(path: &str) -> bool {
     RUNTIME_ARTIFACTS.contains(&path)
         || path == ".orc/worktrees"
@@ -80,9 +137,24 @@ pub fn changed_files(worktree: impl AsRef<Path>) -> Result<Vec<ChangedFile>> {
         if status.contains('R') || status.contains('C') {
             let _ = entries.next();
         }
-        if !is_runtime_artifact(&path) {
+        // Porcelain may collapse an entirely untracked directory to `dir/`,
+        // which is not objective file-level evidence. Expand untracked paths
+        // below with ls-files instead.
+        if status != "??" && !is_runtime_artifact(&path) {
             files.push(ChangedFile { status, path });
         }
+    }
+    for path in git_output(
+        worktree,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?
+    .split('\0')
+    .filter(|path| !path.is_empty() && !is_runtime_artifact(path))
+    {
+        files.push(ChangedFile {
+            status: "??".into(),
+            path: path.into(),
+        });
     }
     Ok(files)
 }

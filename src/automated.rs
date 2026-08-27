@@ -241,6 +241,51 @@ fn schema(action: AgentAction) -> String {
     value.to_string()
 }
 
+/// Native provider schema for the structured result returned by a revision worker.
+pub fn revision_handoff_schema() -> String {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "blocker_id": {"type": "string"},
+                        "status": {"type": "string", "enum": ["addressed", "unresolved"]},
+                        "implementation_summary": {"type": "string"},
+                        "changed_files": {"type": "array", "items": {"type": "string"}},
+                        "evidence": {"type": "array", "items": {
+                            "type": "object", "additionalProperties": false,
+                            "properties": {
+                                "changed_file": {"type": "string"},
+                                "validation_command": {"type": "string"},
+                                "test_names": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["changed_file", "validation_command", "test_names"]
+                        }},
+                        "validation_evidence": {"type": "string"},
+                        "unresolved_risk": {"type": ["string", "null"]}
+                    },
+                    "required": [
+                        "blocker_id",
+                        "status",
+                        "implementation_summary",
+                        "changed_files",
+                        "evidence",
+                        "validation_evidence",
+                        "unresolved_risk"
+                    ]
+                }
+            }
+        },
+        "required": ["claims"]
+    })
+    .to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewResult {
     pub verdict: String,
@@ -288,8 +333,37 @@ pub struct RevisionClaim {
     pub status: String,
     pub implementation_summary: String,
     pub changed_files: Vec<String>,
+    pub evidence: Vec<RevisionClaimEvidence>,
     pub validation_evidence: String,
     pub unresolved_risk: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionClaimEvidence {
+    pub changed_file: String,
+    pub validation_command: String,
+    #[serde(default)]
+    pub test_names: Vec<String>,
+}
+
+/// Validation captured after the current diff was inspected. The fingerprint
+/// prevents an otherwise valid report from being replayed after the worktree changes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionValidationEvidence {
+    pub evidence_id: String,
+    pub worktree_fingerprint: String,
+    pub report: crate::validation::ValidationReport,
+}
+
+pub fn revision_worktree_fingerprint(changes: &crate::git::WorktreeChanges) -> String {
+    let value = serde_json::to_vec(changes).expect("worktree changes are serializable");
+    let mut hash: u64 = 14695981039346656037;
+    for byte in value {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+    }
+    format!("rev-{hash:016x}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,7 +410,7 @@ pub fn validate_revision_handoff_with_evidence(
                 claim.blocker_id
             );
         }
-        let blocker = contract
+        contract
             .unresolved
             .iter()
             .chain(contract.regressions.iter())
@@ -377,7 +451,7 @@ pub fn validate_revision_handoff_with_evidence(
             );
         }
         let changes = changes.context("active revision claims require current change evidence")?;
-        let actual_paths: std::collections::BTreeSet<&str> = changes
+        let mut actual_paths: std::collections::BTreeSet<&str> = changes
             .files
             .iter()
             .flat_map(|file| {
@@ -392,45 +466,81 @@ pub fn validate_revision_handoff_with_evidence(
                 }
             })
             .collect();
-        if claim
+        for line in changes.diff.lines() {
+            if let Some(path) = line
+                .strip_prefix("--- a/")
+                .or_else(|| line.strip_prefix("+++ b/"))
+            {
+                actual_paths.insert(path);
+            }
+        }
+        if let Some(path) = claim
             .changed_files
             .iter()
-            .any(|path| !actual_paths.contains(path.as_str()))
+            .find(|path| !actual_paths.contains(path.as_str()))
         {
             bail!(
-                "revision handoff claim '{}' contains a file not changed in this revision",
-                claim.blocker_id
+                "revision handoff claim '{}' contains a file not changed in this revision: '{}' (current paths: {})",
+                claim.blocker_id,
+                path,
+                actual_paths.iter().copied().collect::<Vec<_>>().join(", ")
             );
         }
         let validation = validation_payload
             .context("active revision claims require current validation evidence")?;
-        let report: crate::validation::ValidationReport = serde_json::from_str(validation)
+        let validation: RevisionValidationEvidence = serde_json::from_str(validation)
             .context("current revision validation evidence is not structured")?;
+        if validation.worktree_fingerprint != revision_worktree_fingerprint(changes) {
+            bail!(
+                "revision handoff claim '{}' is supported by stale validation evidence",
+                claim.blocker_id
+            );
+        }
+        let report = &validation.report;
         if !report.is_success() {
             bail!(
                 "revision handoff claim '{}' is supported by failed validation",
                 claim.blocker_id
             );
         }
-        if !claim.changed_files.iter().any(|path| {
-            claim.implementation_summary.contains(path) || claim.validation_evidence.contains(path)
-        }) && !claim
-            .implementation_summary
-            .to_ascii_lowercase()
-            .contains(&blocker.acceptance_condition.to_ascii_lowercase())
-        {
+        let evidence_paths: std::collections::BTreeSet<_> = claim
+            .evidence
+            .iter()
+            .map(|evidence| evidence.changed_file.as_str())
+            .collect();
+        let claimed_paths: std::collections::BTreeSet<_> =
+            claim.changed_files.iter().map(String::as_str).collect();
+        if evidence_paths != claimed_paths {
             bail!(
                 "revision handoff claim '{}' is not tied to its changed files or acceptance condition",
                 claim.blocker_id
             );
         }
-        if !claim.validation_evidence.contains("command")
-            || !claim.validation_evidence.contains("passed")
-        {
-            bail!(
-                "revision handoff claim '{}' lacks concrete validation evidence",
-                claim.blocker_id
-            );
+        for evidence in &claim.evidence {
+            let step = report
+                .steps
+                .iter()
+                .find(|step| step.command == evidence.validation_command && step.passed)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "revision handoff claim '{}' lacks fresh passing evidence for command '{}'",
+                        claim.blocker_id,
+                        evidence.validation_command
+                    )
+                })?;
+            let patch = changed_file_patch(changes, &evidence.changed_file);
+            for test_name in &evidence.test_names {
+                if test_name.trim().is_empty()
+                    || !patch.contains(test_name)
+                    || !step.output().contains(test_name)
+                {
+                    bail!(
+                        "revision handoff claim '{}' contains fabricated or unexecuted test name '{}'",
+                        claim.blocker_id,
+                        test_name
+                    );
+                }
+            }
         }
         if !required.contains(claim.blocker_id.as_str()) {
             bail!(
@@ -449,6 +559,22 @@ pub fn validate_revision_handoff_with_evidence(
         bail!("revision handoff is missing one or more active blocker claims");
     }
     Ok(handoff)
+}
+
+fn changed_file_patch<'a>(changes: &'a crate::git::WorktreeChanges, path: &str) -> &'a str {
+    let marker_a = format!("a/{path}");
+    let marker_b = format!("b/{path}");
+    changes
+        .diff
+        .split("diff --git ")
+        .skip(1)
+        .find(|section| {
+            section
+                .lines()
+                .next()
+                .is_some_and(|header| header.contains(&marker_a) || header.contains(&marker_b))
+        })
+        .unwrap_or_default()
 }
 
 fn is_vacuous_text(value: &str) -> bool {
@@ -1229,6 +1355,7 @@ mod tests {
         let output = serde_json::json!({"claims": [{
             "blocker_id": "BLK-1", "status": "addressed",
             "implementation_summary": "fixed it", "changed_files": [],
+            "evidence": [],
             "validation_evidence": "cargo test passed", "unresolved_risk": null
         }]})
         .to_string();
@@ -1241,11 +1368,168 @@ mod tests {
         let output = serde_json::json!({"claims": [{
             "blocker_id": "BLK-1", "status": "addressed",
             "implementation_summary": "fixed it", "changed_files": ["src/lib.rs"],
+            "evidence": [{"changed_file":"src/lib.rs","validation_command":"cargo test","test_names":[]}],
             "validation_evidence": "not tested", "unresolved_risk": null
         }]})
         .to_string();
         let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
         assert!(error.to_string().contains("placeholder validation"));
+    }
+
+    fn test_evidence_fixture(
+        changed_path: &str,
+        test_in_patch: &str,
+        executed_test: &str,
+    ) -> (crate::git::WorktreeChanges, String, String) {
+        let changes = crate::git::WorktreeChanges {
+            files: vec![crate::git::ChangedFile {
+                status: "M".into(),
+                path: changed_path.into(),
+            }],
+            stat: format!("{changed_path} | 1 +"),
+            diff: format!(
+                "diff --git a/{changed_path} b/{changed_path}\n--- a/{changed_path}\n+++ b/{changed_path}\n+fn {test_in_patch}() {{}}\n"
+            ),
+        };
+        let validation = RevisionValidationEvidence {
+            evidence_id: "validation-current".into(),
+            worktree_fingerprint: revision_worktree_fingerprint(&changes),
+            report: crate::validation::ValidationReport {
+                steps: vec![crate::validation::ValidationStepResult {
+                    command: "cargo test persisted_revision_contract_lifecycle".into(),
+                    category: crate::validation::ValidationCategory::Test,
+                    passed: true,
+                    stdout: format!("test {executed_test} ... ok"),
+                    stderr: String::new(),
+                    exit_status: Some(0),
+                    diagnostics: None,
+                    failure_classification: None,
+                    fallback_command: None,
+                }],
+            },
+        };
+        let handoff = serde_json::json!({"claims": [{
+            "blocker_id": "BLK-1", "status": "addressed",
+            "implementation_summary": "Added deterministic lifecycle coverage.",
+            "changed_files": [changed_path],
+            "evidence": [{
+                "changed_file": changed_path,
+                "validation_command": "cargo test persisted_revision_contract_lifecycle",
+                "test_names": ["persisted_revision_contract_lifecycle"]
+            }],
+            "validation_evidence": "Named test evidence is attached.",
+            "unresolved_risk": null
+        }]})
+        .to_string();
+        (
+            changes,
+            serde_json::to_string(&validation).unwrap(),
+            handoff,
+        )
+    }
+
+    #[test]
+    fn changed_test_without_fresh_test_evidence_is_rejected() {
+        let (changes, _, handoff) = test_evidence_fixture(
+            "tests/lifecycle.rs",
+            "persisted_revision_contract_lifecycle",
+            "persisted_revision_contract_lifecycle",
+        );
+        let error = validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("current validation evidence"));
+    }
+
+    #[test]
+    fn fresh_validation_with_unchanged_claimed_file_is_rejected() {
+        let (changes, validation, handoff) = test_evidence_fixture(
+            "tests/other.rs",
+            "persisted_revision_contract_lifecycle",
+            "persisted_revision_contract_lifecycle",
+        );
+        let handoff = handoff.replace("tests/other.rs", "tests/lifecycle.rs");
+        let error = validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            Some(&validation),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("file not changed"));
+    }
+
+    #[test]
+    fn fabricated_test_name_is_rejected() {
+        let (changes, validation, handoff) = test_evidence_fixture(
+            "tests/lifecycle.rs",
+            "persisted_revision_contract_lifecycle",
+            "some_other_test",
+        );
+        let error = validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            Some(&validation),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fabricated or unexecuted"));
+    }
+
+    #[test]
+    fn validation_from_previous_fingerprint_is_rejected() {
+        let (changes, validation, handoff) = test_evidence_fixture(
+            "tests/lifecycle.rs",
+            "persisted_revision_contract_lifecycle",
+            "persisted_revision_contract_lifecycle",
+        );
+        let mut validation: RevisionValidationEvidence = serde_json::from_str(&validation).unwrap();
+        validation.worktree_fingerprint = "rev-previous".into();
+        let error = validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            Some(&serde_json::to_string(&validation).unwrap()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale validation"));
+    }
+
+    #[test]
+    fn unrelated_changed_file_is_rejected_even_when_named_test_ran() {
+        let (changes, validation, handoff) = test_evidence_fixture(
+            "tests/unrelated.rs",
+            "unrelated_test",
+            "persisted_revision_contract_lifecycle",
+        );
+        let error = validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            Some(&validation),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fabricated or unexecuted"));
+    }
+
+    #[test]
+    fn current_diff_matching_test_and_fresh_passing_evidence_is_accepted() {
+        let (changes, validation, handoff) = test_evidence_fixture(
+            "tests/lifecycle.rs",
+            "persisted_revision_contract_lifecycle",
+            "persisted_revision_contract_lifecycle",
+        );
+        validate_revision_handoff_with_evidence(
+            &handoff_contract(),
+            &handoff,
+            Some(&changes),
+            Some(&validation),
+        )
+        .unwrap();
     }
 
     type Invocation = (AgentAction, Option<String>, Option<ReasoningEffort>);

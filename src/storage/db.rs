@@ -1088,6 +1088,20 @@ impl Database {
             .optional()?)
     }
 
+    pub fn latest_revision_validation_evidence_for_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<String>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT payload FROM lifecycle_events WHERE run_id = ?1 AND kind = 'revision_validation_evidence' ORDER BY id DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
     fn list_lifecycle_events_scoped(
         &self,
         predicate: &str,

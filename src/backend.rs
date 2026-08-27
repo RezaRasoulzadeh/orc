@@ -91,6 +91,45 @@ impl WorkerFactory {
         )))
     }
 
+    /// Build the Planner with the same enforced read-only boundary as Lead.
+    pub fn build_planner(
+        agent: &AgentDefinition,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String> {
+        Self::build_planner_with_executable(agent, model, reasoning_effort, None)
+    }
+
+    pub fn build_planner_with_executable(
+        agent: &AgentDefinition,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        executable: Option<PathBuf>,
+    ) -> Result<Box<dyn Worker>, String> {
+        if agent.backend != "codex" {
+            return Err(format!(
+                "Planner backend '{}' has no read-only execution boundary",
+                agent.backend
+            ));
+        }
+        let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
+            format!(
+                "Codex Planner agent '{}' requires a configured profile path",
+                agent.id
+            )
+        })?;
+        let worker = CodexWorker::with_read_only_execution(
+            PathBuf::from(profile_path),
+            model.or_else(|| agent.model.clone()),
+            reasoning_effort.or(agent.reasoning_effort),
+        );
+        let worker = match executable {
+            Some(path) => worker.with_executable(path),
+            None => worker,
+        };
+        Ok(Box::new(worker))
+    }
+
     pub fn build(agent: &AgentDefinition) -> Result<Box<dyn Worker>, String> {
         match agent.backend.as_str() {
             "copilot" => Ok(Box::new(CopilotWorker)),
@@ -160,6 +199,19 @@ pub(crate) fn configure_noninteractive(command: &mut Command, cwd: &Path) {
 mod tests {
     use super::*;
 
+    fn agent(backend: &str) -> AgentDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": "planner", "backend": backend, "execution_mode": "automated",
+            "display_name": "Planner", "enabled": true, "priority": 0,
+            "capabilities": [], "status": "available", "unavailable_reason": null,
+            "profile_path": "/profiles/planner", "model": null, "reasoning_effort": null,
+            "config_metadata": null, "quota_remaining_percent": null,
+            "quota_reset_at": null, "quota_checked_at": null, "quota_source": null,
+            "quota_limits": null, "actions": ["Plan"]
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn profile_environment_is_scoped_to_the_codex_command() {
         let mut command = Command::new("codex");
@@ -170,5 +222,14 @@ mod tests {
             .and_then(|(_, value)| value)
             .and_then(|value| value.to_str());
         assert_eq!(value, Some("/profiles/main"));
+    }
+
+    #[test]
+    fn planner_rejects_backends_without_a_read_only_boundary() {
+        let error = match WorkerFactory::build_planner(&agent("copilot"), None, None) {
+            Ok(_) => panic!("unsupported Planner backend was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no read-only execution boundary"));
     }
 }

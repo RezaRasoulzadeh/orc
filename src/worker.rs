@@ -459,6 +459,7 @@ pub struct CodexWorker {
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     sandbox: &'static str,
+    executable: PathBuf,
 }
 
 impl CodexWorker {
@@ -476,6 +477,7 @@ impl CodexWorker {
             model,
             reasoning_effort,
             sandbox: "workspace-write",
+            executable: PathBuf::from("codex"),
         }
     }
 
@@ -489,7 +491,13 @@ impl CodexWorker {
             model,
             reasoning_effort,
             sandbox: "read-only",
+            executable: PathBuf::from("codex"),
         }
+    }
+
+    pub fn with_executable(mut self, executable: PathBuf) -> Self {
+        self.executable = executable;
+        self
     }
 
     pub fn command_args(prompt: &str) -> Vec<String> {
@@ -538,7 +546,7 @@ impl CodexWorker {
         cwd: &Path,
         schema_path: Option<&Path>,
     ) -> std::process::Command {
-        let mut command = std::process::Command::new("codex");
+        let mut command = std::process::Command::new(&self.executable);
         let mut args = Self::command_args_with_sandbox(
             prompt,
             self.model.as_deref(),

@@ -1639,6 +1639,30 @@ impl Database {
         }).optional()?)
     }
 
+    /// Returns pending Lead decisions for read-only consumers such as Planner.
+    pub fn pending_lead_decision_context(
+        &self,
+    ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
+        let mut statement = self.conn.prepare("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary FROM lead_decisions WHERE status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id")?;
+        Ok(statement
+            .query_map([], |r| {
+                let status: String = r.get(4)?;
+                Ok(crate::lead::PersistedLeadDecision {
+                    id: r.get(0)?,
+                    kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?,
+                    details: r.get(2)?,
+                    snapshot: r.get(3)?,
+                    status: status.clone(),
+                    actionable: status == "pending",
+                    run_id: r.get(5)?,
+                    created_at: r.get(6)?,
+                    source_request: r.get(7)?,
+                    summary: r.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_lead_decisions(
         &self,
         project_id: i64,

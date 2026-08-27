@@ -111,13 +111,76 @@ pub trait ActionBackend {
 
 pub struct WorkerActionBackend {
     repo: PathBuf,
+    planner_executable: Option<PathBuf>,
+}
+
+/// The Planner execution boundary exposes only planning to its provider.
+/// This prevents a planner implementation from reaching orchestration actions
+/// even when it shares the general action backend infrastructure.
+pub struct PlannerActionBackend<'a> {
+    inner: &'a dyn ActionBackend,
+}
+
+impl<'a> PlannerActionBackend<'a> {
+    pub fn new(inner: &'a dyn ActionBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl ActionBackend for PlannerActionBackend<'_> {
+    fn observe(&self, message: &str) {
+        self.inner.observe(message);
+    }
+
+    fn invoke(
+        &self,
+        agent: &AgentDefinition,
+        action: AgentAction,
+        input: &str,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        if action != AgentAction::Plan {
+            bail!(
+                "Planner boundary rejects orchestration action '{}'",
+                action.as_str()
+            );
+        }
+        self.inner.invoke(agent, action, input, model, effort)
+    }
+
+    fn invoke_with_progress(
+        &self,
+        agent: &AgentDefinition,
+        action: AgentAction,
+        input: &str,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+        progress: ActionProgress<'_>,
+    ) -> Result<ActionExecution> {
+        if action != AgentAction::Plan {
+            bail!(
+                "Planner boundary rejects orchestration action '{}'",
+                action.as_str()
+            );
+        }
+        self.inner
+            .invoke_with_progress(agent, action, input, model, effort, progress)
+    }
 }
 
 impl WorkerActionBackend {
     pub fn new(repo: impl AsRef<Path>) -> Self {
         Self {
             repo: repo.as_ref().to_path_buf(),
+            planner_executable: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_planner_executable(mut self, executable: impl AsRef<Path>) -> Self {
+        self.planner_executable = Some(executable.as_ref().to_path_buf());
+        self
     }
 }
 
@@ -152,14 +215,21 @@ impl ActionBackend for WorkerActionBackend {
         effort: Option<ReasoningEffort>,
         progress: ActionProgress<'_>,
     ) -> Result<ActionExecution> {
-        let worker = if action == AgentAction::Lead {
-            crate::backend::WorkerFactory::build_lead(agent, model.map(str::to_owned), effort)
-        } else {
-            crate::backend::WorkerFactory::build_with_codex_overrides(
+        let worker = match action {
+            AgentAction::Lead => {
+                crate::backend::WorkerFactory::build_lead(agent, model.map(str::to_owned), effort)
+            }
+            AgentAction::Plan => crate::backend::WorkerFactory::build_planner_with_executable(
                 agent,
                 model.map(str::to_owned),
                 effort,
-            )
+                self.planner_executable.clone(),
+            ),
+            _ => crate::backend::WorkerFactory::build_with_codex_overrides(
+                agent,
+                model.map(str::to_owned),
+                effort,
+            ),
         }
         .map_err(anyhow::Error::msg)?;
         let execution = worker
@@ -214,9 +284,11 @@ fn schema(action: AgentAction) -> String {
             "local_id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},
             "role":{"type":"string"},"priority":{"enum":["low","normal","high","critical"]},
             "depends_on":string_array,"capabilities":string_array,
-            "scope_mode":{"type":["string","null"]},"context_files":string_array,"expected_changes":string_array
+            "scope_mode":{"type":["string","null"]},"context_files":string_array,"expected_changes":string_array,
+            "unchanged":string_array,"acceptance_criteria":string_array,"required_tests":string_array,
+            "validation":string_array,"execution_hints":{"type":"object"}
         },
-        "required":["local_id","title","objective","role","priority","depends_on","capabilities","scope_mode","context_files","expected_changes"]
+        "required":["local_id","title","objective","role","priority","depends_on","capabilities","scope_mode","context_files","expected_changes","unchanged","acceptance_criteria","required_tests","validation","execution_hints"]
     });
     let plan = serde_json::json!({
         "type":"object","additionalProperties":false,
@@ -1265,10 +1337,12 @@ pub fn run_plan(
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
     let prompt = format!(
-        "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state.\n{}",
+        "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state. Persisted Lead context (read-only): {}\n{}",
+        serde_json::to_string(&db.pending_lead_decision_context()?)?,
         serde_json::to_string(request)?
     );
-    let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
+    let planner_backend = PlannerActionBackend::new(backend);
+    let execution = invoke_action(db, run, &planner_backend, &agent, &resolved, &prompt);
     match execution {
         Ok(execution) => {
             let parsed =
@@ -1394,8 +1468,12 @@ pub fn run_lead(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lead::LeadDecisionKind;
     use crate::registry::{AUTOMATED, AVAILABLE};
+    use crate::storage::db::LeadDecisionMetadata;
     use crate::task::TaskPriority;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -1696,6 +1774,152 @@ mod tests {
                 AgentAction::Review,
             ],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planner_production_boundary_is_read_only_and_returns_canonical_plan() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("orc.db");
+        let repo = directory.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("project.txt"), "unchanged").unwrap();
+        let profile = directory.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let codex = bin.join("codex");
+        let event = directory.path().join("event.jsonl");
+        let proposal = serde_json::json!({"local_id":"inspect-repo","title":"Inspect repository","objective":"Inspect the persisted project","role":"developer","priority":"normal","depends_on":[],"capabilities":["inspection"],"scope_mode":"focused","context_files":["project.txt"],"expected_changes":["project.txt"],"unchanged":["task state"],"acceptance_criteria":["context is inspected"],"required_tests":["cargo test"],"validation":["cargo test"],"execution_hints":{}});
+        let response = serde_json::json!({"protocol_version":1,"objective":"inspect","assumptions":["lead-approved"],"risks":[],"questions":[],"tasks":[proposal]});
+        std::fs::write(&event, serde_json::json!({"type":"item.completed", "item":{"type":"agent_message", "text": response.to_string()}}).to_string() + "\n").unwrap();
+        let args_file = directory.path().join("args");
+        std::fs::write(&codex, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ninput=$(cat)\necho \"$input\" | grep -q persisted-context || exit 9\necho \"$input\" | grep -q lead-decision || exit 10\ncat {}\n", args_file.display(), event.display())).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("project").unwrap();
+        db.record_lead_turn(
+            project,
+            crate::lead::LeadRole::Assistant,
+            "persisted Lead context",
+        )
+        .unwrap();
+        db.record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"message":"lead-decision"}),
+            LeadDecisionMetadata {
+                snapshot: "persisted snapshot",
+                run_id: None,
+                source_request: "request",
+                summary: "lead-decision",
+            },
+        )
+        .unwrap();
+        db.insert_agent(&AgentDefinition {
+            profile_path: Some(profile.display().to_string()),
+            ..agent()
+        })
+        .unwrap();
+        let request: PlanningRequest = serde_json::from_value(serde_json::json!({
+            "protocol_version": crate::protocol::PROTOCOL_VERSION, "kind":"project_plan", "project":{"name":"persisted-project","repository":"repo","branch":null,"commit":null},
+            "engineering_contract":"persisted-context", "objective":"inspect", "constraints":[], "target_platforms":[], "stack":[], "non_goals":[], "deliverables":[], "definition_of_done":[],
+            "response_schema": crate::protocol::PlanResponseSchema::v1(), "role_boundaries":["Planner cannot invoke Lead, dispatch, review, revise, accept, create, or apply"], "planning_constraints":[], "approval_requirements":[], "current_state":db.planning_project_state().unwrap(), "full_report":null
+        })).unwrap();
+        let before = std::fs::read(repo.join("project.txt")).unwrap();
+        let backend = WorkerActionBackend::new(&repo).with_planner_executable(&codex);
+        let (_, plan) = run_plan(&db, &request, &ActionOverrides::default(), &backend).unwrap();
+        assert_eq!(plan.objective, "inspect");
+        assert_eq!(plan.tasks[0].local_id, "inspect-repo");
+        assert_eq!(plan.tasks[0].expected_changes, vec!["project.txt"]);
+        let args = std::fs::read_to_string(args_file).unwrap();
+        assert!(args.lines().any(|arg| arg == "--sandbox"));
+        assert!(args.lines().any(|arg| arg == "read-only"));
+        assert_eq!(std::fs::read(repo.join("project.txt")).unwrap(), before);
+        assert!(db.list_tasks().unwrap().is_empty());
+        assert_eq!(
+            db.list_agent_runs(project, 10).unwrap()[0].status,
+            "completed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planner_production_boundary_rejects_malformed_proposal_without_mutation() {
+        let directory = tempdir().unwrap();
+        let profile = directory.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"protocol_version\\\":1,\\\"objective\\\":\\\"bad\\\",\\\"assumptions\\\":[],\\\"risks\\\":[],\\\"questions\\\":[],\\\"tasks\":[{\\\"local_id\\\":\\\"t1\\\",\\\"title\\\":\\\"\\\",\\\"objective\\\":\\\"x\\\",\\\"role\\\":\\\"coder\\\",\\\"priority\\\":\\\"normal\\\",\\\"depends_on\\\":[],\\\"capabilities\\\":[],\\\"scope_mode\\\":null,\\\"context_files\\\":[],\\\"expected_changes\\\":[],\\\"unchanged\\\":[],\\\"acceptance_criteria\\\":[],\\\"required_tests\\\":[],\\\"validation\\\":[],\\\"execution_hints\\\":{}}]}\"}}}'\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = Database::init(directory.path().join("orc.db")).unwrap();
+        let project = db.create_project("project").unwrap();
+        db.insert_agent(&AgentDefinition {
+            profile_path: Some(profile.display().to_string()),
+            ..agent()
+        })
+        .unwrap();
+        let request: PlanningRequest = serde_json::from_value(serde_json::json!({"protocol_version":1,"kind":"project_plan","project":null,"engineering_contract":"","objective":"plan","constraints":[],"target_platforms":[],"stack":[],"non_goals":[],"deliverables":[],"definition_of_done":[],"response_schema":crate::protocol::PlanResponseSchema::v1(),"role_boundaries":[],"planning_constraints":[],"approval_requirements":[],"current_state":null,"full_report":null})).unwrap();
+        assert!(
+            run_plan(
+                &db,
+                &request,
+                &ActionOverrides::default(),
+                &WorkerActionBackend::new(directory.path()).with_planner_executable(&codex)
+            )
+            .is_err()
+        );
+        assert!(db.list_tasks().unwrap().is_empty());
+        assert_eq!(db.list_agent_runs(project, 10).unwrap()[0].status, "failed");
+    }
+
+    #[test]
+    fn planner_boundary_rejects_every_orchestration_action_at_the_backend_seam() {
+        struct RecordingBackend {
+            attempted: RefCell<Vec<AgentAction>>,
+        }
+
+        impl ActionBackend for RecordingBackend {
+            fn invoke(
+                &self,
+                _agent: &AgentDefinition,
+                action: AgentAction,
+                _input: &str,
+                _model: Option<&str>,
+                _effort: Option<ReasoningEffort>,
+            ) -> Result<ActionExecution> {
+                self.attempted.borrow_mut().push(action);
+                Ok(ActionExecution {
+                    output: String::new(),
+                    token_usage: None,
+                })
+            }
+        }
+
+        let inner = RecordingBackend {
+            attempted: RefCell::new(Vec::new()),
+        };
+        let boundary = PlannerActionBackend::new(&inner);
+        let planner = agent();
+        for action in [AgentAction::Lead, AgentAction::Code, AgentAction::Review] {
+            let error = boundary
+                .invoke(
+                    &planner,
+                    action,
+                    "provider attempted orchestration",
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("rejects orchestration action"));
+        }
+        assert!(inner.attempted.borrow().is_empty());
+        boundary
+            .invoke(&planner, AgentAction::Plan, "plan only", None, None)
+            .unwrap();
+        assert_eq!(inner.attempted.borrow().as_slice(), &[AgentAction::Plan]);
     }
 
     #[test]
@@ -2073,7 +2297,12 @@ mod tests {
                     output: serde_json::json!({
                         "protocol_version": crate::protocol::PROTOCOL_VERSION,
                         "objective": "proposed", "assumptions": [], "risks": [],
-                        "questions": [], "tasks": []
+                        "questions": [], "tasks": [serde_json::json!({
+                            "local_id": "progress-check", "title": "Progress check", "objective": "Verify progress", "role": "developer",
+                            "priority": "normal", "depends_on": [], "capabilities": [], "scope_mode": null,
+                            "context_files": ["README.md"], "expected_changes": ["README.md"], "unchanged": ["task state"],
+                            "acceptance_criteria": ["progress is recorded"], "required_tests": ["cargo test"], "validation": ["cargo test"], "execution_hints": {}
+                        })]
                     })
                     .to_string(),
                     token_usage: None,

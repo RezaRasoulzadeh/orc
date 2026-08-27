@@ -9,6 +9,73 @@ use orc::task::TaskPriority;
 use orc::worker::TokenUsage;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+#[test]
+fn configured_lead_run_executes_cli_and_persists_canonical_direct_tasks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+    assert!(
+        orc_command(
+            directory.path(),
+            &[
+                "agent",
+                "add",
+                "lead",
+                "--backend",
+                "codex",
+                "--action",
+                "lead",
+                "--profile",
+                "/tmp/lead-profile"
+            ],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        orc_command(directory.path(), &["lead", "set", "lead"])
+            .status
+            .success()
+    );
+
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    fs::write(&codex, r##"#!/bin/sh
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"message\":\"assessment\",\"proposals\":[],\"decision\":{\"kind\":\"DIRECT_TASKS\",\"details\":{\"tasks\":[{\"local_id\":\"canonical-cli\",\"title\":\"Canonical CLI task\",\"objective\":\"Do it\",\"role\":\"developer\",\"priority\":\"normal\",\"depends_on\":[],\"capabilities\":[],\"scope_mode\":\"project\",\"context_files\":[],\"expected_changes\":[],\"unchanged\":[],\"acceptance_criteria\":[],\"required_tests\":[],\"validation\":[],\"execution_hints\":{}}]}}}"}}'
+"##).unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(directory.path())
+        .env("PATH", path)
+        .args(["lead", "run", "assess"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Decision: DirectTasks"));
+    let db = Database::open(directory.path().join(".orc/orc.db")).unwrap();
+    let project_id = db.get_project_id().unwrap().unwrap();
+    let tasks = db.list_tasks().unwrap();
+    assert!(tasks.is_empty(), "Lead run must not create tasks");
+    let decision = db.pending_lead_decision(project_id).unwrap().unwrap();
+    assert!(
+        decision.run_id.is_some(),
+        "decision must link to its Lead run"
+    );
+    let details: serde_json::Value = serde_json::from_str(&decision.details).unwrap();
+    assert_eq!(details["tasks"][0]["local_id"], "canonical-cli");
+    assert_eq!(details["tasks"][0]["title"], "Canonical CLI task");
+}
+
 #[test]
 fn dispatch_queue_concurrency_parser_accepts_auto_and_positive_values() {
     let directory = tempdir().unwrap();
@@ -48,6 +115,16 @@ fn orc_command(directory: &std::path::Path, args: &[&str]) -> std::process::Outp
         .args(args)
         .output()
         .unwrap()
+}
+
+#[test]
+fn lead_run_without_configuration_explains_how_to_configure_it() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+
+    let output = orc_command(directory.path(), &["lead", "run", "assess"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("orc lead set <agent>"));
 }
 
 #[test]

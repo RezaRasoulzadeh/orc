@@ -572,9 +572,20 @@ fn run(cli: Cli) -> Result<()> {
             let app = orc::app::OrcApp::open(DB_PATH, ".")?;
             match command {
                 LeadCommand::Run { request } => {
-                    let (_, response) =
+                    let (run_id, response) =
                         app.automated_lead(&request, &orc::automated::ActionOverrides::default())?;
-                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    let decision = response.decision.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Lead provider response did not contain a decision")
+                    })?;
+                    println!("Lead assessment complete (run {run_id}).");
+                    println!("Decision: {:?}", decision.kind);
+                    println!("{}", response.turn.content);
+                    if !response.proposals.is_empty() {
+                        println!(
+                            "Proposals persisted: {} (pending operator review).",
+                            response.proposals.len()
+                        );
+                    }
                 }
                 LeadCommand::Pending => println!(
                     "{}",

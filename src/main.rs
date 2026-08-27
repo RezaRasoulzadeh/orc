@@ -282,6 +282,8 @@ enum LeadCommand {
     Pending,
     /// Show all persisted Lead decisions without changing workflow state.
     History,
+    /// Apply the pending DIRECT_TASKS decision and create its tasks atomically.
+    Apply,
     Consume,
     Show,
     Set {
@@ -615,6 +617,10 @@ fn run(cli: Cli) -> Result<()> {
                         .collect::<Result<Vec<_>, _>>()?;
                     println!("{}", serde_json::to_string_pretty(&decisions)?)
                 }
+                LeadCommand::Apply => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&app.apply_pending_lead_decision()?)?
+                ),
                 LeadCommand::Consume => println!(
                     "{}",
                     serde_json::to_string_pretty(&app.consume_pending_lead_decision()?)?

@@ -51,6 +51,13 @@ impl OrcApp {
             .db
             .consume_pending_lead_decision(self.lead().project_id()?)?)
     }
+    pub fn apply_pending_lead_decision(
+        &self,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+        Ok(self
+            .db
+            .apply_pending_lead_decision(self.lead().project_id()?)?)
+    }
     pub fn invoke_lead(
         &self,
         message: &str,

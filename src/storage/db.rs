@@ -709,6 +709,10 @@ impl Database {
                 depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 PRIMARY KEY (task_id, depends_on)
             );
+            CREATE TABLE IF NOT EXISTS task_proposal_metadata (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                proposal TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -1682,6 +1686,78 @@ impl Database {
         Ok(decision)
     }
 
+    /// Apply the actionable DIRECT_TASKS decision as one database mutation.
+    pub fn apply_pending_lead_decision(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, DbError> {
+        let decision = self.pending_lead_decision(project_id)?;
+        let Some(decision) = decision else {
+            return Ok(None);
+        };
+        if decision.kind != crate::lead::LeadDecisionKind::DirectTasks {
+            return Err(DbError::Scheduler(format!(
+                "Lead decision is {:?}, not DIRECT_TASKS",
+                decision.kind
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_str(&decision.details)?;
+        let tasks: Vec<crate::protocol::TaskProposal> = value
+            .get("tasks")
+            .cloned()
+            .ok_or_else(|| DbError::Scheduler("DIRECT_TASKS decision must contain tasks".into()))
+            .and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| DbError::Scheduler(format!("invalid DIRECT_TASKS proposals: {e}")))
+            })?;
+        let response = crate::protocol::PlanResponse {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            objective: "Lead direct tasks".into(),
+            assumptions: vec![],
+            risks: vec![],
+            questions: vec![],
+            tasks,
+        };
+        response
+            .validate()
+            .map_err(|e| DbError::Scheduler(e.to_string()))?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut mapping = std::collections::BTreeMap::new();
+            for task in &response.tasks {
+                let id = self.allocate_task_id()?;
+                self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1,?2,?3,?4,?5,?6,'backlog',?7,?8,?9,?10)", params![id, project_id, task.title, task.objective, task.role, priority_string(task.priority), serde_json::to_string(&task.capabilities)?, task.scope_mode.map(|v| v.to_string()), serde_json::to_string(&task.context_files)?, serde_json::to_string(&task.expected_changes)?])?;
+                self.conn.execute(
+                    "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1,?2)",
+                    params![id, serde_json::to_string(task)?],
+                )?;
+                mapping.insert(task.local_id.clone(), id);
+            }
+            for task in &response.tasks {
+                for dependency in &task.depends_on {
+                    self.add_task_dependency(&mapping[&task.local_id], &mapping[dependency])?;
+                }
+            }
+            let changed = self.conn.execute("UPDATE lead_decisions SET status='consumed', resolved_at=CURRENT_TIMESTAMP WHERE id=?1 AND project_id=?2 AND status='pending'", params![decision.id, project_id])?;
+            if changed != 1 {
+                return Err(DbError::Scheduler(
+                    "Lead decision was already consumed".into(),
+                ));
+            }
+            Ok(mapping)
+        })();
+        match result {
+            Ok(mapping) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(Some(mapping))
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub fn record_lead_turn(
         &self,
         project_id: i64,
@@ -2263,6 +2339,30 @@ impl Database {
         Ok(stmt
             .query_map([], Self::task_from_row)?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns the canonical Lead proposal retained for a created task.
+    pub fn get_task_proposal_metadata(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::protocol::TaskProposal>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT proposal FROM task_proposal_metadata WHERE task_id = ?1",
+                params![task_id],
+                |row| {
+                    let value: String = row.get(0)?;
+                    serde_json::from_str(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .optional()?)
     }
 
     #[allow(dead_code)]

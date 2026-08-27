@@ -767,6 +767,9 @@ fn run(cli: Cli) -> Result<()> {
                 registry::get_agent(&db, &run.agent)?
             };
             if selected.execution_mode == registry::MANUAL {
+                if model.is_some() || effort.is_some() {
+                    anyhow::bail!("--model and --effort require an automated revision agent");
+                }
                 orc::agent::revise_manual(
                     &task_id,
                     feedback.as_deref().unwrap_or(""),
@@ -775,21 +778,19 @@ fn run(cli: Cli) -> Result<()> {
                     ".",
                 )?;
             } else {
-                let worker = orc::backend::WorkerFactory::build_with_codex_overrides(
-                    &selected,
-                    model.clone(),
-                    effort,
-                )
-                .map_err(anyhow::Error::msg)?;
-                let summary = orc::agent::revise_with_worker_and_db_as_with_runner_with_overrides(
+                let summary = orc::agent::revise_with_factory_and_db_as_with_runner(
                     &task_id,
                     feedback.as_deref().unwrap_or(""),
-                    worker.as_ref(),
                     DB_PATH,
                     ".",
                     &selected.id,
                     &orc::SystemValidationRunner,
                     &orc::agent::RevisionExecutionOverrides { model, effort },
+                    |agent, model, effort| {
+                        orc::backend::WorkerFactory::build_with_codex_overrides(
+                            agent, model, effort,
+                        )
+                    },
                 )?;
                 println!("{}", orc::review::format_dispatch(&summary));
                 sync_enabled_agents_after_automated_run(&task_id);
@@ -1103,8 +1104,16 @@ mod cli_tests {
     #[test]
     fn parses_revise_execution_overrides_and_optional_feedback() {
         let cli = Cli::try_parse_from([
-            "orc", "revise", "T-0001", "--agent", "coder", "--model", "gpt-test", "--effort",
+            "orc",
+            "revise",
+            "T-0001",
+            "--model",
+            "gpt-test",
+            "--effort",
             "high",
+            "--agent",
+            "coder",
+            "address the failing check",
         ])
         .unwrap();
         match cli.command {
@@ -1119,7 +1128,28 @@ mod cli_tests {
                 assert_eq!(agent.as_deref(), Some("coder"));
                 assert_eq!(model.as_deref(), Some("gpt-test"));
                 assert_eq!(effort, Some(registry::ReasoningEffort::High));
-                assert_eq!(feedback, None);
+                assert_eq!(feedback.as_deref(), Some("address the failing check"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn parses_revise_without_execution_overrides() {
+        let cli = Cli::try_parse_from(["orc", "revise", "T-0001", "operator feedback"]).unwrap();
+        match cli.command {
+            Some(Command::Revise {
+                task_id,
+                agent,
+                model,
+                effort,
+                feedback,
+            }) => {
+                assert_eq!(task_id, "T-0001");
+                assert_eq!(agent, None);
+                assert_eq!(model, None);
+                assert_eq!(effort, None);
+                assert_eq!(feedback.as_deref(), Some("operator feedback"));
             }
             _ => panic!("unexpected command"),
         }

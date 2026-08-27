@@ -127,6 +127,8 @@ enum Command {
     ApplyPlan {
         path: String,
     },
+    /// Apply the current approved Planner plan exactly once.
+    ApplyApprovedPlan,
     /// Show the deterministic queue of tasks
     Queue {
         /// Explain task readiness, dependency state, and scheduler eligibility
@@ -561,6 +563,16 @@ fn run(cli: Cli) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
             let mapping = db.apply_plan(project_id, &response)?;
             println!("{}", serde_json::to_string_pretty(&mapping)?);
+        }
+        Command::ApplyApprovedPlan => {
+            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let project_id = db
+                .get_project_id()?
+                .ok_or_else(|| anyhow::anyhow!("no project found"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&db.apply_approved_plan(project_id)?)?
+            );
         }
         Command::Plan {
             command,
@@ -1228,6 +1240,7 @@ mod cli_tests {
             Command::PlanRequest { .. } => "PlanRequest",
             Command::Plan { .. } => "Plan",
             Command::ApplyPlan { .. } => "ApplyPlan",
+            Command::ApplyApprovedPlan => "ApplyApprovedPlan",
             Command::Queue { .. } => "Queue",
             Command::Template { .. } => "Template",
             Command::Lead { .. } => "Lead",

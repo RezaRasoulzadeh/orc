@@ -968,6 +968,13 @@ impl OrcApp {
             .context("no project found in DB")?;
         Ok(self.db.apply_plan(id, response)?)
     }
+    pub fn apply_approved_plan(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        Ok(self.db.apply_approved_plan(id)?)
+    }
     pub fn create_task(&self, input: CreateTaskInput) -> Result<String> {
         let project_id = self
             .db

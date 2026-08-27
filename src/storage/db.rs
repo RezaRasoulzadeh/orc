@@ -321,6 +321,29 @@ fn lead_proposal_status(status: crate::lead::LeadProposalStatus) -> &'static str
         crate::lead::LeadProposalStatus::Applying => "applying",
         crate::lead::LeadProposalStatus::Applied => "applied",
         crate::lead::LeadProposalStatus::Rejected => "rejected",
+        crate::lead::LeadProposalStatus::Superseded => "superseded",
+    }
+}
+
+fn lead_decision_kind(kind: crate::lead::LeadDecisionKind) -> &'static str {
+    match kind {
+        crate::lead::LeadDecisionKind::DirectTasks => "DIRECT_TASKS",
+        crate::lead::LeadDecisionKind::PlanRequired => "PLAN_REQUIRED",
+        crate::lead::LeadDecisionKind::UserDecisionRequired => "USER_DECISION_REQUIRED",
+    }
+}
+fn parse_lead_decision_kind(value: &str) -> Result<crate::lead::LeadDecisionKind, rusqlite::Error> {
+    match value {
+        "DIRECT_TASKS" | "direct_tasks" => Ok(crate::lead::LeadDecisionKind::DirectTasks),
+        "PLAN_REQUIRED" | "plan_required" => Ok(crate::lead::LeadDecisionKind::PlanRequired),
+        "USER_DECISION_REQUIRED" | "user_decision_required" => {
+            Ok(crate::lead::LeadDecisionKind::UserDecisionRequired)
+        }
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            1,
+            "kind".into(),
+            rusqlite::types::Type::Text,
+        )),
     }
 }
 
@@ -1472,7 +1495,7 @@ impl Database {
     }
 
     fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT, snapshot TEXT, run_id INTEGER);")?;
         let columns = conn
             .prepare("PRAGMA table_info(lead_decisions)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -1489,6 +1512,12 @@ impl Database {
         if !columns.iter().any(|column| column == "applying_at") {
             conn.execute("ALTER TABLE lead_decisions ADD COLUMN applying_at TEXT", [])?;
         }
+        if !columns.iter().any(|column| column == "snapshot") {
+            conn.execute("ALTER TABLE lead_decisions ADD COLUMN snapshot TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "run_id") {
+            conn.execute("ALTER TABLE lead_decisions ADD COLUMN run_id INTEGER", [])?;
+        }
         let legacy = {
             let mut statement = conn.prepare("SELECT id, kind, proposal FROM lead_decisions")?;
             statement
@@ -1502,7 +1531,11 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (id, kind, value) in legacy {
-            if serde_json::from_str::<crate::lead::LeadProposalKind>(&value).is_err() {
+            if !matches!(
+                kind.as_str(),
+                "DIRECT_TASKS" | "PLAN_REQUIRED" | "USER_DECISION_REQUIRED"
+            ) && serde_json::from_str::<crate::lead::LeadProposalKind>(&value).is_err()
+            {
                 let proposal = crate::lead::LeadProposalKind::ApprovalRequest {
                     reason: format!("Migrated legacy Lead proposal ({kind})"),
                     details: value,
@@ -1514,6 +1547,77 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    pub fn record_lead_decision(
+        &self,
+        project_id: i64,
+        kind: &crate::lead::LeadDecisionKind,
+        details: &serde_json::Value,
+        snapshot: &str,
+        run_id: Option<i64>,
+    ) -> Result<i64, DbError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("UPDATE lead_decisions SET status = 'superseded', resolved_at = CURRENT_TIMESTAMP WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')", params![project_id])?;
+        let payload = serde_json::to_string(details)?;
+        transaction.execute("INSERT INTO lead_decisions (project_id, kind, proposal, snapshot, run_id) VALUES (?1, ?2, ?3, ?4, ?5)", params![project_id, lead_decision_kind(*kind), payload, snapshot, run_id])?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn pending_lead_decision(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<crate::lead::PersistedLeadDecision>, DbError> {
+        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
+            let status: String = r.get(4)?;
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status })
+        }).optional()?)
+    }
+
+    pub fn list_lead_decisions(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, kind, proposal, snapshot, status, run_id FROM lead_decisions
+             WHERE project_id = ?1 AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')
+             ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([project_id], |r| {
+            let status: String = r.get(4)?;
+            Ok(crate::lead::PersistedLeadDecision {
+                id: r.get(0)?,
+                run_id: r.get(5)?,
+                kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?,
+                details: r.get(2)?,
+                snapshot: r.get(3)?,
+                actionable: status == "pending",
+                status,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn consume_pending_lead_decision(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<crate::lead::PersistedLeadDecision>, DbError> {
+        let mut decision = self.pending_lead_decision(project_id)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let id: Option<i64> = transaction.query_row("SELECT id FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| r.get(0)).optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute("UPDATE lead_decisions SET status = 'consumed', resolved_at = CURRENT_TIMESTAMP WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        if let Some(ref mut decision) = decision {
+            decision.status = "consumed".into();
+            decision.actionable = false;
+        }
+        Ok(decision)
     }
 
     pub fn record_lead_turn(
@@ -1593,7 +1697,7 @@ impl Database {
         status: Option<crate::lead::LeadProposalStatus>,
     ) -> Result<Vec<crate::lead::LeadProposal>, DbError> {
         let status = status.map(lead_proposal_status);
-        let mut statement = self.conn.prepare("SELECT id, proposal, status, created_at, applying_at, resolved_at FROM lead_decisions WHERE project_id = ?1 AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3")?;
+        let mut statement = self.conn.prepare("SELECT id, proposal, status, created_at, applying_at, resolved_at FROM lead_decisions WHERE project_id = ?1 AND kind NOT IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3")?;
         Ok(statement
             .query_map(
                 params![project_id, status, limit.min(i64::MAX as usize) as i64],

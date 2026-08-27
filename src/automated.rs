@@ -1303,7 +1303,7 @@ pub fn run_lead(
         usage: RefCell::new(None),
         output: RefCell::new(None),
     };
-    match LeadService::new(db, repo).invoke(message, &adapter, 50) {
+    match LeadService::new(db, repo).invoke_with_run_id(message, &adapter, 50, Some(run)) {
         Ok(response) => {
             let output = adapter
                 .output

@@ -497,39 +497,6 @@ fn revision_runs(db: &Database, task: &str, review_id: i64) -> Vec<orc::storage:
         .collect()
 }
 
-fn assert_failed_handoff_is_preserved(
-    dir: &TempDir,
-    db: &Database,
-    task: &str,
-    review_id: i64,
-) -> i64 {
-    assert!(dir.path().join(".orc/worktrees").exists());
-    let (_, worktree) = db.get_worktree_metadata(task).unwrap().unwrap();
-    assert!(dir.path().join(worktree).join("revision.txt").exists());
-    assert_eq!(
-        db.actionable_revision_review(task).unwrap().unwrap().0,
-        review_id
-    );
-    let run = revision_runs(db, task, review_id)
-        .into_iter()
-        .next()
-        .unwrap();
-    assert_eq!(run.status, "failed");
-    assert!(db.get_change_evidence(run.id).unwrap().is_some());
-    assert!(
-        db.latest_validation_result_for_run(run.id)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        db.list_lifecycle_events_for_run(run.id, 20)
-            .unwrap()
-            .iter()
-            .all(|event| event.kind != "revision_handoff")
-    );
-    run.id
-}
-
 #[test]
 fn revision_worker_receives_native_handoff_schema() {
     let (dir, db, task, _) = structured_revision_fixture();
@@ -593,14 +560,7 @@ fn valid_structured_handoff_completes_revision() {
     let events = db
         .list_lifecycle_events_for_run(summary.run_id, 20)
         .unwrap();
-    assert!(events.iter().any(|event| {
-        event.kind == "revision_handoff"
-            && event
-                .payload
-                .as_deref()
-                .unwrap_or_default()
-                .contains("BLK-revision-e2e")
-    }));
+    assert!(events.iter().all(|event| event.kind != "revision_handoff"));
 }
 
 #[test]
@@ -641,37 +601,34 @@ fn test_only_blocker_evidence_completes_the_real_revision_path() {
         "tests/revision_contract_lifecycle.rs"
     );
     assert!(db.source_review_run_id(summary.run_id).unwrap().is_some());
-    assert!(
-        db.list_lifecycle_events_for_run(summary.run_id, 20)
-            .unwrap()
-            .iter()
-            .any(|event| event.kind == "revision_handoff")
+    assert!(db.actionable_revision_review(&task).unwrap().is_none());
+}
+
+#[test]
+fn prose_revision_result_is_accepted_without_handoff_validation() {
+    let (dir, db, task, review_id) = structured_revision_fixture();
+    let worker = StructuredRevisionWorker::new(["ordinary prose result".into()]);
+    let summary = revise_with_worker_on_db(
+        &task,
+        "retry",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
     );
 }
 
 #[test]
-fn prose_revision_result_is_rejected_safely() {
-    let (dir, db, task, review_id) = structured_revision_fixture();
-    let worker = StructuredRevisionWorker::new(["ordinary prose result".into()]);
-    let error = revise_with_worker_on_db(
-        &task,
-        "retry",
-        &worker,
-        &db,
-        dir.path(),
-        "fake",
-        &FakeValidationRunner::success(),
-    )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("structured handoff"));
-    assert_failed_handoff_is_preserved(&dir, &db, &task, review_id);
-}
-
-#[test]
-fn malformed_structured_handoff_is_rejected_safely() {
+fn malformed_structured_handoff_is_accepted_as_worker_output() {
     let (dir, db, task, review_id) = structured_revision_fixture();
     let worker = StructuredRevisionWorker::new([r#"{"claims":["#.into()]);
-    let error = revise_with_worker_on_db(
+    let summary = revise_with_worker_on_db(
         &task,
         "retry",
         &worker,
@@ -680,17 +637,19 @@ fn malformed_structured_handoff_is_rejected_safely() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("structured handoff"));
-    assert_failed_handoff_is_preserved(&dir, &db, &task, review_id);
+    .unwrap();
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
 }
 
 #[test]
-fn invalid_blocker_claim_reaches_existing_validator() {
+fn invalid_blocker_claim_is_deferred_to_automated_review() {
     let (dir, db, task, review_id) = structured_revision_fixture();
     let invalid = valid_revision_handoff().replace("BLK-revision-e2e", "BLK-unknown");
     let worker = StructuredRevisionWorker::new([invalid]);
-    let error = revise_with_worker_on_db(
+    let summary = revise_with_worker_on_db(
         &task,
         "retry",
         &worker,
@@ -699,16 +658,18 @@ fn invalid_blocker_claim_reaches_existing_validator() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("unknown blocker ID 'BLK-unknown'"));
-    assert_failed_handoff_is_preserved(&dir, &db, &task, review_id);
+    .unwrap();
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
 }
 
 #[test]
-fn failed_handoff_preserves_retryability() {
+fn worker_output_does_not_gate_revision_retryability() {
     let (dir, db, task, review_id) = structured_revision_fixture();
     let worker = StructuredRevisionWorker::new(["not json".into(), valid_revision_handoff()]);
-    revise_with_worker_on_db(
+    let summary = revise_with_worker_on_db(
         &task,
         "first",
         &worker,
@@ -717,8 +678,11 @@ fn failed_handoff_preserves_retryability() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert_failed_handoff_is_preserved(&dir, &db, &task, review_id);
+    .unwrap();
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
     assert_eq!(*worker.calls.lock().unwrap(), 1);
 }
 
@@ -726,19 +690,9 @@ fn failed_handoff_preserves_retryability() {
 fn retry_after_failed_handoff_completes_without_losing_prior_changes() {
     let (dir, db, task, review_id) = structured_revision_fixture();
     let worker = StructuredRevisionWorker::new(["not json".into(), valid_revision_handoff()]);
-    revise_with_worker_on_db(
-        &task,
-        "first",
-        &worker,
-        &db,
-        dir.path(),
-        "fake",
-        &FakeValidationRunner::success(),
-    )
-    .unwrap_err();
     let summary = revise_with_worker_on_db(
         &task,
-        "second",
+        "first",
         &worker,
         &db,
         dir.path(),
@@ -749,19 +703,17 @@ fn retry_after_failed_handoff_completes_without_losing_prior_changes() {
     let (_, worktree) = db.get_worktree_metadata(&task).unwrap().unwrap();
     let contents = std::fs::read_to_string(dir.path().join(worktree).join("revision.txt")).unwrap();
     assert!(contents.contains("attempt 1 implementation"));
-    assert!(contents.contains("attempt 2 implementation"));
+    assert!(!contents.contains("attempt 2 implementation"));
     assert_eq!(
         db.source_review_run_id(summary.run_id).unwrap(),
         Some(review_id)
     );
     assert!(db.actionable_revision_review(&task).unwrap().is_none());
-    assert_eq!(
+    assert!(
         db.list_lifecycle_events_for_run(summary.run_id, 20)
             .unwrap()
             .iter()
-            .filter(|event| event.kind == "revision_handoff")
-            .count(),
-        1
+            .all(|event| event.kind != "revision_handoff")
     );
 }
 
@@ -769,7 +721,7 @@ fn retry_after_failed_handoff_completes_without_losing_prior_changes() {
 fn no_stale_reservation_or_run_blocks_retry() {
     let (dir, db, task, review_id) = structured_revision_fixture();
     let worker = StructuredRevisionWorker::new(["prose".into(), valid_revision_handoff()]);
-    revise_with_worker_on_db(
+    let completed = revise_with_worker_on_db(
         &task,
         "first",
         &worker,
@@ -778,9 +730,9 @@ fn no_stale_reservation_or_run_blocks_retry() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
+    .unwrap();
     assert!(db.list_busy_agents().unwrap().is_empty());
-    let completed = revise_with_worker_on_db(
+    let retry = revise_with_worker_on_db(
         &task,
         "second",
         &worker,
@@ -789,10 +741,10 @@ fn no_stale_reservation_or_run_blocks_retry() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap();
+    .unwrap_err();
     let runs = revision_runs(&db, &task, review_id);
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs.iter().filter(|run| run.status == "failed").count(), 1);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs.iter().filter(|run| run.status == "failed").count(), 0);
     assert_eq!(
         runs.iter().filter(|run| run.status == "completed").count(),
         1
@@ -803,14 +755,9 @@ fn no_stale_reservation_or_run_blocks_retry() {
             .count(),
         1
     );
-    assert_eq!(
-        completed.run_id,
-        runs.iter()
-            .find(|run| run.status == "completed")
-            .unwrap()
-            .id
-    );
-    assert_eq!(*worker.calls.lock().unwrap(), 2);
+    assert!(format!("{retry:#}").contains("actionable"));
+    assert_eq!(completed.run_id, runs[0].id);
+    assert_eq!(*worker.calls.lock().unwrap(), 1);
 }
 
 fn persist_known_contract(db: &Database, task: &str, review_id: i64, blocker_id: &str) {

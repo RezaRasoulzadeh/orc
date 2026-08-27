@@ -148,7 +148,7 @@ impl PlanResponseSchema {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanResponse {
     pub protocol_version: u32,
     pub objective: String,

@@ -13,6 +13,62 @@ pub struct LeadDecisionMetadata<'a> {
     pub summary: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedPlan {
+    pub id: i64,
+    pub project_id: i64,
+    pub version: i64,
+    pub parent_plan_id: Option<i64>,
+    pub source_lead_decision_id: i64,
+    pub source_planner_run_id: i64,
+    pub status: PlanStatus,
+    pub response: crate::protocol::PlanResponse,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanHistoryEntry {
+    pub plan_id: i64,
+    pub version: i64,
+    pub status: PlanStatus,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PlanStatus {
+    Proposed,
+    UnderReview,
+    RevisionRequested,
+    Approved,
+    Rejected,
+    Applied,
+}
+impl PlanStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::UnderReview => "under_review",
+            Self::RevisionRequested => "revision_requested",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Applied => "applied",
+        }
+    }
+    fn parse(value: String) -> rusqlite::Result<Self> {
+        match value.as_str() {
+            "proposed" => Ok(Self::Proposed),
+            "under_review" => Ok(Self::UnderReview),
+            "revision_requested" => Ok(Self::RevisionRequested),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "applied" => Ok(Self::Applied),
+            _ => Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid plan status: {value}"
+            ))),
+        }
+    }
+}
+
 fn priority_string(priority: TaskPriority) -> &'static str {
     match priority {
         TaskPriority::Low => "low",
@@ -449,6 +505,95 @@ impl Drop for RunFinalizer<'_> {
 }
 
 impl Database {
+    pub fn store_plan(
+        &self,
+        project_id: i64,
+        source_lead_decision_id: i64,
+        source_planner_run_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<i64, DbError> {
+        response
+            .validate()
+            .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let lead_project: Option<i64> = transaction
+            .query_row(
+                "SELECT project_id FROM lead_decisions WHERE id = ?1 AND kind = 'PLAN_REQUIRED'",
+                [source_lead_decision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if lead_project != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "invalid source Lead decision linkage".into(),
+            ));
+        }
+        let run_project: Option<i64> = transaction
+            .query_row(
+                "SELECT project_id FROM agent_runs WHERE id = ?1 AND execution_class = 'plan'",
+                [source_planner_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if run_project != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "invalid source Planner run linkage".into(),
+            ));
+        }
+        let (parent_plan_id, version): (Option<i64>, i64) = transaction.query_row(
+            "SELECT id, version FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+            [project_id],
+            |row| Ok((Some(row.get(0)?), row.get::<_, i64>(1)? + 1)),
+        ).optional()?.unwrap_or((None, 1));
+        let canonical = serde_json::to_string(response)?;
+        transaction.execute(
+            "INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
+        )?;
+        let id = transaction.last_insert_rowid();
+        for task in &response.tasks {
+            for dependency in &task.depends_on {
+                transaction.execute(
+                    "INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1, ?2, ?3)",
+                    params![id, task.local_id, dependency],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn get_plan(&self, id: i64) -> Result<Option<PersistedPlan>, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at FROM plans WHERE id = ?1",
+            [id],
+            |row| Ok(PersistedPlan { id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, parent_plan_id: row.get(3)?, source_lead_decision_id: row.get(4)?, source_planner_run_id: row.get(5)?, status: PlanStatus::parse(row.get(6)?)?, response: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?, created_at: row.get(8)? }))
+        .optional()?)
+    }
+
+    pub fn list_plan_history(&self, project_id: i64) -> Result<Vec<PlanHistoryEntry>, DbError> {
+        let mut statement = self.conn.prepare("SELECT id, version, status, created_at FROM plans WHERE project_id = ?1 ORDER BY version, id")?;
+        Ok(statement
+            .query_map([project_id], |row| {
+                Ok(PlanHistoryEntry {
+                    plan_id: row.get(0)?,
+                    version: row.get(1)?,
+                    status: PlanStatus::parse(row.get(2)?)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_plan_dependencies(&self, plan_id: i64) -> Result<Vec<(String, String)>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT task_local_id, depends_on_local_id FROM plan_dependencies WHERE plan_id = ?1 ORDER BY task_local_id, depends_on_local_id",
+        )?;
+        Ok(statement
+            .query_map([plan_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
     pub fn run_finalizer(&self, run_id: i64) -> RunFinalizer<'_> {
         RunFinalizer { db: self, run_id }
     }
@@ -741,6 +886,24 @@ impl Database {
                 , phase TEXT
                 , last_activity TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
+            CREATE TABLE IF NOT EXISTS plans (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,
+                parent_plan_id INTEGER REFERENCES plans(id),
+                source_lead_decision_id INTEGER NOT NULL,
+                source_planner_run_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                response TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                UNIQUE(project_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS plan_dependencies (
+                plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                task_local_id TEXT NOT NULL,
+                depends_on_local_id TEXT NOT NULL,
+                PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)
+            );
             CREATE TABLE IF NOT EXISTS worker_results (
                 run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
                 outcome TEXT NOT NULL,
@@ -784,6 +947,7 @@ impl Database {
         Self::ensure_revision_contracts_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
+        Self::ensure_plan_tables(&conn)?;
         Self::ensure_task_columns(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         let db = Self {
@@ -806,6 +970,7 @@ impl Database {
         Self::ensure_registry_schema(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
+        Self::ensure_plan_tables(&conn)?;
         let db = Self {
             conn,
             lifecycle_sink: None,
@@ -1610,6 +1775,13 @@ impl Database {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), UNIQUE(project_id, version)); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id));",
+        )?;
         Ok(())
     }
 

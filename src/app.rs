@@ -179,6 +179,60 @@ impl OrcApp {
         })
     }
 
+    /// Run Planner once for an actionable Lead REVISE_PLAN decision. The
+    /// resulting plan is persisted as a new version; it is never applied.
+    pub fn run_pending_plan_revision_with_backend(
+        &self,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<PersistedPlanRun> {
+        let project_id = self.lead().project_id()?;
+        let decision = self
+            .db
+            .pending_lead_decision(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("no actionable pending Lead revision decision"))?;
+        if decision.kind != crate::lead::LeadDecisionKind::RevisePlan || !decision.actionable {
+            anyhow::bail!("pending Lead decision is not an actionable REVISE_PLAN decision");
+        }
+        let review_plan = self
+            .db
+            .get_plan_review_for_decision(decision.id)?
+            .ok_or_else(|| anyhow::anyhow!("REVISE_PLAN decision has no persisted plan review"))?;
+        let parent = self
+            .db
+            .get_plan(review_plan.0)?
+            .ok_or_else(|| anyhow::anyhow!("reviewed plan not found"))?;
+        let mut request = self.planning_request()?;
+        request.kind = "project_plan_revision".into();
+        request.objective = format!("Revise the previous plan: {}", parent.response.objective);
+        request.planning_constraints.push(format!(
+            "Previous persisted Plan (read-only): {}",
+            serde_json::to_string(&parent.response)?
+        ));
+        request.planning_constraints.push(format!(
+            "Structured Lead revision feedback: {}",
+            decision.details
+        ));
+        let (run_id, response) = self.automated_plan_with_backend(&request, overrides, backend)?;
+        let (plan_id, _) =
+            self.db
+                .store_plan_revision(project_id, decision.id, run_id, &response)?;
+        Ok(PersistedPlanRun {
+            plan_id,
+            lead_decision_id: decision.id,
+            planner_run_id: run_id,
+            task_count: response.tasks.len(),
+        })
+    }
+
+    pub fn run_pending_plan_revision(
+        &self,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<PersistedPlanRun> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.run_pending_plan_revision_with_backend(overrides, &backend)
+    }
+
     pub fn review_plan_with_backend(
         &self,
         plan_id: i64,

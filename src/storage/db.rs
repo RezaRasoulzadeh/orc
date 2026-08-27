@@ -1917,6 +1917,69 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn get_plan_review_for_decision(
+        &self,
+        decision_id: i64,
+    ) -> Result<Option<(i64, String)>, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT plan_id, details FROM plan_reviews WHERE lead_decision_id = ?1 AND decision = 'REVISE_PLAN' ORDER BY id DESC LIMIT 1",
+            [decision_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+    }
+
+    /// Persist a revision as the next immutable plan version and consume the
+    /// exact actionable review decision in one transaction.
+    pub fn store_plan_revision(
+        &self,
+        project_id: i64,
+        decision_id: i64,
+        planner_run_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<(i64, i64), DbError> {
+        response
+            .validate()
+            .map_err(|e| DbError::Scheduler(format!("invalid plan: {e}")))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let parent: Option<(i64, i64)> = tx.query_row(
+            "SELECT r.plan_id, p.version FROM plan_reviews r JOIN plans p ON p.id = r.plan_id JOIN lead_decisions d ON d.id = r.lead_decision_id WHERE r.lead_decision_id = ?1 AND p.project_id = ?2 AND r.decision = 'REVISE_PLAN' AND d.kind = 'REVISE_PLAN' AND d.status = 'pending'",
+            params![decision_id, project_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((parent_id, parent_version)) = parent else {
+            return Err(DbError::Scheduler(
+                "no actionable REVISE_PLAN review found".into(),
+            ));
+        };
+        let run_project: Option<i64> = tx
+            .query_row(
+                "SELECT project_id FROM agent_runs WHERE id = ?1 AND execution_class = 'plan'",
+                [planner_run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if run_project != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "invalid source Planner run linkage".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE plans SET status = 'revision_requested' WHERE id = ?1 AND status = 'proposed'",
+            [parent_id],
+        )?;
+        tx.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,'proposed',?6)", params![project_id, parent_version + 1, parent_id, decision_id, planner_run_id, serde_json::to_string(response)?])?;
+        let id = tx.last_insert_rowid();
+        for task in &response.tasks {
+            for dependency in &task.depends_on {
+                tx.execute("INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1,?2,?3)", params![id, task.local_id, dependency])?;
+            }
+        }
+        let changed = tx.execute("UPDATE lead_decisions SET status='consumed', resolved_at=CURRENT_TIMESTAMP WHERE id=?1 AND project_id=?2 AND kind='REVISE_PLAN' AND status='pending'", params![decision_id, project_id])?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(
+                "revision decision changed while Planner was running".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok((id, parent_id))
+    }
+
     pub fn record_lead_decision(
         &self,
         project_id: i64,

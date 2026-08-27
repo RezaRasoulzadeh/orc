@@ -202,6 +202,10 @@ enum Command {
         task_id: String,
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
         feedback: Option<String>,
     },
     /// Schedule an agent for a task using deterministic selection rules
@@ -744,6 +748,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Revise {
             task_id,
             agent,
+            model,
+            effort,
             feedback,
         } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
@@ -769,9 +775,13 @@ fn run(cli: Cli) -> Result<()> {
                     ".",
                 )?;
             } else {
-                let worker =
-                    orc::backend::WorkerFactory::build(&selected).map_err(anyhow::Error::msg)?;
-                let summary = orc::agent::revise_with_worker_and_db_as_with_runner(
+                let worker = orc::backend::WorkerFactory::build_with_codex_overrides(
+                    &selected,
+                    model.clone(),
+                    effort,
+                )
+                .map_err(anyhow::Error::msg)?;
+                let summary = orc::agent::revise_with_worker_and_db_as_with_runner_with_overrides(
                     &task_id,
                     feedback.as_deref().unwrap_or(""),
                     worker.as_ref(),
@@ -779,6 +789,7 @@ fn run(cli: Cli) -> Result<()> {
                     ".",
                     &selected.id,
                     &orc::SystemValidationRunner,
+                    &orc::agent::RevisionExecutionOverrides { model, effort },
                 )?;
                 println!("{}", orc::review::format_dispatch(&summary));
                 sync_enabled_agents_after_automated_run(&task_id);
@@ -1087,6 +1098,31 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["orc", "status"]).unwrap();
         assert!(!cli.ui);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn parses_revise_execution_overrides_and_optional_feedback() {
+        let cli = Cli::try_parse_from([
+            "orc", "revise", "T-0001", "--agent", "coder", "--model", "gpt-test", "--effort",
+            "high",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Revise {
+                task_id,
+                agent,
+                model,
+                effort,
+                feedback,
+            }) => {
+                assert_eq!(task_id, "T-0001");
+                assert_eq!(agent.as_deref(), Some("coder"));
+                assert_eq!(model.as_deref(), Some("gpt-test"));
+                assert_eq!(effort, Some(registry::ReasoningEffort::High));
+                assert_eq!(feedback, None);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     #[test]

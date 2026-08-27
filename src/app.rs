@@ -325,6 +325,38 @@ impl OrcApp {
         let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
         self.automated_lead_with_backend(message, &configured, &backend)
     }
+
+    /// Run the explicit new-project intake: capture the read-only repository
+    /// snapshot, ask Lead for an initial decision, and leave that decision
+    /// pending for the operator.
+    pub fn new_project_intake(
+        &self,
+        objective: &str,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<(i64, crate::lead::LeadResponse)> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.new_project_intake_with_backend(objective, overrides, &backend)
+    }
+
+    /// Testable production boundary for the new-project intake.
+    pub fn new_project_intake_with_backend(
+        &self,
+        objective: &str,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<(i64, crate::lead::LeadResponse)> {
+        if objective.trim().is_empty() {
+            anyhow::bail!("new-project objective must not be empty");
+        }
+        let snapshot = crate::discovery::build_snapshot(&self.repo_path)?;
+        let request = serde_json::json!({
+            "kind": "new_project_intake",
+            "objective": objective,
+            "discovery_snapshot": snapshot,
+            "instruction": "Assess this new project read-only. Return one actionable Lead decision; do not apply or dispatch anything."
+        });
+        self.automated_lead_with_backend(&serde_json::to_string(&request)?, overrides, backend)
+    }
     pub fn lead_provider_config(&self) -> Result<Option<crate::lead::LeadProviderConfig>> {
         Ok(self.db.lead_provider_config()?)
     }

@@ -73,6 +73,93 @@ impl ActionBackend for CountingActionBackend {
 }
 
 #[test]
+fn new_project_intake_validates_objective_and_persists_read_only_lead_decision() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".orc")).unwrap();
+    let path = dir.path().join(".orc/orc.db");
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let db = Database::init(&path).unwrap();
+    db.create_project("new-project").unwrap();
+    let mut lead = codex_agent("/profiles/lead");
+    lead.actions = vec![orc::registry::AgentAction::Lead];
+    db.insert_agent(&lead).unwrap();
+    db.set_lead_provider_config(&LeadProviderConfig {
+        agent_id: lead.id.clone(),
+        model: None,
+        reasoning_effort: None,
+    })
+    .unwrap();
+    drop(db);
+
+    struct IntakeBackend {
+        input: RefCell<Option<String>>,
+    }
+    impl ActionBackend for IntakeBackend {
+        fn invoke(
+            &self,
+            _: &AgentDefinition,
+            action: orc::registry::AgentAction,
+            input: &str,
+            _: Option<&str>,
+            _: Option<ReasoningEffort>,
+        ) -> anyhow::Result<ActionExecution> {
+            assert_eq!(action, orc::registry::AgentAction::Lead);
+            self.input.replace(Some(input.to_owned()));
+            Ok(ActionExecution {
+                output: r#"{"message":"intake","proposals":[],"decision":{"kind":"PLAN_REQUIRED","details":{"next":"operator"}}}"#.into(),
+                token_usage: None,
+            })
+        }
+    }
+
+    let app = OrcApp::open(&path, dir.path()).unwrap();
+    let backend = IntakeBackend {
+        input: RefCell::new(None),
+    };
+    app.new_project_intake_with_backend(
+        "Ship the first release",
+        &ActionOverrides::default(),
+        &backend,
+    )
+    .unwrap();
+    let input = backend.input.borrow().clone().unwrap();
+    let lead_input = input.rsplit_once('\n').unwrap().1;
+    let envelope: serde_json::Value = serde_json::from_str(lead_input).unwrap();
+    let request: serde_json::Value = serde_json::from_str(envelope[1].as_str().unwrap()).unwrap();
+    assert_eq!(request["kind"], "new_project_intake");
+    assert_eq!(request["objective"], "Ship the first release");
+    let snapshot = request["discovery_snapshot"].as_object().unwrap();
+    assert_eq!(snapshot["project"]["name"], "new-project");
+    assert!(snapshot.contains_key("repository"));
+    assert!(snapshot.contains_key("architecture"));
+    assert!(snapshot.contains_key("task_state"));
+    assert_eq!(app.tasks().unwrap().len(), 0);
+    assert!(app.pending_lead_decision().unwrap().is_some());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        app.new_project_intake_with_backend("  ", &ActionOverrides::default(), &backend)
+            .is_err()
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn plan_review_rejects_invalid_plan_before_lead_run_or_review_persistence() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("review.sqlite");

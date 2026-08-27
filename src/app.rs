@@ -17,6 +17,14 @@ pub struct ManualRunContext {
     pub task_packet: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PersistedPlanRun {
+    pub plan_id: i64,
+    pub lead_decision_id: i64,
+    pub planner_run_id: i64,
+    pub task_count: usize,
+}
+
 pub struct OrcApp {
     db: Database,
     repo_path: PathBuf,
@@ -121,6 +129,54 @@ impl OrcApp {
     ) -> Result<(i64, PlanResponse)> {
         let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
         self.automated_plan_with_backend(request, overrides, &backend)
+    }
+
+    /// Execute exactly one Planner run for the current actionable PLAN_REQUIRED decision.
+    pub fn run_pending_plan(
+        &self,
+        overrides: &crate::automated::ActionOverrides,
+    ) -> Result<PersistedPlanRun> {
+        let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
+        self.run_pending_plan_with_backend(overrides, &backend)
+    }
+
+    /// Testable production boundary for the operator-invoked Planner flow.
+    pub fn run_pending_plan_with_backend(
+        &self,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<PersistedPlanRun> {
+        let project_id = self.lead().project_id()?;
+        let decision = self
+            .db
+            .pending_lead_decision(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("no actionable pending Lead decision"))?;
+        if decision.kind != crate::lead::LeadDecisionKind::PlanRequired || !decision.actionable {
+            anyhow::bail!("pending Lead decision is not an actionable PLAN_REQUIRED decision")
+        }
+        let mut request = self.planning_request()?;
+        request.objective = if decision.source_request.trim().is_empty() {
+            decision.summary.clone()
+        } else {
+            decision.source_request.clone()
+        };
+        if request.objective.trim().is_empty() {
+            anyhow::bail!("PLAN_REQUIRED Lead decision has no planning objective")
+        }
+        let (planner_run_id, response) =
+            self.automated_plan_with_backend(&request, overrides, backend)?;
+        let plan_id = self.db.store_plan_and_consume_decision(
+            project_id,
+            decision.id,
+            planner_run_id,
+            &response,
+        )?;
+        Ok(PersistedPlanRun {
+            plan_id,
+            lead_decision_id: decision.id,
+            planner_run_id,
+            task_count: response.tasks.len(),
+        })
     }
     pub fn automated_lead_with_backend(
         &self,

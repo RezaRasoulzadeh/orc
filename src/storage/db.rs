@@ -563,6 +563,61 @@ impl Database {
         Ok(id)
     }
 
+    /// Stores a plan and consumes the exact source decision in one transaction.
+    /// The conditional update prevents a decision that changed while Planner ran
+    /// from being consumed or leaving a plan behind.
+    pub fn store_plan_and_consume_decision(
+        &self,
+        project_id: i64,
+        source_lead_decision_id: i64,
+        source_planner_run_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<i64, DbError> {
+        response
+            .validate()
+            .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let valid: Option<i64> = transaction.query_row(
+            "SELECT project_id FROM lead_decisions WHERE id = ?1 AND project_id = ?2 AND kind = 'PLAN_REQUIRED' AND status = 'pending'",
+            params![source_lead_decision_id, project_id], |row| row.get(0)).optional()?;
+        if valid != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "pending Lead decision changed while Planner was running".into(),
+            ));
+        }
+        let run_project: Option<i64> = transaction
+            .query_row(
+                "SELECT project_id FROM agent_runs WHERE id = ?1 AND execution_class = 'plan'",
+                [source_planner_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if run_project != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "invalid source Planner run linkage".into(),
+            ));
+        }
+        let (parent_plan_id, version): (Option<i64>, i64) = transaction.query_row(
+            "SELECT id, version FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id],
+            |row| Ok((Some(row.get(0)?), row.get::<_, i64>(1)? + 1))).optional()?.unwrap_or((None, 1));
+        let canonical = serde_json::to_string(response)?;
+        transaction.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical])?;
+        let id = transaction.last_insert_rowid();
+        for task in &response.tasks {
+            for dependency in &task.depends_on {
+                transaction.execute("INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1, ?2, ?3)", params![id, task.local_id, dependency])?;
+            }
+        }
+        let changed = transaction.execute("UPDATE lead_decisions SET status = 'consumed', resolved_at = CURRENT_TIMESTAMP WHERE id = ?1 AND project_id = ?2 AND status = 'pending'", params![source_lead_decision_id, project_id])?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(
+                "pending Lead decision changed while Planner was running".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+
     pub fn get_plan(&self, id: i64) -> Result<Option<PersistedPlan>, DbError> {
         Ok(self.conn.query_row(
             "SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at FROM plans WHERE id = ?1",

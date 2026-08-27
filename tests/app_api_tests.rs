@@ -1,13 +1,140 @@
 use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewResult};
-use orc::protocol::{PROTOCOL_VERSION, PlanResponse, PlannedTask};
+use orc::lead::LeadDecisionKind;
+use orc::protocol::{ExecutionHints, PROTOCOL_VERSION, PlanResponse, PlannedTask};
 use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
+use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database};
 use orc::task::TaskPriority;
+use orc::task::TaskScopeMode;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
 use tempfile::tempdir;
+
+struct CountingPlanner(AtomicUsize);
+
+impl ActionBackend for CountingPlanner {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> anyhow::Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Plan);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ActionExecution {
+            output: serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION, "objective": "requested", "assumptions": [],
+                "risks": [], "questions": [], "tasks": []
+            })
+            .to_string(),
+            token_usage: None,
+        })
+    }
+}
+
+struct OutputPlanner {
+    calls: AtomicUsize,
+    output: String,
+}
+
+struct DecisionChangingPlanner {
+    db_path: std::path::PathBuf,
+    project_id: i64,
+    calls: AtomicUsize,
+}
+
+impl ActionBackend for DecisionChangingPlanner {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> anyhow::Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Plan);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Database::open(&self.db_path)?.consume_pending_lead_decision(self.project_id)?;
+        Ok(ActionExecution {
+            output: serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION, "objective": "requested",
+                "assumptions": [], "risks": [], "questions": [], "tasks": []
+            })
+            .to_string(),
+            token_usage: None,
+        })
+    }
+}
+
+fn proposal(local_id: &str, depends_on: Vec<&str>) -> PlannedTask {
+    PlannedTask {
+        local_id: local_id.into(),
+        title: format!("{local_id} title"),
+        objective: format!("{local_id} objective"),
+        role: "developer".into(),
+        priority: TaskPriority::Normal,
+        depends_on: depends_on.into_iter().map(str::to_owned).collect(),
+        capabilities: vec!["code".into()],
+        scope_mode: Some(TaskScopeMode::Focused),
+        context_files: vec!["src/lib.rs".into()],
+        expected_changes: vec!["src/lib.rs".into()],
+        unchanged: vec!["task state".into()],
+        acceptance_criteria: vec!["works".into()],
+        required_tests: vec!["production test".into()],
+        validation: vec!["cargo test".into()],
+        execution_hints: ExecutionHints {
+            class: Some("code".into()),
+            model: None,
+            effort: None,
+        },
+    }
+}
+
+impl ActionBackend for OutputPlanner {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> anyhow::Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Plan);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ActionExecution {
+            output: self.output.clone(),
+            token_usage: None,
+        })
+    }
+}
+
+fn planner() -> AgentDefinition {
+    AgentDefinition {
+        id: "planner".into(),
+        backend: "fake".into(),
+        execution_mode: AUTOMATED.into(),
+        display_name: "Planner".into(),
+        enabled: true,
+        priority: 1,
+        capabilities: Vec::new(),
+        status: AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        quota_remaining_percent: None,
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+        actions: vec![AgentAction::Plan],
+    }
+}
 
 fn app_with_task(name: &str) -> (tempfile::TempDir, OrcApp, String) {
     let directory = tempdir().unwrap();
@@ -163,6 +290,326 @@ fn app_instances_are_isolated_for_queries_and_mutations() {
         two.task(&two_task).unwrap().unwrap().status.to_string(),
         "cancelled"
     );
+}
+
+#[test]
+fn pending_plan_run_invokes_once_persists_lineage_and_is_visible_after_reopen() {
+    let directory = tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".orc")).unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("planner").unwrap();
+    db.insert_agent(&planner()).unwrap();
+    let decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"kind":"PLAN_REQUIRED"}),
+            LeadDecisionMetadata {
+                snapshot: "before",
+                run_id: None,
+                source_request: "requested",
+                summary: "make a plan",
+            },
+        )
+        .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let backend = CountingPlanner(AtomicUsize::new(0));
+    let result = app
+        .run_pending_plan_with_backend(
+            &ActionOverrides {
+                agent_id: Some("planner".into()),
+                ..Default::default()
+            },
+            &backend,
+        )
+        .unwrap();
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    assert_eq!(result.lead_decision_id, decision);
+    let reopened = Database::open(&db_path).unwrap();
+    let plan = reopened.get_plan(result.plan_id).unwrap().unwrap();
+    assert_eq!(plan.source_lead_decision_id, decision);
+    assert_eq!(plan.source_planner_run_id, result.planner_run_id);
+    assert!(reopened.pending_lead_decision(project).unwrap().is_none());
+    assert_eq!(reopened.list_tasks().unwrap().len(), 0);
+}
+
+#[test]
+fn plan_run_preserves_canonical_proposals_and_dependencies_without_creating_tasks() {
+    let directory = tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".orc")).unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("planner").unwrap();
+    db.insert_agent(&planner()).unwrap();
+    db.record_lead_decision(
+        project,
+        &LeadDecisionKind::PlanRequired,
+        &serde_json::json!({"kind":"PLAN_REQUIRED"}),
+        LeadDecisionMetadata {
+            snapshot: "before",
+            run_id: None,
+            source_request: "requested",
+            summary: "summary",
+        },
+    )
+    .unwrap();
+    let response = PlanResponse {
+        protocol_version: PROTOCOL_VERSION,
+        objective: "requested".into(),
+        assumptions: vec![],
+        risks: vec![],
+        questions: vec![],
+        tasks: vec![proposal("first", vec![]), proposal("second", vec!["first"])],
+    };
+    let backend = OutputPlanner {
+        calls: AtomicUsize::new(0),
+        output: serde_json::to_string(&response).unwrap(),
+    };
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let result = app
+        .run_pending_plan_with_backend(
+            &ActionOverrides {
+                agent_id: Some("planner".into()),
+                ..Default::default()
+            },
+            &backend,
+        )
+        .unwrap();
+    let reopened = Database::open(&db_path).unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reopened.get_plan(result.plan_id).unwrap().unwrap().response,
+        response
+    );
+    assert_eq!(
+        reopened.list_plan_dependencies(result.plan_id).unwrap(),
+        vec![("second".into(), "first".into())]
+    );
+    assert!(reopened.list_tasks().unwrap().is_empty());
+}
+
+#[test]
+fn plan_run_rejects_missing_superseded_and_consumed_decisions_before_invocation() {
+    let cases = ["missing", "superseded", "consumed"];
+    for case in cases {
+        let directory = tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".orc")).unwrap();
+        std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+        let db_path = directory.path().join("state.sqlite");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("planner").unwrap();
+        db.insert_agent(&planner()).unwrap();
+        if case != "missing" {
+            db.record_lead_decision(
+                project,
+                &LeadDecisionKind::PlanRequired,
+                &serde_json::json!({}),
+                LeadDecisionMetadata {
+                    snapshot: "s",
+                    run_id: None,
+                    source_request: "r",
+                    summary: "s",
+                },
+            )
+            .unwrap();
+        }
+        if case == "superseded" {
+            db.record_lead_decision(
+                project,
+                &LeadDecisionKind::DirectTasks,
+                &serde_json::json!({}),
+                LeadDecisionMetadata {
+                    snapshot: "s",
+                    run_id: None,
+                    source_request: "r",
+                    summary: "s",
+                },
+            )
+            .unwrap();
+        }
+        let app = OrcApp::open(&db_path, directory.path()).unwrap();
+        let backend = CountingPlanner(AtomicUsize::new(0));
+        if case == "consumed" {
+            app.run_pending_plan_with_backend(
+                &ActionOverrides {
+                    agent_id: Some("planner".into()),
+                    ..Default::default()
+                },
+                &backend,
+            )
+            .unwrap();
+        }
+        assert!(
+            app.run_pending_plan_with_backend(
+                &ActionOverrides {
+                    agent_id: Some("planner".into()),
+                    ..Default::default()
+                },
+                &backend
+            )
+            .is_err()
+        );
+        assert_eq!(
+            backend.0.load(Ordering::SeqCst),
+            if case == "consumed" { 1 } else { 0 }
+        );
+        assert!(
+            Database::open(&db_path)
+                .unwrap()
+                .list_tasks()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn plan_run_rejects_non_actionable_decisions_without_planner_or_state_changes() {
+    for kind in [
+        LeadDecisionKind::DirectTasks,
+        LeadDecisionKind::UserDecisionRequired,
+    ] {
+        let directory = tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".orc")).unwrap();
+        std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+        let db_path = directory.path().join("state.sqlite");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("planner").unwrap();
+        db.insert_agent(&planner()).unwrap();
+        db.record_lead_decision(
+            project,
+            &kind,
+            &serde_json::json!({"kind":"other"}),
+            LeadDecisionMetadata {
+                snapshot: "before",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+        let app = OrcApp::open(&db_path, directory.path()).unwrap();
+        let backend = CountingPlanner(AtomicUsize::new(0));
+        assert!(
+            app.run_pending_plan_with_backend(
+                &ActionOverrides {
+                    agent_id: Some("planner".into()),
+                    ..Default::default()
+                },
+                &backend
+            )
+            .is_err()
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+        assert!(
+            Database::open(&db_path)
+                .unwrap()
+                .list_plan_history(project)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            Database::open(&db_path)
+                .unwrap()
+                .list_tasks()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn malformed_planner_output_is_rejected_without_partial_plan_or_task_state() {
+    let directory = tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".orc")).unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("planner").unwrap();
+    db.insert_agent(&planner()).unwrap();
+    let decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"kind":"PLAN_REQUIRED"}),
+            LeadDecisionMetadata {
+                snapshot: "before",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let backend = OutputPlanner {
+        calls: AtomicUsize::new(0),
+        output: "not json".into(),
+    };
+    assert!(
+        app.run_pending_plan_with_backend(
+            &ActionOverrides {
+                agent_id: Some("planner".into()),
+                ..Default::default()
+            },
+            &backend
+        )
+        .is_err()
+    );
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(db.list_plan_history(project).unwrap().is_empty());
+    assert!(db.list_tasks().unwrap().is_empty());
+    assert_eq!(
+        db.pending_lead_decision(project).unwrap().unwrap().id,
+        decision
+    );
+}
+
+#[test]
+fn changed_pending_decision_rolls_back_plan_atomically() {
+    let directory = tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".orc")).unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("planner").unwrap();
+    db.insert_agent(&planner()).unwrap();
+    db.record_lead_decision(
+        project,
+        &LeadDecisionKind::PlanRequired,
+        &serde_json::json!({"kind":"PLAN_REQUIRED"}),
+        LeadDecisionMetadata {
+            snapshot: "before",
+            run_id: None,
+            source_request: "request",
+            summary: "summary",
+        },
+    )
+    .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let backend = DecisionChangingPlanner {
+        db_path: db_path.clone(),
+        project_id: project,
+        calls: AtomicUsize::new(0),
+    };
+    assert!(
+        app.run_pending_plan_with_backend(
+            &ActionOverrides {
+                agent_id: Some("planner".into()),
+                ..Default::default()
+            },
+            &backend
+        )
+        .is_err()
+    );
+    let reopened = Database::open(&db_path).unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(reopened.list_plan_history(project).unwrap().is_empty());
+    assert!(reopened.list_tasks().unwrap().is_empty());
+    assert!(reopened.pending_lead_decision(project).unwrap().is_none());
 }
 
 #[test]

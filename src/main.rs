@@ -113,7 +113,9 @@ enum Command {
         objective: String,
     },
     Plan {
-        objective: String,
+        #[command(subcommand)]
+        command: Option<PlanCommand>,
+        objective: Option<String>,
         #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
@@ -249,6 +251,19 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Run the configured Planner once for the actionable pending Lead decision.
+    Run {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
     },
 }
 
@@ -525,23 +540,41 @@ fn run(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&mapping)?);
         }
         Command::Plan {
+            command,
             objective,
             agent,
             model,
             effort,
         } => {
             let app = orc::app::OrcApp::open(DB_PATH, ".")?;
-            let mut request = app.planning_request()?;
-            request.objective = objective;
-            let (_, response) = app.automated_plan(
-                &request,
-                &orc::automated::ActionOverrides {
-                    agent_id: agent,
-                    model,
-                    reasoning_effort: effort,
-                },
-            )?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            if let Some(objective) = objective {
+                let mut request = app.planning_request()?;
+                request.objective = objective;
+                let (_, response) = app.automated_plan(
+                    &request,
+                    &orc::automated::ActionOverrides {
+                        agent_id: agent,
+                        model,
+                        reasoning_effort: effort,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
+            }
+            let PlanCommand::Run {
+                agent: run_agent,
+                model: run_model,
+                effort: run_effort,
+            } = command.ok_or_else(|| anyhow::anyhow!("usage: orc plan run"))?;
+            let result = app.run_pending_plan(&orc::automated::ActionOverrides {
+                agent_id: run_agent,
+                model: run_model,
+                reasoning_effort: run_effort,
+            })?;
+            println!(
+                "Plan {} persisted ({} tasks, source Lead decision {}, Planner run {}).",
+                result.plan_id, result.task_count, result.lead_decision_id, result.planner_run_id
+            );
         }
         Command::Queue { explain } => match Database::open(DB_PATH) {
             Ok(db) => {

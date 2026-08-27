@@ -67,6 +67,30 @@ pub fn check_health(
 pub struct WorkerFactory;
 
 impl WorkerFactory {
+    pub fn build_lead(
+        agent: &AgentDefinition,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String> {
+        if agent.backend != "codex" {
+            return Err(format!(
+                "Lead backend '{}' has no read-only execution boundary",
+                agent.backend
+            ));
+        }
+        let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
+            format!(
+                "Codex agent '{}' requires a configured profile path",
+                agent.id
+            )
+        })?;
+        Ok(Box::new(CodexWorker::with_read_only_execution(
+            PathBuf::from(profile_path),
+            model.or_else(|| agent.model.clone()),
+            reasoning_effort.or(agent.reasoning_effort),
+        )))
+    }
+
     pub fn build(agent: &AgentDefinition) -> Result<Box<dyn Worker>, String> {
         match agent.backend.as_str() {
             "copilot" => Ok(Box::new(CopilotWorker)),

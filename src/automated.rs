@@ -146,17 +146,21 @@ impl ActionBackend for WorkerActionBackend {
     fn invoke_with_progress(
         &self,
         agent: &AgentDefinition,
-        _action: AgentAction,
+        action: AgentAction,
         input: &str,
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
         progress: ActionProgress<'_>,
     ) -> Result<ActionExecution> {
-        let worker = crate::backend::WorkerFactory::build_with_codex_overrides(
-            agent,
-            model.map(str::to_owned),
-            effort,
-        )
+        let worker = if action == AgentAction::Lead {
+            crate::backend::WorkerFactory::build_lead(agent, model.map(str::to_owned), effort)
+        } else {
+            crate::backend::WorkerFactory::build_with_codex_overrides(
+                agent,
+                model.map(str::to_owned),
+                effort,
+            )
+        }
         .map_err(anyhow::Error::msg)?;
         let execution = worker
             .execute_structured_with_progress_and_usage(
@@ -1328,8 +1332,16 @@ impl LeadBackend for LeadActionAdapter<'_> {
         .map_err(|error| error.to_string())?;
         self.usage.replace(execution.token_usage);
         self.output.replace(Some(execution.output.clone()));
-        serde_json::from_str(&execution.output)
-            .map_err(|error| format!("Lead provider returned malformed structured output: {error}"))
+        let response: LeadBackendResponse =
+            serde_json::from_str(&execution.output).map_err(|error| {
+                format!("Lead provider returned malformed structured output: {error}")
+            })?;
+        if response.decision.is_none() {
+            return Err(
+                "Lead provider response must contain exactly one structured decision".into(),
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -1631,7 +1643,8 @@ mod tests {
                     "proposals": [{
                         "kind": "approval_request",
                         "details": {"reason": "decision", "details": "operator decides"}
-                    }]
+                    }],
+                    "decision": {"kind": "USER_DECISION_REQUIRED", "details": {}}
                 }),
                 AgentAction::Review => serde_json::json!({
                     "verdict": "revise",

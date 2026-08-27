@@ -175,7 +175,7 @@ impl CodexLeadBackend {
         let context = serde_json::to_string(context)
             .map_err(|error| format!("failed to serialize Lead context: {error}"))?;
         Ok(format!(
-            "You are Orc's project Lead. Treat the supplied project context as authoritative. Respond with only JSON matching {{\"message\":string,\"proposals\":array}}. Proposal values must be one of {{\"kind\":\"plan\",\"details\":PlanResponse}}, {{\"kind\":\"task\",\"details\":PlannedTask}}, {{\"kind\":\"revision\",\"details\":{{\"task_id\":string,\"feedback\":string}}}}, or {{\"kind\":\"approval_request\",\"details\":{{\"reason\":string,\"details\":string}}}}. Proposals are suggestions and will not mutate state.\nProject context:\n{context}\nUser message:\n{message}"
+            "You are Orc's project Lead. You are strictly read-only: inspect the supplied persisted project and repository state only. You must not edit files, create commits, create or apply tasks, invoke Planner, dispatch, review, revise, or accept work. Return exactly one decision with kind DIRECT_TASKS, PLAN_REQUIRED, or USER_DECISION_REQUIRED, plus a message. Proposals are optional human-gated suggestions and are never applied by Lead. Respond with only structured JSON.\nProject context:\n{context}\nUser message:\n{message}"
         ))
     }
 

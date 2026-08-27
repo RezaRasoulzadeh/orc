@@ -458,6 +458,7 @@ pub struct CodexWorker {
     pub profile_path: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    sandbox: &'static str,
 }
 
 impl CodexWorker {
@@ -474,6 +475,20 @@ impl CodexWorker {
             profile_path,
             model,
             reasoning_effort,
+            sandbox: "workspace-write",
+        }
+    }
+
+    pub fn with_read_only_execution(
+        profile_path: PathBuf,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        Self {
+            profile_path,
+            model,
+            reasoning_effort,
+            sandbox: "read-only",
         }
     }
 
@@ -482,15 +497,24 @@ impl CodexWorker {
     }
 
     pub fn command_args_with_execution(
+        prompt: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Vec<String> {
+        Self::command_args_with_sandbox(prompt, model, reasoning_effort, "workspace-write")
+    }
+
+    pub fn command_args_with_sandbox(
         _prompt: &str,
         model: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
+        sandbox: &str,
     ) -> Vec<String> {
         vec![
             "exec".into(),
             "--json".into(),
             "--sandbox".into(),
-            "workspace-write".into(),
+            sandbox.into(),
         ]
         .into_iter()
         .chain(
@@ -515,8 +539,12 @@ impl CodexWorker {
         schema_path: Option<&Path>,
     ) -> std::process::Command {
         let mut command = std::process::Command::new("codex");
-        let mut args =
-            Self::command_args_with_execution(prompt, self.model.as_deref(), self.reasoning_effort);
+        let mut args = Self::command_args_with_sandbox(
+            prompt,
+            self.model.as_deref(),
+            self.reasoning_effort,
+            self.sandbox,
+        );
         if let Some(path) = schema_path {
             let stdin_marker = args.pop().expect("Codex command includes stdin marker");
             args.push("--output-schema".into());
@@ -527,6 +555,16 @@ impl CodexWorker {
         backend::apply_profile_environment(&mut command, &self.profile_path);
         backend::configure_noninteractive(&mut command, cwd);
         command
+    }
+
+    #[cfg(test)]
+    fn command_args_for_test(&self) -> Vec<String> {
+        Self::command_args_with_sandbox(
+            "",
+            self.model.as_deref(),
+            self.reasoning_effort,
+            self.sandbox,
+        )
     }
 }
 
@@ -864,6 +902,14 @@ impl Worker for AntigravityWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lead_execution_uses_read_only_sandbox() {
+        let args =
+            CodexWorker::with_read_only_execution(PathBuf::from("/profiles/lead"), None, None)
+                .command_args_for_test();
+        assert_eq!(args, vec!["exec", "--json", "--sandbox", "read-only", "-"]);
+    }
 
     #[test]
     fn codex_json_events_preserve_final_message_and_reported_usage() {

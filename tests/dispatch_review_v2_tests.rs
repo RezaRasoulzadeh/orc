@@ -63,6 +63,33 @@ struct RepairWorker {
 struct CapturingWorker {
     calls: Mutex<Vec<String>>,
     fail_first: bool,
+    blocker_id: String,
+}
+
+struct QueuedReviewBackend {
+    outputs: Mutex<VecDeque<String>>,
+}
+
+impl ActionBackend for QueuedReviewBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Review);
+        Ok(ActionExecution {
+            output: self
+                .outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("review output"),
+            token_usage: None,
+        })
+    }
 }
 
 impl CapturingWorker {
@@ -70,6 +97,7 @@ impl CapturingWorker {
         Self {
             calls: Mutex::new(Vec::new()),
             fail_first: false,
+            blocker_id: "BLK-identity".into(),
         }
     }
 
@@ -77,6 +105,15 @@ impl CapturingWorker {
         Self {
             calls: Mutex::new(Vec::new()),
             fail_first: true,
+            blocker_id: "BLK-identity".into(),
+        }
+    }
+
+    fn with_blocker_id(blocker_id: &str) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            fail_first: false,
+            blocker_id: blocker_id.into(),
         }
     }
 }
@@ -93,7 +130,24 @@ impl Worker for CapturingWorker {
         }
         std::fs::write(cwd.join("captured.txt"), format!("call {}\n", calls.len()))
             .map_err(|error| error.to_string())?;
-        Ok((WorkerOutcome::Success, Some("captured execution".into())))
+        Ok((
+            WorkerOutcome::Success,
+            Some(
+                serde_json::json!({
+                        "claims": [{
+                        "blocker_id": self.blocker_id, "status": "addressed",
+                        "implementation_summary": "implemented acceptance is exact; exact acceptance survives", "changed_files": ["captured.txt"],
+                        "evidence": [{
+                            "changed_file": "captured.txt",
+                            "validation_command": "check",
+                            "test_names": []
+                        }],
+                        "validation_evidence": "command check passed acceptance is exact; exact acceptance survives", "unresolved_risk": null
+                    }]
+                })
+                .to_string(),
+            ),
+        ))
     }
 }
 
@@ -759,6 +813,21 @@ fn no_stale_reservation_or_run_blocks_retry() {
     assert_eq!(*worker.calls.lock().unwrap(), 2);
 }
 
+fn persist_known_contract(db: &Database, task: &str, review_id: i64, blocker_id: &str) {
+    let contract = serde_json::json!({
+        "unresolved": [{
+            "task_id": task, "blocker_id": blocker_id, "run_id": review_id,
+            "requirement_ref": "REQ-EXACT", "evidence": "observed evidence",
+            "severity": "high", "acceptance_condition": "acceptance is exact",
+            "status": "unresolved", "finding": "structured finding",
+            "first_seen": "now", "last_seen": "now", "blocker_key": "key"
+        }],
+        "regressions": [], "regression_constraints": []
+    });
+    db.persist_revision_contract(task, review_id, &contract.to_string())
+        .unwrap();
+}
+
 fn revision_fixture() -> (TempDir, Database, String, i64) {
     let (dir, db, task) = setup();
     db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
@@ -781,6 +850,407 @@ fn revision_fixture() -> (TempDir, Database, String, i64) {
         .unwrap()
         .id;
     (dir, db, task, review_id)
+}
+
+fn production_review_output(verdict: &str, blocker_id: Option<&str>) -> String {
+    let blockers = blocker_id.map_or_else(
+        || "[]".to_owned(),
+        |id| {
+            serde_json::json!([{
+                "id": id, "prior_blocker_id": null, "blocker_key": id,
+                "requirement_ref": "REQ-EXACT", "evidence": "review observed the gap",
+                "severity": "high", "acceptance_condition": "exact acceptance survives",
+                "status": "new", "finding": "structured review finding"
+            }])
+            .to_string()
+        },
+    );
+    let blocking = blocker_id.map_or_else(Vec::new, |id| vec![format!("blocking finding {id}")]);
+    serde_json::json!({
+        "verdict": verdict, "findings": [], "blocking_findings": blocking,
+        "non_blocking_findings": [], "severity": "high",
+        "revision_feedback": "free-form compatibility feedback", "blockers": serde_json::from_str::<serde_json::Value>(&blockers).unwrap()
+    }).to_string()
+}
+
+fn production_contract_fixture() -> (TempDir, Database, String, i64) {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![AgentAction::Code, AgentAction::Review],
+    ))
+    .unwrap();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &ActionOverrides {
+            agent_id: Some("fake".into()),
+            model: None,
+            reasoning_effort: None,
+        },
+        &QueuedReviewBackend {
+            outputs: Mutex::new(VecDeque::from([production_review_output(
+                "REVISE",
+                Some("BLK-production"),
+            )])),
+        },
+    )
+    .unwrap();
+    let (source, _, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    (dir, db, task, source)
+}
+
+#[test]
+fn revise_review_persists_contract_through_real_review_path() {
+    let (_dir, db, task, source) = production_contract_fixture();
+    let (actual_source, json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(actual_source, source);
+    assert_eq!(value["unresolved"][0]["task_id"], task);
+    assert!(
+        !value["unresolved"][0]["blocker_id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert_eq!(
+        value["unresolved"][0]["acceptance_condition"],
+        "exact acceptance survives"
+    );
+}
+
+#[test]
+fn restart_loads_actionable_contract() {
+    let (dir, db, task, source) = production_contract_fixture();
+    drop(db);
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened
+            .actionable_revision_contract(&task)
+            .unwrap()
+            .unwrap()
+            .0,
+        source
+    );
+}
+
+#[test]
+fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let backend = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from([
+            production_review_output("REVISE", Some("BLK-newer")),
+            production_review_output("PASS", None),
+        ])),
+    };
+    let overrides = ActionOverrides {
+        agent_id: Some("fake".into()),
+        model: None,
+        reasoning_effort: None,
+    };
+    app.automated_review_with_backend(&task, &overrides, &backend)
+        .unwrap();
+    let (_, json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert!(json.contains("BLK-newer"));
+    app.automated_review_with_backend(&task, &overrides, &backend)
+        .unwrap();
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert_eq!(db.revision_contract_history_count(&task).unwrap(), 2);
+}
+
+#[test]
+fn failed_revision_start_reuses_same_contract_and_success_consumes_once() {
+    let (dir, db, task, source) = production_contract_fixture();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "operator context",
+            &StartupFailureWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+    let (_, contract_json, contract_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json).unwrap()["unresolved"][0]["blocker_id"].as_str().unwrap().to_owned();
+    let worker = CapturingWorker::with_blocker_id(&blocker_id);
+    let retry = revise_with_worker_on_db(
+        &task,
+        "",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    );
+    assert!(retry.is_ok(), "retry failed: {retry:?}");
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert!(!db.consume_revision_contract(contract_id).unwrap());
+    let revision = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id != source && r.execution_class != "review")
+        .unwrap();
+    assert_eq!(db.source_review_run_id(revision.id).unwrap(), Some(source));
+}
+
+#[test]
+fn terminal_tasks_reject_persisted_contract_and_no_pending_is_actionable_error() {
+    let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Done).unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "",
+            &WritingWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+    assert!(db.actionable_revision_contract(&task).unwrap().is_some());
+    let (dir_cancelled, db_cancelled, task_cancelled, _) = production_contract_fixture();
+    db_cancelled
+        .update_task_status(&task_cancelled, TaskStatus::Cancelled)
+        .unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task_cancelled,
+            "",
+            &WritingWorker,
+            &db_cancelled,
+            dir_cancelled.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+    assert!(
+        db_cancelled
+            .actionable_revision_contract(&task_cancelled)
+            .unwrap()
+            .is_some()
+    );
+    let (dir2, db2, task2) = setup();
+    db2.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task2,
+            "",
+            &WritingWorker,
+            &db2,
+            dir2.path(),
+            "fake",
+            &FakeValidationRunner::success()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn explicit_feedback_is_additional_context_not_contract_override() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let (_, contract_json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json).unwrap()["unresolved"][0]["blocker_id"].as_str().unwrap().to_owned();
+    let worker = CapturingWorker::with_blocker_id(&blocker_id);
+    revise_with_worker_on_db(
+        &task,
+        "operator context",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let prompt = worker.calls.lock().unwrap()[0].clone();
+    assert!(
+        prompt.contains(&blocker_id)
+            && prompt.contains("exact acceptance survives")
+            && prompt.contains("operator context")
+    );
+}
+
+#[test]
+fn production_revise_without_feedback_consumes_persisted_contract() {
+    let (dir, db, task, source_review) = production_contract_fixture();
+    let (_, contract_json, contract_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json)
+        .unwrap()["unresolved"][0]["blocker_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let worker = CapturingWorker::with_blocker_id(&blocker_id);
+
+    revise_with_worker_on_db(
+        &task,
+        "",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert!(!db.consume_revision_contract(contract_id).unwrap());
+    let revision_run = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.id != source_review && run.execution_class != "review")
+        .unwrap();
+    assert_eq!(
+        db.source_review_run_id(revision_run.id).unwrap(),
+        Some(source_review)
+    );
+    let prompt = worker.calls.lock().unwrap()[0].clone();
+    assert!(prompt.contains(&blocker_id) && prompt.contains("exact acceptance survives"));
+}
+
+#[test]
+fn persisted_contract_is_not_cross_task_consumable() {
+    let (dir, db, task_a, _) = production_contract_fixture();
+    let project = db.get_project_id().unwrap().unwrap();
+    let task_b = db
+        .insert_task(
+            project,
+            "other task",
+            "other work",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    assert!(
+        revise_with_worker_on_db(
+            &task_b,
+            "",
+            &WritingWorker,
+            &db,
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success(),
+        )
+        .is_err()
+    );
+    assert!(db.actionable_revision_contract(&task_a).unwrap().is_some());
+    assert!(db.actionable_revision_contract(&task_b).unwrap().is_none());
+}
+
+#[test]
+fn no_feedback_without_production_contract_returns_actionable_error() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
+    let error = revise_with_worker_on_db(
+        &task,
+        "",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no actionable REVISE review"));
+}
+
+#[test]
+fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![AgentAction::Code, AgentAction::Review],
+    ))
+    .unwrap();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let backend = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from([
+            production_review_output("REVISE", Some("BLK-production")),
+            production_review_output("REVISE", Some("BLK-newer")),
+            production_review_output("PASS", None),
+        ])),
+    };
+    app.automated_review_with_backend(
+        &task,
+        &ActionOverrides {
+            agent_id: Some("fake".into()),
+            model: None,
+            reasoning_effort: None,
+        },
+        &backend,
+    )
+    .unwrap();
+    let (_, json, first_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert!(json.contains("BLK-production") && json.contains("exact acceptance survives"));
+    drop(app);
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert!(
+        reopened
+            .actionable_revision_contract(&task)
+            .unwrap()
+            .is_some()
+    );
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &ActionOverrides {
+            agent_id: Some("fake".into()),
+            model: None,
+            reasoning_effort: None,
+        },
+        &backend,
+    )
+    .unwrap();
+    let (_, newer, newer_id) = reopened
+        .actionable_revision_contract(&task)
+        .unwrap()
+        .unwrap();
+    assert!(newer_id > first_id && newer.contains("BLK-newer"));
+    app.automated_review_with_backend(
+        &task,
+        &ActionOverrides {
+            agent_id: Some("fake".into()),
+            model: None,
+            reasoning_effort: None,
+        },
+        &backend,
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .actionable_revision_contract(&task)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reopened.revision_contract_history_count(&task).unwrap(), 2);
 }
 
 #[test]
@@ -897,6 +1367,75 @@ fn restart_preserves_actionable_review() {
 }
 
 #[test]
+fn revise_review_persists_actionable_revision_contract() {
+    let (_dir, db, task, review_id) = revision_fixture();
+    persist_known_contract(&db, &task, review_id, "BLK-exact");
+    let (source, json, id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert_eq!(source, review_id);
+    assert!(id > 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["unresolved"][0]["blocker_id"],
+        "BLK-exact"
+    );
+}
+
+#[test]
+fn persisted_contract_contains_exact_blocker_identity_and_revision_without_feedback_loads_it() {
+    let (dir, db, task, review_id) = revision_fixture();
+    persist_known_contract(&db, &task, review_id, "BLK-identity");
+    let worker = CapturingWorker::successful();
+    revise_with_worker_on_db(
+        &task,
+        "",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let prompt = &worker.calls.lock().unwrap()[0];
+    assert!(prompt.contains("BLK-identity") && prompt.contains("acceptance is exact"));
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+}
+
+#[test]
+fn revision_contract_survives_restart_and_newer_revise_supersedes_previous_pending_contract() {
+    let (dir, db, task, first) = revision_fixture();
+    persist_known_contract(&db, &task, first, "BLK-one");
+    let path = dir.path().join(".orc/orc.db");
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    let (_, _, first_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    seed_actionable_revision_review(&db, &task);
+    let second = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.execution_class == "review")
+        .max_by_key(|r| r.id)
+        .unwrap()
+        .id;
+    persist_known_contract(&db, &task, second, "BLK-two");
+    let (source, json, second_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert_eq!(source, second);
+    assert!(second_id > first_id);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["unresolved"][0]["blocker_id"],
+        "BLK-two"
+    );
+}
+
+#[test]
+fn pass_clears_actionability_without_deleting_contract_history() {
+    let (_, db, task, review_id) = revision_fixture();
+    persist_known_contract(&db, &task, review_id, "BLK-history");
+    db.clear_actionable_revision_contracts(&task).unwrap();
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert_eq!(db.revision_contract_history_count(&task).unwrap(), 1);
+}
+
+#[test]
 fn restart_preserves_consumed_revision_linkage() {
     let (dir, db, task, review_id) = revision_fixture();
     let summary = revise_with_worker_on_db(
@@ -955,6 +1494,7 @@ fn newer_revise_review_becomes_actionable_after_prior_consumption() {
 #[test]
 fn consumed_review_cannot_be_reused_twice() {
     let (dir, db, task, _) = revision_fixture();
+    let history_before = db.revision_contract_history_count(&task).unwrap();
     revise_with_worker_on_db(
         &task,
         "retry",
@@ -965,6 +1505,11 @@ fn consumed_review_cannot_be_reused_twice() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+    assert_eq!(
+        db.revision_contract_history_count(&task).unwrap(),
+        history_before
+    );
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
     assert!(
         revise_with_worker_on_db(
             &task,

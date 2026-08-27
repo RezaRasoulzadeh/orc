@@ -63,6 +63,7 @@ pub enum LeadDecisionKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum LeadProposalKind {
     Plan(PlanResponse),
@@ -309,6 +310,17 @@ impl<'a> LeadService<'a> {
                 return Err(anyhow::Error::msg(error));
             }
         };
+        for proposal in &response.proposals {
+            match proposal {
+                LeadProposalKind::Plan(plan) => plan.validate().map_err(|error| {
+                    anyhow::anyhow!("Lead returned invalid plan proposal: {error}")
+                })?,
+                LeadProposalKind::Task(task) => task.validate().map_err(|error| {
+                    anyhow::anyhow!("Lead returned invalid task proposal: {error}")
+                })?,
+                _ => {}
+            }
+        }
         let turn_id =
             self.db
                 .record_lead_turn(project_id, LeadRole::Assistant, &response.message)?;

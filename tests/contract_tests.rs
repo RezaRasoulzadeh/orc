@@ -143,6 +143,11 @@ fn planned_task() -> PlannedTask {
         scope_mode: Some(TaskScopeMode::Focused),
         context_files: vec!["src/lib.rs".into()],
         expected_changes: vec!["src/lib.rs".into()],
+        unchanged: vec!["other modules".into()],
+        acceptance_criteria: vec!["task behavior is complete".into()],
+        required_tests: vec!["production test".into()],
+        validation: vec!["cargo test".into()],
+        execution_hints: Default::default(),
     }
 }
 

@@ -42,7 +42,9 @@ export interface ProjectHealth {
 }
 export interface DesktopSnapshot { dashboard: Dashboard; health: ProjectHealth }
 export interface LeadTurn { id: number; role: 'user' | 'assistant' | 'system'; content: string; created_at: string }
-export interface PlannedTask { local_id: string; title: string; objective: string; role: string; priority: 'low' | 'normal' | 'high' | 'critical'; depends_on: string[]; capabilities: string[]; scope_mode: 'focused' | 'module' | 'project' | null; context_files: string[]; expected_changes: string[] }
+export interface ExecutionHints { class?: string | null; model?: string | null; effort?: string | null }
+export interface TaskProposal { local_id: string; title: string; objective: string; role: string; priority: 'low' | 'normal' | 'high' | 'critical'; depends_on: string[]; capabilities: string[]; scope_mode: 'focused' | 'module' | 'project' | null; context_files: string[]; expected_changes: string[]; unchanged: string[]; acceptance_criteria: string[]; required_tests: string[]; validation: string[]; execution_hints: ExecutionHints }
+export type PlannedTask = TaskProposal
 export interface PlanResponse { protocol_version: number; objective: string; assumptions: string[]; risks: string[]; questions: string[]; tasks: PlannedTask[] }
 export type LeadProposalKind =
   | { kind: 'plan'; details: PlanResponse }

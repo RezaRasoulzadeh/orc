@@ -87,7 +87,12 @@ fn planned_task(title: &str) -> PlannedTask {
         capabilities: Vec::new(),
         scope_mode: Some(TaskScopeMode::Project),
         context_files: Vec::new(),
-        expected_changes: Vec::new(),
+        expected_changes: vec!["src/lib.rs".into()],
+        unchanged: vec!["unrelated behavior".into()],
+        acceptance_criteria: vec!["behavior works".into()],
+        required_tests: vec!["production path test".into()],
+        validation: vec!["cargo test".into()],
+        execution_hints: Default::default(),
     }
 }
 

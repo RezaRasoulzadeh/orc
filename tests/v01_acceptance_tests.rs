@@ -75,8 +75,16 @@ fn v01_happy_path_is_provider_independent() {
             "objective": "Create accepted.txt through the manual task workflow",
             "role": "developer",
             "priority": "normal",
+            "capabilities": [],
+            "scope_mode": null,
             "context_files": [],
-            "expected_changes": ["accepted.txt"]
+            "expected_changes": ["accepted.txt"],
+            "unchanged": ["unrelated behavior"],
+            "acceptance_criteria": ["accepted marker is created"],
+            "required_tests": ["manual workflow test"],
+            "validation": ["cargo test"],
+            "execution_hints": {},
+            "depends_on": []
         }]
     });
     fs::write(

@@ -25,6 +25,17 @@ pub struct PersistedPlanRun {
     pub task_count: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkflowState {
+    pub position: String,
+    pub lead_decisions: Vec<crate::lead::PersistedLeadDecision>,
+    pub plans: Vec<crate::storage::db::PlanHistoryEntry>,
+    pub plan_reviews: Vec<crate::storage::db::PlanReview>,
+    pub user_decisions: Vec<crate::lead::PersistedLeadDecision>,
+    pub tasks: Vec<Task>,
+    pub runs: Vec<AgentRun>,
+}
+
 pub struct OrcApp {
     db: Database,
     repo_path: PathBuf,
@@ -725,6 +736,70 @@ impl OrcApp {
     }
     pub fn planning_state(&self) -> Result<PlanningProjectState> {
         Ok(self.db.planning_project_state()?)
+    }
+    pub fn workflow_state(&self) -> Result<WorkflowState> {
+        let project = self.lead().project_id()?;
+        let decisions = self.db.list_lead_decisions(project)?;
+        let plans = self.db.list_plan_history(project)?;
+        let reviews = self.db.list_plan_reviews(project)?;
+        let tasks = self.db.list_tasks_for_project(project)?;
+        let runs = self.db.list_agent_runs(project, usize::MAX)?;
+        let position = if decisions.iter().any(|d| {
+            d.status == "pending" && d.kind == crate::lead::LeadDecisionKind::UserDecisionRequired
+        }) {
+            "user_decision_required"
+        } else if decisions
+            .iter()
+            .any(|d| d.status == "pending" && d.kind == crate::lead::LeadDecisionKind::PlanRequired)
+        {
+            "planner_required"
+        } else if plans.last().is_some_and(|p| {
+            p.status == crate::storage::db::PlanStatus::Proposed
+                || p.status == crate::storage::db::PlanStatus::UnderReview
+                || p.status == crate::storage::db::PlanStatus::RevisionRequested
+        }) {
+            "plan_review"
+        } else if tasks
+            .iter()
+            .any(|t| t.status == crate::task::TaskStatus::Review)
+        {
+            "task_review"
+        } else if tasks
+            .iter()
+            .any(|t| t.status == crate::task::TaskStatus::Active)
+            || runs
+                .iter()
+                .any(|r| matches!(r.status.as_str(), "running" | "waiting_external"))
+        {
+            "task_execution"
+        } else if tasks
+            .iter()
+            .any(|t| t.status == crate::task::TaskStatus::Blocked)
+        {
+            "blocked"
+        } else if !tasks.is_empty() && tasks.iter().all(|t| t.status.is_terminal()) {
+            "complete"
+        } else if plans
+            .last()
+            .is_some_and(|p| p.status == crate::storage::db::PlanStatus::Applied)
+        {
+            "tasks_ready"
+        } else {
+            "lead_decision"
+        };
+        Ok(WorkflowState {
+            position: position.into(),
+            user_decisions: decisions
+                .iter()
+                .filter(|d| d.kind == crate::lead::LeadDecisionKind::UserDecisionRequired)
+                .cloned()
+                .collect(),
+            lead_decisions: decisions,
+            plans,
+            plan_reviews: reviews,
+            tasks,
+            runs,
+        })
     }
     pub fn review(&self, task_id: &str) -> Result<ReviewSummary> {
         build_review(&self.db, task_id, &self.repo_path)

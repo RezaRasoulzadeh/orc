@@ -166,6 +166,52 @@ mod reservation_lifecycle_tests {
     }
 
     #[test]
+    fn terminal_run_cannot_be_overwritten_by_late_timeout() {
+        let (_directory, _path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.update_agent_run_status(run, "completed", Some("validation completed"))
+            .unwrap();
+        assert!(
+            !db.update_agent_run_status(run, "timeout", Some("late timeout"))
+                .unwrap()
+        );
+        let saved = db.get_agent_run(run).unwrap().unwrap();
+        assert_eq!(saved.status, "completed");
+        assert_eq!(saved.output.as_deref(), Some("validation completed"));
+        assert!(db.list_busy_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_terminal_callback_cannot_release_a_newer_run_reservation() {
+        let (_directory, _path, db, project, first_task) = fixture();
+        let first = db
+            .create_agent_run(project, &first_task, "codex-main")
+            .unwrap();
+        db.update_agent_run_status(first, "completed", Some("done"))
+            .unwrap();
+
+        let second_task = db
+            .insert_task(
+                project,
+                "second",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let second = db
+            .create_agent_run(project, &second_task, "codex-main")
+            .unwrap();
+
+        assert!(
+            !db.update_agent_run_status(first, "timeout", Some("late timeout"))
+                .unwrap()
+        );
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+        assert_eq!(db.get_agent_run(second).unwrap().unwrap().status, "running");
+    }
+
+    #[test]
     fn simultaneous_execution_protection() {
         let (_directory, _path, db, project, first) = fixture();
         db.create_agent_run(project, &first, "codex-main").unwrap();
@@ -2667,11 +2713,18 @@ impl Database {
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<bool, DbError> {
         let transaction = self.conn.unchecked_transaction()?;
+        let terminal = !matches!(status, "running" | "waiting_external");
         let changed = transaction.execute(
-            "UPDATE agent_runs SET status = ?1, output = ?2, error = CASE WHEN ?1 = 'failed' THEN error ELSE NULL END, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
-            params![status, output, run_id],
+            "UPDATE agent_runs
+             SET status = ?1, output = ?2,
+                 error = CASE WHEN ?1 = 'failed' THEN error ELSE NULL END,
+                 finished_at = CASE WHEN ?4 THEN CURRENT_TIMESTAMP ELSE finished_at END,
+                 last_activity = CURRENT_TIMESTAMP
+             WHERE id = ?3
+               AND (?4 = 0 OR status IN ('running', 'waiting_external'))",
+            params![status, output, run_id, terminal],
         )?;
-        if !matches!(status, "running" | "waiting_external") {
+        if changed != 0 && !matches!(status, "running" | "waiting_external") {
             transaction.execute(
                 "DELETE FROM execution_reservations WHERE run_id = ?1",
                 [run_id],
@@ -2693,13 +2746,15 @@ impl Database {
     ) -> Result<bool, DbError> {
         let transaction = self.conn.unchecked_transaction()?;
         let changed = transaction.execute(
-            "UPDATE agent_runs SET status = 'failed', output = ?1, error = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3",
+            "UPDATE agent_runs SET status = 'failed', output = ?1, error = ?2, finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP WHERE id = ?3 AND status IN ('running', 'waiting_external')",
             params![raw_output, error, run_id],
         )?;
-        transaction.execute(
-            "DELETE FROM execution_reservations WHERE run_id = ?1",
-            [run_id],
-        )?;
+        if changed != 0 {
+            transaction.execute(
+                "DELETE FROM execution_reservations WHERE run_id = ?1",
+                [run_id],
+            )?;
+        }
         transaction.commit()?;
         if changed != 0 {
             self.record_worker_result(run_id, "failed", Some(error), token_usage)?;

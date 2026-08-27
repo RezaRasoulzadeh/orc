@@ -697,6 +697,23 @@ impl Database {
             .collect::<Result<_, _>>()?)
     }
 
+    pub fn list_plan_reviews(&self, project_id: i64) -> Result<Vec<PlanReview>, DbError> {
+        let mut statement = self.conn.prepare("SELECT r.id, r.plan_id, r.lead_run_id, r.lead_decision_id, r.decision, r.details, r.created_at FROM plan_reviews r JOIN plans p ON p.id = r.plan_id WHERE p.project_id = ?1 ORDER BY r.id")?;
+        Ok(statement
+            .query_map([project_id], |row| {
+                Ok(PlanReview {
+                    id: row.get(0)?,
+                    plan_id: row.get(1)?,
+                    lead_run_id: row.get(2)?,
+                    lead_decision_id: row.get(3)?,
+                    decision: parse_lead_decision_kind(&row.get::<_, String>(4)?)?,
+                    details: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     pub fn list_plan_dependencies(&self, plan_id: i64) -> Result<Vec<(String, String)>, DbError> {
         let mut statement = self.conn.prepare(
             "SELECT task_local_id, depends_on_local_id FROM plan_dependencies WHERE plan_id = ?1 ORDER BY task_local_id, depends_on_local_id",
@@ -2817,6 +2834,15 @@ impl Database {
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_tasks_for_project(&self, project_id: i64) -> Result<Vec<Task>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks WHERE project_id = ?1 ORDER BY created_at",
+        )?;
+        Ok(stmt
+            .query_map(params![project_id], Self::task_from_row)?
             .collect::<Result<Vec<_>, _>>()?)
     }
 

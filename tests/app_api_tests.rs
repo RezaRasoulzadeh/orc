@@ -167,6 +167,208 @@ fn app_with_task(name: &str) -> (tempfile::TempDir, OrcApp, String) {
     (directory, app, task)
 }
 
+#[test]
+fn workflow_state_is_project_scoped_and_read_only() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let current = db.create_project("current").unwrap();
+    let other = db.create_project("other").unwrap();
+    let current_task = db
+        .insert_task(
+            current,
+            "current task",
+            "objective",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    db.update_task_status(&current_task, orc::task::TaskStatus::Active)
+        .unwrap();
+    let other_task = db
+        .insert_task(
+            other,
+            "other task",
+            "objective",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    db.update_task_status(&other_task, orc::task::TaskStatus::Blocked)
+        .unwrap();
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let before = app.workflow_state().unwrap();
+    let after = app.workflow_state().unwrap();
+    assert_eq!(before.position, "task_execution");
+    assert_eq!(before.tasks.len(), 1);
+    assert_eq!(before.tasks[0].id, current_task);
+    assert_eq!(before.tasks, after.tasks);
+    assert_eq!(before.position, after.position);
+}
+
+#[test]
+fn workflow_state_derives_each_task_lifecycle_position() {
+    let cases = [
+        (orc::task::TaskStatus::Review, "task_review"),
+        (orc::task::TaskStatus::Active, "task_execution"),
+        (orc::task::TaskStatus::Blocked, "blocked"),
+        (orc::task::TaskStatus::Done, "complete"),
+    ];
+
+    for (status, expected) in cases {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("state.sqlite");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("workflow").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        db.update_task_status(&task, status).unwrap();
+        drop(db);
+
+        let app = OrcApp::open(&db_path, directory.path()).unwrap();
+        let state = app.workflow_state().unwrap();
+        assert_eq!(state.position, expected);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].status, status);
+    }
+}
+
+#[test]
+fn workflow_state_derives_lead_and_planner_positions() {
+    for (kind, expected) in [
+        (LeadDecisionKind::DirectTasks, "lead_decision"),
+        (LeadDecisionKind::PlanRequired, "planner_required"),
+        (
+            LeadDecisionKind::UserDecisionRequired,
+            "user_decision_required",
+        ),
+    ] {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("state.sqlite");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("workflow").unwrap();
+        db.record_lead_decision(
+            project,
+            &kind,
+            &serde_json::json!({"kind": "workflow"}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let app = OrcApp::open(&db_path, directory.path()).unwrap();
+        let state = app.workflow_state().unwrap();
+        assert_eq!(state.position, expected);
+        assert_eq!(state.lead_decisions.len(), 1);
+        assert_eq!(
+            state.user_decisions.len(),
+            usize::from(kind == LeadDecisionKind::UserDecisionRequired)
+        );
+    }
+}
+
+#[test]
+fn workflow_state_derives_plan_review_revision_and_ready_positions() {
+    for (status, expected) in [
+        ("proposed", "plan_review"),
+        ("revision_requested", "plan_review"),
+        ("applied", "tasks_ready"),
+    ] {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("state.sqlite");
+        let db = Database::init(&db_path).unwrap();
+        let project = db.create_project("workflow").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let decision = db
+            .record_lead_decision(
+                project,
+                &LeadDecisionKind::PlanRequired,
+                &serde_json::json!({}),
+                LeadDecisionMetadata {
+                    snapshot: "snapshot",
+                    run_id: None,
+                    source_request: "request",
+                    summary: "summary",
+                },
+            )
+            .unwrap();
+        let run = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "planner",
+                AUTOMATED,
+                AgentRunExecution {
+                    class: "plan",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        let response = PlanResponse {
+            protocol_version: PROTOCOL_VERSION,
+            objective: "objective".into(),
+            assumptions: vec![],
+            risks: vec![],
+            questions: vec![],
+            tasks: vec![],
+        };
+        let plan = db.store_plan(project, decision, run, &response).unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE plans SET status = ?1 WHERE id = ?2",
+                (&status, plan),
+            )
+            .unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE lead_decisions SET status = 'consumed' WHERE id = ?1",
+                [decision],
+            )
+            .unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE agent_runs SET status = 'completed' WHERE id = ?1",
+                [run],
+            )
+            .unwrap();
+        drop(db);
+
+        let state = OrcApp::open(&db_path, directory.path())
+            .unwrap()
+            .workflow_state()
+            .unwrap();
+        assert_eq!(state.position, expected);
+        assert_eq!(state.plans.len(), 1);
+    }
+}
+
 fn persist_review(
     db: &Database,
     project: i64,

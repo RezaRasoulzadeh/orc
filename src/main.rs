@@ -104,6 +104,12 @@ enum Command {
     /// Diagnose project and configured agent health without consuming model quota.
     Doctor,
     Status,
+    /// Inspect the derived, read-only orchestration position.
+    #[command(name = "workflow-state", alias = "workflow")]
+    WorkflowState {
+        #[arg(long)]
+        json: bool,
+    },
     /// Emit a structured project report for a manual planner.
     Report {
         #[arg(long)]
@@ -454,6 +460,27 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("No DB found. Run `orc init` to initialize repository state.");
             }
         },
+        Command::WorkflowState { json } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let state = app.workflow_state()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            } else {
+                println!("Position: {}", state.position);
+                println!(
+                    "Lead decisions: {}  Plans: {}  Plan reviews: {}",
+                    state.lead_decisions.len(),
+                    state.plans.len(),
+                    state.plan_reviews.len()
+                );
+                println!(
+                    "Tasks: {}  Runs: {}  User decisions: {}",
+                    state.tasks.len(),
+                    state.runs.len(),
+                    state.user_decisions.len()
+                );
+            }
+        }
         Command::Approvals { command } => {
             let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project_id = db
@@ -1287,6 +1314,7 @@ mod cli_tests {
             Command::Agents { .. } => "Agents",
             Command::Doctor => "Doctor",
             Command::Status => "Status",
+            Command::WorkflowState { .. } => "WorkflowState",
             Command::Report { .. } => "Report",
             Command::PlanRequest { .. } => "PlanRequest",
             Command::Plan { .. } => "Plan",
@@ -1324,6 +1352,20 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["orc", "status"]).unwrap();
         assert!(!cli.ui);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn parses_read_only_workflow_state_inspection() {
+        let cli = Cli::try_parse_from(["orc", "workflow-state", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::WorkflowState { json: true })
+        ));
+        let alias = Cli::try_parse_from(["orc", "workflow"]).unwrap();
+        assert!(matches!(
+            alias.command,
+            Some(Command::WorkflowState { json: false })
+        ));
     }
 
     #[test]

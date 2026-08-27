@@ -90,6 +90,7 @@ pub struct LeadProposal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LeadContext {
+    pub discovery: Option<crate::discovery::ProjectDiscoverySnapshot>,
     pub project_id: i64,
     pub project_name: String,
     pub repository_path: String,
@@ -265,6 +266,7 @@ impl<'a> LeadService<'a> {
         let mut proposals = self.db.list_lead_proposals(project_id, limit, None)?;
         proposals.reverse();
         Ok(LeadContext {
+            discovery: crate::discovery::build_snapshot(self.repo_path).ok(),
             project_id,
             project_name: self.db.get_project_name()?.unwrap_or_default(),
             repository_path: self.repo_path.display().to_string(),

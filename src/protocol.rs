@@ -86,6 +86,8 @@ pub struct PlanningRequest {
     pub current_state: Option<PlanningProjectState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_report: Option<ProjectReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_snapshot: Option<crate::discovery::ProjectDiscoverySnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

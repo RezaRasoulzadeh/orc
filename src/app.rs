@@ -587,6 +587,7 @@ impl OrcApp {
             approval_requirements: report.approval_requirements.clone(),
             current_state: Some(self.planning_state()?),
             full_report: Some(report),
+            discovery_snapshot: crate::discovery::build_snapshot(&self.repo_path).ok(),
         })
     }
     pub fn validate_plan_json(&self, json: &str) -> Result<PlanResponse> {

@@ -165,6 +165,31 @@ fn discovery_response_deserializes_and_applies_summaries() {
 }
 
 #[test]
+fn discovery_snapshot_is_read_only_and_contains_project_context() {
+    let (_dir, repo) = git_repo();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\ndescription = \"Example project\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+    adoption::adopt(&repo).unwrap();
+    let before = std::fs::read(repo.join(".orc/orc.db")).unwrap();
+    let snapshot = discovery::build_snapshot(&repo).unwrap();
+    assert_eq!(snapshot.project.name, "sample-project");
+    assert_eq!(
+        snapshot.project.description.as_deref(),
+        Some("Example project")
+    );
+    assert_eq!(snapshot.technology_stack, vec!["Rust"]);
+    assert_eq!(snapshot.architecture.entry_points, vec!["src/main.rs"]);
+    assert!(snapshot.important_files.contains(&"Cargo.toml".to_owned()));
+    assert!(!snapshot.validation_commands.is_empty());
+    assert_eq!(before, std::fs::read(repo.join(".orc/orc.db")).unwrap());
+}
+
+#[test]
 fn reopening_database_preserves_adopted_project() {
     let (_dir, repo) = git_repo();
     adoption::adopt(&repo).unwrap();

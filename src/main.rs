@@ -152,6 +152,16 @@ enum Command {
         #[arg(long, value_parser = parse_reasoning_effort)]
         effort: Option<registry::ReasoningEffort>,
     },
+    /// Gather the new-project objective and discovery snapshot, then run Lead once.
+    NewProject {
+        objective: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
     ApplyResponse {
         /// Path to JSON response file produced by the engineering lead (use - for stdin)
         path: String,
@@ -781,6 +791,31 @@ fn run(cli: Cli) -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
+        Command::NewProject {
+            objective,
+            agent,
+            model,
+            effort,
+        } => {
+            if objective.trim().is_empty() {
+                anyhow::bail!("new-project objective must not be empty");
+            }
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let (run_id, response) = app.new_project_intake(
+                objective.trim(),
+                &orc::automated::ActionOverrides {
+                    agent_id: agent,
+                    model,
+                    reasoning_effort: effort,
+                },
+            )?;
+            let decision = response.decision.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Lead provider response did not contain a decision")
+            })?;
+            println!("New-project intake complete (run {run_id}).");
+            println!("Decision: {:?}", decision.kind);
+            println!("{}", response.turn.content);
+        }
         Command::ApplyResponse { path } => {
             let data = if path == "-" {
                 use std::io::{self, Read};
@@ -1245,6 +1280,7 @@ mod cli_tests {
             Command::Template { .. } => "Template",
             Command::Lead { .. } => "Lead",
             Command::Ask { .. } => "Ask",
+            Command::NewProject { .. } => "NewProject",
             Command::ApplyResponse { .. } => "ApplyResponse",
             Command::Dispatch { .. } => "Dispatch",
             Command::DispatchQueue { .. } => "DispatchQueue",

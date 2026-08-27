@@ -120,6 +120,19 @@ fn git_output_owned(dir: &Path, args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+pub fn repository_identity(dir: impl AsRef<Path>) -> Result<(Option<String>, Option<String>)> {
+    let dir = dir.as_ref();
+    let branch = git_output(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let commit = git_output(dir, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    Ok((branch, commit))
+}
+
 pub fn changed_files(worktree: impl AsRef<Path>) -> Result<Vec<ChangedFile>> {
     let worktree = worktree.as_ref();
     let output = git_output(worktree, &["status", "--porcelain=v1", "-z"])?;

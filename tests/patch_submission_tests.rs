@@ -417,9 +417,9 @@ new file mode 100644
         .unwrap();
     assert!(changes.payload.as_deref().unwrap().contains("applied.txt"));
 
-    // Task status must be blocked (not review)
+    // Failed validation is reviewable work, not an execution failure.
     let task = db.get_task(&task_id).unwrap().unwrap();
-    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.status, TaskStatus::Review);
 
     // Applied worktree must be preserved for debugging
     let worktree_file = dir

@@ -265,6 +265,15 @@ enum PlanCommand {
         #[arg(long, value_parser = parse_reasoning_effort)]
         effort: Option<registry::ReasoningEffort>,
     },
+    /// Revise the current persisted Plan for an actionable pending REVISE_PLAN decision.
+    Revise {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -570,19 +579,40 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             }
-            let PlanCommand::Run {
-                agent: run_agent,
-                model: run_model,
-                effort: run_effort,
-            } = command.ok_or_else(|| anyhow::anyhow!("usage: orc plan run"))?;
-            let result = app.run_pending_plan(&orc::automated::ActionOverrides {
-                agent_id: run_agent,
-                model: run_model,
-                reasoning_effort: run_effort,
-            })?;
+            let command = command.ok_or_else(|| anyhow::anyhow!("usage: orc plan run|revise"))?;
+            let (result, operation) = match command {
+                PlanCommand::Run {
+                    agent,
+                    model,
+                    effort,
+                } => (
+                    app.run_pending_plan(&orc::automated::ActionOverrides {
+                        agent_id: agent,
+                        model,
+                        reasoning_effort: effort,
+                    })?,
+                    "persisted",
+                ),
+                PlanCommand::Revise {
+                    agent,
+                    model,
+                    effort,
+                } => (
+                    app.run_pending_plan_revision(&orc::automated::ActionOverrides {
+                        agent_id: agent,
+                        model,
+                        reasoning_effort: effort,
+                    })?,
+                    "revised and persisted",
+                ),
+            };
             println!(
-                "Plan {} persisted ({} tasks, source Lead decision {}, Planner run {}).",
-                result.plan_id, result.task_count, result.lead_decision_id, result.planner_run_id
+                "Plan {} {} ({} tasks, source Lead decision {}, Planner run {}).",
+                result.plan_id,
+                operation,
+                result.task_count,
+                result.lead_decision_id,
+                result.planner_run_id
             );
         }
         Command::Queue { explain } => match Database::open(DB_PATH) {

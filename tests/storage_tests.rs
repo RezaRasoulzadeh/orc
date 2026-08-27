@@ -1,9 +1,210 @@
 use orc::execution::ExecutionClass;
+use orc::lead::LeadDecisionKind;
+use orc::protocol::{ExecutionHints, PROTOCOL_VERSION, PlanResponse, TaskProposal};
+use orc::registry::AUTOMATED;
 use orc::registry::ReasoningEffort;
+use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database, WorkerResult};
+use orc::task::TaskScopeMode;
 use orc::task::{TaskPriority, TaskStatus};
 use rusqlite::Connection;
 use tempfile::tempdir;
+
+fn plan_response() -> PlanResponse {
+    PlanResponse {
+        protocol_version: PROTOCOL_VERSION,
+        objective: "ship feature".into(),
+        assumptions: vec!["stable API".into()],
+        risks: vec!["risk".into()],
+        questions: vec!["question".into()],
+        tasks: vec![
+            TaskProposal {
+                local_id: "first".into(),
+                title: "First task".into(),
+                objective: "implement first".into(),
+                role: "developer".into(),
+                priority: TaskPriority::High,
+                depends_on: vec![],
+                capabilities: vec!["rust".into()],
+                scope_mode: Some(TaskScopeMode::Project),
+                context_files: vec!["src/lib.rs".into()],
+                expected_changes: vec!["implementation".into()],
+                unchanged: vec!["other behavior".into()],
+                acceptance_criteria: vec!["works".into()],
+                required_tests: vec!["round trip".into()],
+                validation: vec!["cargo test".into()],
+                execution_hints: ExecutionHints {
+                    class: Some("plan".into()),
+                    model: Some("model".into()),
+                    effort: Some("low".into()),
+                },
+            },
+            TaskProposal {
+                local_id: "second".into(),
+                title: "Second task".into(),
+                objective: "implement second".into(),
+                role: "reviewer".into(),
+                priority: TaskPriority::Normal,
+                depends_on: vec!["first".into()],
+                capabilities: vec![],
+                scope_mode: None,
+                context_files: vec![],
+                expected_changes: vec!["tests".into()],
+                unchanged: vec!["first".into()],
+                acceptance_criteria: vec!["passes".into()],
+                required_tests: vec!["test".into()],
+                validation: vec!["cargo test".into()],
+                execution_hints: ExecutionHints::default(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn plan_persistence_round_trip_lineage_and_atomic_provenance_validation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let repository_file = dir.path().join("repository.txt");
+    std::fs::write(&repository_file, "unchanged").unwrap();
+    let (project, decision, run, response, task_snapshot, repository_snapshot) = {
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("plan").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "existing",
+                "unchanged",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let decision = db
+            .record_lead_decision(
+                project,
+                &LeadDecisionKind::PlanRequired,
+                &serde_json::json!({"plan":"needed"}),
+                LeadDecisionMetadata {
+                    snapshot: "snapshot",
+                    run_id: None,
+                    source_request: "request",
+                    summary: "summary",
+                },
+            )
+            .unwrap();
+        let run = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "planner",
+                AUTOMATED,
+                AgentRunExecution {
+                    class: "plan",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        let response = plan_response();
+        let task_snapshot = db.list_tasks().unwrap();
+        let repository_snapshot = std::fs::read(&repository_file).unwrap();
+        let id = db.store_plan(project, decision, run, &response).unwrap();
+        db.store_plan(project, decision, run, &response).unwrap();
+        assert_eq!(db.get_plan(id).unwrap().unwrap().response, response);
+        assert_eq!(
+            db.list_plan_dependencies(id).unwrap(),
+            vec![("second".into(), "first".into())]
+        );
+        (
+            project,
+            decision,
+            run,
+            response,
+            task_snapshot,
+            repository_snapshot,
+        )
+    };
+    let db = Database::open(&path).unwrap();
+    let history = db.list_plan_history(project).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!((history[0].version, history[1].version), (1, 2));
+    assert_eq!(
+        db.get_plan(history[1].plan_id)
+            .unwrap()
+            .unwrap()
+            .parent_plan_id,
+        Some(history[0].plan_id)
+    );
+    assert_eq!(
+        db.get_plan(history[1].plan_id).unwrap().unwrap().response,
+        response
+    );
+    let reopened = db.get_plan(history[1].plan_id).unwrap().unwrap();
+    assert_eq!(reopened.source_lead_decision_id, decision);
+    assert_eq!(reopened.source_planner_run_id, run);
+    assert_eq!(db.list_tasks().unwrap(), task_snapshot);
+    let repository_after = std::fs::read(&repository_file).unwrap();
+    assert_eq!(repository_after, repository_snapshot);
+    let plan_row_counts = || {
+        let connection = Connection::open(&path).unwrap();
+        (
+            connection
+                .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM plan_dependencies", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+        )
+    };
+    let valid_counts = plan_row_counts();
+    let bad = plan_response();
+    assert!(db.store_plan(project, -1, run, &bad).is_err());
+    assert_eq!(db.list_plan_history(project).unwrap().len(), 2);
+    assert_eq!(plan_row_counts(), valid_counts);
+    let other = db.create_project("other").unwrap();
+    assert!(db.store_plan(other, decision, run, &bad).is_err());
+    assert_eq!(db.list_plan_history(other).unwrap().len(), 0);
+    assert_eq!(plan_row_counts(), valid_counts);
+    let other_decision = db
+        .record_lead_decision(
+            other,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"plan":"needed"}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+    assert!(db.store_plan(other, other_decision, run, &bad).is_err());
+    assert_eq!(plan_row_counts(), valid_counts);
+    assert!(db.store_plan(project, decision, i64::MAX, &bad).is_err());
+    assert_eq!(plan_row_counts(), valid_counts);
+    let invalid = PlanResponse {
+        tasks: vec![TaskProposal {
+            depends_on: vec!["missing".into()],
+            ..plan_response().tasks[0].clone()
+        }],
+        ..bad
+    };
+    assert!(db.store_plan(project, decision, run, &invalid).is_err());
+    assert_eq!(db.list_plan_history(project).unwrap().len(), 2);
+    assert_eq!(plan_row_counts(), valid_counts);
+    let malformed = PlanResponse {
+        tasks: vec![TaskProposal {
+            title: String::new(),
+            ..plan_response().tasks[0].clone()
+        }],
+        ..plan_response()
+    };
+    assert!(db.store_plan(project, decision, run, &malformed).is_err());
+    assert_eq!(db.list_plan_history(project).unwrap().len(), 2);
+    assert_eq!(plan_row_counts(), valid_counts);
+}
 
 #[test]
 fn agent_run_execution_survives_reopen() {

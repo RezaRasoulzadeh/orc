@@ -68,6 +68,66 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Adopt a repository and assess the operator's objective with the read-only
+/// Lead. The Lead context includes the current structured discovery snapshot;
+/// no proposal is applied and no work is dispatched by this operation.
+pub fn adopt_and_invoke_lead(
+    start: impl AsRef<Path>,
+    objective: &str,
+    backend: &dyn crate::lead::LeadBackend,
+    context_limit: usize,
+) -> Result<(PathBuf, crate::lead::LeadResponse)> {
+    let root = adopt(start)?;
+    let db =
+        Database::open(root.join(".orc/orc.db")).context("failed to open adopted Orc database")?;
+    let response = crate::lead::LeadService::new_with_required_discovery(&db, &root).invoke(
+        objective,
+        backend,
+        context_limit,
+    )?;
+    if response.decision.is_none() {
+        bail!("Lead returned no decision for adoption objective");
+    }
+    Ok((root, response))
+}
+
+/// Provide the built-in Codex Lead when an objective is supplied on a first adoption.
+/// The CLI still permits an operator to replace this configuration afterwards.
+pub fn ensure_default_lead(db: &Database) -> Result<()> {
+    if db.lead_provider_config()?.is_some() {
+        return Ok(());
+    }
+    if db.get_agent("codex-main")?.is_none() {
+        db.insert_agent(&crate::registry::AgentDefinition {
+            id: "codex-main".into(),
+            display_name: "Codex Main".into(),
+            backend: "codex".into(),
+            execution_mode: crate::registry::AUTOMATED.into(),
+            enabled: true,
+            priority: 0,
+            capabilities: vec![],
+            status: crate::registry::AVAILABLE.into(),
+            unavailable_reason: None,
+            profile_path: None,
+            model: None,
+            reasoning_effort: None,
+            config_metadata: None,
+            quota_remaining_percent: None,
+            quota_reset_at: None,
+            quota_checked_at: None,
+            quota_source: None,
+            quota_limits: None,
+            actions: vec![crate::registry::AgentAction::Lead],
+        })?;
+    }
+    db.set_lead_provider_config(&crate::lead::LeadProviderConfig {
+        agent_id: "codex-main".into(),
+        model: None,
+        reasoning_effort: None,
+    })?;
+    Ok(())
+}
+
 pub fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
     ensure_contract_file(
         &orc_dir.join("engineering.md"),

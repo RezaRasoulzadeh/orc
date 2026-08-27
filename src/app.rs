@@ -124,6 +124,31 @@ impl OrcApp {
         let config = self.lead_provider_config()?.ok_or_else(|| anyhow::anyhow!("Lead is not configured. Configure one with `orc lead set <agent>` before running `orc ask`."))?;
         self.invoke_configured_lead(message, &config, context_limit)
     }
+    pub fn invoke_persisted_lead_with_required_discovery(
+        &self,
+        message: &str,
+        context_limit: usize,
+    ) -> Result<crate::lead::LeadResponse> {
+        let config = self
+            .lead_provider_config()?
+            .ok_or_else(|| anyhow::anyhow!("Lead is not configured."))?;
+        let agent = self
+            .db
+            .get_agent(&config.agent_id)?
+            .context("configured Lead agent is unavailable")?;
+        let backend = crate::lead::CodexLeadBackend::from_agent(
+            &agent,
+            &self.repo_path,
+            config.model,
+            config.reasoning_effort,
+        )
+        .map_err(anyhow::Error::msg)?;
+        crate::lead::LeadService::new_with_required_discovery(&self.db, &self.repo_path).invoke(
+            message,
+            &backend,
+            context_limit,
+        )
+    }
     pub fn automated_plan_with_backend(
         &self,
         request: &crate::protocol::PlanningRequest,

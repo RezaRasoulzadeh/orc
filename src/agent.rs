@@ -7,7 +7,7 @@ use crate::backend::WorkerFactory;
 use crate::contract;
 use crate::git;
 use crate::queue::QueueEntry;
-use crate::registry::{self, AgentDefinition};
+use crate::registry::{self, AgentDefinition, ReasoningEffort};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
 use crate::task::{Task, TaskScopeMode, TaskStatus};
@@ -20,6 +20,11 @@ const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
 const MAX_VALIDATION_REPAIRS: usize = 3;
 const MAX_INFRASTRUCTURE_RETRIES: usize = 2;
+#[derive(Clone, Debug, Default)]
+pub struct RevisionExecutionOverrides {
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+}
 const CODER_PROMPT_PRECEDENCE: &str = "## Instruction precedence\n\n1. Orc execution and safety rules have the highest precedence.\n2. The `.orc/engineering.md` content below is the authoritative, mandatory project engineering contract and applies automatically; it does not need to be repeated in the task or user prompt.\n3. Role- and action-specific instructions follow the engineering contract.\n4. Task objectives and context, revision feedback, validation diagnostics, and all other run-specific instructions follow the engineering contract.\n\nLater task, revision, or repair text must not override or contradict mandatory requirements in `.orc/engineering.md`. If task-specific instructions conflict with the engineering contract, follow the engineering contract and report the conflict rather than silently overriding it.\n";
 
 fn run_validation_with_retries(
@@ -650,8 +655,34 @@ pub fn revise_with_worker_and_db_as_with_runner(
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
 ) -> Result<DispatchSummary> {
+    revise_with_worker_and_db_as_with_runner_with_overrides(
+        task_id,
+        feedback,
+        worker,
+        db_path,
+        repo_path,
+        agent_id,
+        validation_runner,
+        &RevisionExecutionOverrides::default(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the revision helper parallel to the existing worker API"
+)]
+pub fn revise_with_worker_and_db_as_with_runner_with_overrides(
+    task_id: &str,
+    feedback: &str,
+    worker: &dyn Worker,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+) -> Result<DispatchSummary> {
     let db = Database::open(db_path)?;
-    revise_with_worker_on_db(
+    revise_with_worker_on_db_with_overrides(
         task_id,
         feedback,
         worker,
@@ -659,6 +690,7 @@ pub fn revise_with_worker_and_db_as_with_runner(
         repo_path,
         agent_id,
         validation_runner,
+        overrides,
     )
 }
 
@@ -670,6 +702,32 @@ pub fn revise_with_worker_on_db(
     repo_path: impl AsRef<Path>,
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
+) -> Result<DispatchSummary> {
+    revise_with_worker_on_db_with_overrides(
+        task_id,
+        feedback,
+        worker,
+        db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        &RevisionExecutionOverrides::default(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the revision helper parallel to the existing worker API"
+)]
+pub fn revise_with_worker_on_db_with_overrides(
+    task_id: &str,
+    feedback: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
@@ -726,8 +784,8 @@ pub fn revise_with_worker_on_db(
         &db.execution_template(crate::execution::class_for_role(&task.role))?,
         agent.model.as_deref(),
         agent.reasoning_effort,
-        None,
-        None,
+        overrides.model.clone(),
+        overrides.effort,
     );
     let run_id = db.create_agent_run_with_execution(
         project_id,
@@ -935,7 +993,6 @@ pub fn revise_manual(
         };
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
-    let _run_finalizer = db.run_finalizer(run_id);
     db.update_task_status(task_id, TaskStatus::Active)?;
     db.set_agent_run_waiting_external(run_id)?;
     if !db.start_revision_execution(run_id, source_review_id)? {

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use orc::agent::{
-    accept_task, dispatch_with_worker_and_db_as_with_runner, reject_task,
-    revise_with_worker_and_db_as_with_runner, revise_with_worker_on_db,
+    RevisionExecutionOverrides, accept_task, dispatch_with_worker_and_db_as_with_runner,
+    reject_task, revise_manual, revise_with_worker_and_db_as_with_runner,
+    revise_with_worker_and_db_as_with_runner_with_overrides, revise_with_worker_on_db,
 };
 use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker};
@@ -1070,6 +1071,60 @@ fn production_revise_without_feedback_consumes_persisted_contract() {
     );
     let prompt = worker.calls.lock().unwrap()[0].clone();
     assert!(prompt.contains(&blocker_id) && prompt.contains("exact acceptance survives"));
+}
+
+#[test]
+fn production_revise_applies_model_and_effort_overrides_to_run_resolution() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let worker = CapturingWorker::with_blocker_id("BLK-production");
+    revise_with_worker_and_db_as_with_runner_with_overrides(
+        &task,
+        "",
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+        &RevisionExecutionOverrides {
+            model: Some("revision-model".into()),
+            effort: Some(ReasoningEffort::High),
+        },
+    )
+    .unwrap();
+    let run = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.agent == "fake" && run.execution_class != "review")
+        .unwrap();
+    assert_eq!(run.resolved_model.as_deref(), Some("revision-model"));
+    assert_eq!(run.resolved_reasoning_effort, Some(ReasoningEffort::High));
+    assert!(run.resolution_source.contains("override"));
+}
+
+#[test]
+fn invalid_revise_agent_is_rejected_by_registry_lookup() {
+    let (_dir, db, task, _) = production_contract_fixture();
+    let error = orc::registry::get_agent(&db, "does-not-exist").unwrap_err();
+    assert!(error.to_string().contains("not registered"));
+    assert!(db.get_task(&task).unwrap().is_some());
+}
+
+#[test]
+fn production_revise_routes_manual_agent_to_waiting_external_run() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let mut manual = automated_agent("manual-reviser", vec![AgentAction::Code]);
+    manual.execution_mode = orc::registry::MANUAL.into();
+    db.insert_agent(&manual).unwrap();
+    revise_manual(&task, "manual feedback", &manual, &db, dir.path()).unwrap();
+    let run = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.agent == "manual-reviser")
+        .unwrap();
+    assert_eq!(run.execution_mode, orc::registry::MANUAL);
+    assert_eq!(run.status, "waiting_external");
 }
 
 #[test]

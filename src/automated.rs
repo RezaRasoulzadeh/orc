@@ -1037,6 +1037,23 @@ fn run_review_mode(
                     )?;
                     if !project_review {
                         db.store_review_blockers(&summary.task.id, run, &result.blockers)?;
+                        if result.verdict.eq_ignore_ascii_case("revise") {
+                            let review =
+                                crate::review::build_review(db, &summary.task.id, Path::new("."))?;
+                            let contract = build_revision_contract_from_db(
+                                db,
+                                &summary.task.id,
+                                &review.prior_reviews,
+                                run,
+                            )?;
+                            db.persist_revision_contract(
+                                &summary.task.id,
+                                run,
+                                &serde_json::to_string(&contract)?,
+                            )?;
+                        } else if result.verdict.eq_ignore_ascii_case("pass") {
+                            db.clear_actionable_revision_contracts(&summary.task.id)?;
+                        }
                     }
                     Ok((run, result))
                 }
@@ -1410,6 +1427,12 @@ mod tests {
         drop(app);
 
         let reopened = Database::open(&db_path).unwrap();
+        assert!(
+            reopened
+                .actionable_revision_contract(&task)
+                .unwrap()
+                .is_some()
+        );
         let runs = reopened.list_agent_runs(project, 10).unwrap();
         assert_eq!(runs.len(), 3);
         assert!(runs.iter().all(|run| run.status == "completed"));

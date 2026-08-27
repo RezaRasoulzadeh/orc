@@ -701,6 +701,7 @@ impl Database {
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
         Self::ensure_review_blockers_table(&conn)?;
+        Self::ensure_revision_contracts_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_task_columns(&conn)?;
@@ -753,6 +754,7 @@ impl Database {
         Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_change_evidence_table(conn)?;
         Self::ensure_review_blockers_table(conn)?;
+        Self::ensure_revision_contracts_table(conn)?;
         Self::ensure_task_columns(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
@@ -1270,6 +1272,49 @@ impl Database {
             conn.execute_batch("INSERT OR IGNORE INTO review_blocker_ledger SELECT task_id, blocker_id, run_id, '', requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen, updated_at FROM review_blocker_ledger_legacy; INSERT OR IGNORE INTO review_blocker_observations SELECT task_id, blocker_id, run_id, '', requirement_ref, evidence, severity, acceptance_condition, status, finding, first_seen, last_seen FROM review_blocker_ledger_legacy;")?;
         }
         Ok(())
+    }
+
+    fn ensure_revision_contracts_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS revision_contracts (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, source_review_run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE, contract TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'actionable', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), consumed_at TEXT, UNIQUE(source_review_run_id)); CREATE INDEX IF NOT EXISTS idx_revision_contracts_actionable ON revision_contracts(task_id, status, id);")?;
+        Ok(())
+    }
+
+    pub fn persist_revision_contract(
+        &self,
+        task_id: &str,
+        review_run_id: i64,
+        contract: &str,
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE revision_contracts SET status='superseded' WHERE task_id=?1 AND status='actionable'", [task_id])?;
+        tx.execute("INSERT OR REPLACE INTO revision_contracts(task_id, source_review_run_id, contract, status) VALUES (?1, ?2, ?3, 'actionable')", params![task_id, review_run_id, contract])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_actionable_revision_contracts(&self, task_id: &str) -> Result<(), DbError> {
+        self.conn.execute("UPDATE revision_contracts SET status='superseded' WHERE task_id=?1 AND status='actionable'", [task_id])?;
+        Ok(())
+    }
+
+    pub fn actionable_revision_contract(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(i64, String, i64)>, DbError> {
+        Ok(self.conn.query_row("SELECT source_review_run_id, contract, id FROM revision_contracts WHERE task_id=?1 AND status='actionable' ORDER BY id DESC LIMIT 1", [task_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+    }
+
+    /// Count persisted contracts, including superseded and consumed history.
+    pub fn revision_contract_history_count(&self, task_id: &str) -> Result<i64, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM revision_contracts WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn consume_revision_contract(&self, id: i64) -> Result<bool, DbError> {
+        Ok(self.conn.execute("UPDATE revision_contracts SET status='consumed', consumed_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='actionable'", [id])? != 0)
     }
 
     pub fn review_blocker_ledger(

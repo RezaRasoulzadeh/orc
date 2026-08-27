@@ -202,7 +202,7 @@ enum Command {
         task_id: String,
         #[arg(long)]
         agent: Option<String>,
-        feedback: String,
+        feedback: Option<String>,
     },
     /// Schedule an agent for a task using deterministic selection rules
     Schedule {
@@ -761,13 +761,19 @@ fn run(cli: Cli) -> Result<()> {
                 registry::get_agent(&db, &run.agent)?
             };
             if selected.execution_mode == registry::MANUAL {
-                orc::agent::revise_manual(&task_id, &feedback, &selected, &db, ".")?;
+                orc::agent::revise_manual(
+                    &task_id,
+                    feedback.as_deref().unwrap_or(""),
+                    &selected,
+                    &db,
+                    ".",
+                )?;
             } else {
                 let worker =
                     orc::backend::WorkerFactory::build(&selected).map_err(anyhow::Error::msg)?;
                 let summary = orc::agent::revise_with_worker_and_db_as_with_runner(
                     &task_id,
-                    &feedback,
+                    feedback.as_deref().unwrap_or(""),
                     worker.as_ref(),
                     DB_PATH,
                     ".",

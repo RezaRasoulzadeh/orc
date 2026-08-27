@@ -690,12 +690,25 @@ pub fn revise_with_worker_on_db(
             task.status
         );
     };
-    let revision_contract = crate::automated::build_revision_contract_from_db(
-        db,
-        task_id,
-        &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
-        source_review_id,
-    )?;
+    let (source_review_id, contract_id, revision_contract) =
+        if let Some((source, json, id)) = db.actionable_revision_contract(task_id)? {
+            (
+                source,
+                Some(id),
+                serde_json::from_str(&json).context("persisted revision contract is invalid")?,
+            )
+        } else {
+            (
+                source_review_id,
+                None,
+                crate::automated::build_revision_contract_from_db(
+                    db,
+                    task_id,
+                    &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
+                    source_review_id,
+                )?,
+            )
+        };
     let (_, worktree_path) = db
         .get_worktree_metadata(task_id)?
         .context("task has no worktree")?;
@@ -780,6 +793,9 @@ pub fn revise_with_worker_on_db(
     // leave the review available for retry.
     if !db.start_revision_execution(run_id, source_review_id)? {
         anyhow::bail!("revision review was consumed before execution started");
+    }
+    if let Some(id) = contract_id {
+        db.consume_revision_contract(id)?;
     }
     let outcome = execution.outcome;
     let output = execution.output;
@@ -896,12 +912,25 @@ pub fn revise_manual(
             task.status
         );
     };
-    let revision_contract = crate::automated::build_revision_contract_from_db(
-        db,
-        task_id,
-        &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
-        source_review_id,
-    )?;
+    let (source_review_id, contract_id, revision_contract) =
+        if let Some((source, json, id)) = db.actionable_revision_contract(task_id)? {
+            (
+                source,
+                Some(id),
+                serde_json::from_str(&json).context("persisted revision contract is invalid")?,
+            )
+        } else {
+            (
+                source_review_id,
+                None,
+                crate::automated::build_revision_contract_from_db(
+                    db,
+                    task_id,
+                    &crate::review::build_review(db, task_id, repo_path)?.prior_reviews,
+                    source_review_id,
+                )?,
+            )
+        };
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
     let _run_finalizer = db.run_finalizer(run_id);
@@ -909,6 +938,9 @@ pub fn revise_manual(
     db.set_agent_run_waiting_external(run_id)?;
     if !db.start_revision_execution(run_id, source_review_id)? {
         anyhow::bail!("revision review was consumed before execution started");
+    }
+    if let Some(id) = contract_id {
+        db.consume_revision_contract(id)?;
     }
     println!(
         "\n{}\n\n{}\n\n## Review feedback\n\n{}",

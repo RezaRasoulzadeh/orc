@@ -781,11 +781,10 @@ pub fn revise_with_worker_on_db(
     progress("worker running");
     let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to capture pre-revision change evidence")?;
-    let handoff_schema = crate::automated::revision_handoff_schema();
     let execution = match worker.execute_structured_with_progress_and_usage(
         &prompt,
         &worktree_dir,
-        &handoff_schema,
+        &crate::automated::revision_handoff_schema(),
         &|line| worker_output(line),
     ) {
         Ok(result) => result,
@@ -857,35 +856,18 @@ pub fn revise_with_worker_on_db(
         Some(agent_id),
         Some(&revision_validation_evidence),
     )?;
-    let handoff = match crate::automated::validate_revision_handoff_with_evidence(
-        &revision_contract,
-        output.as_deref().unwrap_or_default(),
-        Some(&changes),
-        Some(&revision_validation_evidence),
-    ) {
-        Ok(value) => value,
-        Err(error) => return fail(format!("Invalid revision handoff: {error:#}")),
-    };
-    // A provider result is not a completed revision execution until its
-    // structured handoff has passed the authoritative blocker validator.
-    // Consume and link the source review atomically at that boundary so a bad
-    // handoff remains retryable without losing worktree or validation evidence.
-    if !db.start_revision_execution(run_id, source_review_id)? {
-        return fail("Revision review was consumed before handoff completion.".into());
-    }
-    if let Some(id) = contract_id {
-        db.consume_revision_contract(id)?;
-    }
-    db.record_lifecycle_event(
-        "revision_handoff",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&serde_json::to_string(&handoff)?),
-    )?;
     let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
     if !report.is_success() {
         return fail(combined);
+    }
+    // The subsequent automated review is authoritative for blocker
+    // resolution.  Consume and link the source review only after the
+    // revision has produced changes and passed the configured validation.
+    if !db.start_revision_execution(run_id, source_review_id)? {
+        return fail("Revision review was consumed before successful validation.".into());
+    }
+    if let Some(id) = contract_id {
+        db.consume_revision_contract(id)?;
     }
     db.update_agent_run_status_with_usage(run_id, "completed", Some(&combined), token_usage)?;
     db.update_task_status(task_id, TaskStatus::Review)?;

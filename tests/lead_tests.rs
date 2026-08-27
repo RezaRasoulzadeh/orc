@@ -9,6 +9,7 @@ use orc::protocol::PlannedTask;
 use orc::registry::{AgentDefinition, ReasoningEffort};
 use orc::task::{TaskPriority, TaskScopeMode};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 struct FakeLead {
@@ -50,6 +51,55 @@ impl LeadBackend for InvalidDecisionLead {
             r#"{"message":"bad","decision":{"kind":"NOT_A_DECISION","details":{}}}"#,
         )
     }
+}
+
+struct CountingActionBackend(AtomicUsize);
+
+impl ActionBackend for CountingActionBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        _: orc::registry::AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> anyhow::Result<ActionExecution> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ActionExecution {
+            output: String::new(),
+            token_usage: None,
+        })
+    }
+}
+
+#[test]
+fn plan_review_rejects_invalid_plan_before_lead_run_or_review_persistence() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("review.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    db.create_project("review").unwrap();
+    let mut lead = codex_agent("/profiles/lead");
+    lead.actions = vec![orc::registry::AgentAction::Lead];
+    db.insert_agent(&lead).unwrap();
+    drop(db);
+
+    let app = OrcApp::open(&db_path, dir.path()).unwrap();
+    let backend = CountingActionBackend(AtomicUsize::new(0));
+    assert!(
+        app.review_plan_with_backend(999, &ActionOverrides::default(), &backend)
+            .is_err()
+    );
+    assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let runs: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        .unwrap();
+    let reviews: i64 = connection
+        .query_row("SELECT COUNT(*) FROM plan_reviews", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(runs, 0);
+    assert_eq!(reviews, 0);
 }
 
 fn codex_agent(profile_path: &str) -> AgentDefinition {

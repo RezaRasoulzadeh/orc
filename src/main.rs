@@ -294,6 +294,15 @@ enum LeadCommand {
     Run {
         request: String,
     },
+    Review {
+        plan_id: i64,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+    },
     Pending,
     /// Show all persisted Lead decisions without changing workflow state.
     History,
@@ -618,6 +627,23 @@ fn run(cli: Cli) -> Result<()> {
         Command::Lead { command } => {
             let app = orc::app::OrcApp::open(DB_PATH, ".")?;
             match command {
+                LeadCommand::Review {
+                    plan_id,
+                    agent,
+                    model,
+                    effort,
+                } => {
+                    let review = app.review_plan_with_backend(
+                        plan_id,
+                        &orc::automated::ActionOverrides {
+                            agent_id: agent,
+                            model,
+                            reasoning_effort: effort,
+                        },
+                        &orc::automated::WorkerActionBackend::new(std::path::Path::new(".")),
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&review)?);
+                }
                 LeadCommand::Run { request } => {
                     let (run_id, response) =
                         app.automated_lead(&request, &orc::automated::ActionOverrides::default())?;

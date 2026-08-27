@@ -63,6 +63,8 @@ pub enum LeadDecisionKind {
     DirectTasks,
     PlanRequired,
     UserDecisionRequired,
+    Approve,
+    RevisePlan,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1393,7 +1393,7 @@ impl LeadBackend for LeadActionAdapter<'_> {
         let input =
             serde_json::to_string(&(context, message)).map_err(|error| error.to_string())?;
         let prompt = format!(
-            "Act as Orc's project Lead. Return only JSON matching {{\"message\":string,\"proposals\":array}}. Proposals are human-gated and must not be applied.\n{input}"
+            "Act as Orc's project Lead. Return only JSON matching {{\"message\":string,\"proposals\":array,\"decision\":{{\"kind\":\"DIRECT_TASKS\"|\"PLAN_REQUIRED\"|\"USER_DECISION_REQUIRED\"|\"APPROVE\"|\"REVISE_PLAN\",\"details\":object}}}}. Return exactly one decision. Proposals are human-gated and must not be applied.\n{input}"
         );
         let execution = invoke_action(
             self.db,

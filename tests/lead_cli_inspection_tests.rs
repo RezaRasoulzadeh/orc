@@ -124,3 +124,67 @@ fn lead_inspection_cli_shows_pending_history_and_is_read_only() {
     assert!(no_pending.status.success());
     assert_eq!(String::from_utf8_lossy(&no_pending.stdout).trim(), "null");
 }
+
+#[test]
+fn lead_user_decision_resolution_is_persistent_and_single_use() {
+    let dir = tempdir().unwrap();
+    assert!(command(dir.path(), &["init"]).status.success());
+    let db_path = dir.path().join(".orc/orc.db");
+    let db = Database::open(&db_path).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let id = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::UserDecisionRequired,
+            &serde_json::json!({"question":"Choose"}),
+            LeadDecisionMetadata {
+                snapshot: "state",
+                run_id: Some(7),
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+    let before_tasks = db.list_tasks().unwrap();
+    let before_runs = db.list_agent_runs(project, usize::MAX).unwrap();
+    drop(db);
+
+    let invalid = command(dir.path(), &["lead", "resolve", &id.to_string(), "   "]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("resolution must not be empty"));
+
+    let db = Database::open(&db_path).unwrap();
+    let pending = db.pending_lead_decision(project).unwrap().unwrap();
+    assert_eq!(pending.status, "pending");
+    drop(db);
+
+    let valid = command(
+        dir.path(),
+        &["lead", "resolve", &id.to_string(), "take option A"],
+    );
+    assert!(valid.status.success());
+    let resolved: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(resolved["status"], "resolved");
+    assert_eq!(resolved["resolution"], "take option A");
+    assert_eq!(resolved["source_request"], "request");
+
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.list_tasks().unwrap(), before_tasks);
+    assert_eq!(
+        serde_json::to_value(db.list_agent_runs(project, usize::MAX).unwrap()).unwrap(),
+        serde_json::to_value(before_runs).unwrap()
+    );
+    let history = db.list_lead_decisions(project).unwrap();
+    assert_eq!(history[0].details, r#"{"question":"Choose"}"#);
+    assert_eq!(history[0].resolution.as_deref(), Some("take option A"));
+    drop(db);
+
+    let second = command(dir.path(), &["lead", "resolve", &id.to_string(), "again"]);
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("decision is missing or already resolved")
+    );
+
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.list_lead_decisions(project).unwrap(), history);
+}

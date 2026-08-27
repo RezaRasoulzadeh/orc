@@ -1,11 +1,14 @@
 use orc::adoption;
 use orc::contract::DEFAULT_ENGINEERING_CONTRACT;
 use orc::discovery;
+use orc::lead::{LeadBackend, LeadBackendResponse, LeadContext, LeadDecision, LeadDecisionKind};
 use orc::protocol::{
     DiscoveryArchitecture, DiscoveryEngineering, DiscoveryProject, DiscoveryState,
     PROTOCOL_VERSION, ProjectDiscoveryResponse,
 };
 use orc::storage::Database;
+use std::cell::RefCell;
+use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -200,4 +203,146 @@ fn reopening_database_preserves_adopted_project() {
         reopened.get_project_name().unwrap().as_deref(),
         Some("sample-project")
     );
+}
+
+struct RecordingLead(RefCell<Option<LeadContext>>);
+
+impl LeadBackend for RecordingLead {
+    fn invoke(
+        &self,
+        context: &LeadContext,
+        objective: &str,
+    ) -> Result<LeadBackendResponse, String> {
+        assert_eq!(objective, "understand this repository");
+        self.0.borrow_mut().replace(context.clone());
+        Ok(LeadBackendResponse {
+            message: "assessment complete".into(),
+            proposals: Vec::new(),
+            decision: Some(LeadDecision {
+                kind: LeadDecisionKind::PlanRequired,
+                details: serde_json::json!({"reason": "new project"}),
+            }),
+        })
+    }
+}
+
+struct CountingLead(RefCell<usize>);
+
+impl LeadBackend for CountingLead {
+    fn invoke(
+        &self,
+        _context: &LeadContext,
+        _objective: &str,
+    ) -> Result<LeadBackendResponse, String> {
+        *self.0.borrow_mut() += 1;
+        Ok(LeadBackendResponse {
+            message: "unexpected invocation".into(),
+            proposals: Vec::new(),
+            decision: None,
+        })
+    }
+}
+
+#[test]
+fn adopt_and_invoke_lead_discovers_persists_and_does_not_create_work() {
+    let (_dir, repo) = git_repo();
+    let backend = RecordingLead(RefCell::new(None));
+    let (root, response) =
+        adoption::adopt_and_invoke_lead(repo.join("."), "understand this repository", &backend, 20)
+            .unwrap();
+    assert!(backend.0.borrow().as_ref().unwrap().discovery.is_some());
+    assert!(response.decision.is_some());
+    let db = Database::open(root.join(".orc/orc.db")).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    assert_eq!(db.list_tasks().unwrap().len(), 0);
+    assert_eq!(db.list_lead_decisions(project).unwrap().len(), 1);
+    assert_eq!(
+        Database::open(root.join(".orc/orc.db"))
+            .unwrap()
+            .list_lead_decisions(project)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn adopt_resolves_nested_repository_root_for_lead() {
+    let (_dir, repo) = git_repo();
+    let nested = repo.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let backend = RecordingLead(RefCell::new(None));
+    let (root, _) =
+        adoption::adopt_and_invoke_lead(&nested, "understand this repository", &backend, 20)
+            .unwrap();
+    assert_eq!(root, std::fs::canonicalize(repo).unwrap());
+    assert_eq!(
+        backend.0.borrow().as_ref().unwrap().repository_path,
+        root.display().to_string()
+    );
+}
+
+#[test]
+fn adopt_aborts_before_lead_when_structured_discovery_fails() {
+    let (_dir, repo) = git_repo();
+    adoption::adopt(&repo).unwrap();
+    std::fs::create_dir(repo.join(".orc/validation.toml")).unwrap();
+    let backend = CountingLead(RefCell::new(0));
+
+    let error = adoption::adopt_and_invoke_lead(&repo, "understand this repository", &backend, 20)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("failed to read"), "{error}");
+    assert_eq!(*backend.0.borrow(), 0);
+    let db = Database::open(repo.join(".orc/orc.db")).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    assert!(db.list_lead_decisions(project).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn adopt_cli_discovers_invokes_lead_from_nested_directory_and_only_persists_decision() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, repo) = git_repo();
+    let nested = repo.join("src").join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let bin = repo.join(".fake-bin");
+    fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        r##"#!/bin/sh
+printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT_TASKS","details":{"tasks":[]}}}'
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(&nested)
+        .env("PATH", path)
+        .args(["adopt", "assess this existing repository"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = Database::open(repo.join(".orc/orc.db")).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let decisions = db.list_lead_decisions(project).unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("assessment"));
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].source_request,
+        "assess this existing repository"
+    );
+    assert!(decisions[0].snapshot.is_some());
+    assert!(db.list_tasks().unwrap().is_empty());
+    assert!(db.list_agent_runs(project, usize::MAX).unwrap().is_empty());
 }

@@ -84,8 +84,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
-    /// Adopt the existing Git repository in the current directory.
-    Adopt,
+    /// Adopt the existing Git repository, then assess an objective with Lead.
+    Adopt {
+        /// Operator objective to assess after repository discovery and adoption.
+        objective: Option<String>,
+    },
     /// Emit a read-only repository discovery request as JSON.
     DiscoveryRequest,
     /// Apply a structured repository discovery response from a JSON file (or - for stdin).
@@ -389,9 +392,22 @@ fn run(cli: Cli) -> Result<()> {
             };
             println!("Initialized Orc DB in {} (project id={})", DB_PATH, pid);
         }
-        Command::Adopt => {
+        Command::Adopt { objective } => {
             let root = adoption::adopt(".")?;
-            println!("Adopted repository {}", root.display());
+            if let Some(objective) = objective {
+                let db =
+                    Database::open(root.join(".orc/orc.db")).map_err(|e| anyhow::anyhow!(e))?;
+                adoption::ensure_default_lead(&db)?;
+                let app = orc::app::OrcApp::open(root.join(".orc/orc.db"), &root)?;
+                let response =
+                    app.invoke_persisted_lead_with_required_discovery(&objective, 100)?;
+                if response.decision.is_none() {
+                    anyhow::bail!("Lead returned no decision for adoption objective");
+                }
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Adopted repository {}", root.display());
+            }
         }
         Command::DiscoveryRequest => {
             let request = discovery::build_request(".")?;
@@ -1265,7 +1281,7 @@ mod cli_tests {
     fn command_variant(command: &Command) -> &'static str {
         match command {
             Command::Init => "Init",
-            Command::Adopt => "Adopt",
+            Command::Adopt { .. } => "Adopt",
             Command::DiscoveryRequest => "DiscoveryRequest",
             Command::ApplyDiscovery { .. } => "ApplyDiscovery",
             Command::Agents { .. } => "Agents",

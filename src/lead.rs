@@ -131,7 +131,7 @@ pub struct LeadProviderConfig {
 }
 
 pub struct CodexLeadBackend {
-    profile_path: PathBuf,
+    profile_path: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     repo_path: PathBuf,
@@ -150,14 +150,8 @@ impl CodexLeadBackend {
                 agent.id
             ));
         }
-        let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
-            format!(
-                "Codex Lead agent '{}' requires a configured profile path",
-                agent.id
-            )
-        })?;
         Ok(Self {
-            profile_path: PathBuf::from(profile_path),
+            profile_path: agent.profile_path.as_deref().map(PathBuf::from),
             model: model.or_else(|| agent.model.clone()),
             reasoning_effort: reasoning_effort.or(agent.reasoning_effort),
             repo_path: repo_path.to_path_buf(),
@@ -198,7 +192,9 @@ impl LeadBackend for CodexLeadBackend {
         let prompt = Self::prompt(context, message)?;
         let mut command = Command::new("codex");
         command.args(self.command_args(&prompt));
-        backend::apply_profile_environment(&mut command, &self.profile_path);
+        if let Some(profile_path) = &self.profile_path {
+            backend::apply_profile_environment(&mut command, profile_path);
+        }
         backend::configure_noninteractive(&mut command, &self.repo_path);
         let output = crate::worker::run_command_with_timeout(
             command,
@@ -233,11 +229,24 @@ pub struct LeadResponse {
 pub struct LeadService<'a> {
     db: &'a Database,
     repo_path: &'a Path,
+    require_discovery: bool,
 }
 
 impl<'a> LeadService<'a> {
     pub fn new(db: &'a Database, repo_path: &'a Path) -> Self {
-        Self { db, repo_path }
+        Self {
+            db,
+            repo_path,
+            require_discovery: false,
+        }
+    }
+
+    pub fn new_with_required_discovery(db: &'a Database, repo_path: &'a Path) -> Self {
+        Self {
+            db,
+            repo_path,
+            require_discovery: true,
+        }
     }
 
     pub(crate) fn project_id(&self) -> Result<i64, DbError> {
@@ -266,7 +275,17 @@ impl<'a> LeadService<'a> {
         let mut proposals = self.db.list_lead_proposals(project_id, limit, None)?;
         proposals.reverse();
         Ok(LeadContext {
-            discovery: crate::discovery::build_snapshot(self.repo_path).ok(),
+            discovery: if self.require_discovery {
+                Some(
+                    crate::discovery::build_snapshot(self.repo_path).map_err(|error| {
+                        DbError::Scheduler(format!(
+                            "structured project discovery failed: {error:#}"
+                        ))
+                    })?,
+                )
+            } else {
+                crate::discovery::build_snapshot(self.repo_path).ok()
+            },
             project_id,
             project_name: self.db.get_project_name()?.unwrap_or_default(),
             repository_path: self.repo_path.display().to_string(),

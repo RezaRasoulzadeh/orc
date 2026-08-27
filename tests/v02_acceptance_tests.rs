@@ -247,6 +247,7 @@ fn lead_proposals_are_persisted_and_require_explicit_approval_before_mutation() 
                 response: RefCell::new(Some(LeadBackendResponse {
                     message: "A task is proposed".into(),
                     proposals: vec![LeadProposalKind::Task(task("Proposed"))],
+                    decision: None,
                 })),
             },
             20,

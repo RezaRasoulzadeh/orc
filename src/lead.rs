@@ -31,6 +31,35 @@ pub enum LeadProposalStatus {
     Applying,
     Applied,
     Rejected,
+    Superseded,
+}
+
+/// The single operator-actionable outcome of a Lead assessment.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeadDecision {
+    #[serde(rename = "kind")]
+    pub kind: LeadDecisionKind,
+    #[serde(default)]
+    pub details: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedLeadDecision {
+    pub id: i64,
+    pub run_id: Option<i64>,
+    pub kind: LeadDecisionKind,
+    pub details: String,
+    pub snapshot: Option<String>,
+    pub status: String,
+    pub actionable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LeadDecisionKind {
+    DirectTasks,
+    PlanRequired,
+    UserDecisionRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +107,8 @@ pub struct LeadBackendResponse {
     pub message: String,
     #[serde(default)]
     pub proposals: Vec<LeadProposalKind>,
+    #[serde(default)]
+    pub decision: Option<LeadDecision>,
 }
 
 pub trait LeadBackend {
@@ -188,6 +219,7 @@ impl LeadBackend for CodexLeadBackend {
 pub struct LeadResponse {
     pub turn: LeadTurn,
     pub proposals: Vec<LeadProposal>,
+    pub decision: Option<LeadDecision>,
 }
 
 pub struct LeadService<'a> {
@@ -200,7 +232,7 @@ impl<'a> LeadService<'a> {
         Self { db, repo_path }
     }
 
-    fn project_id(&self) -> Result<i64, DbError> {
+    pub(crate) fn project_id(&self) -> Result<i64, DbError> {
         self.db
             .get_project_id()?
             .ok_or_else(|| DbError::Scheduler("no project found in DB".into()))
@@ -253,6 +285,16 @@ impl<'a> LeadService<'a> {
         backend: &dyn LeadBackend,
         limit: usize,
     ) -> Result<LeadResponse, anyhow::Error> {
+        self.invoke_with_run_id(message, backend, limit, None)
+    }
+
+    pub fn invoke_with_run_id(
+        &self,
+        message: &str,
+        backend: &dyn LeadBackend,
+        limit: usize,
+        run_id: Option<i64>,
+    ) -> Result<LeadResponse, anyhow::Error> {
         let project_id = self.project_id()?;
         self.db
             .record_lead_turn(project_id, LeadRole::User, message)?;
@@ -273,6 +315,16 @@ impl<'a> LeadService<'a> {
         let turn = self.db.get_lead_turn(project_id, turn_id)?.ok_or_else(|| {
             anyhow::anyhow!("persisted Lead assistant turn could not be reloaded")
         })?;
+        if let Some(decision) = response.decision.as_ref() {
+            let snapshot = serde_json::to_string(&self.context(limit)?)?;
+            self.db.record_lead_decision(
+                project_id,
+                &decision.kind,
+                &decision.details,
+                &snapshot,
+                run_id,
+            )?;
+        }
         let mut proposals = Vec::new();
         for proposal in response.proposals {
             let id = self.db.record_lead_proposal(project_id, &proposal)?;
@@ -282,7 +334,11 @@ impl<'a> LeadService<'a> {
                 })?,
             );
         }
-        Ok(LeadResponse { turn, proposals })
+        Ok(LeadResponse {
+            turn,
+            proposals,
+            decision: response.decision,
+        })
     }
 
     pub fn pending_proposals(&self) -> Result<Vec<LeadProposal>, DbError> {

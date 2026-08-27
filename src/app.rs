@@ -35,6 +35,22 @@ impl OrcApp {
     pub fn lead(&self) -> crate::lead::LeadService<'_> {
         crate::lead::LeadService::new(&self.db, &self.repo_path)
     }
+
+    pub fn pending_lead_decision(&self) -> Result<Option<crate::lead::PersistedLeadDecision>> {
+        Ok(self.db.pending_lead_decision(self.lead().project_id()?)?)
+    }
+
+    pub fn lead_decisions(&self) -> Result<Vec<crate::lead::PersistedLeadDecision>> {
+        Ok(self.db.list_lead_decisions(self.lead().project_id()?)?)
+    }
+
+    pub fn consume_pending_lead_decision(
+        &self,
+    ) -> Result<Option<crate::lead::PersistedLeadDecision>> {
+        Ok(self
+            .db
+            .consume_pending_lead_decision(self.lead().project_id()?)?)
+    }
     pub fn invoke_lead(
         &self,
         message: &str,

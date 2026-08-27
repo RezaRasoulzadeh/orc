@@ -1,8 +1,9 @@
 use orc::Database;
 use orc::app::OrcApp;
+use orc::automated::{ActionBackend, ActionExecution, ActionOverrides};
 use orc::lead::{
-    CodexLeadBackend, LeadBackend, LeadBackendResponse, LeadContext, LeadProposalKind,
-    LeadProposalStatus, LeadProviderConfig, LeadRole,
+    CodexLeadBackend, LeadBackend, LeadBackendResponse, LeadContext, LeadDecision,
+    LeadDecisionKind, LeadProposalKind, LeadProposalStatus, LeadProviderConfig, LeadRole,
 };
 use orc::protocol::PlannedTask;
 use orc::registry::{AgentDefinition, ReasoningEffort};
@@ -38,6 +39,16 @@ struct MalformedProviderLead;
 impl LeadBackend for MalformedProviderLead {
     fn invoke(&self, _: &LeadContext, _: &str) -> Result<LeadBackendResponse, String> {
         CodexLeadBackend::parse_response("{not valid json")
+    }
+}
+
+struct InvalidDecisionLead;
+
+impl LeadBackend for InvalidDecisionLead {
+    fn invoke(&self, _: &LeadContext, _: &str) -> Result<LeadBackendResponse, String> {
+        CodexLeadBackend::parse_response(
+            r#"{"message":"bad","decision":{"kind":"NOT_A_DECISION","details":{}}}"#,
+        )
     }
 }
 
@@ -101,6 +112,7 @@ fn invocation_uses_fresh_state_and_persists_turns_and_pending_proposals() {
         response: RefCell::new(Some(LeadBackendResponse {
             message: "I propose one task".into(),
             proposals: vec![LeadProposalKind::Task(planned_task("Proposed"))],
+            decision: None,
         })),
     };
     let response = app.invoke_lead("What next?", &backend, 20).unwrap();
@@ -116,6 +128,198 @@ fn invocation_uses_fresh_state_and_persists_turns_and_pending_proposals() {
     assert_eq!(reopened.lead().pending_proposals().unwrap().len(), 1);
 }
 
+#[test]
+fn structured_decisions_are_persisted_reopened_superseded_and_explicitly_consumed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("decisions.sqlite");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("decision project").unwrap();
+    let task_id = db
+        .insert_task(
+            project,
+            "lead run task",
+            "provide a run lineage",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let run_id = db.create_agent_run(project, &task_id, "lead").unwrap();
+    drop(db);
+    for (index, kind) in [
+        LeadDecisionKind::DirectTasks,
+        LeadDecisionKind::PlanRequired,
+        LeadDecisionKind::UserDecisionRequired,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let app = OrcApp::open(&path, dir.path()).unwrap();
+        app.lead()
+            .invoke_with_run_id(
+                "assess",
+                &FakeLead {
+                    contexts: RefCell::new(Vec::new()),
+                    response: RefCell::new(Some(LeadBackendResponse {
+                        message: "assessment".into(),
+                        proposals: Vec::new(),
+                        decision: Some(LeadDecision {
+                            kind,
+                            details: serde_json::json!({"operator": "next"}),
+                        }),
+                    })),
+                },
+                20,
+                Some(run_id),
+            )
+            .unwrap();
+        let pending = app.pending_lead_decision().unwrap().unwrap();
+        assert_eq!(pending.kind, kind);
+        assert_eq!(pending.status, "pending");
+        assert!(pending.actionable && pending.snapshot.is_some());
+        assert_eq!(pending.run_id, Some(run_id));
+        if index > 0 {
+            assert_eq!(pending.kind, kind);
+        }
+        drop(app);
+        let reopened = OrcApp::open(&path, dir.path()).unwrap();
+        let consumed = reopened.consume_pending_lead_decision().unwrap().unwrap();
+        assert_eq!(consumed.status, "consumed");
+        assert!(!consumed.actionable);
+    }
+    assert!(
+        OrcApp::open(&path, dir.path())
+            .unwrap()
+            .pending_lead_decision()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn lead_decision_supersession_is_historical_and_read_only() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("supersession.sqlite");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("decision project").unwrap();
+    db.insert_task(
+        project,
+        "Existing",
+        "unchanged",
+        "developer",
+        TaskPriority::Normal,
+    )
+    .unwrap();
+    drop(db);
+    let app = OrcApp::open(&path, dir.path()).unwrap();
+    let before = app.tasks().unwrap();
+    for kind in [
+        LeadDecisionKind::DirectTasks,
+        LeadDecisionKind::PlanRequired,
+    ] {
+        app.invoke_lead(
+            "assess",
+            &FakeLead {
+                contexts: RefCell::new(Vec::new()),
+                response: RefCell::new(Some(LeadBackendResponse {
+                    message: "assessment".into(),
+                    proposals: Vec::new(),
+                    decision: Some(LeadDecision {
+                        kind,
+                        details: serde_json::json!({"next": "operator"}),
+                    }),
+                })),
+            },
+            20,
+        )
+        .unwrap();
+    }
+    let decisions = app.lead_decisions().unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].status, "superseded");
+    assert!(!decisions[0].actionable);
+    assert_eq!(decisions[1].status, "pending");
+    assert!(decisions[1].actionable);
+    assert_eq!(app.tasks().unwrap(), before);
+}
+
+#[test]
+fn malformed_decision_output_fails_without_state_mutation_or_planner_call() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("malformed-decision.sqlite");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("decision project").unwrap();
+    db.insert_task(
+        project,
+        "Existing",
+        "unchanged",
+        "developer",
+        TaskPriority::Normal,
+    )
+    .unwrap();
+    drop(db);
+    let app = OrcApp::open(&path, dir.path()).unwrap();
+    let before = app.tasks().unwrap();
+    assert!(app.invoke_lead("assess", &InvalidDecisionLead, 20).is_err());
+    assert_eq!(app.tasks().unwrap(), before);
+    assert!(app.pending_lead_decision().unwrap().is_none());
+    assert!(app.lead().context(20).unwrap().proposals.is_empty());
+}
+
+#[test]
+fn automated_lead_invokes_only_lead_and_never_planner_or_task_creation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("automated-lead-read-only.sqlite");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("decision project").unwrap();
+    db.insert_agent(&AgentDefinition {
+        actions: vec![orc::registry::AgentAction::Lead],
+        ..codex_agent("/profiles/lead")
+    })
+    .unwrap();
+    db.insert_task(
+        project,
+        "Existing",
+        "unchanged",
+        "developer",
+        TaskPriority::Normal,
+    )
+    .unwrap();
+    drop(db);
+
+    struct Spy {
+        calls: RefCell<Vec<orc::registry::AgentAction>>,
+    }
+    impl ActionBackend for Spy {
+        fn invoke(
+            &self,
+            _agent: &AgentDefinition,
+            action: orc::registry::AgentAction,
+            _input: &str,
+            _model: Option<&str>,
+            _effort: Option<ReasoningEffort>,
+        ) -> anyhow::Result<ActionExecution> {
+            self.calls.borrow_mut().push(action);
+            Ok(ActionExecution {
+                output: r#"{"message":"assess","proposals":[],"decision":{"kind":"PLAN_REQUIRED","details":{"next":"operator"}}}"#.into(),
+                token_usage: None,
+            })
+        }
+    }
+
+    let app = OrcApp::open(&path, dir.path()).unwrap();
+    let before = app.tasks().unwrap();
+    let spy = Spy {
+        calls: RefCell::new(Vec::new()),
+    };
+    app.automated_lead_with_backend("assess", &ActionOverrides::default(), &spy)
+        .unwrap();
+    assert_eq!(
+        spy.calls.into_inner(),
+        vec![orc::registry::AgentAction::Lead]
+    );
+    assert_eq!(app.tasks().unwrap(), before);
+    assert!(app.pending_lead_decision().unwrap().is_some());
+}
 #[test]
 fn applying_and_rejecting_are_explicit_and_project_scoped() {
     let dir = tempdir().unwrap();
@@ -134,6 +338,7 @@ fn applying_and_rejecting_are_explicit_and_project_scoped() {
                 LeadProposalKind::Task(planned_task("Applied")),
                 LeadProposalKind::Task(planned_task("Rejected")),
             ],
+            decision: None,
         })),
     };
     let response = first.invoke_lead("plan", &backend, 10).unwrap();
@@ -168,6 +373,7 @@ fn proposal_application_is_single_use_and_ends_applied() {
         response: RefCell::new(Some(LeadBackendResponse {
             message: "proposal".into(),
             proposals: vec![LeadProposalKind::Task(planned_task("Once"))],
+            decision: None,
         })),
     };
     let id = app.invoke_lead("plan", &backend, 10).unwrap().proposals[0].id;

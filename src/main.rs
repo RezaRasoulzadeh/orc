@@ -265,6 +265,12 @@ enum ApprovalCommand {
 
 #[derive(Subcommand)]
 enum LeadCommand {
+    /// Run one read-only Lead assessment and persist its decision.
+    Run {
+        request: String,
+    },
+    Pending,
+    Consume,
     Show,
     Set {
         agent: String,
@@ -565,6 +571,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Lead { command } => {
             let app = orc::app::OrcApp::open(DB_PATH, ".")?;
             match command {
+                LeadCommand::Run { request } => {
+                    let (_, response) =
+                        app.automated_lead(&request, &orc::automated::ActionOverrides::default())?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                LeadCommand::Pending => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&app.pending_lead_decision()?)?
+                ),
+                LeadCommand::Consume => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&app.consume_pending_lead_decision()?)?
+                ),
                 LeadCommand::Show => match app.lead_provider_config()? {
                     Some(config) => println!(
                         "agent={} model={} effort={}",

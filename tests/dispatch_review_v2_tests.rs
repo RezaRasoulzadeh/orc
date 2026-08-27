@@ -2011,7 +2011,7 @@ fn untracked_and_runtime_db_artifacts_are_handled_correctly() {
 }
 
 #[test]
-fn no_change_and_validation_failure_block_task() {
+fn no_change_blocks_but_validation_failure_enters_review() {
     let (dir, db, task) = setup();
     let db_path = dir.path().join(".orc/orc.db");
     assert!(
@@ -2052,7 +2052,7 @@ fn no_change_and_validation_failure_block_task() {
     );
     assert_eq!(
         db.get_task(&task2).unwrap().unwrap().status,
-        TaskStatus::Blocked
+        TaskStatus::Review
     );
     let run_id = db.list_agent_runs_for_task(&task2).unwrap()[0].id;
     let validation = db

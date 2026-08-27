@@ -1,4 +1,7 @@
+use anyhow::Result;
 use orc::agent;
+use orc::app::OrcApp;
+use orc::automated::{ActionBackend, ActionExecution, ActionOverrides};
 use orc::registry::{self, AgentAction, AgentDefinition};
 use orc::storage::Database;
 use orc::task::TaskStatus;
@@ -9,6 +12,35 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
+
+struct ValidationLifecycleReviewBackend;
+
+struct EvolvingWorker;
+impl Worker for EvolvingWorker {
+    fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let path = cwd.join("feature.txt");
+        let content = "revised\n";
+        std::fs::write(path, content).map_err(|error| error.to_string())?;
+        Ok((WorkerOutcome::Success, Some(r#"{"claims":[{"blocker_id":"BLK-validation","status":"addressed","implementation_summary":"fixed validation","changed_files":["lifecycle-change.txt"],"evidence":[{"changed_file":"lifecycle-change.txt","validation_command":"validation","test_names":["validation"]}],"validation_evidence":"validation passes","unresolved_risk":null}]}"#.into())))
+    }
+}
+
+impl ActionBackend for ValidationLifecycleReviewBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<registry::ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Review);
+        Ok(ActionExecution {
+            output: r#"{"verdict":"REVISE","findings":["validation failed"],"blocking_findings":["validation failed"],"revision_feedback":"Fix the validation failure","blockers":[{"id":"BLK-validation","blocker_key":"validation","requirement_ref":"validation","evidence":"validation failed","severity":"high","acceptance_condition":"validation passes","status":"unresolved","finding":"validation failed"}]}"#.into(),
+            token_usage: None,
+        })
+    }
+}
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -125,7 +157,7 @@ fn active_task_cannot_be_dispatched_again() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_temp_git_repo(&repo_dir);
 
-    let db_path = repo_dir.join("orc.db");
+    let db_path = repo_dir.join(".orc/orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
     register_eligible_agent(&db);
@@ -160,7 +192,7 @@ fn done_task_cannot_be_dispatched() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     init_temp_git_repo(&repo_dir);
 
-    let db_path = repo_dir.join("orc.db");
+    let db_path = repo_dir.join(".orc/orc.db");
     let db = Database::init(&db_path).expect("init");
     let pid = db.create_project("test").expect("create project");
     register_eligible_agent(&db);
@@ -238,6 +270,191 @@ fn successful_worker_transitions_active_to_review() {
             .expect("list approvals")
             .is_empty()
     );
+}
+
+#[test]
+fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join(".orc/validation.toml"),
+        "commands = [\"cargo test validation-lifecycle\"]\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["add", ".orc/validation.toml"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["commit", "-m", "configure failing validation test"])
+        .output()
+        .unwrap();
+
+    let db_path = repo_dir.join("orc.db");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("validation-lifecycle").unwrap();
+    register_eligible_agent(&db);
+    let task = get_unique_task_id();
+    db.insert_task_with_id(
+        project,
+        &task,
+        "Validation lifecycle",
+        "preserve the worktree",
+        "developer",
+        orc::task::TaskPriority::Normal,
+    )
+    .unwrap();
+
+    let runner = FakeValidationRunner::failing_on("cargo test validation-lifecycle");
+    let worker = FakeWorker::new_success(None);
+    let result = agent::dispatch_with_worker_on_db(
+        &task,
+        &worker,
+        &db,
+        &repo_dir,
+        "eligible-codex",
+        &runner,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+
+    let runs = db.list_agent_runs_for_task(&task).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "failed");
+    let validation = db
+        .latest_validation_result_for_run(runs[0].id)
+        .unwrap()
+        .unwrap();
+    assert!(validation.contains("validation-lifecycle"));
+    assert!(validation.contains("command failed"));
+    assert!(repo_dir.join(".orc/worktrees").join(&task).exists());
+
+    let app = OrcApp::open(&db_path, &repo_dir).unwrap();
+    let requeue = app.requeue(&task).unwrap_err().to_string();
+    assert!(requeue.contains("cannot be requeued") || requeue.contains("not active"));
+    assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Review);
+}
+
+#[test]
+fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_temp_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join(".orc/validation.toml"),
+        "commands = [\"validation\"]\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["add", ".orc/validation.toml"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["commit", "-m", "configure validation"])
+        .output()
+        .unwrap();
+    let db_path = repo_dir.join(".orc/orc.db");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("validation-e2e").unwrap();
+    register_eligible_agent(&db);
+    db.insert_agent(&AgentDefinition {
+        id: "eligible-reviewer".into(),
+        backend: "codex".into(),
+        execution_mode: registry::AUTOMATED.into(),
+        display_name: "Reviewer".into(),
+        enabled: true,
+        priority: 100,
+        capabilities: vec!["review".into()],
+        status: registry::AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        quota_remaining_percent: Some(100),
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+        actions: vec![AgentAction::Review],
+    })
+    .unwrap();
+    let task = get_unique_task_id();
+    db.insert_task_with_id(
+        project,
+        &task,
+        "Validation e2e",
+        "fix it",
+        "developer",
+        orc::task::TaskPriority::Normal,
+    )
+    .unwrap();
+
+    let failing = FakeValidationRunner::failing_on("validation");
+    assert!(
+        agent::dispatch_with_worker_on_db(
+            &task,
+            &FakeWorker::new_success(None),
+            &db,
+            &repo_dir,
+            "eligible-codex",
+            &failing
+        )
+        .is_err()
+    );
+    let worker = EvolvingWorker;
+    let worktree = repo_dir.join(db.get_worktree_metadata(&task).unwrap().unwrap().1);
+    assert!(worktree.exists());
+    let app = OrcApp::open(&db_path, &repo_dir).unwrap();
+    assert!(app.requeue(&task).is_err());
+
+    let overrides = ActionOverrides {
+        agent_id: Some("eligible-reviewer".into()),
+        ..ActionOverrides::default()
+    };
+    let (review_run, review) = app
+        .automated_review_with_backend(&task, &overrides, &ValidationLifecycleReviewBackend)
+        .unwrap();
+    assert_eq!(review.verdict, "REVISE");
+    assert!(db.actionable_revision_contract(&task).unwrap().is_some());
+
+    agent::revise_with_worker_on_db(
+        &task,
+        "",
+        &worker,
+        &db,
+        &repo_dir,
+        "eligible-codex",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    assert!(worktree.exists());
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+
+    let accepted = agent::accept_task(&db, &task, &repo_dir);
+    assert!(
+        accepted.is_ok(),
+        "PASS acceptance should succeed: {accepted:?}"
+    );
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Done
+    );
+    assert!(review_run > 0);
 }
 
 #[test]

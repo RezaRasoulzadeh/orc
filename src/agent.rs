@@ -574,8 +574,11 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             Some(&combined_output),
                             token_usage,
                         )?;
-                        db.update_task_status(task_id, TaskStatus::Blocked)?;
-                        anyhow::bail!("validation failed for task {task_id}; task remains blocked");
+                        // The worker completed and left inspectable changes.  A failed
+                        // validation is therefore reviewable work, unlike an execution
+                        // failure which cannot safely enter the review/revise flow.
+                        db.update_task_status(task_id, TaskStatus::Review)?;
+                        anyhow::bail!("validation failed for task {task_id}; task requires review");
                     }
                     db.update_agent_run_status_with_usage(
                         run_id,
@@ -1596,8 +1599,8 @@ pub fn submit_patch_with_runner(
         );
         db.fail_run(run_id, &failure_summary)
             .context("failed to mark patch validation run as failed")?;
-        db.update_task_status(&task_id, TaskStatus::Blocked)
-            .context("failed to block task after patch validation failure")?;
+        db.update_task_status(&task_id, TaskStatus::Review)
+            .context("failed to set task to review after patch validation failure")?;
         anyhow::bail!(
             "Validation failed after applying patch to {}:\n{}",
             worktree_path.display(),

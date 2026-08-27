@@ -800,9 +800,10 @@ pub fn revise_with_worker_on_db_with_overrides(
     }
     let Some((source_review_id, _source_feedback)) = db.actionable_revision_review(task_id)? else {
         anyhow::bail!(
-            "task {} has no actionable REVISE review (currently {})",
+            "task {} has no actionable REVISE review (currently {}); the prior review may already have been consumed by a completed revision. Run `orc review {} --automated` to publish a fresh review before revising again",
             task_id,
-            task.status
+            task.status,
+            task_id
         );
     };
     let (source_review_id, contract_id, revision_contract) =
@@ -1024,9 +1025,10 @@ pub fn revise_manual(
     }
     let Some((source_review_id, _source_feedback)) = db.actionable_revision_review(task_id)? else {
         anyhow::bail!(
-            "task {} has no actionable REVISE review (currently {})",
+            "task {} has no actionable REVISE review (currently {}); the prior review may already have been consumed by a completed revision. Run `orc review {} --automated` to publish a fresh review before revising again",
             task_id,
-            task.status
+            task.status,
+            task_id
         );
     };
     let (source_review_id, contract_id, revision_contract) =

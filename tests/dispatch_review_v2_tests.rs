@@ -1507,6 +1507,7 @@ fn no_feedback_without_production_contract_returns_actionable_error() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("no actionable REVISE review"));
+    assert!(error.contains(&format!("orc review {task} --automated")));
 }
 
 #[test]

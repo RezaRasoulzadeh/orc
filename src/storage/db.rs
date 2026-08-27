@@ -34,6 +34,17 @@ pub struct PlanHistoryEntry {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanReview {
+    pub id: i64,
+    pub plan_id: i64,
+    pub lead_run_id: i64,
+    pub lead_decision_id: i64,
+    pub decision: crate::lead::LeadDecisionKind,
+    pub details: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlanStatus {
     Proposed,
@@ -393,6 +404,8 @@ fn lead_decision_kind(kind: crate::lead::LeadDecisionKind) -> &'static str {
         crate::lead::LeadDecisionKind::DirectTasks => "DIRECT_TASKS",
         crate::lead::LeadDecisionKind::PlanRequired => "PLAN_REQUIRED",
         crate::lead::LeadDecisionKind::UserDecisionRequired => "USER_DECISION_REQUIRED",
+        crate::lead::LeadDecisionKind::Approve => "APPROVE",
+        crate::lead::LeadDecisionKind::RevisePlan => "REVISE_PLAN",
     }
 }
 fn parse_lead_decision_kind(value: &str) -> Result<crate::lead::LeadDecisionKind, rusqlite::Error> {
@@ -402,6 +415,8 @@ fn parse_lead_decision_kind(value: &str) -> Result<crate::lead::LeadDecisionKind
         "USER_DECISION_REQUIRED" | "user_decision_required" => {
             Ok(crate::lead::LeadDecisionKind::UserDecisionRequired)
         }
+        "APPROVE" | "approve" => Ok(crate::lead::LeadDecisionKind::Approve),
+        "REVISE_PLAN" | "revise_plan" => Ok(crate::lead::LeadDecisionKind::RevisePlan),
         _ => Err(rusqlite::Error::InvalidColumnType(
             1,
             "kind".into(),
@@ -624,6 +639,48 @@ impl Database {
             [id],
             |row| Ok(PersistedPlan { id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, parent_plan_id: row.get(3)?, source_lead_decision_id: row.get(4)?, source_planner_run_id: row.get(5)?, status: PlanStatus::parse(row.get(6)?)?, response: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?, created_at: row.get(8)? }))
         .optional()?)
+    }
+
+    /// Checks that a plan is the project's current, actionable Planner output.
+    /// This is deliberately performed before any Lead run is created.
+    pub fn is_current_valid_planner_plan(
+        &self,
+        project_id: i64,
+        plan: &PersistedPlan,
+    ) -> Result<bool, DbError> {
+        if plan.project_id != project_id
+            || plan.status != PlanStatus::Proposed
+            || plan.response.validate().is_err()
+        {
+            return Ok(false);
+        }
+        let current: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(plan.id) {
+            return Ok(false);
+        }
+        let valid: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT p.id FROM plans p
+             JOIN lead_decisions d ON d.id = p.source_lead_decision_id
+             JOIN agent_runs r ON r.id = p.source_planner_run_id
+             WHERE p.id = ?1 AND p.project_id = ?2
+               AND d.project_id = p.project_id AND d.kind = 'PLAN_REQUIRED'
+               AND d.status = 'consumed'
+               AND r.project_id = p.project_id AND r.execution_class = 'plan'
+               AND r.status = 'completed'",
+                params![plan.id, project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(valid == Some(plan.id))
     }
 
     pub fn list_plan_history(&self, project_id: i64) -> Result<Vec<PlanHistoryEntry>, DbError> {
@@ -1835,9 +1892,29 @@ impl Database {
 
     fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), UNIQUE(project_id, version)); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id));",
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));",
         )?;
         Ok(())
+    }
+
+    pub fn record_plan_review(
+        &self,
+        plan_id: i64,
+        lead_run_id: i64,
+        decision_id: i64,
+        decision: &crate::lead::LeadDecisionKind,
+        details: &str,
+    ) -> Result<i64, DbError> {
+        if !matches!(
+            decision,
+            crate::lead::LeadDecisionKind::Approve
+                | crate::lead::LeadDecisionKind::RevisePlan
+                | crate::lead::LeadDecisionKind::UserDecisionRequired
+        ) {
+            return Err(DbError::Scheduler("invalid plan review decision".into()));
+        }
+        self.conn.execute("INSERT INTO plan_reviews (plan_id, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan_id, lead_run_id, decision_id, lead_decision_kind(*decision), details])?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub fn record_lead_decision(

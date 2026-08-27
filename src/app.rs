@@ -178,6 +178,60 @@ impl OrcApp {
             task_count: response.tasks.len(),
         })
     }
+
+    pub fn review_plan_with_backend(
+        &self,
+        plan_id: i64,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+    ) -> Result<crate::storage::db::PlanReview> {
+        let plan = self
+            .db
+            .get_plan(plan_id)?
+            .ok_or_else(|| anyhow::anyhow!("plan {plan_id} not found"))?;
+        let project_id = self.lead().project_id()?;
+        if !self.db.is_current_valid_planner_plan(project_id, &plan)? {
+            anyhow::bail!("plan {plan_id} is not the current valid Planner plan");
+        }
+        let prompt = format!(
+            "Review exactly this current valid Planner plan and the supplied project context. Return exactly one decision: APPROVE, REVISE_PLAN, or USER_DECISION_REQUIRED. Do not invoke another workflow stage, apply changes, or dispatch work. Plan: {}",
+            serde_json::to_string(&plan)?
+        );
+        let (run_id, response) = self.automated_lead_with_backend(&prompt, overrides, backend)?;
+        let decision = response
+            .decision
+            .ok_or_else(|| anyhow::anyhow!("Lead review returned no decision"))?;
+        if !matches!(
+            decision.kind,
+            crate::lead::LeadDecisionKind::Approve
+                | crate::lead::LeadDecisionKind::RevisePlan
+                | crate::lead::LeadDecisionKind::UserDecisionRequired
+        ) {
+            anyhow::bail!("Lead review returned invalid decision {:?}", decision.kind);
+        }
+        let decision_id = self
+            .lead_decisions()?
+            .into_iter()
+            .find(|d| d.run_id == Some(run_id))
+            .map(|d| d.id)
+            .ok_or_else(|| anyhow::anyhow!("Lead review decision was not persisted"))?;
+        let review_id = self.db.record_plan_review(
+            plan_id,
+            run_id,
+            decision_id,
+            &decision.kind,
+            &decision.details.to_string(),
+        )?;
+        Ok(crate::storage::db::PlanReview {
+            id: review_id,
+            plan_id,
+            lead_run_id: run_id,
+            lead_decision_id: decision_id,
+            decision: decision.kind,
+            details: decision.details.to_string(),
+            created_at: String::new(),
+        })
+    }
     pub fn automated_lead_with_backend(
         &self,
         message: &str,

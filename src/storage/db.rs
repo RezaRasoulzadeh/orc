@@ -875,6 +875,24 @@ impl Database {
             .validate()
             .map_err(|e| DbError::Scheduler(e.to_string()))?;
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.apply_plan_in_transaction(project_id, response);
+        match result {
+            Ok(mapping) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(mapping)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_plan_in_transaction(
+        &self,
+        project_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
         let result = (|| {
             let mut mapping = std::collections::BTreeMap::new();
             for task in &response.tasks {
@@ -894,6 +912,38 @@ impl Database {
             Ok::<_, DbError>(mapping)
         })();
         match result {
+            Ok(mapping) => Ok(mapping),
+            Err(error) => Err(error),
+        }
+    }
+    pub fn apply_approved_plan(
+        &self,
+        project_id: i64,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let plan = self.conn.query_row("SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at FROM plans WHERE project_id=?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id], |r| Ok(PersistedPlan { id:r.get(0)?, project_id:r.get(1)?, version:r.get(2)?, parent_plan_id:r.get(3)?, source_lead_decision_id:r.get(4)?, source_planner_run_id:r.get(5)?, status:PlanStatus::parse(r.get(6)?)?, response:serde_json::from_str(&r.get::<_,String>(7)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?, created_at:r.get(8)? })).optional()?.ok_or_else(|| DbError::Scheduler("no Planner plan found".into()))?;
+            if plan.status != PlanStatus::Approved {
+                return Err(DbError::Scheduler(
+                    "current Planner plan is not approved".into(),
+                ));
+            }
+            plan.response
+                .validate()
+                .map_err(|e| DbError::Scheduler(e.to_string()))?;
+            let mapping = self.apply_plan_in_transaction(project_id, &plan.response)?;
+            if self.conn.execute(
+                "UPDATE plans SET status='applied' WHERE id=?1 AND status='approved'",
+                [plan.id],
+            )? != 1
+            {
+                return Err(DbError::Scheduler(
+                    "Planner plan was already applied".into(),
+                ));
+            }
+            Ok(mapping)
+        })();
+        match result {
             Ok(mapping) => {
                 self.conn.execute_batch("COMMIT")?;
                 Ok(mapping)
@@ -904,6 +954,7 @@ impl Database {
             }
         }
     }
+
     pub fn init(path: impl AsRef<Path>) -> Result<Self, DbError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
@@ -1917,6 +1968,15 @@ impl Database {
             return Err(DbError::Scheduler("invalid plan review decision".into()));
         }
         self.conn.execute("INSERT INTO plan_reviews (plan_id, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan_id, lead_run_id, decision_id, lead_decision_kind(*decision), details])?;
+        let status = match decision {
+            crate::lead::LeadDecisionKind::Approve => "approved",
+            crate::lead::LeadDecisionKind::RevisePlan => "revision_requested",
+            _ => "under_review",
+        };
+        self.conn.execute(
+            "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
+            params![status, plan_id],
+        )?;
         Ok(self.conn.last_insert_rowid())
     }
 

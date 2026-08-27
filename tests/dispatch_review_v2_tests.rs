@@ -81,6 +81,21 @@ struct QueuedReviewBackend {
     outputs: Mutex<VecDeque<String>>,
 }
 
+struct FailingReviewBackend;
+
+impl ActionBackend for FailingReviewBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        _: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        anyhow::bail!("provider failure")
+    }
+}
+
 impl ActionBackend for QueuedReviewBackend {
     fn invoke(
         &self,
@@ -863,6 +878,22 @@ fn production_review_output(verdict: &str, blocker_id: Option<&str>) -> String {
     }).to_string()
 }
 
+fn prior_blocker_review_output(prior_blocker_id: &str) -> String {
+    serde_json::json!({
+        "verdict": "REVISE", "findings": [],
+        "blocking_findings": ["prior blocker remains"], "non_blocking_findings": [],
+        "severity": "high", "revision_feedback": "still blocked",
+        "blockers": [{
+            "id": "ignored", "prior_blocker_id": prior_blocker_id,
+            "blocker_key": "prior", "requirement_ref": "REQ-EXACT",
+            "evidence": "still failing", "severity": "high",
+            "acceptance_condition": "exact acceptance survives",
+            "status": "unresolved", "finding": "prior blocker remains"
+        }]
+    })
+    .to_string()
+}
+
 fn production_contract_fixture() -> (TempDir, Database, String, i64) {
     let (dir, db, task) = setup();
     db.insert_agent(&automated_agent(
@@ -956,6 +987,73 @@ fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
         .unwrap();
     assert!(db.actionable_revision_contract(&task).unwrap().is_none());
     assert_eq!(db.revision_contract_history_count(&task).unwrap(), 2);
+}
+
+#[test]
+fn failed_review_attempts_preserve_prior_actionability_until_real_revision_consumes_it() {
+    let (dir, db, task, source) = production_contract_fixture();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let overrides = ActionOverrides {
+        agent_id: Some("fake".into()),
+        model: None,
+        reasoning_effort: None,
+    };
+
+    let invalid = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from([prior_blocker_review_output(
+            "BLK-productio",
+        )])),
+    };
+    let error = app
+        .automated_review_with_backend(&task, &overrides, &invalid)
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong to task"));
+    let failed = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(failed.status, "failed");
+    assert_ne!(failed.id, source);
+    assert_eq!(
+        db.actionable_revision_review(&task).unwrap().unwrap().0,
+        source
+    );
+    assert_eq!(
+        db.actionable_revision_contract(&task).unwrap().unwrap().0,
+        source
+    );
+
+    assert!(
+        app.automated_review_with_backend(&task, &overrides, &FailingReviewBackend)
+            .is_err()
+    );
+    let malformed = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from(["not json".into()])),
+    };
+    assert!(
+        app.automated_review_with_backend(&task, &overrides, &malformed)
+            .is_err()
+    );
+    assert_eq!(
+        db.actionable_revision_review(&task).unwrap().unwrap().0,
+        source
+    );
+
+    let (_, contract_json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json).unwrap()
+        ["unresolved"][0]["blocker_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    revise_with_worker_on_db(
+        &task,
+        "",
+        &CapturingWorker::with_blocker_id(&blocker_id),
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert!(db.actionable_revision_review(&task).unwrap().is_none());
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
 }
 
 #[test]

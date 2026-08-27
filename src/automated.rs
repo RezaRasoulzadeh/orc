@@ -608,12 +608,30 @@ pub fn build_revision_contract_from_db(
         .iter()
         .find(|r| r.run_id == source_review_id)
         .context("source review not found")?;
-    let ledger = db.review_blocker_ledger(task_id)?;
     let source_ids: std::collections::BTreeSet<_> = source
         .blockers
         .iter()
         .map(|b| b.blocker_id.as_str())
         .collect();
+    let mut contract = build_revision_contract_for_source_ids(db, task_id, &source_ids)?;
+    // Legacy reviews without a persisted structured ledger retain compatibility.
+    if ledger_is_empty_for_source(db, task_id, &source_ids)? {
+        contract.unresolved = source
+            .blockers
+            .iter()
+            .filter(|blocker| blocker.status != "resolved")
+            .cloned()
+            .collect();
+    }
+    Ok(contract)
+}
+
+fn build_revision_contract_for_source_ids(
+    db: &crate::storage::Database,
+    task_id: &str,
+    source_ids: &std::collections::BTreeSet<&str>,
+) -> Result<RevisionContract> {
+    let ledger = db.review_blocker_ledger(task_id)?;
     let mut unresolved = Vec::new();
     let mut regressions = Vec::new();
     let mut constraints = Vec::new();
@@ -625,15 +643,6 @@ pub fn build_revision_contract_from_db(
                 _ => unresolved.push(record),
             }
         }
-    }
-    // Legacy reviews without a persisted structured ledger retain compatibility.
-    if ledger_is_empty_for_source(db, task_id, &source_ids)? {
-        unresolved = source
-            .blockers
-            .iter()
-            .filter(|b| b.status != "resolved")
-            .cloned()
-            .collect();
     }
     Ok(RevisionContract {
         unresolved,
@@ -1155,22 +1164,18 @@ fn run_review_mode(
             );
             match parsed {
                 Ok(result) => {
-                    db.update_agent_run_status_with_usage(
-                        run,
-                        "completed",
-                        Some(&execution.output),
-                        execution.token_usage,
-                    )?;
                     if !project_review {
                         db.store_review_blockers(&summary.task.id, run, &result.blockers)?;
                         if result.verdict.eq_ignore_ascii_case("revise") {
-                            let review =
-                                crate::review::build_review(db, &summary.task.id, Path::new("."))?;
-                            let contract = build_revision_contract_from_db(
+                            let source_ids = result
+                                .blockers
+                                .iter()
+                                .map(|blocker| blocker.id.as_str())
+                                .collect();
+                            let contract = build_revision_contract_for_source_ids(
                                 db,
                                 &summary.task.id,
-                                &review.prior_reviews,
-                                run,
+                                &source_ids,
                             )?;
                             db.persist_revision_contract(
                                 &summary.task.id,
@@ -1181,6 +1186,12 @@ fn run_review_mode(
                             db.clear_actionable_revision_contracts(&summary.task.id)?;
                         }
                     }
+                    db.update_agent_run_status_with_usage(
+                        run,
+                        "completed",
+                        Some(&execution.output),
+                        execution.token_usage,
+                    )?;
                     Ok((run, result))
                 }
                 Err(error) => {

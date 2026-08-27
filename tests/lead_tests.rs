@@ -325,6 +325,108 @@ fn automated_lead_invokes_only_lead_and_never_planner_or_task_creation() {
     assert_eq!(app.tasks().unwrap(), before);
     assert!(app.pending_lead_decision().unwrap().is_some());
 }
+
+#[test]
+fn configured_lead_decisions_are_canonical_read_only_and_restart_safe() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("configured-lead.sqlite");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("configured lead").unwrap();
+    db.insert_task(
+        project,
+        "Existing",
+        "unchanged",
+        "developer",
+        TaskPriority::Normal,
+    )
+    .unwrap();
+    let mut lead_agent = codex_agent("/profiles/lead");
+    lead_agent.actions = vec![orc::registry::AgentAction::Lead];
+    db.insert_agent(&lead_agent).unwrap();
+    db.set_lead_provider_config(&LeadProviderConfig {
+        agent_id: lead_agent.id.clone(),
+        model: Some("configured-model".into()),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+    })
+    .unwrap();
+    drop(db);
+
+    struct CanonicalLead {
+        kind: LeadDecisionKind,
+    }
+    impl ActionBackend for CanonicalLead {
+        fn invoke(
+            &self,
+            _: &AgentDefinition,
+            action: orc::registry::AgentAction,
+            _: &str,
+            _: Option<&str>,
+            _: Option<ReasoningEffort>,
+        ) -> anyhow::Result<ActionExecution> {
+            assert_eq!(action, orc::registry::AgentAction::Lead);
+            let details = if self.kind == LeadDecisionKind::DirectTasks {
+                serde_json::json!({"tasks": [planned_task("Canonical") ]})
+            } else {
+                serde_json::json!({"operator": "next"})
+            };
+            Ok(ActionExecution {
+                output: serde_json::json!({
+                    "message": "assessment",
+                    "proposals": [],
+                    "decision": {"kind": self.kind, "details": details}
+                })
+                .to_string(),
+                token_usage: None,
+            })
+        }
+    }
+
+    for kind in [
+        LeadDecisionKind::DirectTasks,
+        LeadDecisionKind::PlanRequired,
+        LeadDecisionKind::UserDecisionRequired,
+    ] {
+        let app = OrcApp::open(&path, dir.path()).unwrap();
+        let before = app.tasks().unwrap();
+        let (run_id, response) = app
+            .automated_lead_with_backend(
+                "assess",
+                &ActionOverrides::default(),
+                &CanonicalLead { kind },
+            )
+            .unwrap();
+        assert_eq!(response.decision.unwrap().kind, kind);
+        assert_eq!(app.tasks().unwrap(), before);
+        let persisted = app.pending_lead_decision().unwrap().unwrap();
+        assert_eq!(persisted.run_id, Some(run_id));
+        if kind == LeadDecisionKind::DirectTasks {
+            let details: serde_json::Value = serde_json::from_str(&persisted.details).unwrap();
+            let tasks = details
+                .get("tasks")
+                .and_then(serde_json::Value::as_array)
+                .expect("DIRECT_TASKS details persist canonical tasks");
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0].get("local_id").and_then(|v| v.as_str()),
+                Some("lead-task")
+            );
+            assert_eq!(
+                tasks[0].get("title").and_then(|v| v.as_str()),
+                Some("Canonical")
+            );
+        }
+        drop(app);
+        let reopened = OrcApp::open(&path, dir.path()).unwrap();
+        let reopened_decision = reopened.pending_lead_decision().unwrap().unwrap();
+        assert_eq!(reopened_decision.run_id, Some(run_id));
+        if kind == LeadDecisionKind::DirectTasks {
+            let details: serde_json::Value =
+                serde_json::from_str(&reopened_decision.details).unwrap();
+            assert_eq!(details["tasks"][0]["title"], "Canonical");
+        }
+        reopened.consume_pending_lead_decision().unwrap();
+    }
+}
 #[test]
 fn applying_and_rejecting_are_explicit_and_project_scoped() {
     let dir = tempdir().unwrap();

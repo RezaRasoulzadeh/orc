@@ -1072,7 +1072,7 @@ fn run_review_mode(
         review_resolution_ledger(&summary.prior_reviews)
     };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Do not accept or merge the task.\nCurrent blocker ledger (IDs are authoritative):\n{history}\nReview packet:\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the ledger, including every hexadecimal character; never shorten, regenerate, or retype an ID from memory. Do not accept or merge the task.\nCurrent blocker ledger (IDs are authoritative):\n{history}\nReview packet:\n{}",
         serde_json::to_string(summary)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -1115,13 +1115,27 @@ fn run_review_mode(
                     let prior = db.review_blocker_ledger(&summary.task.id)?;
                     let mut referenced = std::collections::HashSet::new();
                     for blocker in &mut result.blockers {
-                        if let Some(prior_id) = blocker.prior_blocker_id.as_deref() {
-                            let old = prior.iter().find(|old| old.blocker_id == prior_id)
-                                .ok_or_else(|| anyhow::anyhow!("prior_blocker_id '{prior_id}' does not belong to task '{}'", summary.task.id))?;
-                            if !referenced.insert(prior_id.to_owned()) {
-                                bail!("prior_blocker_id '{prior_id}' is referenced by duplicate findings")
+                        if let Some(returned_id) = blocker.prior_blocker_id.as_deref() {
+                            let old = if let Some(exact) =
+                                prior.iter().find(|old| old.blocker_id == returned_id)
+                            {
+                                exact
+                            } else {
+                                let mut keyed = prior.iter().filter(|old| {
+                                    old.blocker_key == blocker.blocker_key
+                                });
+                                let unique = keyed.next();
+                                match (unique, keyed.next()) {
+                                    (Some(old), None) => old,
+                                    _ => bail!("prior_blocker_id '{returned_id}' does not belong to task '{}'", summary.task.id),
+                                }
+                            };
+                            let canonical_id = old.blocker_id.clone();
+                            if !referenced.insert(canonical_id.clone()) {
+                                bail!("prior_blocker_id '{canonical_id}' is referenced by duplicate findings")
                             }
-                            blocker.id = old.blocker_id.clone();
+                            blocker.prior_blocker_id = Some(canonical_id.clone());
+                            blocker.id = canonical_id;
                             blocker.status = if old.status == "resolved" {
                                 "regression"
                             } else {
@@ -1164,34 +1178,58 @@ fn run_review_mode(
             );
             match parsed {
                 Ok(result) => {
+                    let persisted_output = serde_json::to_string(&result)?;
                     if !project_review {
-                        db.store_review_blockers(&summary.task.id, run, &result.blockers)?;
-                        if result.verdict.eq_ignore_ascii_case("revise") {
-                            let source_ids = result
-                                .blockers
-                                .iter()
-                                .map(|blocker| blocker.id.as_str())
-                                .collect();
-                            let contract = build_revision_contract_for_source_ids(
-                                db,
-                                &summary.task.id,
-                                &source_ids,
-                            )?;
-                            db.persist_revision_contract(
-                                &summary.task.id,
-                                run,
-                                &serde_json::to_string(&contract)?,
-                            )?;
-                        } else if result.verdict.eq_ignore_ascii_case("pass") {
-                            db.clear_actionable_revision_contracts(&summary.task.id)?;
-                        }
+                        let contract = if result.verdict.eq_ignore_ascii_case("revise") {
+                            let records = result.blockers.iter().map(|blocker| {
+                                crate::storage::db::ReviewBlockerRecord {
+                                    task_id: summary.task.id.clone(),
+                                    blocker_id: blocker.id.clone(),
+                                    run_id: run,
+                                    blocker_key: blocker.blocker_key.clone(),
+                                    requirement_ref: blocker.requirement_ref.clone(),
+                                    evidence: blocker.evidence.clone(),
+                                    severity: blocker.severity.clone(),
+                                    acceptance_condition: blocker.acceptance_condition.clone(),
+                                    status: blocker.status.clone(),
+                                    finding: blocker.finding.clone(),
+                                    first_seen: String::new(),
+                                    last_seen: String::new(),
+                                }
+                            });
+                            let mut contract = RevisionContract {
+                                unresolved: Vec::new(),
+                                regressions: Vec::new(),
+                                regression_constraints: Vec::new(),
+                            };
+                            for record in records {
+                                match record.status.as_str() {
+                                    "resolved" => contract.regression_constraints.push(record),
+                                    "regression" => contract.regressions.push(record),
+                                    _ => contract.unresolved.push(record),
+                                }
+                            }
+                            Some(serde_json::to_string(&contract)?)
+                        } else {
+                            None
+                        };
+                        db.commit_task_review_result(
+                            &summary.task.id,
+                            run,
+                            &result.blockers,
+                            contract.as_deref(),
+                            result.verdict.eq_ignore_ascii_case("pass"),
+                            &persisted_output,
+                            execution.token_usage,
+                        )?;
+                    } else {
+                        db.update_agent_run_status_with_usage(
+                            run,
+                            "completed",
+                            Some(&persisted_output),
+                            execution.token_usage,
+                        )?;
                     }
-                    db.update_agent_run_status_with_usage(
-                        run,
-                        "completed",
-                        Some(&execution.output),
-                        execution.token_usage,
-                    )?;
                     Ok((run, result))
                 }
                 Err(error) => {

@@ -879,19 +879,166 @@ fn production_review_output(verdict: &str, blocker_id: Option<&str>) -> String {
 }
 
 fn prior_blocker_review_output(prior_blocker_id: &str) -> String {
+    prior_blocker_review_output_with_key(prior_blocker_id, "prior")
+}
+
+fn prior_blocker_review_output_with_key(prior_blocker_id: &str, blocker_key: &str) -> String {
     serde_json::json!({
         "verdict": "REVISE", "findings": [],
         "blocking_findings": ["prior blocker remains"], "non_blocking_findings": [],
         "severity": "high", "revision_feedback": "still blocked",
         "blockers": [{
             "id": "ignored", "prior_blocker_id": prior_blocker_id,
-            "blocker_key": "prior", "requirement_ref": "REQ-EXACT",
+            "blocker_key": blocker_key, "requirement_ref": "REQ-EXACT",
             "evidence": "still failing", "severity": "high",
             "acceptance_condition": "exact acceptance survives",
             "status": "unresolved", "finding": "prior blocker remains"
         }]
     })
     .to_string()
+}
+
+#[test]
+fn unique_blocker_key_canonicalizes_mistyped_prior_id() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let persisted = db.review_blocker_ledger(&task).unwrap().remove(0);
+    let mistyped = &persisted.blocker_id[..persisted.blocker_id.len() - 1];
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let (_, result) = app
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([prior_blocker_review_output_with_key(
+                    mistyped,
+                    &persisted.blocker_key,
+                )])),
+            },
+        )
+        .unwrap();
+    assert_eq!(result.blockers[0].id, persisted.blocker_id);
+    assert_eq!(
+        result.blockers[0].prior_blocker_id,
+        Some(persisted.blocker_id)
+    );
+}
+
+#[test]
+fn unknown_blocker_key_with_invalid_prior_id_is_rejected() {
+    let (dir, _db, task, _) = production_contract_fixture();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let error = app
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([prior_blocker_review_output_with_key(
+                    "BLK-invalid",
+                    "unknown",
+                )])),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong to task"));
+}
+
+#[test]
+fn ambiguous_blocker_key_is_rejected() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let run = db.actionable_revision_review(&task).unwrap().unwrap().0;
+    let mut blockers = Vec::new();
+    for id in ["BLK-ambiguous-one", "BLK-ambiguous-two"] {
+        blockers.push(ReviewBlocker {
+            id: id.into(),
+            prior_blocker_id: None,
+            blocker_key: "ambiguous".into(),
+            requirement_ref: "REQ".into(),
+            evidence: "evidence".into(),
+            severity: "high".into(),
+            acceptance_condition: "condition".into(),
+            status: "new".into(),
+            finding: "finding".into(),
+        });
+    }
+    db.store_review_blockers(&task, run, &blockers).unwrap();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let error = app
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([prior_blocker_review_output_with_key(
+                    "BLK-invalid",
+                    "ambiguous",
+                )])),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong to task"));
+}
+
+#[test]
+fn blocker_from_other_task_is_rejected() {
+    let (dir, db, task, _) = production_contract_fixture();
+    let project = db.get_project_id().unwrap().unwrap();
+    let other = db
+        .insert_task(
+            project,
+            "other",
+            "other task",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let run = db.create_agent_run(project, &other, "fake").unwrap();
+    db.store_review_blockers(
+        &other,
+        run,
+        &[ReviewBlocker {
+            id: "BLK-foreign".into(),
+            prior_blocker_id: None,
+            blocker_key: "foreign".into(),
+            requirement_ref: "REQ".into(),
+            evidence: "evidence".into(),
+            severity: "high".into(),
+            acceptance_condition: "condition".into(),
+            status: "new".into(),
+            finding: "finding".into(),
+        }],
+    )
+    .unwrap();
+    db.update_agent_run_status(run, "completed", Some("{}"))
+        .unwrap();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let error = app
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([prior_blocker_review_output_with_key(
+                    "BLK-foreign",
+                    "foreign",
+                )])),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong to task"));
 }
 
 fn production_contract_fixture() -> (TempDir, Database, String, i64) {

@@ -1440,6 +1440,47 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically publishes a validated task review. Until this transaction
+    /// commits, neither its blocker ledger changes nor its verdict can affect
+    /// revision actionability.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transaction boundary needs the complete validated review payload"
+    )]
+    pub fn commit_task_review_result(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        blockers: &[crate::automated::ReviewBlocker],
+        revision_contract: Option<&str>,
+        supersedes_with_pass: bool,
+        output: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for blocker in blockers {
+            tx.execute("INSERT OR IGNORE INTO review_blocker_observations (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
+            tx.execute("INSERT INTO review_blocker_ledger (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(task_id, blocker_id) DO UPDATE SET run_id=excluded.run_id, blocker_key=excluded.blocker_key, status=excluded.status, evidence=excluded.evidence, requirement_ref=excluded.requirement_ref, acceptance_condition=excluded.acceptance_condition, finding=excluded.finding, last_seen=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
+        }
+        if revision_contract.is_some() || supersedes_with_pass {
+            tx.execute("UPDATE revision_contracts SET status='superseded' WHERE task_id=?1 AND status='actionable'", [task_id])?;
+        }
+        if let Some(contract) = revision_contract {
+            tx.execute("INSERT OR REPLACE INTO revision_contracts(task_id, source_review_run_id, contract, status) VALUES (?1, ?2, ?3, 'actionable')", params![task_id, run_id, contract])?;
+        }
+        let changed = tx.execute("UPDATE agent_runs SET status='completed', output=?1, error=NULL, finished_at=CURRENT_TIMESTAMP, last_activity=CURRENT_TIMESTAMP WHERE id=?2 AND status IN ('running','waiting_external')", params![output, run_id])?;
+        if changed == 0 {
+            return Err(DbError::InvalidRunStatus(run_id));
+        }
+        tx.execute(
+            "DELETE FROM execution_reservations WHERE run_id=?1",
+            [run_id],
+        )?;
+        tx.commit()?;
+        self.record_worker_result(run_id, "completed", Some(output), token_usage)?;
+        Ok(())
+    }
+
     pub fn store_change_evidence(
         &self,
         run_id: i64,
@@ -2597,25 +2638,23 @@ impl Database {
         &self,
         task_id: &str,
     ) -> Result<Option<(i64, String)>, DbError> {
-        let value = self.conn.query_row(
-            "SELECT id, output FROM agent_runs WHERE task_id = ?1 AND execution_class = 'review' AND status = 'completed' AND review_consumed = 0 ORDER BY id DESC LIMIT 1",
-            [task_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-        ).optional()?;
-        Ok(value.and_then(|(id, output)| {
-            let json = serde_json::from_str::<serde_json::Value>(output.as_deref()?).ok()?;
-            json.get("verdict")?
-                .as_str()?
+        let mut stmt = self.conn.prepare(
+            "SELECT id, output FROM agent_runs WHERE task_id=?1 AND execution_class='review' AND status='completed' AND review_consumed=0 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([task_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, Some(output)) = row? else { continue };
+            let Ok(review) = serde_json::from_str::<crate::automated::ReviewResult>(&output) else {
+                continue;
+            };
+            return Ok(review
+                .verdict
                 .eq_ignore_ascii_case("revise")
-                .then(|| {
-                    (
-                        id,
-                        json.get("revision_feedback")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_owned(),
-                    )
-                })
-        }))
+                .then(|| (id, review.revision_feedback.unwrap_or_default())));
+        }
+        Ok(None)
     }
 
     pub fn link_revision_to_review(

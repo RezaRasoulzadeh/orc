@@ -52,6 +52,16 @@ impl OrcApp {
         Ok(self.db.list_lead_decisions(self.lead().project_id()?)?)
     }
 
+    pub fn resolve_user_decision(
+        &self,
+        id: i64,
+        resolution: &str,
+    ) -> Result<crate::lead::PersistedLeadDecision> {
+        Ok(self
+            .db
+            .resolve_user_decision(self.lead().project_id()?, id, resolution)?)
+    }
+
     pub fn consume_pending_lead_decision(
         &self,
     ) -> Result<Option<crate::lead::PersistedLeadDecision>> {

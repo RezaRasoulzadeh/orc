@@ -306,6 +306,11 @@ enum LeadCommand {
     Pending,
     /// Show all persisted Lead decisions without changing workflow state.
     History,
+    /// Resolve one USER_DECISION_REQUIRED decision without advancing workflow.
+    Resolve {
+        id: i64,
+        resolution: String,
+    },
     /// Apply the pending DIRECT_TASKS decision and create its tasks atomically.
     Apply,
     Consume,
@@ -676,6 +681,12 @@ fn run(cli: Cli) -> Result<()> {
                         .collect::<Result<Vec<_>, _>>()?;
                     println!("{}", serde_json::to_string_pretty(&decisions)?)
                 }
+                LeadCommand::Resolve { id, resolution } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&lead_decision_json(
+                        app.resolve_user_decision(id, &resolution)?
+                    )?)?
+                ),
                 LeadCommand::Apply => println!(
                     "{}",
                     serde_json::to_string_pretty(&app.apply_pending_lead_decision()?)?

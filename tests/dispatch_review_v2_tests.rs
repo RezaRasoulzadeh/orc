@@ -6,7 +6,7 @@ use orc::agent::{
     revise_with_worker_and_db_as_with_runner_with_overrides, revise_with_worker_on_db,
 };
 use orc::app::OrcApp;
-use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker};
+use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker, blocker_id};
 use orc::git;
 use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
 use orc::review;
@@ -40,6 +40,17 @@ struct NoChangeWorker;
 impl Worker for NoChangeWorker {
     fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         Ok((WorkerOutcome::Success, None))
+    }
+}
+
+struct IncrementalRevisionWorker;
+impl Worker for IncrementalRevisionWorker {
+    fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let file = cwd.join("feature.txt");
+        let mut content = std::fs::read_to_string(&file).unwrap_or_default();
+        content.push_str("revision\n");
+        std::fs::write(file, content).map_err(|e| e.to_string())?;
+        Ok((WorkerOutcome::Success, Some("revision output".into())))
     }
 }
 
@@ -878,6 +889,32 @@ fn production_review_output(verdict: &str, blocker_id: Option<&str>) -> String {
     }).to_string()
 }
 
+fn multi_blocker_review_output(verdict: &str, statuses: &[(&str, Option<&str>)]) -> String {
+    let blockers = statuses
+        .iter()
+        .map(|(key, prior)| serde_json::json!({
+            "id": key,
+            "prior_blocker_id": prior,
+            "blocker_key": key,
+            "requirement_ref": format!("REQ-{key}"),
+            "evidence": format!("evidence for {key}"),
+            "severity": "high",
+            "acceptance_condition": format!("accept {key}"),
+            "status": if prior.is_some() { if verdict == "PASS" || *key == "A" { "resolved" } else { "unresolved" } } else { "new" },
+            "finding": format!("finding {key}"),
+        }))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "verdict": verdict,
+        "findings": [],
+        "blocking_findings": if verdict == "PASS" { Vec::<String>::new() } else { statuses.iter().filter(|(_, prior)| prior.is_none() || *prior != Some("resolved")).map(|(key, _)| format!("blocking {key}")).collect() },
+        "non_blocking_findings": [],
+        "severity": "high",
+        "revision_feedback": "resolve the remaining blockers",
+        "blockers": blockers,
+    }).to_string()
+}
+
 fn prior_blocker_review_output(prior_blocker_id: &str) -> String {
     prior_blocker_review_output_with_key(prior_blocker_id, "prior")
 }
@@ -1588,6 +1625,141 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
             .is_none()
     );
     assert_eq!(reopened.revision_contract_history_count(&task).unwrap(), 2);
+}
+
+#[test]
+fn automated_review_resolves_blockers_incrementally_across_revisions() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![AgentAction::Code, AgentAction::Review],
+    ))
+    .unwrap();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let a_id = blocker_id("A");
+    let b_id = blocker_id("B");
+    let backend = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from([
+            multi_blocker_review_output("REVISE", &[("A", None), ("B", None)]),
+            multi_blocker_review_output("REVISE", &[("A", Some(&a_id)), ("B", Some(&b_id))]),
+            multi_blocker_review_output("PASS", &[("B", Some(&b_id))]),
+        ])),
+    };
+    let overrides = ActionOverrides {
+        agent_id: Some("fake".into()),
+        model: None,
+        reasoning_effort: None,
+    };
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    app.automated_review_with_backend(&task, &overrides, &backend)
+        .unwrap();
+    let (_, first_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert!(first_contract.contains(&a_id) && first_contract.contains(&b_id));
+
+    revise_with_worker_on_db(
+        &task,
+        "resolve A",
+        &IncrementalRevisionWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    app.automated_review_with_backend(&task, &overrides, &backend)
+        .unwrap();
+    let (_, second_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&second_contract).unwrap();
+    let unresolved = second["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0]["blocker_id"], b_id);
+    let ledger = db.review_blocker_ledger(&task).unwrap();
+    assert_eq!(
+        ledger.iter().find(|b| b.blocker_id == a_id).unwrap().status,
+        "resolved"
+    );
+    assert_eq!(
+        ledger.iter().find(|b| b.blocker_id == b_id).unwrap().status,
+        "unresolved"
+    );
+    let latest_review = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .filter(|run| run.execution_class == "review")
+        .max_by_key(|run| run.id)
+        .unwrap();
+    assert!(
+        db.review_blocker_observations(latest_review.id)
+            .unwrap()
+            .len()
+            >= 2
+    );
+    drop(app);
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened
+            .review_blocker_ledger(&task)
+            .unwrap()
+            .iter()
+            .find(|b| b.blocker_id == a_id)
+            .unwrap()
+            .status,
+        "resolved"
+    );
+
+    revise_with_worker_on_db(
+        &task,
+        "resolve B",
+        &IncrementalRevisionWorker,
+        &reopened,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    app.automated_review_with_backend(&task, &overrides, &backend)
+        .unwrap();
+    assert!(
+        reopened
+            .actionable_revision_contract(&task)
+            .unwrap()
+            .is_none()
+    );
+    accept_task(&reopened, &task, dir.path()).unwrap();
+    assert_eq!(
+        reopened.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        reopened
+            .review_blocker_ledger(&task)
+            .unwrap()
+            .iter()
+            .find(|b| b.blocker_id == a_id)
+            .unwrap()
+            .status,
+        "resolved"
+    );
+    assert_eq!(
+        reopened
+            .review_blocker_ledger(&task)
+            .unwrap()
+            .iter()
+            .find(|b| b.blocker_id == b_id)
+            .unwrap()
+            .status,
+        "resolved"
+    );
 }
 
 #[test]

@@ -35,6 +35,11 @@ export interface QueueReport {
 export interface AgentDefinition { id: string; backend: string; execution_mode: string; display_name: string; enabled: boolean; priority: number; capabilities: string[]; status: string; unavailable_reason: string | null; profile_path: string | null; model: string | null; reasoning_effort: string | null; config_metadata: string | null; quota_remaining_percent: number | null; quota_reset_at: string | null; quota_checked_at: string | null; quota_source: string | null; quota_limits: unknown | null; actions: AgentActionProfile['action'][] }
 export interface CreateTaskInput { title: string; objective: string; role: string; priority: Task['priority']; required_capabilities: string[]; scope_mode: Task['scope_mode']; context_files: string[]; expected_changes: string[]; dependencies: string[] }
 export interface AgentActionProfile { action: 'code' | 'review' | 'plan' | 'lead'; model: string | null; reasoning_effort: string | null }
+export type OperatorPermission = 'repository_read' | 'repository_write' | 'command_execution' | 'network_access' | string
+export interface AgentAuthentication { verified: boolean; method: string; detail: string | null }
+export interface AgentConfigurationDocument { configuration_version: number; agent: AgentDefinition; permissions: OperatorPermission[]; authentication: AgentAuthentication }
+export interface AgentOnboardingRequest { id: string; backend: string; execution_mode: 'automated' | 'manual'; display_name: string; profile_path: string | null; model: string | null; reasoning_effort: string | null; priority: number; roles: AgentActionProfile['action'][]; permissions: OperatorPermission[]; declared_capabilities: string[] }
+export interface AgentOnboardingResult { preview: { agent: AgentDefinition; provider_capabilities: string[]; permissions: OperatorPermission[]; authentication: AgentAuthentication }; persisted: boolean }
 export interface Dashboard { project_name: string; repository_path: string; queue: QueueReport; tasks: Task[]; agents: AgentDefinition[]; approvals: ApprovalRequest[]; recent_activity: LifecycleEvent[]; running_agents: AgentRun[]; capacity: AgentCapacity; outcome_trends: Record<string, number>; repository_available: boolean }
 export interface AgentCapacity { agents: AgentDefinition[]; busy: string[]; quota_reserve_percent: number }
 export interface ApprovalRequest { id: number; reason: string; resolved: boolean }
@@ -101,6 +106,8 @@ export const api = {
   agents: () => invoke<AgentDefinition[]>('agents'),
   createTask: (input: CreateTaskInput) => invoke<string>('create_task', { input }),
   configureAgentRecord: (agent: unknown) => invoke<void>('configure_agent_record', { agent }),
+  onboardAgent: (request: AgentOnboardingRequest, approve: boolean) => invoke<AgentOnboardingResult>('onboard_agent', { request, approve }),
+  agentConfiguration: (id: string) => invoke<AgentConfigurationDocument>('agent_configuration', { id }),
   archiveAgent: (id: string) => invoke<void>('archive_agent', { id }),
   agentActions: (id: string) => invoke<AgentActionProfile[]>('agent_actions', { id }),
   configureAgentAction: (id: string, action: AgentActionProfile['action'], enabled: boolean) => invoke<void>('configure_agent_action', { id, action, enabled }),

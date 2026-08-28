@@ -52,6 +52,33 @@ fn configure_agent_record(state: tauri::State<'_, AppState>, agent: orc::registr
 }
 
 #[tauri::command]
+fn onboard_agent(
+    state: tauri::State<'_, AppState>,
+    request: orc::agent_onboarding::AgentOnboardingRequest,
+    approve: bool,
+) -> Result<orc::agent_onboarding::AgentOnboardingResult, String> {
+    state
+        .0
+        .active()?
+        .app()?
+        .onboard_agent(&request, approve)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn agent_configuration(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<orc::agent_onboarding::AgentConfigurationDocument, String> {
+    state
+        .0
+        .active()?
+        .app()?
+        .agent_configuration(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn archive_agent(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     state.0.active()?.app()?.remove_agent(&id).map_err(|error| error.to_string())
 }
@@ -1010,6 +1037,8 @@ pub fn run() -> anyhow::Result<()> {
             agents,
             create_task,
             configure_agent_record,
+            onboard_agent,
+            agent_configuration,
             archive_agent,
             agent_actions,
             configure_agent_action,

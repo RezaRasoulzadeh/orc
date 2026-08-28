@@ -4,6 +4,16 @@ use std::process::{Command, Stdio};
 use crate::registry::{Agent, AgentDefinition, AgentExecutionMode, ReasoningEffort};
 use crate::worker::{AntigravityWorker, CodexWorker, CopilotWorker, Worker};
 
+/// Result of provider-owned onboarding inspection. The fields intentionally do
+/// not include Orc roles or operator permissions.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderInspection {
+    pub authenticated: bool,
+    pub authentication_method: String,
+    pub authentication_detail: Option<String>,
+    pub capabilities: Vec<crate::registry::AgentCapability>,
+}
+
 /// Stable boundary between Orc's canonical agent contract and a provider.
 ///
 /// An adapter translates an already validated Orc `Agent` into a worker. It

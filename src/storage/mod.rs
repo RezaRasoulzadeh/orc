@@ -1,3 +1,6 @@
 pub mod db;
 
-pub use db::{AgentRun, AgentRunExecution, Database, DbError, ProjectAgentReference, WorkerResult};
+pub use db::{
+    AgentAuthorization, AgentRun, AgentRunExecution, Database, DbError, ProjectAgentReference,
+    WorkerResult,
+};

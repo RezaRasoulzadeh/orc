@@ -29,6 +29,58 @@ pub enum AgentCommand {
         #[arg(long, value_parser = ["automated", "manual"], default_value = "automated")]
         mode: String,
     },
+    /// Inspect a provider, show its capabilities, and optionally persist it
+    /// after explicit operator approval.
+    Onboard {
+        id: String,
+        #[arg(long)]
+        backend: String,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        #[arg(long)]
+        capability: Vec<String>,
+        #[arg(long, value_parser = parse_agent_action)]
+        #[arg(alias = "action")]
+        role: Vec<registry::AgentAction>,
+        #[arg(long)]
+        permission: Vec<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        effort: Option<registry::ReasoningEffort>,
+        #[arg(long, value_parser = ["automated", "manual"], default_value = "automated")]
+        mode: String,
+        /// Approve the inspected provider capabilities and requested access.
+        #[arg(long)]
+        approve: bool,
+    },
+    Export {
+        id: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    Import {
+        path: String,
+    },
+    Update {
+        id: String,
+        path: String,
+    },
+    Permissions {
+        id: String,
+    },
+    PermissionAdd {
+        id: String,
+        permission: String,
+    },
+    PermissionRemove {
+        id: String,
+        permission: String,
+    },
     Enable {
         id: String,
     },
@@ -163,6 +215,142 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
             };
             app.configure_agent(agent.clone())?;
             println!("Added agent {}", agent.id);
+        }
+        AgentCommand::Onboard {
+            id,
+            backend,
+            priority,
+            capability,
+            role,
+            permission,
+            display_name,
+            profile,
+            model,
+            effort,
+            mode,
+            approve,
+        } => {
+            let execution_mode = registry::AgentExecutionMode::parse(&mode)?;
+            let request = crate::agent_onboarding::AgentOnboardingRequest {
+                display_name: display_name.unwrap_or_else(|| id.clone()),
+                id,
+                backend,
+                execution_mode,
+                profile_path: profile,
+                model,
+                reasoning_effort: effort,
+                priority,
+                roles: if role.is_empty() {
+                    vec![registry::AgentAction::Code]
+                } else {
+                    role
+                },
+                permissions: permission
+                    .iter()
+                    .map(|value| registry::OperatorPermission::parse(value))
+                    .collect(),
+                declared_capabilities: capability,
+            };
+            let result = app.onboard_agent(&request, approve)?;
+            if result.persisted {
+                println!("Onboarded agent {}", result.preview.agent.id);
+            } else {
+                println!("Provider inspection complete; nothing persisted.");
+                println!("Run again with --approve to persist this configuration.");
+            }
+            println!(
+                "Authentication: {} ({})",
+                result.preview.authentication.verified, result.preview.authentication.method
+            );
+            println!(
+                "Provider capabilities: {}",
+                result
+                    .preview
+                    .provider_capabilities
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "Operator permissions: {}",
+                result
+                    .preview
+                    .permissions
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "Orc roles: {}",
+                result
+                    .preview
+                    .agent
+                    .actions
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        AgentCommand::Export { id, output } => {
+            let document = app.agent_configuration(&id)?;
+            let serialized = serde_json::to_string_pretty(&document)?;
+            if let Some(path) = output {
+                std::fs::write(&path, format!("{serialized}\n"))?;
+                println!("Exported agent {id} to {path}");
+            } else {
+                println!("{serialized}");
+            }
+        }
+        AgentCommand::Import { path } => {
+            let document = read_configuration(&path)?;
+            let id = document.agent.id.clone();
+            app.import_agent_configuration(&document)?;
+            println!("Imported agent configuration {id}");
+        }
+        AgentCommand::Update { id, path } => {
+            let document = read_configuration(&path)?;
+            if document.agent.id != id {
+                anyhow::bail!(
+                    "configuration agent id '{}' does not match '{}'",
+                    document.agent.id,
+                    id
+                );
+            }
+            if db.get_global_agent(&id)?.is_none() {
+                anyhow::bail!("agent '{}' is not registered", id);
+            }
+            app.import_agent_configuration(&document)?;
+            println!("Updated agent configuration {id}");
+        }
+        AgentCommand::Permissions { id } => {
+            let permissions = app.agent_permissions(&id)?;
+            println!(
+                "{}",
+                permissions
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        AgentCommand::PermissionAdd { id, permission } => {
+            let permission = registry::OperatorPermission::parse(&permission);
+            app.add_agent_permission(&id, permission.clone())?;
+            println!("Granted {} to agent {}", permission.as_str(), id);
+        }
+        AgentCommand::PermissionRemove { id, permission } => {
+            let permission = registry::OperatorPermission::parse(&permission);
+            if !app.remove_agent_permission(&id, &permission)? {
+                anyhow::bail!(
+                    "agent '{}' does not have operator permission '{}'",
+                    id,
+                    permission.as_str()
+                );
+            }
+            println!("Revoked {} from agent {}", permission.as_str(), id);
         }
         AgentCommand::Enable { id } => {
             ensure_agent_updated(app.set_agent_enabled(&id, true)?, &id)?
@@ -353,9 +541,45 @@ fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
 }
 fn print_agents(db: &Database) -> Result<()> {
     for a in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
-        println!("{}\t{}", a.id, a.status);
+        let permissions = db
+            .agent_permissions(&a.id)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let auth = db
+            .agent_authorization(&a.id)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .is_some_and(|value| value.authenticated);
+        println!(
+            "{}\t{}\tprovider={}\troles={}\tcapabilities={}\tpermissions={}\tauthenticated={}",
+            a.id,
+            a.status,
+            a.backend,
+            a.actions
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            a.capabilities.join(","),
+            permissions.join(","),
+            auth
+        );
     }
     Ok(())
+}
+
+fn read_configuration(path: &str) -> Result<crate::agent_onboarding::AgentConfigurationDocument> {
+    let contents = if path == "-" {
+        use std::io::Read;
+        let mut contents = String::new();
+        std::io::stdin().read_to_string(&mut contents)?;
+        contents
+    } else {
+        std::fs::read_to_string(path)?
+    };
+    serde_json::from_str(&contents)
+        .map_err(|error| anyhow::anyhow!("invalid agent configuration: {error}"))
 }
 fn print_synced_quota(id: &str, snapshot: &codex_app_server::QuotaSnapshot) {
     println!("{}:\n  remaining: {}%", id, snapshot.remaining_percent);

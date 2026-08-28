@@ -1269,12 +1269,28 @@ fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
 
 fn print_agents(db: &Database) -> Result<()> {
     println!(
-        "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} RESET",
-        "ID", "BACKEND", "MODE", "STATUS", "PRIORITY", "QUOTA"
+        "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} {:<20} {:<16} {:<20} {:<20} AUTH",
+        "ID",
+        "BACKEND",
+        "MODE",
+        "STATUS",
+        "PRIORITY",
+        "QUOTA",
+        "RESET",
+        "ROLES",
+        "CAPABILITIES",
+        "PERMISSIONS"
     );
     for agent in db.list_agents().map_err(|e| anyhow::anyhow!(e))? {
+        let permissions = db
+            .agent_permissions(&agent.id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let authenticated = db
+            .agent_authorization(&agent.id)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .is_some_and(|value| value.authenticated);
         println!(
-            "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} {}",
+            "{:<18} {:<9} {:<10} {:<12} {:<10} {:<7} {:<20} {:<16} {:<20} {:<20} {}",
             agent.id,
             agent.backend,
             agent.execution_mode,
@@ -1292,7 +1308,20 @@ fn print_agents(db: &Database) -> Result<()> {
                 .quota_reset_at
                 .as_deref()
                 .map(orc::format::timestamp)
-                .unwrap_or_else(|| "-".into())
+                .unwrap_or_else(|| "-".into()),
+            agent
+                .actions
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            agent.capabilities.join(","),
+            permissions
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            authenticated
         );
     }
     Ok(())

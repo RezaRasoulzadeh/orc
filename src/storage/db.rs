@@ -339,6 +339,15 @@ pub struct AgentRun {
     pub resolved_profile: Option<String>,
 }
 
+/// Provider authentication evidence and operator-granted permissions are
+/// stored separately from provider capabilities in `agents`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentAuthorization {
+    pub authenticated: bool,
+    pub authentication_method: String,
+    pub authentication_detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AgentRunExecution<'a> {
     pub class: &'a str,
@@ -1094,6 +1103,14 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 PRIMARY KEY (project_id, agent_id)
             );
+            CREATE TABLE IF NOT EXISTS agent_authorizations (
+                agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                permissions TEXT NOT NULL DEFAULT '[]',
+                authenticated INTEGER NOT NULL DEFAULT 0,
+                authentication_method TEXT NOT NULL DEFAULT 'unknown',
+                authentication_detail TEXT,
+                verified_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -1218,6 +1235,7 @@ impl Database {
         Self::ensure_project_agent_references_table(&conn)?;
         Self::ensure_execution_templates_table(&conn)?;
         Self::ensure_agent_actions_table(&conn)?;
+        Self::ensure_agent_authorizations_table(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_execution_reservations_table(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
@@ -1276,6 +1294,7 @@ impl Database {
         Self::ensure_project_agent_references_table(conn)?;
         Self::ensure_execution_templates_table(conn)?;
         Self::ensure_agent_actions_table(conn)?;
+        Self::ensure_agent_authorizations_table(conn)?;
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_execution_reservations_table(conn)?;
         Self::ensure_worker_results_table(conn)?;
@@ -1409,6 +1428,24 @@ impl Database {
 
     fn ensure_agent_actions_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_action_profiles (agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE, action TEXT NOT NULL, model TEXT, reasoning_effort TEXT, PRIMARY KEY(agent_id, action))")?;
+        Ok(())
+    }
+
+    fn ensure_agent_authorizations_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_authorizations (
+                agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                permissions TEXT NOT NULL DEFAULT '[]',
+                authenticated INTEGER NOT NULL DEFAULT 0,
+                authentication_method TEXT NOT NULL DEFAULT 'unknown',
+                authentication_detail TEXT,
+                verified_at TEXT
+            )",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_authorizations (agent_id) SELECT id FROM agents",
+            [],
+        )?;
         Ok(())
     }
 
@@ -2969,6 +3006,10 @@ impl Database {
                 agent.reasoning_effort,
             )?;
         }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO agent_authorizations (agent_id) VALUES (?1)",
+            [&agent.id],
+        )?;
         Ok(())
     }
 
@@ -2992,6 +3033,128 @@ impl Database {
             rusqlite::params![agent.model_version, agent.scope, agent.id],
         )?;
         Ok(())
+    }
+
+    /// Atomically replace the globally owned agent configuration, its Orc role
+    /// assignments, and its operator authorization evidence.
+    pub fn upsert_global_agent_configuration(
+        &self,
+        agent: &crate::registry::Agent,
+        permissions: &[crate::registry::OperatorPermission],
+        authorization: &AgentAuthorization,
+    ) -> Result<(), DbError> {
+        if agent.model_version != crate::registry::AGENT_MODEL_VERSION {
+            return Err(DbError::Scheduler(format!(
+                "unsupported agent model version {}",
+                agent.model_version
+            )));
+        }
+        if !agent.is_global() {
+            return Err(DbError::Scheduler(
+                "only globally owned agents can be registered".into(),
+            ));
+        }
+        let definition = agent.to_definition();
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO agents (id, model_version, scope, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             ON CONFLICT(id) DO UPDATE SET model_version=excluded.model_version, scope=excluded.scope, backend=excluded.backend, display_name=excluded.display_name, enabled=excluded.enabled, priority=excluded.priority, capabilities=excluded.capabilities, status=excluded.status, unavailable_reason=excluded.unavailable_reason, profile_path=excluded.profile_path, model=excluded.model, reasoning_effort=excluded.reasoning_effort, config_metadata=excluded.config_metadata, execution_mode=excluded.execution_mode, quota_remaining_percent=excluded.quota_remaining_percent, quota_reset_at=excluded.quota_reset_at, quota_checked_at=excluded.quota_checked_at, quota_source=excluded.quota_source, quota_limits=excluded.quota_limits",
+            params![
+                definition.id,
+                agent.model_version,
+                agent.scope,
+                definition.backend,
+                definition.display_name,
+                definition.enabled,
+                definition.priority,
+                serde_json::to_string(&definition.capabilities)?,
+                definition.status,
+                definition.unavailable_reason,
+                definition.profile_path,
+                definition.model,
+                definition.reasoning_effort.map(ReasoningEffort::as_str),
+                definition.config_metadata,
+                definition.execution_mode,
+                definition.quota_remaining_percent,
+                definition.quota_reset_at,
+                definition.quota_checked_at,
+                definition.quota_source,
+                definition.quota_limits.as_ref().map(serde_json::to_string).transpose()?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_action_profiles WHERE agent_id = ?1",
+            [&definition.id],
+        )?;
+        for action in &definition.actions {
+            transaction.execute(
+                "INSERT INTO agent_action_profiles(agent_id, action, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4)",
+                params![definition.id, action.as_str(), definition.model, definition.reasoning_effort.map(ReasoningEffort::as_str)],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO agent_authorizations (agent_id, permissions, authenticated, authentication_method, authentication_detail, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+             ON CONFLICT(agent_id) DO UPDATE SET permissions=excluded.permissions, authenticated=excluded.authenticated, authentication_method=excluded.authentication_method, authentication_detail=excluded.authentication_detail, verified_at=excluded.verified_at",
+            params![
+                definition.id,
+                serde_json::to_string(permissions)?,
+                authorization.authenticated,
+                authorization.authentication_method,
+                authorization.authentication_detail,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn agent_authorization(&self, id: &str) -> Result<Option<AgentAuthorization>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT authenticated, authentication_method, authentication_detail FROM agent_authorizations WHERE agent_id = ?1",
+                [id],
+                |row| {
+                    Ok(AgentAuthorization {
+                        authenticated: row.get::<_, i64>(0)? != 0,
+                        authentication_method: row.get(1)?,
+                        authentication_detail: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn agent_permissions(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::registry::OperatorPermission>, DbError> {
+        let permissions: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT permissions FROM agent_authorizations WHERE agent_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        permissions
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+            .map_err(DbError::from)
+    }
+
+    pub fn set_agent_permissions(
+        &self,
+        id: &str,
+        permissions: &[crate::registry::OperatorPermission],
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE agent_authorizations SET permissions = ?1 WHERE agent_id = ?2",
+            params![serde_json::to_string(permissions)?, id],
+        )?;
+        Ok(changed != 0)
     }
 
     pub fn get_global_agent(&self, id: &str) -> Result<Option<crate::registry::Agent>, DbError> {

@@ -27,7 +27,9 @@ fn proposal(local_id: &str, depends_on: Vec<&str>) -> TaskProposal {
             class: Some("focused".into()),
             model: Some("m".into()),
             effort: Some("high".into()),
+            effort_reason: Some("cross-module integration".into()),
         },
+        risk_factors: vec![orc::protocol::TaskRiskFactor::SchemaDataFlow],
     }
 }
 

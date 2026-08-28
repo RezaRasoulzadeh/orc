@@ -33,6 +33,12 @@ pub struct Task {
     pub context_files: Vec<String>,
     #[serde(default)]
     pub expected_changes: Vec<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::registry::ReasoningEffort>,
+    #[serde(default)]
+    pub effort_reason: Option<String>,
+    #[serde(default)]
+    pub risk_factors: Vec<crate::protocol::TaskRiskFactor>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +150,9 @@ mod tests {
             scope_mode: None,
             context_files: Vec::new(),
             expected_changes: Vec::new(),
+            reasoning_effort: None,
+            effort_reason: None,
+            risk_factors: Vec::new(),
         }
     }
 

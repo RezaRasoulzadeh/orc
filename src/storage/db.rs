@@ -36,6 +36,14 @@ pub struct PlanHistoryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskExecutionCondition {
+    pub task_id: String,
+    pub kind: String,
+    pub details: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanReview {
     pub id: i64,
     pub plan_id: i64,
@@ -932,8 +940,7 @@ impl Database {
             let mut mapping = std::collections::BTreeMap::new();
             for task in &response.tasks {
                 let id = self.allocate_task_id()?;
-                let priority = priority_string(task.priority);
-                self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10)", params![id, project_id, task.title, task.objective, task.role, priority, serde_json::to_string(&task.capabilities)?, task.scope_mode.map(|v| v.to_string()), serde_json::to_string(&task.context_files)?, serde_json::to_string(&task.expected_changes)?])?;
+                self.insert_task_from_proposal(project_id, &id, task)?;
                 mapping.insert(task.local_id.clone(), id);
             }
             for task in &response.tasks {
@@ -950,6 +957,41 @@ impl Database {
             Ok(mapping) => Ok(mapping),
             Err(error) => Err(error),
         }
+    }
+
+    fn insert_task_from_proposal(
+        &self,
+        project_id: i64,
+        id: &str,
+        task: &crate::protocol::TaskProposal,
+    ) -> Result<(), DbError> {
+        let effort =
+            task.execution_hints.effort.as_deref().ok_or_else(|| {
+                DbError::Scheduler("task proposal has no execution effort".into())
+            })?;
+        self.conn.execute(
+            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id,
+                project_id,
+                task.title,
+                task.objective,
+                task.role,
+                priority_string(task.priority),
+                serde_json::to_string(&task.capabilities)?,
+                task.scope_mode.map(|value| value.to_string()),
+                serde_json::to_string(&task.context_files)?,
+                serde_json::to_string(&task.expected_changes)?,
+                effort,
+                task.execution_hints.effort_reason,
+                serde_json::to_string(&task.risk_factors)?,
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1, ?2)",
+            params![id, serde_json::to_string(task)?],
+        )?;
+        Ok(())
     }
     pub fn apply_approved_plan(
         &self,
@@ -1043,6 +1085,9 @@ impl Database {
                 scope_mode TEXT,
                 context_files TEXT,
                 expected_changes TEXT,
+                reasoning_effort TEXT,
+                effort_reason TEXT,
+                risk_factors TEXT,
                 cancellation_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
@@ -1055,6 +1100,12 @@ impl Database {
             CREATE TABLE IF NOT EXISTS task_proposal_metadata (
                 task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
                 proposal TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_execution_conditions (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY,
@@ -1154,6 +1205,7 @@ impl Database {
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_plan_tables(&conn)?;
         Self::ensure_task_columns(&conn)?;
+        Self::ensure_task_execution_conditions_table(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
         let db = Self {
             conn,
@@ -1207,6 +1259,7 @@ impl Database {
         Self::ensure_review_blockers_table(conn)?;
         Self::ensure_revision_contracts_table(conn)?;
         Self::ensure_task_columns(conn)?;
+        Self::ensure_task_execution_conditions_table(conn)?;
         Self::ensure_approval_request_columns(conn)?;
         Ok(())
     }
@@ -1609,12 +1662,27 @@ impl Database {
             ("scope_mode", "TEXT"),
             ("context_files", "TEXT"),
             ("expected_changes", "TEXT"),
+            ("reasoning_effort", "TEXT"),
+            ("effort_reason", "TEXT"),
+            ("risk_factors", "TEXT"),
             ("cancellation_reason", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {definition}"))?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_task_execution_conditions_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_execution_conditions (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )?;
         Ok(())
     }
 
@@ -2426,11 +2494,7 @@ impl Database {
             let mut mapping = std::collections::BTreeMap::new();
             for task in &response.tasks {
                 let id = self.allocate_task_id()?;
-                self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1,?2,?3,?4,?5,?6,'backlog',?7,?8,?9,?10)", params![id, project_id, task.title, task.objective, task.role, priority_string(task.priority), serde_json::to_string(&task.capabilities)?, task.scope_mode.map(|v| v.to_string()), serde_json::to_string(&task.context_files)?, serde_json::to_string(&task.expected_changes)?])?;
-                self.conn.execute(
-                    "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1,?2)",
-                    params![id, serde_json::to_string(task)?],
-                )?;
+                self.insert_task_from_proposal(project_id, &id, task)?;
                 mapping.insert(task.local_id.clone(), id);
             }
             for task in &response.tasks {
@@ -3033,6 +3097,12 @@ impl Database {
                 None => Ok(Vec::new()),
             }
         };
+        let reasoning_effort = match row.get::<_, Option<String>>(11)? {
+            Some(value) => Some(ReasoningEffort::parse(&value).map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!("invalid task effort: {error}"))
+            })?),
+            None => None,
+        };
         Ok(Task {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -3045,12 +3115,20 @@ impl Database {
             scope_mode,
             context_files: list(8)?,
             expected_changes: list(9)?,
+            reasoning_effort,
+            effort_reason: row.get(12)?,
+            risk_factors: match row.get::<_, Option<String>>(13)? {
+                Some(value) => serde_json::from_str(&value).map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!("invalid task risks: {error}"))
+                })?,
+                None => Vec::new(),
+            },
         })
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -3059,7 +3137,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: i64) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks WHERE project_id = ?1 ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE project_id = ?1 ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map(params![project_id], Self::task_from_row)?
@@ -3114,7 +3192,91 @@ impl Database {
         if changed != 1 {
             return Err(DbError::TaskNotFound(task_id.to_owned()));
         }
+        let effort =
+            proposal.execution_hints.effort.as_deref().ok_or_else(|| {
+                DbError::Scheduler("task proposal has no execution effort".into())
+            })?;
+        self.conn.execute(
+            "UPDATE tasks SET reasoning_effort = ?1, effort_reason = ?2, risk_factors = ?3 WHERE id = ?4",
+            params![
+                effort,
+                proposal.execution_hints.effort_reason,
+                serde_json::to_string(&proposal.risk_factors)?,
+                task_id
+            ],
+        )?;
         Ok(())
+    }
+
+    pub fn get_task_execution_condition(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskExecutionCondition>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT task_id, kind, details, created_at FROM task_execution_conditions WHERE task_id = ?1",
+                [task_id],
+                |row| {
+                    Ok(TaskExecutionCondition {
+                        task_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        details: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_task_execution_condition(
+        &self,
+        task_id: &str,
+        kind: &str,
+        details: &str,
+    ) -> Result<(), DbError> {
+        if self.get_task(task_id)?.is_none() {
+            return Err(DbError::TaskNotFound(task_id.to_owned()));
+        }
+        self.conn.execute(
+            "INSERT INTO task_execution_conditions (task_id, kind, details) VALUES (?1, ?2, ?3) ON CONFLICT(task_id) DO UPDATE SET kind = excluded.kind, details = excluded.details",
+            params![task_id, kind, details],
+        )?;
+        Ok(())
+    }
+
+    pub fn completed_revision_effort_for_blocker(
+        &self,
+        task_id: &str,
+        review_run_id: i64,
+        blocker_id: &str,
+    ) -> Result<Option<ReasoningEffort>, DbError> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT revision.resolved_reasoning_effort
+                 FROM agent_runs revision
+                 JOIN review_blocker_observations prior
+                   ON prior.run_id = revision.source_review_run_id
+                  AND prior.blocker_id = ?3
+                 JOIN review_blocker_observations current
+                   ON current.run_id = ?2
+                  AND current.blocker_id = ?3
+                 WHERE revision.task_id = ?1
+                   AND revision.source_review_run_id IS NOT NULL
+                   AND revision.status = 'completed'
+                 ORDER BY revision.id DESC LIMIT 1",
+                params![task_id, review_run_id, blocker_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                ReasoningEffort::parse(&value).map_err(|error| {
+                    DbError::Scheduler(format!("invalid persisted revision effort: {error}"))
+                })
+            })
+            .transpose()
     }
 
     #[allow(dead_code)]
@@ -3294,7 +3456,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason FROM tasks WHERE id = ?1",
+                    "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE id = ?1",
                 params![id],
                 Self::task_from_row,
             )

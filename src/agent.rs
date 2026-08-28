@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -310,6 +310,84 @@ fn run_validation_with_retries(
     reports
 }
 
+fn task_contract_effort(
+    db: &Database,
+    task: &crate::task::Task,
+) -> Result<Option<ReasoningEffort>> {
+    if let Some(proposal) = db.get_task_proposal_metadata(&task.id)? {
+        let value = proposal
+            .execution_hints
+            .effort
+            .as_deref()
+            .context("persisted task proposal has no execution effort")?;
+        let effort = ReasoningEffort::parse(value)?;
+        if effort == ReasoningEffort::None {
+            bail!("persisted task proposal has invalid execution effort '{value}'")
+        }
+        return Ok(Some(effort));
+    }
+    Ok(task.reasoning_effort)
+}
+
+fn apply_task_effort(
+    mut resolution: crate::execution::ExecutionResolution,
+    task_effort: Option<ReasoningEffort>,
+) -> crate::execution::ExecutionResolution {
+    if let Some(effort) = task_effort {
+        resolution.reasoning_effort = Some(effort);
+        resolution.source = "task-contract".into();
+    }
+    resolution
+}
+
+fn effective_revision_effort(
+    db: &Database,
+    task: &crate::task::Task,
+    source_review_id: i64,
+    explicit_override: Option<ReasoningEffort>,
+) -> Result<ReasoningEffort> {
+    let base = task_contract_effort(db, task)?.unwrap_or(ReasoningEffort::Low);
+    if let Some(explicit) = explicit_override {
+        return Ok(explicit);
+    }
+    let blockers = db
+        .review_blocker_observations(source_review_id)?
+        .into_iter()
+        .filter(|blocker| blocker.status != "resolved")
+        .collect::<Vec<_>>();
+    let mut effective = base;
+    for blocker in blockers {
+        if let Some(previous) = db.completed_revision_effort_for_blocker(
+            &task.id,
+            source_review_id,
+            &blocker.blocker_id,
+        )? {
+            if previous == ReasoningEffort::High {
+                let details = serde_json::json!({
+                    "blocker_id": blocker.blocker_id,
+                    "source_review_id": source_review_id,
+                    "previous_effort": previous.as_str(),
+                    "condition": "same substantive blocker survived a completed high-effort revision"
+                });
+                db.set_task_execution_condition(
+                    &task.id,
+                    "non_convergence_replan_required",
+                    &details.to_string(),
+                )?;
+                bail!(
+                    "REPLAN_REQUIRED: task '{}' has a blocker that survived a completed high-effort revision",
+                    task.id
+                );
+            }
+            let escalated = previous.next();
+            if escalated.rank() > effective.rank() {
+                effective = escalated;
+            }
+        }
+    }
+    Ok(effective)
+}
+
 fn validation_diagnostics(report: &ValidationReport) -> String {
     report
         .steps
@@ -413,8 +491,23 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         None => String::new(),
     };
     let objective = format!("{}{}", task.objective, guidance);
+    let execution_contract = task
+        .reasoning_effort
+        .map(|effort| {
+            format!(
+                "\n\n## Execution contract\n\nReasoning effort: {}\nEffort reason: {}\nRisk factors: {}\n",
+                effort.as_str(),
+                task.effort_reason.as_deref().unwrap_or("not recorded"),
+                if task.risk_factors.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{:?}", task.risk_factors)
+                }
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run any relevant checks and tests (e.g., cargo test) and fix failures you encounter. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
+        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run any relevant checks and tests (e.g., cargo test) and fix failures you encounter. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         contract = contract,
         project = project,
@@ -422,6 +515,7 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         title = task.title,
         objective = objective,
         role = task.role,
+        execution_contract = execution_contract,
     )
 }
 
@@ -449,13 +543,29 @@ pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id:
         None => String::new(),
     };
     let objective = format!("{}{}", task.objective, guidance);
+    let execution_contract = task
+        .reasoning_effort
+        .map(|effort| {
+            format!(
+                "\n\n## Execution contract\n\nReasoning effort: {}\nEffort reason: {}\nRisk factors: {}\n",
+                effort.as_str(),
+                task.effort_reason.as_deref().unwrap_or("not recorded"),
+                if task.risk_factors.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{:?}", task.risk_factors)
+                }
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}\n\n## Constraints\n\nStay strictly inside this task's scope. Do not modify unrelated project work or assume access to credentials, private memory, or external systems.\n\n## Required validation\n\nDescribe the checks and tests you performed. If you could not run a check, say why.\n\n## Required response / handoff format\n\nSummarize changes or recommendations, list files affected (if any), report validation results, and identify follow-up risks or questions.\n",
+        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\n## Constraints\n\nStay strictly inside this task's scope. Do not modify unrelated project work or assume access to credentials, private memory, or external systems.\n\n## Required validation\n\nDescribe the checks and tests you performed. If you could not run a check, say why.\n\n## Required response / handoff format\n\nSummarize changes or recommendations, list files affected (if any), report validation results, and identify follow-up risks or questions.\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         id = task.id,
         title = task.title,
         objective = objective,
-        role = task.role
+        role = task.role,
+        execution_contract = execution_contract
     )
 }
 
@@ -590,7 +700,14 @@ pub fn dispatch_with_worker_on_db_cancellable(
         required_tests: vec!["configured validation pipeline".into()],
         validation: vec!["configured validation evidence".into()],
         execution_hints: Default::default(),
+        risk_factors: vec![],
     });
+    if enforce_worker_protocol {
+        proposal
+            .validate()
+            .context("persisted task contract is invalid")?;
+    }
+    let proposal_effort = task_contract_effort(db, &task)?.unwrap_or(ReasoningEffort::Low);
     let plan = crate::worker_protocol::WorkerPlan {
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
         read_only_snapshot: serde_json::to_string(&snapshot)
@@ -617,7 +734,18 @@ pub fn dispatch_with_worker_on_db_cancellable(
 
     // Create an agent run
     let run_id = db
-        .create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)
+        .create_agent_run_with_execution(
+            project_id,
+            task_id,
+            agent_id,
+            registry::AUTOMATED,
+            crate::storage::AgentRunExecution {
+                class: "general",
+                model: None,
+                effort: Some(proposal_effort),
+                source: "task-contract",
+            },
+        )
         .with_context(|| "failed to create agent run")?;
     let _run_finalizer = db.run_finalizer(run_id);
     db.store_worker_prepare(run_id, &plan)
@@ -1127,7 +1255,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         backend: "unknown".to_owned(),
                         profile: None,
                         model: None,
-                        reasoning_effort: None,
+                        reasoning_effort: Some(proposal_effort),
                         worktree_path: worktree_path.display().to_string(),
                         run_id,
                         run_status: "completed".to_owned(),
@@ -1226,6 +1354,12 @@ where
         .into_iter()
         .find(|candidate| candidate.id == agent_id)
         .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
+    let source_review_id = db
+        .actionable_revision_review(task_id)?
+        .map(|(id, _)| id)
+        .context("task has no actionable revision review")?;
+    let revision_effort =
+        effective_revision_effort(&db, &task, source_review_id, overrides.effort)?;
     let resolution = crate::execution::resolve_with_template(
         &task.role,
         &db.execution_template(crate::execution::class_for_role(&task.role))?,
@@ -1234,6 +1368,11 @@ where
         overrides.model.clone(),
         overrides.effort,
     );
+    let resolution = if overrides.effort.is_some() {
+        resolution
+    } else {
+        apply_task_effort(resolution, Some(revision_effort))
+    };
     let worker = factory(
         &agent,
         resolution.model.clone(),
@@ -1334,6 +1473,16 @@ pub fn revise_with_worker_on_db_with_overrides(
             task_id
         );
     };
+    if overrides.effort.is_none()
+        && let Some(condition) = db.get_task_execution_condition(task_id)?
+    {
+        bail!(
+            "{}: task '{}' cannot enter another ordinary revision ({})",
+            condition.kind,
+            task_id,
+            condition.details
+        );
+    }
     let (source_review_id, contract_id, revision_contract) =
         if let Some((source, json, id)) = db.actionable_revision_contract(task_id)? {
             (
@@ -1362,6 +1511,7 @@ pub fn revise_with_worker_on_db_with_overrides(
     }
     let revision_snapshot = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect revision worktree during Worker PREPARE")?;
+    let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
     let persisted_proposal = db.get_task_proposal_metadata(task_id)?;
     let enforce_worker_protocol = persisted_proposal.is_some();
     let proposal = persisted_proposal.unwrap_or_else(|| crate::protocol::TaskProposal {
@@ -1380,6 +1530,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         required_tests: vec!["configured validation pipeline".into()],
         validation: vec!["configured validation evidence".into()],
         execution_hints: Default::default(),
+        risk_factors: vec![],
     });
     let mut revision_requirements = proposal.acceptance_criteria.clone();
     revision_requirements.extend(
@@ -1432,6 +1583,11 @@ pub fn revise_with_worker_on_db_with_overrides(
         overrides.model.clone(),
         overrides.effort,
     );
+    let resolution = if overrides.effort.is_some() {
+        resolution
+    } else {
+        apply_task_effort(resolution, Some(revision_effort))
+    };
     let run_id = db.create_agent_run_with_execution(
         project_id,
         task_id,
@@ -1469,8 +1625,9 @@ pub fn revise_with_worker_on_db_with_overrides(
     };
     progress("revision/worker starting");
     let prompt = format!(
-        "{}\n\n{}\n\n## Review feedback (compatibility context)\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
+        "{}\n\n## Selected revision effort\n\nReasoning effort: {}\n\n{}\n\n## Review feedback (compatibility context)\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
         build_worker_prompt(&contract, &project_name, &task),
+        revision_effort.as_str(),
         crate::automated::format_revision_contract(&revision_contract),
         feedback
     );
@@ -1892,6 +2049,8 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     let task = db
         .get_task(task_id)?
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
+    let task_effort = task_contract_effort(db, &task)?;
+    let explicit_effort = effort_override.is_some();
     let agent = if let Some(agent_id) = requested_agent {
         let agent = registry::get_agent(db, agent_id)?;
         let busy_agents = db.list_busy_agents()?.into_iter().collect();
@@ -1964,6 +2123,11 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
         model_override,
         effort_override,
     );
+    let resolution = if explicit_effort {
+        resolution
+    } else {
+        apply_task_effort(resolution, task_effort)
+    };
     let model = resolution.model.clone();
     let reasoning_effort = resolution.reasoning_effort;
     let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
@@ -2471,6 +2635,87 @@ mod tests {
         .unwrap();
         db.insert_agent(&manual_agent()).unwrap();
         (dir, db, "T-0001".into())
+    }
+
+    #[test]
+    fn revision_effort_escalates_once_per_surviving_blocker_and_stops_at_high() {
+        let (_dir, db, task) = setup();
+        let project = db.get_project_id().unwrap().unwrap();
+        let blocker = || crate::automated::ReviewBlocker {
+            id: "BLK-repeat".into(),
+            prior_blocker_id: None,
+            blocker_key: "repeatable blocker".into(),
+            requirement_ref: "acceptance".into(),
+            evidence: "still failing".into(),
+            severity: "high".into(),
+            acceptance_condition: "passes".into(),
+            status: "unresolved".into(),
+            finding: "same substantive issue".into(),
+        };
+        let review = |db: &Database| {
+            let run = db
+                .create_agent_run_with_execution(
+                    project,
+                    &task,
+                    "reviewer",
+                    registry::AUTOMATED,
+                    crate::storage::AgentRunExecution {
+                        class: "review",
+                        model: None,
+                        effort: None,
+                        source: "test",
+                    },
+                )
+                .unwrap();
+            db.store_review_blockers(&task, run, &[blocker()]).unwrap();
+            db.update_agent_run_status(run, "completed", Some("review"))
+                .unwrap();
+            run
+        };
+        let revision = |db: &Database, source_review: i64, effort: ReasoningEffort| {
+            let run = db
+                .create_agent_run_with_execution(
+                    project,
+                    &task,
+                    "coder",
+                    registry::AUTOMATED,
+                    crate::storage::AgentRunExecution {
+                        class: "coder",
+                        model: None,
+                        effort: Some(effort),
+                        source: "test",
+                    },
+                )
+                .unwrap();
+            assert!(db.start_revision_execution(run, source_review).unwrap());
+            db.update_agent_run_status(run, "completed", Some("revision"))
+                .unwrap();
+        };
+        let effort = |review_id| {
+            effective_revision_effort(&db, &db.get_task(&task).unwrap().unwrap(), review_id, None)
+                .unwrap()
+        };
+
+        let first_review = review(&db);
+        assert_eq!(effort(first_review), ReasoningEffort::Low);
+        revision(&db, first_review, ReasoningEffort::Low);
+        let second_review = review(&db);
+        assert_eq!(effort(second_review), ReasoningEffort::Medium);
+        revision(&db, second_review, ReasoningEffort::Medium);
+        let third_review = review(&db);
+        assert_eq!(effort(third_review), ReasoningEffort::High);
+        revision(&db, third_review, ReasoningEffort::High);
+        let fourth_review = review(&db);
+        let error = effective_revision_effort(
+            &db,
+            &db.get_task(&task).unwrap().unwrap(),
+            fourth_review,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("REPLAN_REQUIRED"));
+        let condition = db.get_task_execution_condition(&task).unwrap().unwrap();
+        assert_eq!(condition.kind, "non_convergence_replan_required");
     }
 
     #[test]

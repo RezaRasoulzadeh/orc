@@ -89,8 +89,10 @@ fn proposal(local_id: &str, depends_on: Vec<&str>) -> PlannedTask {
         execution_hints: ExecutionHints {
             class: Some("code".into()),
             model: None,
-            effort: None,
+            effort: Some("low".into()),
+            effort_reason: Some("isolated and well understood".into()),
         },
+        risk_factors: vec![],
     }
 }
 
@@ -988,6 +990,7 @@ fn app_plan_uses_database_validation() {
             required_tests: vec!["production path test".into()],
             validation: vec!["cargo test".into()],
             execution_hints: Default::default(),
+            risk_factors: vec![],
         }],
         assumptions: vec![],
         risks: vec![],

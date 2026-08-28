@@ -141,6 +141,7 @@ impl PlanResponseSchema {
                 "required_tests",
                 "validation",
                 "execution_hints",
+                "risk_factors",
                 "depends_on",
             ]
             .into_iter()
@@ -177,12 +178,14 @@ pub struct TaskProposal {
     pub required_tests: Vec<String>,
     pub validation: Vec<String>,
     pub execution_hints: ExecutionHints,
+    #[serde(default)]
+    pub risk_factors: Vec<TaskRiskFactor>,
 }
 
 /// Compatibility name for callers of the v1 planning API.
 pub type PlannedTask = TaskProposal;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionHints {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
@@ -190,6 +193,44 @@ pub struct ExecutionHints {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reason: Option<String>,
+}
+
+impl Default for ExecutionHints {
+    fn default() -> Self {
+        Self {
+            class: None,
+            model: None,
+            effort: Some("low".into()),
+            effort_reason: Some("isolated and well understood".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRiskFactor {
+    StateMachineLifecycle,
+    Persistence,
+    RestartRecovery,
+    Concurrency,
+    CrossRoleProtocol,
+    SchemaDataFlow,
+    Verification,
+}
+
+impl TaskRiskFactor {
+    pub const fn minimum_effort(self) -> crate::registry::ReasoningEffort {
+        match self {
+            Self::StateMachineLifecycle
+            | Self::Persistence
+            | Self::RestartRecovery
+            | Self::Concurrency
+            | Self::CrossRoleProtocol => crate::registry::ReasoningEffort::High,
+            Self::SchemaDataFlow | Self::Verification => crate::registry::ReasoningEffort::Medium,
+        }
+    }
 }
 
 impl TaskProposal {
@@ -240,6 +281,63 @@ impl TaskProposal {
                 "task proposal '{}' is not independently reviewable: acceptance_criteria may contain at most {} items",
                 self.local_id,
                 Self::MAX_ACCEPTANCE_CRITERIA
+            )
+        }
+        let effort = self
+            .execution_hints
+            .effort
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task proposal '{}' requires execution_hints.effort",
+                    self.local_id
+                )
+            })
+            .and_then(crate::registry::ReasoningEffort::parse)?;
+        if effort == crate::registry::ReasoningEffort::None {
+            anyhow::bail!(
+                "task proposal '{}' effort must be low, medium, or high",
+                self.local_id
+            )
+        }
+        let effort_reason = self
+            .execution_hints
+            .effort_reason
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task proposal '{}' requires execution_hints.effort_reason",
+                    self.local_id
+                )
+            })?;
+        if effort_reason.trim().is_empty() || effort_reason.chars().count() > 240 {
+            anyhow::bail!(
+                "task proposal '{}' effort_reason must be concise and non-empty",
+                self.local_id
+            )
+        }
+        let minimum = self
+            .risk_factors
+            .iter()
+            .map(|risk| risk.minimum_effort())
+            .max_by_key(|value| value.rank())
+            .unwrap_or(crate::registry::ReasoningEffort::Low);
+        let unique_risks = self
+            .risk_factors
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_risks.len() != self.risk_factors.len() {
+            anyhow::bail!(
+                "task proposal '{}' contains duplicate risk factors",
+                self.local_id
+            )
+        }
+        if effort.rank() < minimum.rank() {
+            anyhow::bail!(
+                "task proposal '{}' effort '{}' is too low for declared risk factors; minimum is '{}'",
+                self.local_id,
+                effort.as_str(),
+                minimum.as_str()
             )
         }
         let unchanged: std::collections::HashSet<_> =
@@ -382,7 +480,9 @@ mod tests {
                 class: Some("code".into()),
                 model: Some("x".into()),
                 effort: Some("low".into()),
+                effort_reason: Some("isolated and well understood".into()),
             },
+            risk_factors: vec![],
         }
     }
 
@@ -431,6 +531,27 @@ mod tests {
         let mut value = proposal();
         value.expected_changes.clear();
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn task_effort_is_required_and_bounded() {
+        let mut value = proposal();
+        value.execution_hints.effort = None;
+        assert!(value.validate().is_err());
+        value.execution_hints.effort = Some("none".into());
+        assert!(value.validate().is_err());
+        value.execution_hints.effort = Some("maximum".into());
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn declared_high_risk_cannot_use_low_effort() {
+        let mut value = proposal();
+        value.risk_factors = vec![TaskRiskFactor::Persistence];
+        let error = value.validate().unwrap_err().to_string();
+        assert!(error.contains("minimum is 'high'"));
+        value.execution_hints.effort = Some("high".into());
+        assert!(value.validate().is_ok());
     }
 }
 

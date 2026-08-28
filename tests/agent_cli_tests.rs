@@ -460,7 +460,8 @@ fn apply_plan_warns_for_missing_context_files_without_aborting() {
             "acceptance_criteria": ["context warning is reported"],
             "required_tests": ["apply plan CLI test"],
             "validation": ["cargo test"],
-            "execution_hints": {},
+            "execution_hints": {"effort":"low","effort_reason":"isolated context check"},
+            "risk_factors": [],
             "depends_on": []
         }]
     });

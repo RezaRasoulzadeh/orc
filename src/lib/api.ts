@@ -15,6 +15,9 @@ export interface Task {
   scope_mode: 'focused' | 'module' | 'project' | null
   context_files: string[]
   expected_changes: string[]
+  reasoning_effort: 'None' | 'Low' | 'Medium' | 'High' | null
+  effort_reason: string | null
+  risk_factors: string[]
 }
 
 export interface DependencyInfo { task_id: string; status: TaskStatus | null; is_done: boolean }
@@ -42,8 +45,8 @@ export interface ProjectHealth {
 }
 export interface DesktopSnapshot { dashboard: Dashboard; health: ProjectHealth }
 export interface LeadTurn { id: number; role: 'user' | 'assistant' | 'system'; content: string; created_at: string }
-export interface ExecutionHints { class?: string | null; model?: string | null; effort?: string | null }
-export interface TaskProposal { local_id: string; title: string; objective: string; role: string; priority: 'low' | 'normal' | 'high' | 'critical'; depends_on: string[]; capabilities: string[]; scope_mode: 'focused' | 'module' | 'project' | null; context_files: string[]; expected_changes: string[]; unchanged: string[]; acceptance_criteria: string[]; required_tests: string[]; validation: string[]; execution_hints: ExecutionHints }
+export interface ExecutionHints { class?: string | null; model?: string | null; effort?: 'low' | 'medium' | 'high' | null; effort_reason?: string | null }
+export interface TaskProposal { local_id: string; title: string; objective: string; role: string; priority: 'low' | 'normal' | 'high' | 'critical'; depends_on: string[]; capabilities: string[]; scope_mode: 'focused' | 'module' | 'project' | null; context_files: string[]; expected_changes: string[]; unchanged: string[]; acceptance_criteria: string[]; required_tests: string[]; validation: string[]; execution_hints: ExecutionHints; risk_factors: string[] }
 export type PlannedTask = TaskProposal
 export interface PlanResponse { protocol_version: number; objective: string; assumptions: string[]; risks: string[]; questions: string[]; tasks: PlannedTask[] }
 export type LeadProposalKind =

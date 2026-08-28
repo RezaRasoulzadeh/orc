@@ -83,7 +83,8 @@ fn v01_happy_path_is_provider_independent() {
             "acceptance_criteria": ["accepted marker is created"],
             "required_tests": ["manual workflow test"],
             "validation": ["cargo test"],
-            "execution_hints": {},
+            "execution_hints": {"effort":"low","effort_reason":"isolated marker creation"},
+            "risk_factors": [],
             "depends_on": []
         }]
     });

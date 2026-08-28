@@ -669,7 +669,10 @@ impl OrcApp {
             stack: Vec::new(),
             non_goals: vec!["Do not mutate project state while planning.".into()],
             deliverables: vec!["A validated PlanResponse JSON document.".into()],
-            definition_of_done: vec!["Every task has a unique id and valid dependencies.".into()],
+            definition_of_done: vec![
+                "Every task has a unique id and valid dependencies.".into(),
+                "Every task selects low, medium, or high execution effort with a concise semantic reason and bounded risk factors.".into(),
+            ],
             response_schema: crate::protocol::PlanResponseSchema::v1(),
             role_boundaries: report.role_boundaries.clone(),
             planning_constraints: report.planning_constraints.clone(),

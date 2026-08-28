@@ -224,7 +224,7 @@ fn lead_inspection_cli_shows_pending_history_and_is_read_only() {
     for (kind, details, request, summary) in [
         (
             LeadDecisionKind::DirectTasks,
-            serde_json::json!({"tasks":[{"local_id":"canonical","title":"Ship it","objective":"Ship the task","role":"developer","priority":"normal","depends_on":[],"capabilities":[],"scope_mode":"project","context_files":[],"expected_changes":["implementation"],"unchanged":["unrelated behavior"],"acceptance_criteria":["works"],"required_tests":["focused test"],"validation":["cargo test"],"execution_hints":{}}]}),
+            serde_json::json!({"tasks":[{"local_id":"canonical","title":"Ship it","objective":"Ship the task","role":"developer","priority":"normal","depends_on":[],"capabilities":[],"scope_mode":"project","context_files":[],"expected_changes":["implementation"],"unchanged":["unrelated behavior"],"acceptance_criteria":["works"],"required_tests":["focused test"],"validation":["cargo test"],"execution_hints":{"effort":"low","effort_reason":"isolated task"},"risk_factors":[]}]}),
             "direct request",
             "direct summary",
         ),

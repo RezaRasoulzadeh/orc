@@ -117,6 +117,7 @@ fn canonicalize_task_with_expected_changes(db: &Database, task: &str, expected_c
             required_tests: vec!["configured validation pipeline".into()],
             validation: vec!["configured validation evidence".into()],
             execution_hints: Default::default(),
+            risk_factors: vec![],
         },
     )
     .unwrap();

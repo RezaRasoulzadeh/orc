@@ -174,6 +174,22 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                     println!("Role:         {}", task.role);
                     println!("Priority:     {:?}", task.priority);
                     println!("Status:       {}", task.status);
+                    println!(
+                        "Effort:       {}",
+                        task.reasoning_effort
+                            .map(|effort| effort.as_str())
+                            .unwrap_or("legacy/unspecified")
+                    );
+                    if let Some(reason) = &task.effort_reason {
+                        println!("Effort reason: {}", reason);
+                    }
+                    if !task.risk_factors.is_empty() {
+                        println!("Risk factors:  {:?}", task.risk_factors);
+                    }
+                    if let Some(condition) = db.get_task_execution_condition(&task_id)? {
+                        println!("Execution condition: {}", condition.kind);
+                        println!("Condition details:  {}", condition.details);
+                    }
                     if let Some(reason) = &task.cancellation_reason {
                         println!("Cancellation: {}", reason);
                     }

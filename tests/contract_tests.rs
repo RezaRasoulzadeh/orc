@@ -62,6 +62,9 @@ fn build_worker_prompt_contains_engineering_contract() {
         scope_mode: None,
         context_files: Vec::new(),
         expected_changes: Vec::new(),
+        reasoning_effort: None,
+        effort_reason: None,
+        risk_factors: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "testproj", &task);
@@ -91,6 +94,9 @@ fn generated_worker_prompt_still_contains_task_information() {
         scope_mode: None,
         context_files: Vec::new(),
         expected_changes: Vec::new(),
+        reasoning_effort: None,
+        effort_reason: None,
+        risk_factors: Vec::new(),
     };
 
     let prompt = orc::agent::build_worker_prompt_for_testing(contract, "myproject", &task);
@@ -121,6 +127,9 @@ fn targeted_prompt_guidance_is_scoped_and_optional() {
         scope_mode: Some(orc::task::TaskScopeMode::Focused),
         context_files: vec!["src/review.rs".into(), "src/agent.rs".into()],
         expected_changes: vec!["src/review.rs".into()],
+        reasoning_effort: None,
+        effort_reason: None,
+        risk_factors: Vec::new(),
     };
     let prompt = orc::agent::build_worker_prompt_for_testing("# Contract", "p", &task);
     assert!(prompt.contains("Read these files first:"));
@@ -148,6 +157,7 @@ fn planned_task() -> PlannedTask {
         required_tests: vec!["production test".into()],
         validation: vec!["cargo test".into()],
         execution_hints: Default::default(),
+        risk_factors: vec![],
     }
 }
 

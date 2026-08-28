@@ -997,6 +997,108 @@ impl OrcApp {
         self.db.insert_agent(&agent)?;
         Ok(())
     }
+
+    pub fn inspect_agent_onboarding(
+        &self,
+        request: &crate::agent_onboarding::AgentOnboardingRequest,
+    ) -> Result<crate::agent_onboarding::AgentOnboardingPreview> {
+        let inspector = crate::agent_onboarding::SystemProviderOnboarding::new(&self.repo_path);
+        self.inspect_agent_onboarding_with(request, &inspector)
+    }
+
+    pub fn inspect_agent_onboarding_with(
+        &self,
+        request: &crate::agent_onboarding::AgentOnboardingRequest,
+        inspector: &dyn crate::agent_onboarding::ProviderOnboarding,
+    ) -> Result<crate::agent_onboarding::AgentOnboardingPreview> {
+        crate::agent_onboarding::preview(request, inspector)
+    }
+
+    /// Inspect first and persist only when the operator explicitly approves
+    /// the resulting provider capabilities, permissions, and Orc roles.
+    pub fn onboard_agent_with(
+        &self,
+        request: &crate::agent_onboarding::AgentOnboardingRequest,
+        approved: bool,
+        inspector: &dyn crate::agent_onboarding::ProviderOnboarding,
+    ) -> Result<crate::agent_onboarding::AgentOnboardingResult> {
+        let preview = self.inspect_agent_onboarding_with(request, inspector)?;
+        if !approved {
+            return Ok(crate::agent_onboarding::AgentOnboardingResult {
+                preview,
+                persisted: false,
+            });
+        }
+        crate::agent_onboarding::persist_preview(&self.db, &preview)?;
+        Ok(crate::agent_onboarding::AgentOnboardingResult {
+            preview,
+            persisted: true,
+        })
+    }
+
+    pub fn onboard_agent(
+        &self,
+        request: &crate::agent_onboarding::AgentOnboardingRequest,
+        approved: bool,
+    ) -> Result<crate::agent_onboarding::AgentOnboardingResult> {
+        let inspector = crate::agent_onboarding::SystemProviderOnboarding::new(&self.repo_path);
+        self.onboard_agent_with(request, approved, &inspector)
+    }
+
+    pub fn agent_configuration(
+        &self,
+        id: &str,
+    ) -> Result<crate::agent_onboarding::AgentConfigurationDocument> {
+        crate::agent_onboarding::document_from_storage(&self.db, id)
+    }
+
+    pub fn import_agent_configuration(
+        &self,
+        document: &crate::agent_onboarding::AgentConfigurationDocument,
+    ) -> Result<()> {
+        crate::agent_onboarding::validate_document(document)?;
+        self.db.upsert_global_agent_configuration(
+            &document.agent,
+            &document.permissions,
+            &crate::storage::AgentAuthorization {
+                authenticated: document.authentication.verified,
+                authentication_method: document.authentication.method.clone(),
+                authentication_detail: document.authentication.detail.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_permissions(&self, id: &str) -> Result<Vec<registry::OperatorPermission>> {
+        registry::get_agent(&self.db, id)?;
+        Ok(self.db.agent_permissions(id)?)
+    }
+
+    pub fn add_agent_permission(
+        &self,
+        id: &str,
+        permission: registry::OperatorPermission,
+    ) -> Result<bool> {
+        let mut permissions = self.agent_permissions(id)?;
+        if !permissions.contains(&permission) {
+            permissions.push(permission);
+        }
+        Ok(self.db.set_agent_permissions(id, &permissions)?)
+    }
+
+    pub fn remove_agent_permission(
+        &self,
+        id: &str,
+        permission: &registry::OperatorPermission,
+    ) -> Result<bool> {
+        let mut permissions = self.agent_permissions(id)?;
+        let before = permissions.len();
+        permissions.retain(|value| value != permission);
+        if before == permissions.len() {
+            return Ok(false);
+        }
+        Ok(self.db.set_agent_permissions(id, &permissions)?)
+    }
     pub fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let result = self.db.set_agent_enabled(id, enabled)?;
         Ok(result)

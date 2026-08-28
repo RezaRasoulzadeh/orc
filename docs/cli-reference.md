@@ -252,6 +252,19 @@ Registers a new agent.
 - `--effort EFFORT` — reasoning effort: `none`, `low`, `medium`, `high` (automated Codex agents only).
 - `--mode MODE` — `automated` or `manual` (default: `automated`).
 
+### `orc agent onboard ID --backend BACKEND [options]`
+Inspects and optionally registers a globally reusable agent. Provider login is checked without making an AI request; discovered provider capabilities, operator permissions, and Orc roles are displayed separately.
+- `--approve` — explicitly approve the inspection and persist the configuration. Without it, onboarding is preview-only.
+- `--permission PERMISSION` — operator-granted access (`repository-read`, `repository-write`, `command-execution`, or `network-access`); repeatable.
+- `--role ROLE` — Orc role assignment (`code`, `review`, `plan`, or `lead`); repeatable. `--action` is accepted as an alias.
+- The remaining provider/configuration flags match `orc agent add`.
+
+### `orc agent export ID [--output PATH]`, `orc agent import PATH`, and `orc agent update ID PATH`
+Export or validate a versioned global agent configuration. Imports and updates are atomic and reject unsupported configuration/model versions, non-global agents, invalid provider configuration, and unverified authentication evidence. Provider credentials are never exported.
+
+### `orc agent permissions ID`, `orc agent permission-add ID PERMISSION`, and `orc agent permission-remove ID PERMISSION`
+Inspect or change operator-granted permissions. These permissions are persisted independently from provider capabilities and Orc role assignments.
+
 ### `orc agent enable ID`
 Enables a previously registered agent.
 

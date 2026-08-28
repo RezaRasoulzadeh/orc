@@ -123,6 +123,9 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc agents [--sync]` | List registered agents, optionally syncing quota first. |
 | `orc agent list` | List registered agents. |
 | `orc agent add <ID> --backend NAME [options]` | Register an agent (`--priority`, `--capability`, repeatable `--action` (`code`, `review`, `plan`, `lead`), `--display-name`, `--profile`, `--model`, `--effort`, `--mode`). |
+| `orc agent onboard <ID> --backend NAME [options]` | Inspect provider login and capabilities, then persist only with `--approve`; supports repeatable `--permission` and `--role`. |
+| `orc agent export <ID> [--output PATH]` | Export a versioned agent configuration without provider credentials. |
+| `orc agent import PATH` / `update <ID> PATH` | Validate and atomically import or update a versioned global agent configuration. |
 | `orc agent enable <ID>` / `disable <ID>` | Enable or disable an agent. |
 | `orc agent remove <ID>` | Archive an agent. |
 | `orc agent available <ID>` / `unavailable <ID> <REASON>` | Mark an agent available or unavailable. |
@@ -138,6 +141,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc agent actions <ID>` | Show supported actions and their profiles. |
 | `orc agent action-add <ID> ACTION` | Add a supported action. |
 | `orc agent action-remove <ID> ACTION` | Remove a supported action (the final action cannot be removed). |
+| `orc agent permissions <ID>` / `permission-add` / `permission-remove` | Inspect or change operator-granted permissions independently from provider capabilities and Orc roles. |
 
 ### Execution templates
 

@@ -42,6 +42,7 @@ pub const AUTOMATED: &str = "automated";
 pub const MANUAL: &str = "manual";
 pub const AGENT_MODEL_VERSION: u16 = 1;
 pub const GLOBAL_AGENT_SCOPE: &str = "global";
+pub const AGENT_CONFIGURATION_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AgentAction {
@@ -69,6 +70,43 @@ pub enum AgentCapability {
     Streaming,
     Cancellation,
     Custom(String),
+}
+
+/// Permissions granted by the operator to an onboarded provider. These are
+/// deliberately separate from provider capabilities and Orc roles: a
+/// provider may support an operation without Orc granting it, and a role is
+/// an Orc scheduling authority rather than a provider feature.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorPermission {
+    RepositoryRead,
+    RepositoryWrite,
+    CommandExecution,
+    NetworkAccess,
+    Custom(String),
+}
+
+impl OperatorPermission {
+    pub fn parse(value: &str) -> Self {
+        let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match normalized.as_str() {
+            "read" | "repository_read" | "repo_read" => Self::RepositoryRead,
+            "write" | "repository_write" | "repo_write" => Self::RepositoryWrite,
+            "command" | "terminal" | "command_execution" => Self::CommandExecution,
+            "network" | "network_access" => Self::NetworkAccess,
+            _ => Self::Custom(normalized),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::RepositoryRead => "repository_read",
+            Self::RepositoryWrite => "repository_write",
+            Self::CommandExecution => "command_execution",
+            Self::NetworkAccess => "network_access",
+            Self::Custom(value) => value,
+        }
+    }
 }
 
 impl AgentCapability {

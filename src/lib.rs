@@ -1,5 +1,6 @@
 pub mod adoption;
 pub mod agent;
+pub mod agent_onboarding;
 pub mod app;
 pub mod automated;
 pub mod backend;
@@ -38,6 +39,7 @@ pub use queue::{
 pub use registry::{
     AGENT_MODEL_VERSION, Agent, AgentCapability, AgentExecution, AgentExecutionMode,
     AgentLifecycleState, AgentProviderConfiguration, AgentRole, GLOBAL_AGENT_SCOPE,
+    OperatorPermission,
 };
 pub use scheduler::{
     CandidateEvaluation, CandidateStatus, RejectionReason, ScheduleDecision, SelectionReason,

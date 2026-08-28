@@ -1212,12 +1212,13 @@ fn run_review_mode(
                             }
                             blocker.prior_blocker_id = Some(canonical_id.clone());
                             blocker.id = canonical_id.clone();
-                            // The reviewer may resolve an actionable prior blocker, but
-                            // cannot author its lifecycle arbitrarily.  A resolved blocker
-                            // recurring is always a regression; unresolved/regression
-                            // blockers may remain actionable or become resolved.
+                            // A resolved blocker remains resolved unless the structured
+                            // review explicitly labels the current evidence a regression.
+                            // Merely referencing it (including an unresolved/reworded
+                            // finding) must not reopen the canonical blocker.
                             blocker.status = match (old.status.as_str(), blocker.status.as_str()) {
-                                ("resolved", _) => "regression",
+                                ("resolved", "regression") => "regression",
+                                ("resolved", "resolved" | "unresolved") => "resolved",
                                 ("new" | "unresolved" | "regression", "resolved") => "resolved",
                                 ("new" | "unresolved" | "regression", "unresolved") => "unresolved",
                                 ("new" | "unresolved" | "regression", _) => {

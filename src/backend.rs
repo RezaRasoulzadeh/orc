@@ -676,13 +676,11 @@ impl LeadBackend for CodexLeadBackend {
             ),
         )?;
         if !output.status.success() {
-            return Err(format!(
-                "Codex Lead exited with non-zero status: {}",
-                output
-                    .status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+            return Err(crate::worker::codex_failure_error(
+                &output.status,
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                true,
             ));
         }
         let stdout = String::from_utf8(output.stdout)

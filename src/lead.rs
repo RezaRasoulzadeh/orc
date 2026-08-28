@@ -82,6 +82,34 @@ pub enum LeadProposalKind {
     ApprovalRequest { reason: String, details: String },
 }
 
+impl LeadProposalKind {
+    /// Validate the provider-independent proposal after tagged deserialization.
+    /// Provider schemas may flatten variants for transport compatibility, so
+    /// variant-specific semantics are deliberately enforced here.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Plan(plan) => plan
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid plan proposal: {error}")),
+            Self::Task(task) => task
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid task proposal: {error}")),
+            Self::Revision { task_id, feedback } => {
+                if task_id.trim().is_empty() || feedback.trim().is_empty() {
+                    anyhow::bail!("revision proposals require a task_id and feedback")
+                }
+                Ok(())
+            }
+            Self::ApprovalRequest { reason, details } => {
+                if reason.trim().is_empty() || details.trim().is_empty() {
+                    anyhow::bail!("approval proposals require a reason and details")
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LeadProposal {
     pub id: i64,
@@ -253,15 +281,9 @@ impl<'a> LeadService<'a> {
             }
         };
         for proposal in &response.proposals {
-            match proposal {
-                LeadProposalKind::Plan(plan) => plan.validate().map_err(|error| {
-                    anyhow::anyhow!("Lead returned invalid plan proposal: {error}")
-                })?,
-                LeadProposalKind::Task(task) => task.validate().map_err(|error| {
-                    anyhow::anyhow!("Lead returned invalid task proposal: {error}")
-                })?,
-                _ => {}
-            }
+            proposal
+                .validate()
+                .map_err(|error| anyhow::anyhow!("Lead returned invalid proposal: {error}"))?;
         }
         let turn_id =
             self.db

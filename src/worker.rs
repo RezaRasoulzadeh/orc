@@ -739,6 +739,8 @@ impl Worker for CodexWorker {
     ) -> Result<WorkerExecution, String> {
         use std::io::Write;
 
+        let schema = codex_compatible_output_schema(schema)?;
+
         let mut path = std::env::temp_dir();
         static SCHEMA_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = SCHEMA_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -822,9 +824,11 @@ impl CodexWorker {
                 })
             }
             Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 Err(codex_failure_error(
                     &output.status,
+                    &stdout,
                     &stderr,
                     schema_path.is_some(),
                 ))
@@ -834,6 +838,234 @@ impl CodexWorker {
             )),
             Err(error) => Err(format!("failed to spawn 'codex' executable: {error}")),
         }
+    }
+}
+
+/// Translate Orc's provider-neutral JSON Schema into the strict subset accepted
+/// by Codex structured outputs. Semantic variant checks remain in Orc after the
+/// response is deserialized; this function only adapts the transport contract.
+pub(crate) fn codex_compatible_output_schema(schema: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(schema)
+        .map_err(|error| format!("invalid Orc output schema: {error}"))?;
+    normalize_codex_schema(&mut value, "root")?;
+    serde_json::to_string(&value)
+        .map_err(|error| format!("failed to serialize Codex output schema: {error}"))
+}
+
+fn normalize_codex_schema(schema: &mut serde_json::Value, context: &str) -> Result<(), String> {
+    if schema.get("oneOf").is_some() {
+        let variants = schema
+            .as_object_mut()
+            .and_then(|object| object.remove("oneOf"))
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| format!("{context}: oneOf must contain an array of schemas"))?;
+        *schema = merge_codex_variants(&variants, context)?;
+    }
+
+    let Some(object) = schema.as_object_mut() else {
+        return Err(format!("{context}: schema nodes must be objects"));
+    };
+
+    if let Some(constant) = object.remove("const") {
+        object.insert(
+            "enum".into(),
+            serde_json::Value::Array(vec![constant.clone()]),
+        );
+        if !object.contains_key("type") {
+            object.insert("type".into(), inferred_json_type(&constant).into());
+        }
+    }
+
+    let is_object =
+        object.contains_key("properties") || schema_type_contains(object.get("type"), "object");
+    if is_object {
+        let formerly_required = object
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let properties = object
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| format!("{context}: object properties must be an object"))?;
+        let names = properties.keys().cloned().collect::<Vec<_>>();
+        for (name, property) in properties.iter_mut() {
+            normalize_codex_schema(property, &format!("{context}.properties.{name}"))?;
+            if !formerly_required.contains(name) {
+                make_schema_nullable(property, &format!("{context}.properties.{name}"))?;
+            }
+        }
+        object.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "required".into(),
+            serde_json::Value::Array(names.into_iter().map(Into::into).collect()),
+        );
+    }
+
+    if let Some(items) = object.get_mut("items") {
+        normalize_codex_schema(items, &format!("{context}.items"))?;
+    }
+    if let Some(definitions) = object
+        .get_mut("$defs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (name, definition) in definitions {
+            normalize_codex_schema(definition, &format!("{context}.$defs.{name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_codex_variants(
+    variants: &[serde_json::Value],
+    context: &str,
+) -> Result<serde_json::Value, String> {
+    if variants.is_empty() {
+        return Err(format!("{context}: oneOf must contain at least one schema"));
+    }
+    if variants.iter().all(|variant| {
+        variant.get("properties").is_some() || schema_type_contains(variant.get("type"), "object")
+    }) {
+        return merge_codex_object_variants(variants, context);
+    }
+    if variants
+        .iter()
+        .all(|variant| variant.get("const").is_some())
+    {
+        let values = variants
+            .iter()
+            .filter_map(|variant| variant.get("const").cloned())
+            .collect::<Vec<_>>();
+        let mut merged = serde_json::json!({"enum": values});
+        if let Some(first) = merged
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.first())
+        {
+            merged["type"] = inferred_json_type(first).into();
+        }
+        return Ok(merged);
+    }
+    if variants.windows(2).all(|pair| pair[0] == pair[1]) {
+        return Ok(variants[0].clone());
+    }
+    Err(format!(
+        "{context}: Codex transport cannot safely merge these oneOf variants"
+    ))
+}
+
+fn merge_codex_object_variants(
+    variants: &[serde_json::Value],
+    context: &str,
+) -> Result<serde_json::Value, String> {
+    let mut names = std::collections::BTreeSet::new();
+    for variant in variants {
+        if let Some(properties) = variant
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            names.extend(properties.keys().cloned());
+        }
+    }
+
+    let mut merged_properties = serde_json::Map::new();
+    for name in names {
+        let mut schemas = Vec::new();
+        let mut required_in_every_variant = true;
+        for variant in variants {
+            let property = variant
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|properties| properties.get(&name));
+            let required = variant
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| required.iter().any(|value| value.as_str() == Some(&name)));
+            match property {
+                Some(property) => schemas.push(property.clone()),
+                None => required_in_every_variant = false,
+            }
+            required_in_every_variant &= required;
+        }
+        let property_context = format!("{context}.properties.{name}");
+        let mut merged = if schemas.windows(2).all(|pair| pair[0] == pair[1]) {
+            schemas[0].clone()
+        } else {
+            merge_codex_variants(&schemas, &property_context)?
+        };
+        if !required_in_every_variant {
+            normalize_codex_schema(&mut merged, &property_context)?;
+            make_schema_nullable(&mut merged, &property_context)?;
+        }
+        merged_properties.insert(name, merged);
+    }
+    let required = merged_properties
+        .keys()
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": merged_properties,
+        "required": required
+    }))
+}
+
+fn make_schema_nullable(schema: &mut serde_json::Value, context: &str) -> Result<(), String> {
+    let object = schema
+        .as_object_mut()
+        .ok_or_else(|| format!("{context}: schema nodes must be objects"))?;
+    match object.get_mut("type") {
+        Some(serde_json::Value::String(value)) if value != "null" => {
+            let value = std::mem::take(value);
+            object.insert("type".into(), serde_json::json!([value, "null"]));
+        }
+        Some(serde_json::Value::Array(values)) => {
+            if !values.iter().any(|value| value.as_str() == Some("null")) {
+                values.push("null".into());
+            }
+        }
+        Some(serde_json::Value::String(_)) => {}
+        Some(_) => return Err(format!("{context}: schema type must be a string or array")),
+        None => {}
+    }
+    if let Some(values) = object
+        .get_mut("enum")
+        .and_then(serde_json::Value::as_array_mut)
+        && !values.iter().any(serde_json::Value::is_null)
+    {
+        values.push(serde_json::Value::Null);
+    }
+    Ok(())
+}
+
+fn schema_type_contains(value: Option<&serde_json::Value>, expected: &str) -> bool {
+    match value {
+        Some(serde_json::Value::String(value)) => value == expected,
+        Some(serde_json::Value::Array(values)) => {
+            values.iter().any(|value| value.as_str() == Some(expected))
+        }
+        _ => false,
+    }
+}
+
+fn inferred_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(value) if value.is_i64() || value.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -912,8 +1144,9 @@ fn combine_codex_output(
     }
 }
 
-fn codex_failure_error(
+pub(crate) fn codex_failure_error(
     status: &std::process::ExitStatus,
+    stdout: &str,
     stderr: &str,
     structured: bool,
 ) -> String {
@@ -921,12 +1154,51 @@ fn codex_failure_error(
         .code()
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".into());
-    let stderr = stderr.trim();
-    if structured && !stderr.is_empty() {
-        format!("Codex exited with non-zero status: {code}: {stderr}")
+    let diagnostics = codex_failure_diagnostics(stdout, stderr, structured);
+    if !diagnostics.is_empty() {
+        format!("Codex exited with non-zero status: {code}: {diagnostics}")
     } else {
         format!("Codex exited with non-zero status: {code}")
     }
+}
+
+fn codex_failure_diagnostics(stdout: &str, stderr: &str, structured: bool) -> String {
+    let mut diagnostics = Vec::new();
+    if structured {
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let event_type = event
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let failed_event = event_type == "error" || event_type.ends_with(".failed");
+            let schema_error = line.contains("invalid_json_schema");
+            if !failed_event && !schema_error {
+                continue;
+            }
+            let diagnostic = event
+                .pointer("/error/message")
+                .or_else(|| event.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| event.get("error").map(serde_json::Value::to_string))
+                .unwrap_or_else(|| event.to_string());
+            if schema_error && !diagnostic.contains("invalid_json_schema") {
+                diagnostics.push(event.to_string());
+            } else {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        diagnostics.push(stderr.to_owned());
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+    diagnostics.join("; ")
 }
 
 /// Antigravity CLI worker. Runs `agy` in headless print mode with JSON output
@@ -1104,11 +1376,31 @@ mod tests {
         )
         .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let error = codex_failure_error(&output.status, &stderr, true);
+        let error = codex_failure_error(&output.status, "", &stderr, true);
         assert_eq!(
             error,
             "Codex exited with non-zero status: 7: schema rejected"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_structured_failure_surfaces_json_error_from_stdout() {
+        let output = run_command_with_timeout(
+            shell(
+                r#"printf '%s\n' '{"type":"turn.failed","error":{"code":"invalid_json_schema","message":"invalid_json_schema: oneOf is not permitted"}}'; exit 1"#,
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let error = codex_failure_error(
+            &output.status,
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            true,
+        );
+        assert!(error.contains("invalid_json_schema"), "{error}");
+        assert!(error.contains("oneOf is not permitted"), "{error}");
     }
 
     #[test]

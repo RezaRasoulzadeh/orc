@@ -264,7 +264,7 @@ fn schema(action: AgentAction) -> String {
         "additionalProperties":false,
         "properties":{
             "local_id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},
-            "role":{"type":"string"},"priority":{"enum":["low","normal","high","critical"]},
+            "role":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high","critical"]},
             "depends_on":string_array,"capabilities":string_array,
             "scope_mode":{"type":["string","null"]},"context_files":string_array,"expected_changes":string_array,
             "unchanged":string_array,"acceptance_criteria":string_array,"required_tests":string_array,
@@ -277,6 +277,25 @@ fn schema(action: AgentAction) -> String {
         "type":"object","additionalProperties":false,
         "properties":{"protocol_version":{"type":"integer"},"objective":{"type":"string"},"assumptions":string_array,"risks":string_array,"questions":string_array,"tasks":{"type":"array","items":planned_task}},
         "required":["protocol_version","objective","assumptions","risks","questions","tasks"]
+    });
+    let decision_details = serde_json::json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "tasks":{"type":"array","items":planned_task},
+            "objective":{"type":"string"},"reason":{"type":"string"},
+            "question":{"type":"string"},"options":string_array,
+            "feedback":{"type":"string"},"summary":{"type":"string"},
+            "operator":{"type":"string"},"next":{"type":"string"}
+        },
+        "required":[]
+    });
+    let decision = serde_json::json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["DIRECT_TASKS","PLAN_REQUIRED","USER_DECISION_REQUIRED","APPROVE","REVISE_PLAN"]},
+            "details":decision_details
+        },
+        "required":["kind","details"]
     });
     let value = match action {
         AgentAction::Review => serde_json::json!({
@@ -292,8 +311,8 @@ fn schema(action: AgentAction) -> String {
                 {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"task"},"details":planned_task},"required":["kind","details"]},
                 {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"revision"},"details":{"type":"object","additionalProperties":false,"properties":{"task_id":{"type":"string"},"feedback":{"type":"string"}},"required":["task_id","feedback"]}},"required":["kind","details"]},
                 {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"approval_request"},"details":{"type":"object","additionalProperties":false,"properties":{"reason":{"type":"string"},"details":{"type":"string"}},"required":["reason","details"]}},"required":["kind","details"]}
-            ]}}},
-            "required":["message","proposals"]
+            ]}},"decision":decision},
+            "required":["message","proposals","decision"]
         }),
         AgentAction::Code => serde_json::json!({"type":"object"}),
     };
@@ -352,7 +371,7 @@ pub fn revision_handoff_schema() -> String {
                 "required": ["operations_performed", "verification_passed"]
             }
         },
-        "required": ["claims"]
+        "required": ["claims", "worker_protocol"]
     })
     .to_string()
 }
@@ -508,7 +527,12 @@ pub fn validate_revision_handoff_with_evidence(
     if active_count == 0 {
         return Ok(RevisionHandoff { claims: Vec::new() });
     }
-    let handoff: RevisionHandoff = serde_json::from_str(output)
+    let mut handoff_value: serde_json::Value = serde_json::from_str(output)
+        .context("revision worker did not return a structured handoff")?;
+    if let Some(object) = handoff_value.as_object_mut() {
+        object.remove("worker_protocol");
+    }
+    let handoff: RevisionHandoff = serde_json::from_value(handoff_value)
         .context("revision worker did not return a structured handoff")?;
     let required: std::collections::BTreeSet<_> =
         active.iter().map(|b| b.blocker_id.as_str()).collect();
@@ -960,7 +984,7 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
     for failure in &contract.validation_failures {
         out.push_str(&format!("- {failure}\n"));
     }
-    out.push_str("\n### Required handoff\nReturn JSON {\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. Keep changes focused.");
+    out.push_str("\n### Required handoff\nReturn JSON {\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"evidence\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}],\"worker_protocol\":{\"operations_performed\":[\"modify\"],\"verification_passed\":[\"...\"]}} with exactly one claim for every active blocker ID. Resolved constraints require no claim. Report the actual operations and completed checks in worker_protocol. Keep changes focused.");
     out
 }
 
@@ -1654,13 +1678,122 @@ pub fn run_lead(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lead::LeadDecisionKind;
+    use crate::lead::{LeadDecisionKind, LeadProposalKind};
     use crate::registry::{AUTOMATED, AVAILABLE};
     use crate::storage::db::LeadDecisionMetadata;
     use crate::task::TaskPriority;
+    use std::collections::BTreeSet;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    fn assert_codex_schema_compatible(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                assert!(!object.contains_key("oneOf"), "unsupported oneOf: {value}");
+                if let Some(properties) = object
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    assert_eq!(
+                        object.get("additionalProperties"),
+                        Some(&serde_json::Value::Bool(false))
+                    );
+                    let property_names = properties.keys().cloned().collect::<BTreeSet<_>>();
+                    let required_names = object
+                        .get("required")
+                        .and_then(serde_json::Value::as_array)
+                        .expect("Codex object schema must have required")
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(required_names, property_names);
+                }
+                for child in object.values() {
+                    assert_codex_schema_compatible(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    assert_codex_schema_compatible(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn codex_lead_schema_flattens_variants_and_requires_every_property() {
+        let generic = schema(AgentAction::Lead);
+        assert!(generic.contains("oneOf"));
+        let adapted = crate::worker::codex_compatible_output_schema(&generic).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&adapted).unwrap();
+        assert_codex_schema_compatible(&value);
+        assert!(value.pointer("/properties/decision").is_some());
+        assert!(
+            value
+                .pointer("/properties/proposals/items/properties/details/properties/task_id/type")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+        );
+    }
+
+    #[test]
+    fn codex_worker_schema_requires_worker_protocol_recursively() {
+        let adapted =
+            crate::worker::codex_compatible_output_schema(&revision_handoff_schema()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&adapted).unwrap();
+        assert_codex_schema_compatible(&value);
+        assert!(
+            value["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "worker_protocol")
+        );
+    }
+
+    #[test]
+    fn every_codex_action_schema_uses_the_supported_object_subset() {
+        for action in [
+            AgentAction::Lead,
+            AgentAction::Plan,
+            AgentAction::Review,
+            AgentAction::Code,
+        ] {
+            let adapted = crate::worker::codex_compatible_output_schema(&schema(action)).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&adapted).unwrap();
+            assert_codex_schema_compatible(&value);
+        }
+        let adapted =
+            crate::worker::codex_compatible_output_schema(&revision_handoff_schema()).unwrap();
+        assert_codex_schema_compatible(&serde_json::from_str(&adapted).unwrap());
+    }
+
+    #[test]
+    fn lead_proposal_variants_remain_semantically_strict_after_deserialization() {
+        let proposal: LeadProposalKind = serde_json::from_value(serde_json::json!({
+            "kind": "task",
+            "details": {
+                "local_id": "task-1", "title": "Incomplete", "objective": "Do work",
+                "role": "developer", "priority": "normal", "depends_on": [],
+                "capabilities": [], "scope_mode": null, "context_files": ["src/lib.rs"],
+                "expected_changes": ["src/lib.rs"], "unchanged": [],
+                "acceptance_criteria": [], "required_tests": ["cargo test"],
+                "validation": ["cargo test"],
+                "execution_hints": {"effort": "low", "effort_reason": "isolated"},
+                "risk_factors": []
+            }
+        }))
+        .unwrap();
+        assert!(proposal.validate().is_err());
+
+        let proposal: LeadProposalKind = serde_json::from_value(serde_json::json!({
+            "kind": "revision", "details": {"task_id": "", "feedback": "fix it"}
+        }))
+        .unwrap();
+        assert!(proposal.validate().is_err());
+    }
 
     #[test]
     fn blocker_ids_are_stable_across_whitespace_and_case_rephrasing() {

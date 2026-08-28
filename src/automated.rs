@@ -355,6 +355,18 @@ pub fn revision_handoff_schema() -> String {
                         "unresolved_risk"
                     ]
                 }
+            },
+            "worker_protocol": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "operations_performed": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["inspect", "create", "modify", "delete", "move", "command", "validate", "no_mutation"]}
+                    },
+                    "verification_passed": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["operations_performed", "verification_passed"]
             }
         },
         "required": ["claims"]

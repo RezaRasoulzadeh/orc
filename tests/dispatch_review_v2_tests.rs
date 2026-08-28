@@ -23,6 +23,105 @@ use std::process::Command;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
+struct ProtocolOperationWorker {
+    operation: &'static str,
+    verify: bool,
+    calls: Mutex<Vec<String>>,
+}
+
+impl Worker for ProtocolOperationWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        Err("unplanned Worker execution was invoked".into())
+    }
+
+    fn execute_planned_step(
+        &self,
+        step: &orc::worker_protocol::PlannedStep,
+        _: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        self.calls.lock().unwrap().push(step.id.clone());
+        let operation = if self.operation == "auto" {
+            orc::worker_protocol::operation_name(&step.operations[0])
+        } else {
+            self.operation
+        };
+        let intent = step.intent.as_str();
+        let target = intent.split_once(':').map(|(_, value)| value.trim());
+        match operation {
+            "create" => std::fs::write(cwd.join(target.unwrap()), "created\n")
+                .map_err(|error| error.to_string())?,
+            "modify" => std::fs::write(cwd.join(target.unwrap()), "modified\n")
+                .map_err(|error| error.to_string())?,
+            "delete" => std::fs::remove_file(cwd.join(target.unwrap()))
+                .map_err(|error| error.to_string())?,
+            "move" => {
+                let (source, destination) = target
+                    .unwrap()
+                    .split_once("->")
+                    .ok_or_else(|| "move intent has no destination".to_owned())?;
+                std::fs::rename(cwd.join(source.trim()), cwd.join(destination.trim()))
+                    .map_err(|error| error.to_string())?;
+            }
+            "command" => {
+                let status = Command::new("git")
+                    .arg("--version")
+                    .current_dir(cwd)
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                if !status.success() {
+                    return Err("command failed".into());
+                }
+            }
+            "inspect" | "validate" | "no_mutation" => {}
+            other => return Err(format!("unknown test operation {other}")),
+        }
+        let mut output = format!("OPERATION PERFORMED: {operation}\n");
+        if self.verify {
+            output.push_str("VERIFICATION PASSED: configured validation evidence\n");
+        }
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(output),
+            token_usage: None,
+        })
+    }
+}
+
+fn canonicalize_task(db: &Database, task: &str, expected_change: &str) {
+    canonicalize_task_with_expected_changes(db, task, &[expected_change]);
+}
+
+fn canonicalize_task_with_expected_changes(db: &Database, task: &str, expected_changes: &[&str]) {
+    let task_record = db.get_task(task).unwrap().unwrap();
+    db.set_task_proposal_metadata(
+        task,
+        &orc::protocol::TaskProposal {
+            local_id: task.into(),
+            title: task_record.title,
+            objective: task_record.objective,
+            role: task_record.role,
+            priority: task_record.priority,
+            depends_on: vec![],
+            capabilities: vec!["code".into(), "terminal".into()],
+            scope_mode: None,
+            context_files: vec!["README.md".into()],
+            expected_changes: expected_changes
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+            unchanged: vec!["untouched.txt".into()],
+            acceptance_criteria: vec!["the declared operation is performed".into()],
+            required_tests: vec!["configured validation pipeline".into()],
+            validation: vec!["configured validation evidence".into()],
+            execution_hints: Default::default(),
+        },
+    )
+    .unwrap();
+}
+
 struct WritingWorker;
 impl Worker for WritingWorker {
     fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
@@ -2914,6 +3013,114 @@ fn stale_task_branch_is_not_reused_after_worktree_disappears() {
 
     assert_eq!(prepared_commit, new_commit);
     assert_ne!(prepared_commit, old_commit);
+}
+
+#[test]
+fn canonical_worker_operation_matrix_executes_and_reopens_structured_evidence() {
+    for (operation, expected_change) in [
+        ("create", "create: created.txt"),
+        ("modify", "modify: README.md"),
+        ("delete", "delete: README.md"),
+        ("move", "move: README.md -> renamed.md"),
+        ("command", "command: git --version"),
+        ("inspect", "inspect: repository state"),
+        ("validate", "validate: configured checks"),
+        ("no_mutation", "no-mutation: report the repository state"),
+    ] {
+        let (dir, db, task) = setup();
+        canonicalize_task(&db, &task, expected_change);
+        let worker = ProtocolOperationWorker {
+            operation,
+            verify: true,
+            calls: Mutex::new(Vec::new()),
+        };
+        let summary = dispatch_with_worker_and_db_as_with_runner(
+            &task,
+            &worker,
+            dir.path().join(".orc/orc.db").to_str().unwrap(),
+            dir.path(),
+            "fake",
+            &FakeValidationRunner::success(),
+        )
+        .unwrap();
+        let persisted = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+        assert_eq!(persisted.0.steps[0].intent, expected_change);
+        assert_eq!(persisted.1.unwrap().performed_operations.len(), 1);
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
+    }
+}
+
+#[test]
+fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: failed-verification.txt");
+    let worker = ProtocolOperationWorker {
+        operation: "create",
+        verify: false,
+        calls: Mutex::new(Vec::new()),
+    };
+    let error = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("verification"));
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].id;
+    let (_, execution) = db.load_worker_protocol(run).unwrap().unwrap();
+    let execution = execution.expect("failed protocol result must be retained");
+    assert!(
+        execution
+            .focused_verification
+            .iter()
+            .all(|step| !step.passed)
+    );
+    assert!(execution.validate().is_err());
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    let (_, reopened_execution) = reopened.load_worker_protocol(run).unwrap().unwrap();
+    assert_eq!(reopened_execution, Some(execution));
+}
+
+#[test]
+fn canonical_worker_follows_persisted_step_order() {
+    let (dir, db, task) = setup();
+    canonicalize_task_with_expected_changes(
+        &db,
+        &task,
+        &["create: ordered.txt", "modify: README.md"],
+    );
+    let worker = ProtocolOperationWorker {
+        operation: "auto",
+        verify: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(
+        *worker.calls.lock().unwrap(),
+        vec!["execute-step-1", "execute-step-2"]
+    );
+    let (_, execution) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+    assert_eq!(
+        execution.unwrap().performed_operations,
+        vec![
+            orc::worker_protocol::PlannedOperation::Create,
+            orc::worker_protocol::PlannedOperation::Modify,
+        ]
+    );
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> String {

@@ -1113,6 +1113,11 @@ impl Database {
                 input_tokens INTEGER,
                 output_tokens INTEGER
             );
+            CREATE TABLE IF NOT EXISTS worker_protocol_results (
+                run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+                prepare TEXT NOT NULL,
+                execution TEXT
+            );
             CREATE TABLE IF NOT EXISTS lifecycle_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -1139,6 +1144,7 @@ impl Database {
         Self::ensure_agent_run_columns(&conn)?;
         Self::ensure_execution_reservations_table(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
+        Self::ensure_worker_protocol_results_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
@@ -1194,6 +1200,7 @@ impl Database {
         Self::ensure_agent_run_columns(conn)?;
         Self::ensure_execution_reservations_table(conn)?;
         Self::ensure_worker_results_table(conn)?;
+        Self::ensure_worker_protocol_results_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_change_evidence_table(conn)?;
@@ -1693,6 +1700,78 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn ensure_worker_protocol_results_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS worker_protocol_results (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, prepare TEXT NOT NULL, execution TEXT)")?;
+        Ok(())
+    }
+
+    pub fn store_worker_prepare(
+        &self,
+        run_id: i64,
+        plan: &crate::worker_protocol::WorkerPlan,
+    ) -> Result<(), DbError> {
+        plan.validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let value = serde_json::to_string(plan).map_err(DbError::Serde)?;
+        self.conn.execute("INSERT OR REPLACE INTO worker_protocol_results(run_id, prepare, execution) VALUES (?1, ?2, COALESCE((SELECT execution FROM worker_protocol_results WHERE run_id=?1), NULL))", params![run_id, value])?;
+        Ok(())
+    }
+
+    pub fn store_worker_execution(
+        &self,
+        run_id: i64,
+        result: &crate::worker_protocol::WorkerExecutionResult,
+    ) -> Result<(), DbError> {
+        let value = serde_json::to_string(result).map_err(DbError::Serde)?;
+        let changed = self.conn.execute(
+            "UPDATE worker_protocol_results SET execution=?1 WHERE run_id=?2",
+            params![value, run_id],
+        )?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(format!(
+                "Worker PREPARE result does not exist for run {run_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn worker_protocol_result(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<(String, Option<String>)>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT prepare, execution FROM worker_protocol_results WHERE run_id=?1",
+                [run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Reopen persisted protocol evidence through the same typed boundary used
+    /// by execution, so callers cannot mistake an unrelated JSON blob for a
+    /// valid plan or execution result.
+    pub fn load_worker_protocol(
+        &self,
+        run_id: i64,
+    ) -> Result<
+        Option<(
+            crate::worker_protocol::WorkerPlan,
+            Option<crate::worker_protocol::WorkerExecutionResult>,
+        )>,
+        DbError,
+    > {
+        let Some((prepare, execution)) = self.worker_protocol_result(run_id)? else {
+            return Ok(None);
+        };
+        let plan = serde_json::from_str(&prepare).map_err(DbError::Serde)?;
+        let execution = execution
+            .map(|value| serde_json::from_str(&value).map_err(DbError::Serde))
+            .transpose()?;
+        Ok(Some((plan, execution)))
     }
 
     fn ensure_worktree_metadata_table(conn: &Connection) -> Result<(), DbError> {
@@ -3009,6 +3088,33 @@ impl Database {
                 },
             )
             .optional()?)
+    }
+
+    /// Persist the canonical task contract used by Worker PREPARE.  This is a
+    /// separate operation from execution so callers can create a task and
+    /// retain the exact Lead proposal that authorized it.
+    pub fn set_task_proposal_metadata(
+        &self,
+        task_id: &str,
+        proposal: &crate::protocol::TaskProposal,
+    ) -> Result<(), DbError> {
+        if proposal.local_id != task_id {
+            return Err(DbError::Scheduler(format!(
+                "task proposal local_id '{}' does not match task '{}'",
+                proposal.local_id, task_id
+            )));
+        }
+        proposal
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let changed = self.conn.execute(
+            "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1, ?2) ON CONFLICT(task_id) DO UPDATE SET proposal=excluded.proposal",
+            params![task_id, serde_json::to_string(proposal)?],
+        )?;
+        if changed != 1 {
+            return Err(DbError::TaskNotFound(task_id.to_owned()));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

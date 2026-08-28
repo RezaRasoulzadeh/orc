@@ -372,11 +372,24 @@ fn run_validation_with_retries(
     reports
 }
 
-fn task_contract_effort(
-    _db: &Database,
-    task: &crate::task::Task,
-) -> Result<Option<ReasoningEffort>> {
-    Ok(task.reasoning_effort)
+fn task_contract_effort(db: &Database, task: &crate::task::Task) -> Result<ReasoningEffort> {
+    let persisted = db
+        .get_task(&task.id)?
+        .context("task disappeared while resolving its execution contract")?;
+    let effort = persisted
+        .reasoning_effort
+        .context("persisted task contract has no execution effort")?;
+    if effort == ReasoningEffort::None {
+        bail!("persisted task contract has invalid execution effort 'none'")
+    }
+    let effort_reason = persisted
+        .effort_reason
+        .as_deref()
+        .context("persisted task contract has no execution-effort reason")?;
+    if effort_reason.trim().is_empty() || effort_reason.chars().count() > 240 {
+        bail!("persisted task contract has an invalid execution-effort reason")
+    }
+    Ok(effort)
 }
 
 /// Build the execution contract from the authoritative persisted Task row.
@@ -386,6 +399,7 @@ fn worker_task_contract(
     db: &Database,
     task: &Task,
 ) -> Result<(crate::protocol::TaskProposal, bool)> {
+    let effort = task_contract_effort(db, task)?;
     let task_contract = db
         .get_task_contract(&task.id)?
         .unwrap_or_else(|| crate::task::TaskContract::defaults(&task.objective));
@@ -405,12 +419,7 @@ fn worker_task_contract(
         required_tests: task_contract.required_tests,
         validation: task_contract.validation,
         execution_hints: crate::protocol::ExecutionHints {
-            effort: Some(
-                task.reasoning_effort
-                    .unwrap_or(ReasoningEffort::Low)
-                    .as_str()
-                    .to_owned(),
-            ),
+            effort: Some(effort.as_str().to_owned()),
             effort_reason: task.effort_reason.clone(),
             ..Default::default()
         },
@@ -440,10 +449,7 @@ fn effective_revision_effort(
     source_review_id: i64,
     explicit_override: Option<ReasoningEffort>,
 ) -> Result<ReasoningEffort> {
-    let base = task_contract_effort(db, task)?.unwrap_or(ReasoningEffort::Low);
-    if let Some(explicit) = explicit_override {
-        return Ok(explicit);
-    }
+    let base = task_contract_effort(db, task)?;
     let blockers = db
         .review_blocker_observations(source_review_id)?
         .into_iter()
@@ -479,7 +485,12 @@ fn effective_revision_effort(
             }
         }
     }
-    Ok(effective)
+    let selected = explicit_override.unwrap_or(effective);
+    Ok(if selected.rank() < effective.rank() {
+        effective
+    } else {
+        selected
+    })
 }
 
 fn validation_diagnostics(report: &ValidationReport) -> String {
@@ -778,7 +789,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
         .context("failed to inspect repository during Worker PREPARE")?;
     let (proposal, enforce_worker_protocol) =
         worker_task_contract(db, &task).context("persisted task contract is invalid")?;
-    let proposal_effort = task_contract_effort(db, &task)?.unwrap_or(ReasoningEffort::Low);
+    let proposal_effort = task_contract_effort(db, &task)?;
     let acceptance_criteria =
         worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
     let required_tests = worker_requirements(&proposal.required_tests, "required-test");
@@ -1453,7 +1464,7 @@ where
         overrides.model.clone(),
         overrides.effort,
     );
-    let resolution = if overrides.effort.is_some() {
+    let resolution = if overrides.effort == Some(revision_effort) {
         resolution
     } else {
         apply_task_effort(resolution, Some(revision_effort))
@@ -1558,11 +1569,9 @@ pub fn revise_with_worker_on_db_with_overrides(
             task_id
         );
     };
-    if overrides.effort.is_none()
-        && let Some(condition) = db.get_task_execution_condition(task_id)?
-    {
+    if let Some(condition) = db.get_task_execution_condition(task_id)? {
         bail!(
-            "{}: task '{}' cannot enter another ordinary revision ({})",
+            "{}: task '{}' cannot enter another revision ({})",
             condition.kind,
             task_id,
             condition.details
@@ -1690,7 +1699,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         overrides.model.clone(),
         overrides.effort,
     );
-    let resolution = if overrides.effort.is_some() {
+    let resolution = if overrides.effort == Some(revision_effort) {
         resolution
     } else {
         apply_task_effort(resolution, Some(revision_effort))
@@ -2238,7 +2247,7 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     let resolution = if explicit_effort {
         resolution
     } else {
-        apply_task_effort(resolution, task_effort)
+        apply_task_effort(resolution, Some(task_effort))
     };
     let model = resolution.model.clone();
     let reasoning_effort = resolution.reasoning_effort;
@@ -2813,6 +2822,10 @@ mod tests {
         revision(&db, first_review, ReasoningEffort::Low);
         let second_review = review(&db);
         assert_eq!(effort(second_review), ReasoningEffort::Medium);
+        assert_eq!(
+            effort_with_override(&db, &task, second_review, ReasoningEffort::Low),
+            ReasoningEffort::Medium
+        );
         revision(&db, second_review, ReasoningEffort::Medium);
         let third_review = review(&db);
         assert_eq!(effort(third_review), ReasoningEffort::High);
@@ -2828,6 +2841,29 @@ mod tests {
         assert!(error.to_string().contains("REPLAN_REQUIRED"));
         let condition = db.get_task_execution_condition(&task).unwrap().unwrap();
         assert_eq!(condition.kind, "non_convergence_replan_required");
+        let error = effective_revision_effort(
+            &db,
+            &db.get_task(&task).unwrap().unwrap(),
+            fourth_review,
+            Some(ReasoningEffort::High),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("REPLAN_REQUIRED"));
+    }
+
+    fn effort_with_override(
+        db: &Database,
+        task_id: &str,
+        review_id: i64,
+        override_effort: ReasoningEffort,
+    ) -> ReasoningEffort {
+        effective_revision_effort(
+            db,
+            &db.get_task(task_id).unwrap().unwrap(),
+            review_id,
+            Some(override_effort),
+        )
+        .unwrap()
     }
 
     #[test]

@@ -283,6 +283,88 @@ fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reop
 }
 
 #[test]
+fn manually_created_tasks_persist_default_execution_effort() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("default effort").unwrap();
+    let task_id = db
+        .insert_task(
+            project,
+            "Manual task",
+            "Complete the manual task",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+
+    let task = db.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(
+        task.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "execution effort must be part of every persisted task"
+    );
+    assert_eq!(
+        task.effort_reason.as_deref(),
+        Some(orc::task::Task::DEFAULT_EFFORT_REASON)
+    );
+
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    let task = reopened.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        task.effort_reason.as_deref(),
+        Some(orc::task::Task::DEFAULT_EFFORT_REASON)
+    );
+}
+
+#[test]
+fn task_effort_migration_preserves_planner_selection() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("migrate effort").unwrap();
+    let task_id = db
+        .insert_task(
+            project,
+            "Planned task",
+            "Preserve the selected execution depth",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    let mut proposal = plan_response().tasks[0].clone();
+    proposal.local_id = task_id.clone();
+    proposal.execution_hints.effort = Some("high".into());
+    proposal.execution_hints.effort_reason = Some("persistence and restart recovery".into());
+    proposal.risk_factors = vec![orc::protocol::TaskRiskFactor::Persistence];
+    db.set_task_proposal_metadata(&task_id, &proposal).unwrap();
+    drop(db);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET reasoning_effort = NULL, effort_reason = NULL, risk_factors = NULL WHERE id = ?1",
+            [&task_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Database::open(&path).unwrap();
+    let task = reopened.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        task.effort_reason.as_deref(),
+        Some("persistence and restart recovery")
+    );
+    assert_eq!(
+        task.risk_factors,
+        vec![orc::protocol::TaskRiskFactor::Persistence]
+    );
+}
+
+#[test]
 fn agent_run_execution_survives_reopen() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("orc.db");

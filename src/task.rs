@@ -94,6 +94,10 @@ impl fmt::Display for TaskScopeMode {
 
 impl Task {
     pub const DEFAULT_REQUIRED_CAPABILITIES: [&'static str; 2] = ["code", "terminal"];
+    pub const DEFAULT_REASONING_EFFORT: crate::registry::ReasoningEffort =
+        crate::registry::ReasoningEffort::Low;
+    pub const DEFAULT_EFFORT_REASON: &'static str =
+        "manually-created task uses the default execution depth";
 
     pub fn required_capabilities(&self) -> Vec<String> {
         if !self.required_capabilities.is_empty() {

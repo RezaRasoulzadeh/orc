@@ -13,6 +13,208 @@ fn command(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn workflow_history_cli_renders_linked_resolution_in_json() {
+    let dir = tempdir().unwrap();
+    assert!(command(dir.path(), &["init"]).status.success());
+    let db = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    db.record_lead_decision(
+        project,
+        &LeadDecisionKind::UserDecisionRequired,
+        &serde_json::json!({"question":"Choose"}),
+        orc::storage::db::LeadDecisionMetadata {
+            snapshot: "",
+            run_id: None,
+            source_request: "operator request",
+            summary: "Need choice",
+        },
+    )
+    .unwrap();
+    let decision = db.list_lead_decisions(project).unwrap().pop().unwrap();
+    db.resolve_user_decision(project, decision.id, "approved")
+        .unwrap();
+    let history = orc::app::OrcApp::open(dir.path().join(".orc/orc.db"), dir.path())
+        .unwrap()
+        .workflow_history()
+        .unwrap();
+    let kinds: Vec<_> = history.iter().map(|entry| entry.kind.as_str()).collect();
+    assert!(kinds.contains(&"user_decision_resolved"));
+    let resolved = history
+        .iter()
+        .find(|entry| entry.kind == "user_decision_resolved")
+        .unwrap();
+    assert_eq!(resolved.details["decision_id"], decision.id);
+    assert_eq!(resolved.details["source_request"], "operator request");
+    let output = command(dir.path(), &["workflow-history", "--json"]);
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "user_decision_resolved")
+    );
+}
+
+#[test]
+fn workflow_history_is_scoped_ordered_and_classifies_persisted_work() {
+    let dir = tempdir().unwrap();
+    assert!(command(dir.path(), &["init"]).status.success());
+    let db = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let other = db.create_project("other").unwrap();
+
+    let lead = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"objective":"ship"}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: None,
+                source_request: "operator request",
+                summary: "plan this",
+            },
+        )
+        .unwrap();
+    let task = db
+        .insert_task(
+            project,
+            "Applied task",
+            "ship",
+            "developer",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let other_task = db
+        .insert_task(
+            other,
+            "Other task",
+            "ignore",
+            "developer",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let run = db
+        .create_agent_run_with_execution(
+            project,
+            &task,
+            "history-agent",
+            "automated",
+            orc::storage::db::AgentRunExecution {
+                class: "plan",
+                model: None,
+                effort: None,
+                source: "test",
+            },
+        )
+        .unwrap();
+    let plan = orc::protocol::PlanResponse {
+        protocol_version: orc::protocol::PROTOCOL_VERSION,
+        objective: "ship".into(),
+        assumptions: vec![],
+        risks: vec![],
+        questions: vec![],
+        tasks: vec![],
+    };
+    let plan_id = db.store_plan(project, lead, run, &plan).unwrap();
+    let review_decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::Approve,
+            &serde_json::json!({}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: Some(run),
+                source_request: "operator request",
+                summary: "approve",
+            },
+        )
+        .unwrap();
+    db.record_plan_review(
+        plan_id,
+        run,
+        review_decision,
+        &LeadDecisionKind::Approve,
+        "approved",
+    )
+    .unwrap();
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(&task),
+        Some(run),
+        None,
+        Some("{\"passed\":true}"),
+    )
+    .unwrap();
+    db.record_lifecycle_event(
+        "review_completed",
+        Some(&task),
+        Some(run),
+        None,
+        Some("{\"verdict\":\"accept\"}"),
+    )
+    .unwrap();
+    db.record_lifecycle_event(
+        "acceptance_completed",
+        Some(&task),
+        Some(run),
+        None,
+        Some("{\"accepted\":true,\"source\":\"operator\"}"),
+    )
+    .unwrap();
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(&other_task),
+        None,
+        None,
+        Some("{\"passed\":false}"),
+    )
+    .unwrap();
+    db.record_lifecycle_event("orphan_event", None, None, None, Some("{\"leaked\":true}"))
+        .unwrap();
+
+    let app = orc::app::OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    let history = app.workflow_history().unwrap();
+    let timestamps: Vec<_> = history
+        .iter()
+        .map(|entry| entry.timestamp.as_str())
+        .collect();
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    let kinds: Vec<_> = history.iter().map(|entry| entry.kind.as_str()).collect();
+    for expected in [
+        "project_entry",
+        "lead_PlanRequired",
+        "plan_revision",
+        "plan_review",
+        "task_applied",
+        "dispatch_run",
+        "validation_result",
+        "review",
+        "acceptance",
+    ] {
+        assert!(kinds.contains(&expected), "missing {expected}: {kinds:?}");
+    }
+    assert_eq!(
+        history
+            .iter()
+            .filter(|entry| entry.task_id.as_deref() == Some(&other_task))
+            .count(),
+        0
+    );
+    assert!(!history.iter().any(|entry| entry.summary == "orphan_event"));
+    let output = command(dir.path(), &["workflow-history", "--json"]);
+    assert!(output.status.success());
+    let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(rendered.as_array().unwrap().iter().any(|entry| entry["kind"] == "validation_result" && entry["details"]["passed"] == true));
+    assert!(rendered.as_array().unwrap().iter().any(|entry| {
+        entry["kind"] == "acceptance"
+            && entry["details"]["accepted"] == true
+            && entry["task_id"] == task
+    }));
+}
+
+#[test]
 fn lead_inspection_cli_shows_pending_history_and_is_read_only() {
     let dir = tempdir().unwrap();
     assert!(command(dir.path(), &["init"]).status.success());

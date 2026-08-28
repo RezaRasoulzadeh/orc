@@ -7,6 +7,161 @@ use crate::{
 };
 use anyhow::{Context, Result};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct WorkflowHistoryEntry {
+    pub sequence: i64,
+    pub timestamp: String,
+    pub kind: String,
+    pub summary: String,
+    pub task_id: Option<String>,
+    pub run_id: Option<i64>,
+    pub details: serde_json::Value,
+}
+
+/// Read-only, cross-subsystem chronology for the active project.
+pub fn workflow_history(db: &crate::storage::Database) -> Result<Vec<WorkflowHistoryEntry>> {
+    let project = db.get_project_id()?.context("no project found in DB")?;
+    let mut history = Vec::new();
+    let mut sequence = 0;
+    if let Some(name) = db.get_project_name()? {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: db.project_created_at(project)?,
+            kind: "project_entry".into(),
+            summary: name.clone(),
+            task_id: None,
+            run_id: None,
+            details: serde_json::json!({"project_id": project, "name": name}),
+        });
+        sequence += 1;
+    }
+    for decision in db.list_lead_decisions(project)? {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: decision.created_at.clone(),
+            kind: format!("lead_{:?}", decision.kind),
+            summary: decision.summary.clone(),
+            task_id: None,
+            run_id: decision.run_id,
+            details: serde_json::to_value(&decision)?,
+        });
+        sequence += 1;
+        if let (Some(timestamp), Some(resolution)) = (&decision.resolved_at, &decision.resolution) {
+            history.push(WorkflowHistoryEntry {
+                sequence,
+                timestamp: timestamp.clone(),
+                kind: "user_decision_resolved".into(),
+                summary: resolution.clone(),
+                task_id: None,
+                run_id: decision.run_id,
+                details: serde_json::json!({"decision_id": decision.id, "source_request": decision.source_request, "resolution": resolution}),
+            });
+            sequence += 1;
+        }
+    }
+    for plan in db.list_plan_history(project)? {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: plan.created_at.clone(),
+            kind: "plan_revision".into(),
+            summary: format!("plan v{} ({:?})", plan.version, plan.status),
+            task_id: None,
+            run_id: None,
+            details: serde_json::to_value(plan)?,
+        });
+        sequence += 1;
+    }
+    for review in db.list_plan_reviews(project)? {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: review.created_at.clone(),
+            kind: "plan_review".into(),
+            summary: format!("plan review: {:?}", review.decision),
+            task_id: None,
+            run_id: Some(review.lead_run_id),
+            details: serde_json::to_value(review)?,
+        });
+        sequence += 1;
+    }
+    let project_tasks = db.list_tasks_for_project(project)?;
+    let project_task_ids = project_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for task in project_tasks {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: db.task_created_at(&task.id)?,
+            kind: "task_applied".into(),
+            summary: task.title.clone(),
+            task_id: Some(task.id.clone()),
+            run_id: None,
+            details: serde_json::to_value(task)?,
+        });
+        sequence += 1;
+    }
+    for run in db.list_agent_runs(project, usize::MAX)? {
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: run.started_at.clone(),
+            kind: "dispatch_run".into(),
+            summary: format!("{} run", run.execution_class),
+            task_id: run.task_id.clone(),
+            run_id: Some(run.id),
+            details: serde_json::to_value(run)?,
+        });
+        sequence += 1;
+    }
+    let project_runs = history
+        .iter()
+        .filter_map(|entry| entry.run_id)
+        .collect::<std::collections::HashSet<_>>();
+    for event in db
+        .list_lifecycle_events(usize::MAX)?
+        .into_iter()
+        .filter(|event| {
+            // Lifecycle events are only meaningful in this projection when they
+            // have a positive link to this project's task or run.  An event with
+            // neither link must not become part of every project's history.
+            (event.run_id.is_some() || event.task_id.is_some())
+                && event.run_id.is_none_or(|id| project_runs.contains(&id))
+                && event
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|id| project_task_ids.contains(id))
+        })
+    {
+        let kind = if event.kind == "validation_result" {
+            "validation_result"
+        } else if event.kind.contains("accept") {
+            "acceptance"
+        } else if event.kind.contains("review") {
+            "review"
+        } else {
+            "lifecycle_event"
+        };
+        history.push(WorkflowHistoryEntry {
+            sequence,
+            timestamp: event.timestamp,
+            kind: kind.into(),
+            summary: event.kind,
+            task_id: event.task_id,
+            run_id: event.run_id,
+            details: event
+                .payload
+                .and_then(|p| serde_json::from_str(&p).ok())
+                .unwrap_or(serde_json::Value::Null),
+        });
+        sequence += 1;
+    }
+    history.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then(a.sequence.cmp(&b.sequence))
+    });
+    Ok(history)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Dashboard {
     pub project_name: String,

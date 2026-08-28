@@ -801,6 +801,9 @@ impl OrcApp {
             runs,
         })
     }
+    pub fn workflow_history(&self) -> Result<Vec<crate::read_model::WorkflowHistoryEntry>> {
+        crate::read_model::workflow_history(&self.db)
+    }
     pub fn review(&self, task_id: &str) -> Result<ReviewSummary> {
         build_review(&self.db, task_id, &self.repo_path)
     }

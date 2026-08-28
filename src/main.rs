@@ -110,6 +110,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the chronological, read-only project workflow history.
+    WorkflowHistory {
+        #[arg(long)]
+        json: bool,
+    },
     /// Emit a structured project report for a manual planner.
     Report {
         #[arg(long)]
@@ -479,6 +484,17 @@ fn run(cli: Cli) -> Result<()> {
                     state.runs.len(),
                     state.user_decisions.len()
                 );
+            }
+        }
+        Command::WorkflowHistory { json } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let history = app.workflow_history()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&history)?);
+            } else {
+                for entry in history {
+                    println!("{}  {:<24} {}", entry.timestamp, entry.kind, entry.summary);
+                }
             }
         }
         Command::Approvals { command } => {
@@ -1315,6 +1331,7 @@ mod cli_tests {
             Command::Doctor => "Doctor",
             Command::Status => "Status",
             Command::WorkflowState { .. } => "WorkflowState",
+            Command::WorkflowHistory { .. } => "WorkflowHistory",
             Command::Report { .. } => "Report",
             Command::PlanRequest { .. } => "PlanRequest",
             Command::Plan { .. } => "Plan",

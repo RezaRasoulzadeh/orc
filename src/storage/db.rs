@@ -2080,9 +2080,9 @@ impl Database {
         &self,
         project_id: i64,
     ) -> Result<Option<crate::lead::PersistedLeadDecision>, DbError> {
-        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
+        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
             let status: String = r.get(4)?;
-            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status, resolution: r.get(9)? })
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status, resolution: r.get(9)?, resolved_at: r.get(10)? })
         }).optional()?)
     }
 
@@ -2103,9 +2103,9 @@ impl Database {
                 "USER_DECISION_REQUIRED decision is missing or already resolved".into(),
             ));
         }
-        self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution FROM lead_decisions WHERE id = ?1", [decision_id], |r| {
+        self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE id = ?1", [decision_id], |r| {
             let status: String = r.get(4)?;
-            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, status: status.clone(), actionable: false, resolution: r.get(9)? })
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, status: status.clone(), actionable: false, resolution: r.get(9)?, resolved_at: r.get(10)? })
         }).map_err(DbError::from)
     }
 
@@ -2113,7 +2113,7 @@ impl Database {
     pub fn pending_lead_decision_context(
         &self,
     ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
-        let mut statement = self.conn.prepare("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution FROM lead_decisions WHERE status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id")?;
+        let mut statement = self.conn.prepare("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id")?;
         Ok(statement
             .query_map([], |r| {
                 let status: String = r.get(4)?;
@@ -2129,6 +2129,7 @@ impl Database {
                     source_request: r.get(7)?,
                     summary: r.get(8)?,
                     resolution: r.get(9)?,
+                    resolved_at: r.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -2139,7 +2140,7 @@ impl Database {
         project_id: i64,
     ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution FROM lead_decisions
+            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions
              WHERE project_id = ?1 AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')
              ORDER BY id ASC",
         )?;
@@ -2157,6 +2158,7 @@ impl Database {
                 actionable: status == "pending",
                 status,
                 resolution: r.get(9)?,
+                resolved_at: r.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -2402,6 +2404,22 @@ impl Database {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    pub fn project_created_at(&self, project_id: i64) -> Result<String, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT created_at FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn task_created_at(&self, task_id: &str) -> Result<String, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT created_at FROM tasks WHERE id = ?1",
+            [task_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn get_project_id(&self) -> Result<Option<i64>, DbError> {

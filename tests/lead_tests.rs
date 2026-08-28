@@ -73,6 +73,153 @@ impl ActionBackend for CountingActionBackend {
 }
 
 #[test]
+fn codex_lead_transport_normalizes_nullable_plan_lists() {
+    let response = CodexLeadBackend::parse_response(
+        r#"{
+            "message":"plan suggestion",
+            "proposals":[{
+                "kind":"plan",
+                "details":{
+                    "protocol_version":1,
+                    "objective":"Repair structured transport",
+                    "assumptions":null,
+                    "risks":null,
+                    "questions":null,
+                    "tasks":null,
+                    "local_id":"ignored flattened task payload",
+                    "task_id":null,
+                    "feedback":null
+                }
+            }],
+            "decision":{"kind":"PLAN_REQUIRED","details":{"tasks":null}}
+        }"#,
+    )
+    .unwrap();
+
+    let LeadProposalKind::Plan(plan) = &response.proposals[0] else {
+        panic!("expected a plan proposal");
+    };
+    assert!(plan.assumptions.is_empty());
+    assert!(plan.risks.is_empty());
+    assert!(plan.questions.is_empty());
+    assert!(plan.tasks.is_empty());
+    assert_eq!(
+        response.decision.unwrap().kind,
+        LeadDecisionKind::PlanRequired
+    );
+}
+
+#[test]
+fn codex_lead_transport_normalizes_only_optional_task_lists() {
+    let response = CodexLeadBackend::parse_response(
+        r#"{
+            "message":"task suggestion",
+            "proposals":[{
+                "kind":"task",
+                "details":{
+                    "local_id":"transport-fix",
+                    "title":"Fix transport",
+                    "objective":"Normalize nullable provider fields",
+                    "role":"developer",
+                    "priority":"normal",
+                    "depends_on":null,
+                    "capabilities":null,
+                    "scope_mode":"project",
+                    "context_files":null,
+                    "expected_changes":["src/lead.rs"],
+                    "unchanged":["Lead domain types"],
+                    "acceptance_criteria":["Null optional lists deserialize"],
+                    "required_tests":["cargo test --test lead_tests"],
+                    "validation":["cargo test --test lead_tests"],
+                    "execution_hints":{"class":null,"model":null,"effort":"low","effort_reason":"focused boundary fix"},
+                    "risk_factors":null,
+                    "tasks":null,
+                    "task_id":null,
+                    "feedback":null
+                }
+            }],
+            "decision":{"kind":"DIRECT_TASKS","details":{"tasks":null}}
+        }"#,
+    )
+    .unwrap();
+
+    let LeadProposalKind::Task(task) = &response.proposals[0] else {
+        panic!("expected a task proposal");
+    };
+    assert!(task.depends_on.is_empty());
+    assert!(task.capabilities.is_empty());
+    assert!(task.context_files.is_empty());
+    assert!(task.risk_factors.is_empty());
+}
+
+#[test]
+fn codex_lead_transport_normalizes_a_null_proposals_list() {
+    let response = CodexLeadBackend::parse_response(
+        r#"{"message":"assessment","proposals":null,"decision":{"kind":"PLAN_REQUIRED","details":{}}}"#,
+    )
+    .unwrap();
+
+    assert!(response.proposals.is_empty());
+}
+
+#[test]
+fn codex_lead_transport_rejects_null_or_mismatched_proposal_payloads() {
+    let null_payload = CodexLeadBackend::parse_response(
+        r#"{"message":"bad","proposals":[{"kind":"plan","details":null}],"decision":{"kind":"PLAN_REQUIRED","details":{}}}"#,
+    )
+    .unwrap_err();
+    assert!(null_payload.contains("plan proposal requires a non-null details payload"));
+
+    let mismatched = CodexLeadBackend::parse_response(
+        r#"{
+            "message":"bad",
+            "proposals":[{
+                "kind":"revision",
+                "details":{
+                    "local_id":"task-shaped",
+                    "title":"Wrong payload",
+                    "task_id":null,
+                    "feedback":null
+                }
+            }],
+            "decision":{"kind":"PLAN_REQUIRED","details":{}}
+        }"#,
+    )
+    .unwrap_err();
+    assert!(mismatched.contains("invalid revision proposal payload"));
+
+    let null_required_list = CodexLeadBackend::parse_response(
+        r#"{
+            "message":"bad",
+            "proposals":[{
+                "kind":"task",
+                "details":{
+                    "local_id":"transport-fix",
+                    "title":"Fix transport",
+                    "objective":"Normalize nullable provider fields",
+                    "role":"developer",
+                    "priority":"normal",
+                    "depends_on":null,
+                    "capabilities":null,
+                    "scope_mode":"project",
+                    "context_files":null,
+                    "expected_changes":["src/lead.rs"],
+                    "unchanged":["Lead domain types"],
+                    "acceptance_criteria":null,
+                    "required_tests":["cargo test --test lead_tests"],
+                    "validation":["cargo test --test lead_tests"],
+                    "execution_hints":{"effort":"low","effort_reason":"focused boundary fix"},
+                    "risk_factors":null
+                }
+            }],
+            "decision":{"kind":"PLAN_REQUIRED","details":{}}
+        }"#,
+    )
+    .unwrap_err();
+    assert!(null_required_list.contains("invalid task proposal payload"));
+}
+
+#[test]
 fn new_project_intake_validates_objective_and_persists_read_only_lead_decision() {
     let dir = tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".orc")).unwrap();

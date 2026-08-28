@@ -654,8 +654,7 @@ impl CodexLeadBackend {
     }
 
     pub fn parse_response(output: &str) -> Result<LeadBackendResponse, String> {
-        serde_json::from_str(output.trim())
-            .map_err(|error| format!("Lead provider returned malformed structured output: {error}"))
+        crate::lead::parse_lead_transport_response(output)
     }
 }
 

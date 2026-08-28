@@ -151,6 +151,187 @@ pub struct LeadBackendResponse {
     pub decision: Option<LeadDecision>,
 }
 
+/// Provider-facing representation of a Lead response.
+///
+/// Codex requires every object property in its structured-output schema to be
+/// required. The schema adapter therefore represents fields that only belong
+/// to some proposal variants as required-but-nullable. Keep that transport
+/// compromise out of the provider-independent Lead domain types.
+#[derive(Deserialize)]
+struct LeadTransportResponse {
+    message: String,
+    proposals: Option<Vec<LeadTransportProposal>>,
+    decision: Option<LeadDecision>,
+}
+
+#[derive(Deserialize)]
+struct LeadTransportProposal {
+    kind: LeadTransportProposalKind,
+    details: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LeadTransportProposalKind {
+    Plan,
+    Task,
+    Revision,
+    ApprovalRequest,
+}
+
+#[derive(Deserialize)]
+struct PlanTransportPayload {
+    protocol_version: u32,
+    objective: String,
+    assumptions: Option<Vec<String>>,
+    risks: Option<Vec<String>>,
+    questions: Option<Vec<String>>,
+    tasks: Option<Vec<PlannedTask>>,
+}
+
+impl From<PlanTransportPayload> for PlanResponse {
+    fn from(transport: PlanTransportPayload) -> Self {
+        Self {
+            protocol_version: transport.protocol_version,
+            objective: transport.objective,
+            assumptions: transport.assumptions.unwrap_or_default(),
+            risks: transport.risks.unwrap_or_default(),
+            questions: transport.questions.unwrap_or_default(),
+            tasks: transport.tasks.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskTransportPayload {
+    local_id: String,
+    title: String,
+    objective: String,
+    role: String,
+    priority: crate::task::TaskPriority,
+    depends_on: Option<Vec<String>>,
+    capabilities: Option<Vec<String>>,
+    scope_mode: Option<crate::task::TaskScopeMode>,
+    context_files: Option<Vec<String>>,
+    expected_changes: Vec<String>,
+    unchanged: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    required_tests: Vec<String>,
+    validation: Vec<String>,
+    execution_hints: crate::protocol::ExecutionHints,
+    risk_factors: Option<Vec<crate::protocol::TaskRiskFactor>>,
+}
+
+impl From<TaskTransportPayload> for PlannedTask {
+    fn from(transport: TaskTransportPayload) -> Self {
+        Self {
+            local_id: transport.local_id,
+            title: transport.title,
+            objective: transport.objective,
+            role: transport.role,
+            priority: transport.priority,
+            depends_on: transport.depends_on.unwrap_or_default(),
+            capabilities: transport.capabilities.unwrap_or_default(),
+            scope_mode: transport.scope_mode,
+            context_files: transport.context_files.unwrap_or_default(),
+            expected_changes: transport.expected_changes,
+            unchanged: transport.unchanged,
+            acceptance_criteria: transport.acceptance_criteria,
+            required_tests: transport.required_tests,
+            validation: transport.validation,
+            execution_hints: transport.execution_hints,
+            risk_factors: transport.risk_factors.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RevisionTransportPayload {
+    task_id: String,
+    feedback: String,
+}
+
+#[derive(Deserialize)]
+struct ApprovalRequestTransportPayload {
+    reason: String,
+    details: String,
+}
+
+impl TryFrom<LeadTransportProposal> for LeadProposalKind {
+    type Error = String;
+
+    fn try_from(transport: LeadTransportProposal) -> Result<Self, Self::Error> {
+        let kind = match transport.kind {
+            LeadTransportProposalKind::Plan => "plan",
+            LeadTransportProposalKind::Task => "task",
+            LeadTransportProposalKind::Revision => "revision",
+            LeadTransportProposalKind::ApprovalRequest => "approval_request",
+        };
+        let details = transport
+            .details
+            .ok_or_else(|| format!("{kind} proposal requires a non-null details payload"))?;
+        if !details.is_object() {
+            return Err(format!("{kind} proposal details must be an object"));
+        }
+
+        let proposal = match transport.kind {
+            LeadTransportProposalKind::Plan => {
+                let payload: PlanTransportPayload = deserialize_transport_payload(details, kind)?;
+                Self::Plan(payload.into())
+            }
+            LeadTransportProposalKind::Task => {
+                let payload: TaskTransportPayload = deserialize_transport_payload(details, kind)?;
+                Self::Task(payload.into())
+            }
+            LeadTransportProposalKind::Revision => {
+                let payload: RevisionTransportPayload =
+                    deserialize_transport_payload(details, kind)?;
+                Self::Revision {
+                    task_id: payload.task_id,
+                    feedback: payload.feedback,
+                }
+            }
+            LeadTransportProposalKind::ApprovalRequest => {
+                let payload: ApprovalRequestTransportPayload =
+                    deserialize_transport_payload(details, kind)?;
+                Self::ApprovalRequest {
+                    reason: payload.reason,
+                    details: payload.details,
+                }
+            }
+        };
+        proposal
+            .validate()
+            .map_err(|error| format!("invalid {kind} proposal payload: {error}"))?;
+        Ok(proposal)
+    }
+}
+
+fn deserialize_transport_payload<T: for<'de> Deserialize<'de>>(
+    details: serde_json::Value,
+    kind: &str,
+) -> Result<T, String> {
+    serde_json::from_value(details)
+        .map_err(|error| format!("invalid {kind} proposal payload: {error}"))
+}
+
+pub(crate) fn parse_lead_transport_response(output: &str) -> Result<LeadBackendResponse, String> {
+    let transport: LeadTransportResponse = serde_json::from_str(output.trim())
+        .map_err(|error| format!("Lead provider returned malformed structured output: {error}"))?;
+    let proposals = transport
+        .proposals
+        .unwrap_or_default()
+        .into_iter()
+        .map(LeadProposalKind::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Lead provider returned malformed structured output: {error}"))?;
+    Ok(LeadBackendResponse {
+        message: transport.message,
+        proposals,
+        decision: transport.decision,
+    })
+}
+
 pub trait LeadBackend {
     fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String>;
 }

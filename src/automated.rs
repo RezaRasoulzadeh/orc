@@ -1616,10 +1616,7 @@ impl LeadBackend for LeadActionAdapter<'_> {
         .map_err(|error| error.to_string())?;
         self.usage.replace(execution.token_usage);
         self.output.replace(Some(execution.output.clone()));
-        let response: LeadBackendResponse =
-            serde_json::from_str(&execution.output).map_err(|error| {
-                format!("Lead provider returned malformed structured output: {error}")
-            })?;
+        let response = crate::lead::parse_lead_transport_response(&execution.output)?;
         if response.decision.is_none() {
             return Err(
                 "Lead provider response must contain exactly one structured decision".into(),

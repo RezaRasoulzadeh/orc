@@ -408,11 +408,53 @@ pub struct ReviewBlocker {
 }
 
 /// The actionable work contract handed from a review to a revision worker.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevisionContract {
+    /// Blockers which must be implemented and proved by this revision.
+    #[serde(default)]
+    pub active_blockers: Vec<crate::storage::db::ReviewBlockerRecord>,
+    /// Blockers which are already resolved. These are preserve-only
+    /// invariants and are never revision work items.
+    #[serde(default)]
+    pub resolved_blockers: Vec<crate::storage::db::ReviewBlockerRecord>,
+    #[serde(default)]
+    pub reviewer_revision_feedback: Vec<String>,
+    #[serde(default)]
+    pub original_task_requirements: RevisionTaskRequirements,
+    #[serde(default)]
+    pub current_persisted_execution_evidence: Option<crate::worker_protocol::WorkerExecutionResult>,
+    #[serde(default)]
+    pub validation_failures: Vec<String>,
+    // These fields retain the v1 ledger shape for persisted contracts and
+    // inspection clients. The new fields above are the authoritative shape.
+    #[serde(default)]
     pub unresolved: Vec<crate::storage::db::ReviewBlockerRecord>,
+    #[serde(default)]
     pub regressions: Vec<crate::storage::db::ReviewBlockerRecord>,
+    #[serde(default)]
     pub regression_constraints: Vec<crate::storage::db::ReviewBlockerRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevisionTaskRequirements {
+    pub acceptance_criteria: Vec<String>,
+    pub required_tests: Vec<String>,
+    pub expected_changes: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub validation: Vec<String>,
+}
+
+impl RevisionContract {
+    fn active_blocker_records(&self) -> Vec<&crate::storage::db::ReviewBlockerRecord> {
+        if self.active_blockers.is_empty() {
+            self.unresolved
+                .iter()
+                .chain(self.regressions.iter())
+                .collect()
+        } else {
+            self.active_blockers.iter().collect()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -477,7 +519,8 @@ pub fn validate_revision_handoff_with_evidence(
     changes: Option<&crate::git::WorktreeChanges>,
     validation_payload: Option<&str>,
 ) -> Result<RevisionHandoff> {
-    let active_count = contract.unresolved.len() + contract.regressions.len();
+    let active = contract.active_blocker_records();
+    let active_count = active.len();
     // Preserve the legacy one-shot revision path when the authoritative ledger
     // contains no active blocker work. There is no claim to validate in that case.
     if active_count == 0 {
@@ -485,12 +528,8 @@ pub fn validate_revision_handoff_with_evidence(
     }
     let handoff: RevisionHandoff = serde_json::from_str(output)
         .context("revision worker did not return a structured handoff")?;
-    let required: std::collections::BTreeSet<_> = contract
-        .unresolved
-        .iter()
-        .chain(contract.regressions.iter())
-        .map(|b| b.blocker_id.as_str())
-        .collect();
+    let required: std::collections::BTreeSet<_> =
+        active.iter().map(|b| b.blocker_id.as_str()).collect();
     let mut seen = std::collections::BTreeSet::new();
     for claim in &handoff.claims {
         if !matches!(claim.status.as_str(), "addressed" | "unresolved") {
@@ -499,10 +538,8 @@ pub fn validate_revision_handoff_with_evidence(
                 claim.blocker_id
             );
         }
-        contract
-            .unresolved
+        active
             .iter()
-            .chain(contract.regressions.iter())
             .find(|b| b.blocker_id == claim.blocker_id)
             .ok_or_else(|| anyhow::anyhow!("unknown blocker ID '{}'", claim.blocker_id))?;
         if claim.implementation_summary.trim().is_empty() {
@@ -712,6 +749,53 @@ pub fn build_revision_contract_from_db(
             .cloned()
             .collect();
     }
+    let task = db
+        .get_task(task_id)?
+        .context("revision contract task not found")?;
+    let task_contract = db
+        .get_task_contract(task_id)?
+        .unwrap_or_else(|| crate::task::TaskContract::defaults(&task.objective));
+    contract.original_task_requirements = RevisionTaskRequirements {
+        acceptance_criteria: task_contract.acceptance_criteria,
+        required_tests: task_contract.required_tests,
+        expected_changes: task.expected_changes.clone(),
+        unchanged: task_contract.unchanged,
+        validation: task_contract.validation,
+    };
+    contract.active_blockers = contract
+        .unresolved
+        .iter()
+        .chain(contract.regressions.iter())
+        .cloned()
+        .collect();
+    contract.resolved_blockers = contract.regression_constraints.clone();
+    contract.reviewer_revision_feedback = source
+        .revision_feedback
+        .iter()
+        .filter(|feedback| !feedback.trim().is_empty())
+        .cloned()
+        .collect();
+    for run in db.list_agent_runs_for_task(task_id)? {
+        if let Some((_, evidence)) = db.load_worker_protocol(run.id)?
+            && evidence.is_some()
+        {
+            contract.current_persisted_execution_evidence = evidence;
+            break;
+        }
+    }
+    contract.validation_failures = source
+        .validation_evidence
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<crate::validation::ValidationReport>(value).ok())
+        .map(|report| {
+            report
+                .steps
+                .iter()
+                .filter(|step| !step.passed)
+                .map(|step| format!("{}: {}", step.command, step.output()))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(contract)
 }
 
@@ -737,6 +821,7 @@ fn build_revision_contract_for_source_ids(
         unresolved,
         regressions,
         regression_constraints: constraints,
+        ..RevisionContract::default()
     })
 }
 
@@ -812,20 +897,39 @@ pub fn build_revision_contract(
             _ => unresolved.push(record),
         }
     }
+    let active_blockers = unresolved
+        .iter()
+        .chain(regressions.iter())
+        .cloned()
+        .collect();
+    let resolved_blockers = regression_constraints.clone();
     RevisionContract {
+        active_blockers,
+        resolved_blockers,
         unresolved,
         regressions,
         regression_constraints,
+        ..RevisionContract::default()
     }
 }
 
 pub fn format_revision_contract(contract: &RevisionContract) -> String {
     let mut out = String::from("## Revision contract\n\n");
+    out.push_str("### Original task requirements (preserve and satisfy)\n");
+    out.push_str(&format!(
+        "- Acceptance criteria: {:?}\n- Required tests: {:?}\n- Expected changes: {:?}\n- Unchanged constraints: {:?}\n- Required validation: {:?}\n",
+        contract.original_task_requirements.acceptance_criteria,
+        contract.original_task_requirements.required_tests,
+        contract.original_task_requirements.expected_changes,
+        contract.original_task_requirements.unchanged,
+        contract.original_task_requirements.validation,
+    ));
     out.push_str("### Unresolved blockers (implement and prove each)\n");
-    if contract.unresolved.is_empty() {
+    let active = contract.active_blocker_records();
+    if active.is_empty() {
         out.push_str("- None recorded; verify the supplied review feedback.\n");
     }
-    for blocker in &contract.unresolved {
+    for blocker in active {
         out.push_str(&format!(
             "- {} | requirement: {} | acceptance: {} | finding: {}\n  Evidence required: {}\n",
             blocker.blocker_id,
@@ -836,10 +940,15 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
         ));
     }
     out.push_str("### Resolved blockers (regression constraints; do not reimplement)\n");
-    if contract.regression_constraints.is_empty() {
+    let resolved = if contract.resolved_blockers.is_empty() {
+        &contract.regression_constraints
+    } else {
+        &contract.resolved_blockers
+    };
+    if resolved.is_empty() {
         out.push_str("- None recorded.\n");
     }
-    for blocker in &contract.regression_constraints {
+    for blocker in resolved {
         out.push_str(&format!("- {} | acceptance: {} | preserve the resolved behavior unless current evidence proves regression\n", blocker.blocker_id, blocker.acceptance_condition));
     }
     out.push_str("### Regressions (implement and prove each)\n");
@@ -848,6 +957,26 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
             "- {} | acceptance: {} | finding: {}\n",
             blocker.blocker_id, blocker.acceptance_condition, blocker.finding
         ));
+    }
+    out.push_str("### Reviewer revision feedback (context, not a replacement for requirements)\n");
+    if contract.reviewer_revision_feedback.is_empty() {
+        out.push_str("- None recorded.\n");
+    }
+    for feedback in &contract.reviewer_revision_feedback {
+        out.push_str(&format!("- {feedback}\n"));
+    }
+    out.push_str("### Current persisted execution evidence\n");
+    if let Some(evidence) = &contract.current_persisted_execution_evidence {
+        out.push_str(&format!("- {evidence:?}\n"));
+    } else {
+        out.push_str("- None recorded.\n");
+    }
+    out.push_str("### Validation failures\n");
+    if contract.validation_failures.is_empty() {
+        out.push_str("- None recorded.\n");
+    }
+    for failure in &contract.validation_failures {
+        out.push_str(&format!("- {failure}\n"));
     }
     out.push_str("\n### Required handoff\nReturn JSON {\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. Keep changes focused.");
     out
@@ -1305,6 +1434,7 @@ fn run_review_mode(
                                 unresolved: Vec::new(),
                                 regressions: Vec::new(),
                                 regression_constraints: Vec::new(),
+                                ..RevisionContract::default()
                             };
                             for record in records {
                                 match record.status.as_str() {
@@ -1312,6 +1442,52 @@ fn run_review_mode(
                                     "regression" => contract.regressions.push(record),
                                     _ => contract.unresolved.push(record),
                                 }
+                            }
+                            let task_contract =
+                                db.get_task_contract(&summary.task.id)?.unwrap_or_else(|| {
+                                    crate::task::TaskContract::defaults(&summary.task.objective)
+                                });
+                            contract.original_task_requirements = RevisionTaskRequirements {
+                                acceptance_criteria: task_contract.acceptance_criteria,
+                                required_tests: task_contract.required_tests,
+                                expected_changes: summary.task.expected_changes.clone(),
+                                unchanged: task_contract.unchanged,
+                                validation: task_contract.validation,
+                            };
+                            contract.active_blockers = contract
+                                .unresolved
+                                .iter()
+                                .chain(contract.regressions.iter())
+                                .cloned()
+                                .collect();
+                            contract.resolved_blockers = contract.regression_constraints.clone();
+                            if let Some(run) = summary.run.as_ref()
+                                && let Some((_, evidence)) = db.load_worker_protocol(run.id)?
+                            {
+                                contract.current_persisted_execution_evidence = evidence;
+                            }
+                            contract.validation_failures = summary
+                                .validation_evidence
+                                .as_ref()
+                                .and_then(|value| {
+                                    serde_json::from_str::<crate::validation::ValidationReport>(
+                                        value,
+                                    )
+                                    .ok()
+                                })
+                                .map(|report| {
+                                    report
+                                        .steps
+                                        .iter()
+                                        .filter(|step| !step.passed)
+                                        .map(|step| format!("{}: {}", step.command, step.output()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if let Some(feedback) = &result.revision_feedback
+                                && !feedback.trim().is_empty()
+                            {
+                                contract.reviewer_revision_feedback.push(feedback.clone());
                             }
                             Some(serde_json::to_string(&contract)?)
                         } else {
@@ -1531,6 +1707,7 @@ mod tests {
             }],
             regressions: Vec::new(),
             regression_constraints: Vec::new(),
+            ..RevisionContract::default()
         }
     }
 

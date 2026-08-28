@@ -15,6 +15,28 @@ pub struct CreateTaskInput {
     pub dependencies: Vec<String>,
 }
 
+/// The contract fields persisted with a Task and consumed by Worker PREPARE.
+/// Planner proposal metadata may populate these fields when a task is created,
+/// but it is not consulted during execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskContract {
+    pub unchanged: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub required_tests: Vec<String>,
+    pub validation: Vec<String>,
+}
+
+impl TaskContract {
+    pub fn defaults(objective: &str) -> Self {
+        Self {
+            unchanged: Vec::new(),
+            acceptance_criteria: vec![objective.to_owned()],
+            required_tests: vec!["configured validation pipeline".into()],
+            validation: vec!["configured validation evidence".into()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
     pub id: String,

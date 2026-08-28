@@ -970,7 +970,7 @@ impl Database {
                 DbError::Scheduler("task proposal has no execution effort".into())
             })?;
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 id,
                 project_id,
@@ -985,6 +985,10 @@ impl Database {
                 effort,
                 task.execution_hints.effort_reason,
                 serde_json::to_string(&task.risk_factors)?,
+                serde_json::to_string(&task.acceptance_criteria)?,
+                serde_json::to_string(&task.required_tests)?,
+                serde_json::to_string(&task.validation)?,
+                serde_json::to_string(&task.unchanged)?,
             ],
         )?;
         self.conn.execute(
@@ -1088,6 +1092,10 @@ impl Database {
                 reasoning_effort TEXT,
                 effort_reason TEXT,
                 risk_factors TEXT,
+                acceptance_criteria TEXT,
+                required_tests TEXT,
+                validation TEXT,
+                unchanged TEXT,
                 cancellation_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
@@ -1666,10 +1674,64 @@ impl Database {
             ("effort_reason", "TEXT"),
             ("risk_factors", "TEXT"),
             ("cancellation_reason", "TEXT"),
+            ("acceptance_criteria", "TEXT"),
+            ("required_tests", "TEXT"),
+            ("validation", "TEXT"),
+            ("unchanged", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {definition}"))?;
             }
+        }
+        Self::backfill_task_contract_columns(conn)?;
+        Ok(())
+    }
+
+    fn backfill_task_contract_columns(conn: &Connection) -> Result<(), DbError> {
+        let has_proposals: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_proposal_metadata')",
+            [],
+            |row| row.get(0),
+        )?;
+        let query = if has_proposals {
+            "SELECT t.id, t.objective, p.proposal FROM tasks t LEFT JOIN task_proposal_metadata p ON p.task_id = t.id WHERE t.acceptance_criteria IS NULL OR t.required_tests IS NULL OR t.validation IS NULL OR t.unchanged IS NULL"
+        } else {
+            "SELECT id, objective, NULL FROM tasks WHERE acceptance_criteria IS NULL OR required_tests IS NULL OR validation IS NULL OR unchanged IS NULL"
+        };
+        let mut statement = conn.prepare(query)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (task_id, objective, proposal_json) in rows {
+            let contract = proposal_json
+                .map(|value| {
+                    serde_json::from_str::<crate::protocol::TaskProposal>(&value)
+                        .map(|proposal| crate::task::TaskContract {
+                            unchanged: proposal.unchanged,
+                            acceptance_criteria: proposal.acceptance_criteria,
+                            required_tests: proposal.required_tests,
+                            validation: proposal.validation,
+                        })
+                        .map_err(DbError::Serde)
+                })
+                .transpose()?
+                .unwrap_or_else(|| crate::task::TaskContract::defaults(&objective));
+            conn.execute(
+                "UPDATE tasks SET acceptance_criteria = COALESCE(acceptance_criteria, ?1), required_tests = COALESCE(required_tests, ?2), validation = COALESCE(validation, ?3), unchanged = COALESCE(unchanged, ?4) WHERE id = ?5",
+                params![
+                    serde_json::to_string(&contract.acceptance_criteria)?,
+                    serde_json::to_string(&contract.required_tests)?,
+                    serde_json::to_string(&contract.validation)?,
+                    serde_json::to_string(&contract.unchanged)?,
+                    task_id,
+                ],
+            )?;
         }
         Ok(())
     }
@@ -1835,7 +1897,12 @@ impl Database {
         let Some((prepare, execution)) = self.worker_protocol_result(run_id)? else {
             return Ok(None);
         };
-        let plan = serde_json::from_str(&prepare).map_err(DbError::Serde)?;
+        let mut plan: crate::worker_protocol::WorkerPlan =
+            serde_json::from_str(&prepare).map_err(DbError::Serde)?;
+        plan.upgrade_legacy();
+        plan.validate().map_err(|error| {
+            DbError::Scheduler(format!("persisted Worker PREPARE is invalid: {error}"))
+        })?;
         let execution = execution
             .map(|value| serde_json::from_str(&value).map_err(DbError::Serde))
             .transpose()?;
@@ -3168,6 +3235,47 @@ impl Database {
             .optional()?)
     }
 
+    /// Read the Worker contract from the authoritative Task row. Proposal
+    /// metadata is deliberately not a fallback here: it is only an input to
+    /// task creation and legacy migration.
+    pub fn get_task_contract(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::task::TaskContract>, DbError> {
+        let contract: Option<Option<crate::task::TaskContract>> = self
+            .conn
+            .query_row(
+                "SELECT acceptance_criteria, required_tests, validation, unchanged FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| -> rusqlite::Result<Option<crate::task::TaskContract>> {
+                    let values: Vec<Option<String>> = (0..4)
+                        .map(|index| row.get::<_, Option<String>>(index))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if values.iter().any(Option::is_none) {
+                        return Ok(None);
+                    }
+                    let parse = |index: usize| -> Result<Vec<String>, rusqlite::Error> {
+                        serde_json::from_str::<Vec<String>>(
+                            values[index].as_deref().unwrap_or_default(),
+                        )
+                        .map_err(|error| {
+                                rusqlite::Error::InvalidParameterName(format!(
+                                    "invalid task contract metadata: {error}"
+                                ))
+                            })
+                    };
+                    Ok(Some(crate::task::TaskContract {
+                        acceptance_criteria: parse(0)?,
+                        required_tests: parse(1)?,
+                        validation: parse(2)?,
+                        unchanged: parse(3)?,
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(contract.flatten())
+    }
+
     /// Persist the canonical task contract used by Worker PREPARE.  This is a
     /// separate operation from execution so callers can create a task and
     /// retain the exact Lead proposal that authorized it.
@@ -3197,11 +3305,16 @@ impl Database {
                 DbError::Scheduler("task proposal has no execution effort".into())
             })?;
         self.conn.execute(
-            "UPDATE tasks SET reasoning_effort = ?1, effort_reason = ?2, risk_factors = ?3 WHERE id = ?4",
+            "UPDATE tasks SET reasoning_effort = ?1, effort_reason = ?2, risk_factors = ?3, expected_changes = ?4, acceptance_criteria = ?5, required_tests = ?6, validation = ?7, unchanged = ?8 WHERE id = ?9",
             params![
                 effort,
                 proposal.execution_hints.effort_reason,
                 serde_json::to_string(&proposal.risk_factors)?,
+                serde_json::to_string(&proposal.expected_changes)?,
+                serde_json::to_string(&proposal.acceptance_criteria)?,
+                serde_json::to_string(&proposal.required_tests)?,
+                serde_json::to_string(&proposal.validation)?,
+                serde_json::to_string(&proposal.unchanged)?,
                 task_id
             ],
         )?;
@@ -3323,7 +3436,8 @@ impl Database {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             let id = self.allocate_task_id()?;
-            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?])?;
+            let contract = crate::task::TaskContract::defaults(&input.objective);
+            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?, serde_json::to_string(&contract.acceptance_criteria)?, serde_json::to_string(&contract.required_tests)?, serde_json::to_string(&contract.validation)?, serde_json::to_string(&contract.unchanged)?])?;
             for dependency in &input.dependencies {
                 self.add_task_dependency(&id, dependency)?;
             }

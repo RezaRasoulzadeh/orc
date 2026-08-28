@@ -193,6 +193,9 @@ pub struct ExecutionHints {
 }
 
 impl TaskProposal {
+    const MAX_EXPECTED_CHANGES: usize = 8;
+    const MAX_ACCEPTANCE_CRITERIA: usize = 8;
+
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
             ("local_id", &self.local_id),
@@ -217,6 +220,39 @@ impl TaskProposal {
             if values.iter().any(|value| value.trim().is_empty()) {
                 anyhow::bail!("task proposal {name} contains an empty requirement")
             }
+            let unique = values
+                .iter()
+                .map(|value| value.trim())
+                .collect::<std::collections::HashSet<_>>();
+            if unique.len() != values.len() {
+                anyhow::bail!("task proposal {name} contains duplicate requirements")
+            }
+        }
+        if self.expected_changes.len() > Self::MAX_EXPECTED_CHANGES {
+            anyhow::bail!(
+                "task proposal '{}' is too broad: expected_changes may contain at most {} items",
+                self.local_id,
+                Self::MAX_EXPECTED_CHANGES
+            )
+        }
+        if self.acceptance_criteria.len() > Self::MAX_ACCEPTANCE_CRITERIA {
+            anyhow::bail!(
+                "task proposal '{}' is not independently reviewable: acceptance_criteria may contain at most {} items",
+                self.local_id,
+                Self::MAX_ACCEPTANCE_CRITERIA
+            )
+        }
+        let unchanged: std::collections::HashSet<_> =
+            self.unchanged.iter().map(|value| value.trim()).collect();
+        if self
+            .expected_changes
+            .iter()
+            .any(|value| unchanged.contains(value.trim()))
+        {
+            anyhow::bail!(
+                "task proposal '{}' lists the same behavior as changed and unchanged",
+                self.local_id
+            )
         }
         Ok(())
     }
@@ -363,6 +399,24 @@ mod tests {
         let mut value = proposal();
         value.acceptance_criteria.clear();
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn task_proposal_quality_rules_reject_broad_or_ambiguous_tasks() {
+        let mut value = proposal();
+        value.expected_changes = (0..9).map(|index| format!("file-{index}")).collect();
+        let error = value.validate().unwrap_err().to_string();
+        assert!(error.contains("too broad"));
+
+        let mut value = proposal();
+        value.unchanged.push("src/lib.rs".into());
+        let error = value.validate().unwrap_err().to_string();
+        assert!(error.contains("changed and unchanged"));
+
+        let mut value = proposal();
+        value.required_tests.push("production test".into());
+        let error = value.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate"));
     }
 
     #[test]

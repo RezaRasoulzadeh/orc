@@ -73,6 +73,26 @@ impl OrcApp {
             .resolve_user_decision(self.lead().project_id()?, id, resolution)?)
     }
 
+    pub fn cancel_lead_decision(
+        &self,
+        id: i64,
+        reason: Option<&str>,
+    ) -> Result<crate::lead::PersistedLeadDecision, CancelError> {
+        let project = self
+            .lead()
+            .project_id()
+            .map_err(|error| CancelError::Invalid(error.to_string()))?;
+        Ok(self.db.cancel_lead_decision(project, id, reason)?)
+    }
+
+    pub fn cancel_plan_review(&self, id: i64, reason: Option<&str>) -> Result<(), CancelError> {
+        let project = self
+            .lead()
+            .project_id()
+            .map_err(|error| CancelError::Invalid(error.to_string()))?;
+        Ok(self.db.cancel_plan_review(project, id, reason)?)
+    }
+
     pub fn consume_pending_lead_decision(
         &self,
     ) -> Result<Option<crate::lead::PersistedLeadDecision>> {

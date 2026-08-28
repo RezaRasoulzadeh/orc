@@ -143,6 +143,13 @@ enum Command {
     },
     /// Apply the current approved Planner plan exactly once.
     ApplyApprovedPlan,
+    /// Cancel an actionable workflow gate. TARGET is `lead` or `plan-review`.
+    Cancel {
+        target: String,
+        id: i64,
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
     /// Show the deterministic queue of tasks
     Queue {
         /// Explain task readiness, dependency state, and scheduler eligibility
@@ -642,6 +649,24 @@ fn run(cli: Cli) -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&db.apply_approved_plan(project_id)?)?
             );
+        }
+        Command::Cancel { target, id, reason } => {
+            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            match target.as_str() {
+                "lead" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &app.cancel_lead_decision(id, reason.as_deref())?
+                    )?
+                ),
+                "plan-review" => {
+                    app.cancel_plan_review(id, reason.as_deref())?;
+                    println!("Cancelled plan review {id}.");
+                }
+                _ => {
+                    anyhow::bail!("unknown cancellation target '{target}'; use lead or plan-review")
+                }
+            }
         }
         Command::Plan {
             command,
@@ -1337,6 +1362,7 @@ mod cli_tests {
             Command::Plan { .. } => "Plan",
             Command::ApplyPlan { .. } => "ApplyPlan",
             Command::ApplyApprovedPlan => "ApplyApprovedPlan",
+            Command::Cancel { .. } => "Cancel",
             Command::Queue { .. } => "Queue",
             Command::Template { .. } => "Template",
             Command::Lead { .. } => "Lead",
@@ -1369,6 +1395,18 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["orc", "status"]).unwrap();
         assert!(!cli.ui);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn parses_operator_cancellation_with_reason() {
+        let cli =
+            Cli::try_parse_from(["orc", "cancel", "plan-review", "42", "--reason", "stop now"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cancel { target, id: 42, reason: Some(reason) })
+                if target == "plan-review" && reason == "stop now"
+        ));
     }
 
     #[test]

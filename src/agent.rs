@@ -224,6 +224,7 @@ fn failed_execution_evidence(
                 step.acceptance_criteria
                     .iter()
                     .chain(step.required_tests.iter())
+                    .chain(step.active_review_blockers.iter())
                     .map(move |requirement| (requirement.clone(), step.id.clone()))
             })
             .collect(),
@@ -341,6 +342,7 @@ fn performed_operations_for_plan(
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
 const MAX_VALIDATION_REPAIRS: usize = 3;
+const MAX_COMPLETION_REPAIRS: usize = 2;
 const MAX_INFRASTRUCTURE_RETRIES: usize = 2;
 #[derive(Clone, Debug, Default)]
 pub struct RevisionExecutionOverrides {
@@ -507,6 +509,70 @@ fn validation_diagnostics(report: &ValidationReport) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn validate_worker_step_completion(
+    step: &crate::worker_protocol::PlannedStep,
+    snapshot: Option<&(git::WorktreeChanges, git::WorktreeChanges)>,
+    output: Option<&str>,
+    enforce_protocol: bool,
+    unchanged: &[String],
+) -> Result<()> {
+    let Some((before, after)) = snapshot else {
+        anyhow::bail!("Worker did not execute persisted step '{}'", step.id);
+    };
+    performed_operations_for_step(step, output, enforce_protocol)?;
+    if enforce_protocol {
+        validate_operation_effect(step, before, after, true)?;
+        validate_unchanged_constraints(after, unchanged)?;
+        let reported = crate::worker_protocol::reported_verifications(output.unwrap_or_default());
+        for check in &step.verification {
+            if !reported.iter().any(|value| value == check) {
+                anyhow::bail!(
+                    "Worker did not report verification '{}' for step '{}'",
+                    check,
+                    step.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn completion_repair_prompt(
+    context: &str,
+    step: &crate::worker_protocol::PlannedStep,
+    failure: &str,
+    attempt: usize,
+) -> String {
+    format!(
+        "{context}\n\nWORKER COMPLETION SELF-CHECK REPAIR (attempt {attempt}): The persisted step below was executed, but the completion gate found an omission:\n{failure}\n\nRepair only the implementation or evidence needed for this step. Reconcile the result with the persisted task/revision contract. After checking the actual worktree, emit the required operation and verification protocol lines for this step. Do not claim a check from the plan alone.\n\nPERSISTED STEP:\n{}",
+        serde_json::to_string_pretty(step).unwrap_or_else(|_| step.id.clone())
+    )
+}
+
+fn validate_unchanged_constraints(
+    changes: &git::WorktreeChanges,
+    unchanged: &[String],
+) -> Result<()> {
+    let changed_paths = changes
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.path
+                .split_once(" -> ")
+                .map(|(source, destination)| vec![source, destination])
+                .unwrap_or_else(|| vec![file.path.as_str()])
+        })
+        .collect::<HashSet<_>>();
+    if let Some(constraint) = unchanged
+        .iter()
+        .map(|value| value.trim())
+        .find(|value| changed_paths.contains(value))
+    {
+        anyhow::bail!("Worker changed an unchanged path '{constraint}'");
+    }
+    Ok(())
 }
 
 fn persist_validation_result(
@@ -969,7 +1035,150 @@ pub fn dispatch_with_worker_on_db_cancellable(
             match outcome {
                 WorkerOutcome::Success => {
                     progress("worker completed");
-                    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+                    let mut changes;
+                    if enforce_worker_protocol {
+                        let mut completion_repair = 0;
+                        loop {
+                            let failed_step =
+                                plan.steps.iter().enumerate().find_map(|(index, step)| {
+                                    validate_worker_step_completion(
+                                        step,
+                                        step_snapshots.get(index),
+                                        step_outputs.get(index).and_then(Option::as_deref),
+                                        true,
+                                        &plan.unchanged,
+                                    )
+                                    .err()
+                                    .map(|error| (index, error))
+                                });
+                            let Some((index, gate_error)) = failed_step else {
+                                break;
+                            };
+                            if completion_repair >= MAX_COMPLETION_REPAIRS {
+                                let evidence = failed_execution_evidence(
+                                    &plan,
+                                    &step_outputs,
+                                    &step_snapshots,
+                                    &[],
+                                    &gate_error.to_string(),
+                                    true,
+                                );
+                                db.store_worker_execution(run_id, &evidence)?;
+                                let message = format!(
+                                    "Worker completion self-check failed (verification/evidence): {gate_error:#}"
+                                );
+                                db.update_agent_run_status_with_usage(
+                                    run_id,
+                                    "failed",
+                                    Some(&message),
+                                    token_usage,
+                                )?;
+                                db.update_task_status(task_id, TaskStatus::Blocked)?;
+                                anyhow::bail!(message);
+                            }
+                            completion_repair += 1;
+                            let repair_prompt = completion_repair_prompt(
+                                &prompt,
+                                &plan.steps[index],
+                                &gate_error.to_string(),
+                                completion_repair,
+                            );
+                            db.record_lifecycle_event(
+                                "worker_completion_repair_started",
+                                Some(task_id),
+                                Some(run_id),
+                                Some(agent_id),
+                                Some(
+                                    &serde_json::json!({
+                                        "attempt": completion_repair,
+                                        "step_id": plan.steps[index].id,
+                                        "failure": gate_error.to_string(),
+                                    })
+                                    .to_string(),
+                                ),
+                            )?;
+                            let before = step_snapshots
+                                .get(index)
+                                .map(|(before, _)| before.clone())
+                                .context("completion repair lost the step snapshot")?;
+                            let repaired = match cancellation {
+                                Some(cancellation) => worker.execute_planned_step_cancellable(
+                                    &plan.steps[index],
+                                    &repair_prompt,
+                                    &worktree_dir,
+                                    &crate::automated::revision_handoff_schema(),
+                                    &|line| worker_output(line),
+                                    cancellation,
+                                ),
+                                None => worker.execute_planned_step(
+                                    &plan.steps[index],
+                                    &repair_prompt,
+                                    &worktree_dir,
+                                    &crate::automated::revision_handoff_schema(),
+                                    &|line| worker_output(line),
+                                ),
+                            };
+                            let repaired = match repaired {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    let message = format!(
+                                        "Worker completion repair failed after self-check '{gate_error}': {error}"
+                                    );
+                                    db.update_agent_run_status_with_usage(
+                                        run_id,
+                                        "failed",
+                                        Some(&message),
+                                        token_usage,
+                                    )?;
+                                    db.update_task_status(task_id, TaskStatus::Blocked)?;
+                                    anyhow::bail!(message);
+                                }
+                            };
+                            if let WorkerOutcome::Failure(error) = repaired.outcome {
+                                let message = format!(
+                                    "Worker completion repair failed after self-check '{gate_error}': {error}"
+                                );
+                                db.update_agent_run_status_with_usage(
+                                    run_id,
+                                    "failed",
+                                    Some(&message),
+                                    token_usage,
+                                )?;
+                                db.update_task_status(task_id, TaskStatus::Blocked)?;
+                                anyhow::bail!(message);
+                            }
+                            if let Some(repair_output) = repaired.output {
+                                step_outputs[index] = Some(repair_output);
+                            }
+                            if repaired.token_usage.is_some() {
+                                token_usage = repaired.token_usage;
+                            }
+                            let after = git::inspect_worktree(&worktree_dir, repo_path)
+                                .context("failed to inspect worktree after completion repair")?;
+                            step_snapshots[index] = (before, after);
+                            db.record_lifecycle_event(
+                                "worker_completion_repair_completed",
+                                Some(task_id),
+                                Some(run_id),
+                                Some(agent_id),
+                                Some(
+                                    &serde_json::json!({
+                                        "attempt": completion_repair,
+                                        "step_id": plan.steps[index].id,
+                                    })
+                                    .to_string(),
+                                ),
+                            )?;
+                        }
+                        output = (!step_outputs.is_empty()).then(|| {
+                            step_outputs
+                                .iter()
+                                .filter_map(|value| value.as_deref())
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        });
+                    }
+                    changes = match git::inspect_worktree(&worktree_dir, repo_path) {
                         Ok(changes) => changes,
                         Err(error) => {
                             let output = format!(
@@ -983,47 +1192,11 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 token_usage,
                             )?;
                             db.update_task_status(task_id, TaskStatus::Blocked)?;
-                            anyhow::bail!("could not inspect task worktree after worker completion")
+                            anyhow::bail!(
+                                "could not inspect task worktree after Worker completion gate"
+                            )
                         }
                     };
-                    if enforce_worker_protocol {
-                        let protocol_check =
-                            plan.steps.iter().enumerate().try_for_each(|(index, step)| {
-                                let (before, after) =
-                                    step_snapshots.get(index).with_context(|| {
-                                        format!(
-                                            "Worker did not execute persisted step '{}'",
-                                            step.id
-                                        )
-                                    })?;
-                                performed_operations_for_step(
-                                    step,
-                                    step_outputs.get(index).and_then(Option::as_deref),
-                                    true,
-                                )?;
-                                validate_operation_effect(step, before, after, true)
-                            });
-                        if let Err(error) = protocol_check {
-                            let evidence = failed_execution_evidence(
-                                &plan,
-                                &step_outputs,
-                                &step_snapshots,
-                                &[],
-                                &error.to_string(),
-                                true,
-                            );
-                            db.store_worker_execution(run_id, &evidence)?;
-                            let message = format!("Worker plan verification failed: {error:#}");
-                            db.update_agent_run_status_with_usage(
-                                run_id,
-                                "failed",
-                                Some(&message),
-                                token_usage,
-                            )?;
-                            db.update_task_status(task_id, TaskStatus::Blocked)?;
-                            anyhow::bail!(message);
-                        }
-                    }
                     if changes.files.is_empty() {
                         let output = format!(
                             "{}\n\nDispatch result: no meaningful project changes.",
@@ -1266,6 +1439,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 step.acceptance_criteria
                                     .iter()
                                     .chain(step.required_tests.iter())
+                                    .chain(step.active_review_blockers.iter())
                                     .map(move |criterion| (criterion.clone(), step.id.clone()))
                             })
                             .collect(),
@@ -1323,6 +1497,20 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         db.update_task_status(task_id, TaskStatus::Blocked)?;
                         anyhow::bail!(message);
                     }
+                    db.record_lifecycle_event(
+                        "worker_completion_gate",
+                        Some(task_id),
+                        Some(run_id),
+                        Some(agent_id),
+                        Some(
+                            &serde_json::json!({
+                                "status": "passed",
+                                "contract": "authoritative task contract",
+                                "evidence": evidence,
+                            })
+                            .to_string(),
+                        ),
+                    )?;
                     db.store_worker_execution(run_id, &evidence)
                         .context("failed to persist Worker execution evidence")?;
                     db.record_lifecycle_event(
@@ -1823,7 +2011,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         }
     };
     let outcome = execution.outcome;
-    let output = execution.output;
+    let mut output = execution.output;
     let token_usage = execution.token_usage;
     let fail = |message: String| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
@@ -1840,46 +2028,110 @@ pub fn revise_with_worker_on_db_with_overrides(
         return fail(format!("Worker failed: {error}"));
     }
     progress("worker completed");
-    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
-        Ok(changes) => git::changes_since(&baseline_changes, &changes),
-        Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
-    };
     if enforce_worker_protocol {
-        let protocol_check =
-            revision_plan
+        let mut completion_repair = 0;
+        loop {
+            let failed_step = revision_plan
                 .steps
                 .iter()
                 .enumerate()
-                .try_for_each(|(index, step)| {
-                    let (before, after) =
-                        revision_step_snapshots.get(index).with_context(|| {
-                            format!(
-                                "Worker did not execute persisted revision step '{}'",
-                                step.id
-                            )
-                        })?;
-                    performed_operations_for_step(
+                .find_map(|(index, step)| {
+                    validate_worker_step_completion(
                         step,
+                        revision_step_snapshots.get(index),
                         revision_step_outputs.get(index).and_then(Option::as_deref),
                         true,
-                    )?;
-                    validate_operation_effect(step, before, after, true)
+                        &revision_plan.unchanged,
+                    )
+                    .err()
+                    .map(|error| (index, error))
                 });
-        if let Err(error) = protocol_check {
-            let evidence = failed_execution_evidence(
-                &revision_plan,
-                &revision_step_outputs,
-                &revision_step_snapshots,
-                &[],
+            let Some((index, error)) = failed_step else {
+                break;
+            };
+            if completion_repair >= MAX_COMPLETION_REPAIRS {
+                let evidence = failed_execution_evidence(
+                    &revision_plan,
+                    &revision_step_outputs,
+                    &revision_step_snapshots,
+                    &[],
+                    &error.to_string(),
+                    true,
+                );
+                db.store_worker_execution(run_id, &evidence)?;
+                return fail(format!(
+                    "Worker revision completion self-check failed: {error:#}"
+                ));
+            }
+            completion_repair += 1;
+            let repair_prompt = completion_repair_prompt(
+                &prompt,
+                &revision_plan.steps[index],
                 &error.to_string(),
-                true,
+                completion_repair,
             );
-            db.store_worker_execution(run_id, &evidence)?;
-            return fail(format!(
-                "Worker revision plan verification failed: {error:#}"
-            ));
+            db.record_lifecycle_event(
+                "worker_completion_repair_started",
+                Some(task_id),
+                Some(run_id),
+                Some(agent_id),
+                Some(
+                    &serde_json::json!({
+                        "attempt": completion_repair,
+                        "step_id": revision_plan.steps[index].id,
+                        "failure": error.to_string(),
+                    })
+                    .to_string(),
+                ),
+            )?;
+            let before = revision_step_snapshots
+                .get(index)
+                .map(|(before, _)| before.clone())
+                .context("completion repair lost the revision step snapshot")?;
+            let repaired = worker
+                .execute_planned_step(
+                    &revision_plan.steps[index],
+                    &repair_prompt,
+                    &worktree_dir,
+                    &crate::automated::revision_handoff_schema(),
+                    &|line| worker_output(line),
+                )
+                .map_err(anyhow::Error::msg)?;
+            if let WorkerOutcome::Failure(error) = repaired.outcome {
+                return fail(format!("Worker completion repair failed: {error}"));
+            }
+            if let Some(repair_output) = repaired.output {
+                revision_step_outputs[index] = Some(repair_output);
+                output = Some(
+                    revision_step_outputs
+                        .iter()
+                        .filter_map(|value| value.as_deref())
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                );
+            }
+            let after = git::inspect_worktree(&worktree_dir, repo_path)
+                .context("failed to inspect worktree after completion repair")?;
+            revision_step_snapshots[index] = (before, after);
+            db.record_lifecycle_event(
+                "worker_completion_repair_completed",
+                Some(task_id),
+                Some(run_id),
+                Some(agent_id),
+                Some(
+                    &serde_json::json!({
+                        "attempt": completion_repair,
+                        "step_id": revision_plan.steps[index].id,
+                    })
+                    .to_string(),
+                ),
+            )?;
         }
     }
+    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+        Ok(current) => git::changes_since(&baseline_changes, &current),
+        Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
+    };
     if changes.files.is_empty() {
         return fail("Revision completed without meaningful project changes.".into());
     }
@@ -1955,6 +2207,7 @@ pub fn revise_with_worker_on_db_with_overrides(
                 step.acceptance_criteria
                     .iter()
                     .chain(step.required_tests.iter())
+                    .chain(step.active_review_blockers.iter())
                     .map(move |criterion| (criterion.clone(), step.id.clone()))
             })
             .collect(),
@@ -2004,6 +2257,20 @@ pub fn revise_with_worker_on_db_with_overrides(
             "Worker revision verification evidence failed: {error:#}"
         ));
     }
+    db.record_lifecycle_event(
+        "worker_completion_gate",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(
+            &serde_json::json!({
+                "status": "passed",
+                "contract": "authoritative task and revision contract",
+                "evidence": revision_evidence,
+            })
+            .to_string(),
+        ),
+    )?;
     db.store_worker_execution(run_id, &revision_evidence)
         .context("failed to persist Worker revision execution evidence")?;
     // The subsequent automated review is authoritative for blocker

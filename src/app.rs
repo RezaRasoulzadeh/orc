@@ -138,14 +138,21 @@ impl OrcApp {
                     .unwrap_or_default()
             );
         }
-        let backend = crate::lead::CodexLeadBackend::from_agent(
-            &agent,
-            &self.repo_path,
-            config.model.clone(),
-            config.reasoning_effort,
-        )
-        .map_err(anyhow::Error::msg)?;
-        self.lead().invoke(message, &backend, context_limit)
+        let adapter = crate::backend::provider_adapter(&agent.backend)
+            .ok_or_else(|| anyhow::anyhow!("unsupported provider '{}'.", agent.backend))?;
+        let backend = adapter
+            .build_lead(
+                &agent,
+                &self.repo_path,
+                crate::backend::ProviderExecutionOptions {
+                    model: config.model.clone().or(agent.model.clone()),
+                    reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
+                    read_only: true,
+                    executable: None,
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+        self.lead().invoke(message, backend.as_ref(), context_limit)
     }
     pub fn invoke_persisted_lead(
         &self,
@@ -167,16 +174,23 @@ impl OrcApp {
             .db
             .get_agent(&config.agent_id)?
             .context("configured Lead agent is unavailable")?;
-        let backend = crate::lead::CodexLeadBackend::from_agent(
-            &agent,
-            &self.repo_path,
-            config.model,
-            config.reasoning_effort,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let adapter = crate::backend::provider_adapter(&agent.backend)
+            .ok_or_else(|| anyhow::anyhow!("unsupported provider '{}'.", agent.backend))?;
+        let backend = adapter
+            .build_lead(
+                &agent,
+                &self.repo_path,
+                crate::backend::ProviderExecutionOptions {
+                    model: config.model.or(agent.model.clone()),
+                    reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
+                    read_only: true,
+                    executable: None,
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
         crate::lead::LeadService::new_with_required_discovery(&self.db, &self.repo_path).invoke(
             message,
-            &backend,
+            backend.as_ref(),
             context_limit,
         )
     }
@@ -424,7 +438,8 @@ impl OrcApp {
             .with_context(|| format!("Lead agent '{}' does not exist", config.agent_id))?;
         if !agent.supports_action(registry::AgentAction::Lead)
             || agent.execution_mode != registry::AUTOMATED
-            || agent.backend != "codex"
+            || !crate::backend::provider_adapter(&agent.backend)
+                .is_some_and(|adapter| adapter.supports_lead())
         {
             anyhow::bail!(
                 "Lead agent '{}' is not compatible with Lead execution",
@@ -978,14 +993,15 @@ impl OrcApp {
     pub fn configure_agent(&self, agent: AgentDefinition) -> Result<()> {
         registry::validate_backend(&agent.backend)?;
         if (agent.model.is_some() || agent.reasoning_effort.is_some())
-            && (agent.backend != "codex" || agent.execution_mode == registry::MANUAL)
+            && (agent.execution_mode == registry::MANUAL
+                || !crate::backend::provider_supports_execution_options(&agent.backend))
         {
             anyhow::bail!(
-                "only automated Codex agents support model and reasoning-effort configuration"
+                "only automated providers with execution settings support model and reasoning-effort configuration"
             );
         }
         if agent.execution_mode == registry::AUTOMATED
-            && !matches!(agent.backend.as_str(), "codex" | "copilot" | "antigravity")
+            && !crate::backend::provider_supports_automated_execution(&agent.backend)
         {
             anyhow::bail!("backend '{}' requires --mode manual", agent.backend);
         }
@@ -1179,15 +1195,19 @@ impl OrcApp {
     }
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<bool> {
         let agent = registry::get_agent(&self.db, id)?;
-        if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
-            anyhow::bail!("agent '{}' does not support Codex model settings", id)
+        if agent.execution_mode != registry::AUTOMATED
+            || !crate::backend::provider_supports_execution_options(&agent.backend)
+        {
+            anyhow::bail!("agent '{}' does not support model settings", id)
         }
         Ok(self.db.set_agent_model(id, model)?)
     }
     pub fn set_agent_effort(&self, id: &str, effort: registry::ReasoningEffort) -> Result<bool> {
         let agent = registry::get_agent(&self.db, id)?;
-        if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
-            anyhow::bail!("agent '{}' does not support Codex reasoning settings", id)
+        if agent.execution_mode != registry::AUTOMATED
+            || !crate::backend::provider_supports_execution_options(&agent.backend)
+        {
+            anyhow::bail!("agent '{}' does not support reasoning settings", id)
         }
         Ok(self.db.set_agent_reasoning_effort(id, effort)?)
     }
@@ -1219,12 +1239,7 @@ impl OrcApp {
     }
     pub fn sync_agent_capacity(&self, id: &str) -> Result<()> {
         let agent = registry::get_agent(&self.db, id)?;
-        crate::codex_app_server::sync_agent(
-            &self.db,
-            &agent,
-            &crate::codex_app_server::CodexAppServer,
-        )
-        .map_err(anyhow::Error::msg)?;
+        crate::backend::sync_agent_quota(&self.db, &agent).map_err(anyhow::Error::msg)?;
         Ok(())
     }
     pub fn set_task_scope(&self, id: &str, scope: TaskScopeMode) -> Result<bool> {

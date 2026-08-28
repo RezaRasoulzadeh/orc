@@ -1,5 +1,4 @@
 use crate::app::OrcApp;
-use crate::codex_app_server::{self, CodexAppServer};
 use crate::registry::{self, AgentDefinition};
 use crate::storage::Database;
 use anyhow::Result;
@@ -175,16 +174,15 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
         } => {
             registry::validate_backend(&backend)?;
             if (model.is_some() || effort.is_some())
-                && (backend != "codex" || mode == registry::MANUAL)
+                && (mode == registry::MANUAL
+                    || !crate::backend::provider_supports_execution_options(&backend))
             {
                 anyhow::bail!(
-                    "only automated Codex agents support model and reasoning-effort configuration"
+                    "only automated providers with execution settings support model and reasoning-effort configuration"
                 );
             }
             if mode == registry::AUTOMATED
-                && backend != "codex"
-                && backend != "copilot"
-                && backend != "antigravity"
+                && !crate::backend::provider_supports_automated_execution(&backend)
             {
                 anyhow::bail!("backend '{}' requires --mode manual", backend);
             }
@@ -379,11 +377,11 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
             ensure_agent_updated(app.set_agent_profile(&id, &path)?, &id)?
         }
         AgentCommand::Model { id, model } => {
-            ensure_codex_automated_agent(&db, &id)?;
+            ensure_provider_execution_options(&db, &id)?;
             ensure_agent_updated(app.set_agent_model(&id, &model)?, &id)?;
         }
         AgentCommand::Effort { id, effort } => {
-            ensure_codex_automated_agent(&db, &id)?;
+            ensure_provider_execution_options(&db, &id)?;
             ensure_agent_updated(app.set_agent_effort(&id, effort)?, &id)?;
         }
         AgentCommand::Quota {
@@ -398,8 +396,8 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
         }
         AgentCommand::Sync { id } => {
             let agent = registry::get_agent(&db, &id)?;
-            let snapshot = codex_app_server::sync_agent(&db, &agent, &CodexAppServer)
-                .map_err(anyhow::Error::msg)?;
+            let snapshot =
+                crate::backend::sync_agent_quota(&db, &agent).map_err(anyhow::Error::msg)?;
             print_synced_quota(&id, &snapshot);
         }
         AgentCommand::Show { id } => {
@@ -530,11 +528,13 @@ fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
+fn ensure_provider_execution_options(db: &Database, id: &str) -> Result<()> {
     let agent = registry::get_agent(db, id)?;
-    if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
+    if agent.execution_mode != registry::AUTOMATED
+        || !crate::backend::provider_supports_execution_options(&agent.backend)
+    {
         anyhow::bail!(
-            "only automated Codex agents support model and reasoning-effort configuration"
+            "only automated providers with execution settings support model and reasoning-effort configuration"
         );
     }
     Ok(())
@@ -581,7 +581,7 @@ fn read_configuration(path: &str) -> Result<crate::agent_onboarding::AgentConfig
     serde_json::from_str(&contents)
         .map_err(|error| anyhow::anyhow!("invalid agent configuration: {error}"))
 }
-fn print_synced_quota(id: &str, snapshot: &codex_app_server::QuotaSnapshot) {
+fn print_synced_quota(id: &str, snapshot: &crate::backend::ProviderQuotaSnapshot) {
     println!("{}:\n  remaining: {}%", id, snapshot.remaining_percent);
 }
 fn print_quota_limit(_label: &str, _limit: Option<&registry::QuotaLimit>) {}

@@ -216,16 +216,15 @@ impl ActionBackend for WorkerActionBackend {
         progress: ActionProgress<'_>,
     ) -> Result<ActionExecution> {
         let worker = match action {
-            AgentAction::Lead => {
-                crate::backend::WorkerFactory::build_lead(agent, model.map(str::to_owned), effort)
+            AgentAction::Lead | AgentAction::Plan => {
+                crate::backend::WorkerFactory::build_read_only(
+                    agent,
+                    model.map(str::to_owned),
+                    effort,
+                    self.planner_executable.clone(),
+                )
             }
-            AgentAction::Plan => crate::backend::WorkerFactory::build_planner_with_executable(
-                agent,
-                model.map(str::to_owned),
-                effort,
-                self.planner_executable.clone(),
-            ),
-            _ => crate::backend::WorkerFactory::build_with_codex_overrides(
+            _ => crate::backend::WorkerFactory::build_with_overrides(
                 agent,
                 model.map(str::to_owned),
                 effort,
@@ -238,7 +237,7 @@ impl ActionBackend for WorkerActionBackend {
                 &self.repo,
                 progress.schema,
                 &|event| {
-                    (progress.callback)(&provider_activity(event));
+                    (progress.callback)(&worker.activity(event));
                 },
             )
             .map_err(anyhow::Error::msg)?;
@@ -255,23 +254,6 @@ impl ActionBackend for WorkerActionBackend {
 
     fn observe(&self, message: &str) {
         eprintln!("{message}");
-    }
-}
-
-fn provider_activity(event: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
-        return "provider activity".into();
-    };
-    let event_type = value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("activity");
-    let item_type = value
-        .pointer("/item/type")
-        .and_then(serde_json::Value::as_str);
-    match item_type {
-        Some(item_type) => format!("provider {event_type}: {item_type}"),
-        None => format!("provider {event_type}"),
     }
 }
 

@@ -315,6 +315,12 @@ const SIGKILL: i32 = 9;
 /// Trait for task execution backends.
 /// Implementations are responsible for executing a task and returning the outcome.
 pub trait Worker: Send + Sync {
+    /// Convert a provider event into an Orc activity message. Event formats
+    /// stay inside the provider implementation.
+    fn activity(&self, _event: &str) -> String {
+        "provider activity".into()
+    }
+
     /// Provider execution settings selected for this worker, when applicable.
     fn execution_configuration(&self) -> (Option<&str>, Option<ReasoningEffort>) {
         (None, None)
@@ -610,6 +616,10 @@ impl CodexWorker {
 }
 
 impl Worker for CodexWorker {
+    fn activity(&self, event: &str) -> String {
+        codex_activity(event)
+    }
+
     fn execution_configuration(&self) -> (Option<&str>, Option<ReasoningEffort>) {
         (self.model.as_deref(), self.reasoning_effort)
     }
@@ -683,6 +693,23 @@ impl Worker for CodexWorker {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(format!("failed to remove Codex output schema: {error}")),
         }
+    }
+}
+
+fn codex_activity(event: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
+        return "provider activity".into();
+    };
+    let event_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("activity");
+    let item_type = value
+        .pointer("/item/type")
+        .and_then(serde_json::Value::as_str);
+    match item_type {
+        Some(item_type) => format!("provider {event_type}: {item_type}"),
+        None => format!("provider {event_type}"),
     }
 }
 

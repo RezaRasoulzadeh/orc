@@ -2476,7 +2476,7 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     if agent.execution_mode == registry::MANUAL {
         if model_override.is_some() || effort_override.is_some() {
             anyhow::bail!(
-                "manual agent '{}' does not support Codex model or reasoning-effort overrides",
+                "manual agent '{}' does not support model or reasoning-effort overrides",
                 agent.id
             );
         }
@@ -2518,7 +2518,7 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     };
     let model = resolution.model.clone();
     let reasoning_effort = resolution.reasoning_effort;
-    let worker = WorkerFactory::build_with_codex_overrides(&agent, model.clone(), reasoning_effort)
+    let worker = WorkerFactory::build_with_overrides(&agent, model.clone(), reasoning_effort)
         .map_err(anyhow::Error::msg)?;
     let mut summary = dispatch_with_worker_on_db_cancellable(
         task_id,

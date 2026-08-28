@@ -68,14 +68,17 @@ impl AgentOnboardingRequest {
         }
         registry::validate_backend(&self.backend)?;
         if self.execution_mode == AgentExecutionMode::Automated
-            && !matches!(self.backend.as_str(), "codex" | "copilot" | "antigravity")
+            && !crate::backend::provider_supports_automated_execution(&self.backend)
         {
             bail!("backend '{}' requires manual execution mode", self.backend)
         }
         if (self.model.is_some() || self.reasoning_effort.is_some())
-            && (self.backend != "codex" || self.execution_mode != AgentExecutionMode::Automated)
+            && (self.execution_mode != AgentExecutionMode::Automated
+                || !crate::backend::provider_supports_execution_options(&self.backend))
         {
-            bail!("only automated Codex agents support model and reasoning-effort configuration")
+            bail!(
+                "only automated providers with execution settings support model and reasoning-effort configuration"
+            )
         }
         if self.roles.is_empty() {
             bail!("at least one Orc role must be assigned")
@@ -195,6 +198,27 @@ impl ProviderCommandRunner for SystemProviderCommandRunner {
     }
 }
 
+struct InspectionRunner<'a>(&'a dyn ProviderCommandRunner);
+
+impl crate::backend::ProviderInspectionRunner for InspectionRunner<'_> {
+    fn run(
+        &self,
+        executable: &str,
+        args: &[&str],
+        cwd: &Path,
+        environment: Option<(&str, &Path)>,
+    ) -> Result<crate::backend::ProviderCommandOutput, String> {
+        self.0
+            .run(executable, args, cwd, environment)
+            .map(|output| crate::backend::ProviderCommandOutput {
+                success: output.success,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+    }
+}
+
+#[cfg(test)]
 fn authentication_check(
     backend: &str,
 ) -> Result<(&'static str, &'static [&'static str], &'static str), String> {
@@ -227,58 +251,24 @@ impl ProviderOnboarding for SystemProviderOnboarding {
                 ),
                 capabilities: declared_capabilities
                     .iter()
-                    .map(|v| AgentCapability::parse(v))
+                    .map(|value| AgentCapability::parse(value))
                     .collect(),
             });
         }
-        let (executable, args, authentication_method) = authentication_check(&provider.backend)?;
-        if provider.backend == "codex" && provider.profile_path.is_none() {
-            return Err("Codex onboarding requires a configured profile path".into());
-        }
-        if let Some(profile) = provider.profile_path.as_deref()
-            && provider.backend == "codex"
-            && !Path::new(profile).is_dir()
-        {
-            return Err(format!("profile path does not exist: {profile}"));
-        }
-        let output = self.command_runner.run(
-            executable,
-            args,
+        let adapter = crate::backend::provider_adapter(&provider.backend)
+            .ok_or_else(|| format!("unsupported agent backend '{}'", provider.backend))?;
+        adapter.inspect(
+            provider,
+            mode,
+            declared_capabilities,
             &self.cwd,
-            provider
-                .profile_path
-                .as_deref()
-                .filter(|_| provider.backend == "codex")
-                .map(|profile| ("CODEX_HOME", Path::new(profile))),
-        )?;
-        if !output.success {
-            let detail = output.stderr.trim().to_owned();
-            return Err(if detail.is_empty() {
-                format!("{executable} authentication check failed")
-            } else {
-                detail
-            });
-        }
-        Ok(ProviderInspection {
-            authenticated: true,
-            authentication_method: authentication_method.into(),
-            authentication_detail: Some(output.stdout.trim().to_owned()),
-            capabilities: discovered_capabilities(&provider.backend),
-        })
+            &InspectionRunner(self.command_runner.as_ref()),
+        )
     }
 }
 
 pub fn discovered_capabilities(backend: &str) -> Vec<AgentCapability> {
-    match backend {
-        "codex" | "copilot" | "antigravity" => vec![
-            AgentCapability::Code,
-            AgentCapability::RepositoryRead,
-            AgentCapability::RepositoryWrite,
-            AgentCapability::CommandExecution,
-            AgentCapability::StructuredOutput,
-        ],
-        _ => Vec::new(),
-    }
+    crate::backend::provider_capabilities(backend)
 }
 
 pub fn preview(
@@ -351,19 +341,18 @@ pub fn validate_document(document: &AgentConfigurationDocument) -> Result<()> {
         bail!("agent configuration must assign at least one Orc role")
     }
     if document.agent.execution_mode() == AgentExecutionMode::Automated
-        && !matches!(
-            document.agent.provider(),
-            "codex" | "copilot" | "antigravity"
-        )
+        && !crate::backend::provider_supports_automated_execution(document.agent.provider())
     {
         bail!("automated agent configuration uses a backend that requires manual mode")
     }
     if (document.agent.execution.provider.model.is_some()
         || document.agent.execution.provider.reasoning_effort.is_some())
-        && (document.agent.provider() != "codex"
-            || document.agent.execution_mode() != AgentExecutionMode::Automated)
+        && (document.agent.execution_mode() != AgentExecutionMode::Automated
+            || !crate::backend::provider_supports_execution_options(document.agent.provider()))
     {
-        bail!("only automated Codex agents support model and reasoning-effort configuration")
+        bail!(
+            "only automated providers with execution settings support model and reasoning-effort configuration"
+        )
     }
     Agent::from_definition(&document.agent.to_definition())?;
     if !document.authentication.verified {

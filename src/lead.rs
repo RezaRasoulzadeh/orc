@@ -1,12 +1,14 @@
 use crate::protocol::{PROTOCOL_VERSION, PlanResponse, PlannedTask, PlanningProjectState};
+use crate::registry::ReasoningEffort;
 use crate::storage::db::{ApprovalRequest, DbError, LifecycleEvent, WorkerResult};
 use crate::storage::{AgentRun, Database};
 use crate::task::Task;
-use crate::{backend, registry::ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+// Kept as a compatibility re-export for callers that used the old location.
+pub use crate::backend::CodexLeadBackend;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -130,95 +132,6 @@ pub struct LeadProviderConfig {
     pub agent_id: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
-}
-
-pub struct CodexLeadBackend {
-    profile_path: Option<PathBuf>,
-    model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
-    repo_path: PathBuf,
-}
-
-impl CodexLeadBackend {
-    pub fn from_agent(
-        agent: &crate::registry::AgentDefinition,
-        repo_path: &Path,
-        model: Option<String>,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<Self, String> {
-        if agent.backend != "codex" {
-            return Err(format!(
-                "Lead provider agent '{}' must use the codex backend",
-                agent.id
-            ));
-        }
-        Ok(Self {
-            profile_path: agent.profile_path.as_deref().map(PathBuf::from),
-            model: model.or_else(|| agent.model.clone()),
-            reasoning_effort: reasoning_effort.or(agent.reasoning_effort),
-            repo_path: repo_path.to_path_buf(),
-        })
-    }
-
-    pub fn command_args(&self, prompt: &str) -> Vec<String> {
-        let mut args = crate::worker::CodexWorker::command_args_with_execution(
-            prompt,
-            self.model.as_deref(),
-            self.reasoning_effort,
-        );
-        if let Some(sandbox) = args
-            .iter_mut()
-            .find(|arg| arg.as_str() == "workspace-write")
-        {
-            *sandbox = "read-only".into();
-        }
-        args
-    }
-
-    fn prompt(context: &LeadContext, message: &str) -> Result<String, String> {
-        let context = serde_json::to_string(context)
-            .map_err(|error| format!("failed to serialize Lead context: {error}"))?;
-        Ok(format!(
-            "You are Orc's project Lead. You are strictly read-only: inspect the supplied persisted project and repository state only. You must not edit files, create commits, create or apply tasks, invoke Planner, dispatch, review, revise, or accept work. Return exactly one decision with kind DIRECT_TASKS, PLAN_REQUIRED, or USER_DECISION_REQUIRED, plus a message. Proposals are optional human-gated suggestions and are never applied by Lead. Respond with only structured JSON.\nProject context:\n{context}\nUser message:\n{message}"
-        ))
-    }
-
-    pub fn parse_response(output: &str) -> Result<LeadBackendResponse, String> {
-        serde_json::from_str(output.trim())
-            .map_err(|error| format!("Lead provider returned malformed structured output: {error}"))
-    }
-}
-
-impl LeadBackend for CodexLeadBackend {
-    fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String> {
-        let prompt = Self::prompt(context, message)?;
-        let mut command = Command::new("codex");
-        command.args(self.command_args(&prompt));
-        if let Some(profile_path) = &self.profile_path {
-            backend::apply_profile_environment(&mut command, profile_path);
-        }
-        backend::configure_noninteractive(&mut command, &self.repo_path);
-        let output = crate::worker::run_command_with_timeout(
-            command,
-            crate::worker::configured_timeout(
-                "ORC_LEAD_TIMEOUT_SECS",
-                crate::worker::DEFAULT_WORKER_TIMEOUT,
-            ),
-        )?;
-        if !output.status.success() {
-            return Err(format!(
-                "Codex Lead exited with non-zero status: {}",
-                output
-                    .status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unknown".into())
-            ));
-        }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|error| format!("Codex Lead returned non-UTF-8 output: {error}"))?;
-        Self::parse_response(&stdout)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

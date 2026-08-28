@@ -5,7 +5,6 @@ use orc::agent;
 use orc::cli::agent::AgentCommand;
 use orc::cli::run::RunCommand;
 use orc::cli::task::TaskCommand;
-use orc::codex_app_server::{self, CodexAppServer, QuotaSnapshot};
 use orc::desktop;
 use orc::discovery;
 use orc::doctor::{self, CheckStatus};
@@ -39,11 +38,13 @@ fn parse_concurrency(value: &str) -> Result<Concurrency, String> {
 }
 
 #[allow(dead_code)]
-fn ensure_codex_automated_agent(db: &Database, id: &str) -> Result<()> {
+fn ensure_provider_execution_options(db: &Database, id: &str) -> Result<()> {
     let agent = registry::get_agent(db, id)?;
-    if agent.backend != "codex" || agent.execution_mode != registry::AUTOMATED {
+    if agent.execution_mode != registry::AUTOMATED
+        || !orc::backend::provider_supports_execution_options(&agent.backend)
+    {
         anyhow::bail!(
-            "only automated Codex agents support model and reasoning-effort configuration"
+            "only automated providers with execution settings support model and reasoning-effort configuration"
         );
     }
     Ok(())
@@ -1078,9 +1079,7 @@ fn run(cli: Cli) -> Result<()> {
                     &orc::SystemValidationRunner,
                     &orc::agent::RevisionExecutionOverrides { model, effort },
                     |agent, model, effort| {
-                        orc::backend::WorkerFactory::build_with_codex_overrides(
-                            agent, model, effort,
-                        )
+                        orc::backend::WorkerFactory::build_with_overrides(agent, model, effort)
                     },
                 )?;
                 println!("{}", orc::review::format_dispatch(&summary));
@@ -1194,12 +1193,14 @@ fn ensure_agent_updated(changed: bool, id: &str) -> Result<()> {
 }
 
 fn sync_enabled_agents(db: &Database) {
-    match codex_app_server::sync_enabled_agents(db, &CodexAppServer) {
-        Ok(results) => {
-            for (id, result) in results {
-                match result {
-                    Ok(snapshot) => print_synced_quota(&id, &snapshot),
-                    Err(error) => eprintln!("{id}: quota sync failed: {error}"),
+    match db.list_agents() {
+        Ok(agents) => {
+            for agent in agents.into_iter().filter(|agent| {
+                agent.enabled && orc::backend::provider_supports_quota(&agent.backend)
+            }) {
+                match orc::backend::sync_agent_quota(db, &agent) {
+                    Ok(snapshot) => print_synced_quota(&agent.id, &snapshot),
+                    Err(error) => eprintln!("{}: quota sync failed: {error}", agent.id),
                 }
             }
         }
@@ -1216,14 +1217,15 @@ fn sync_enabled_agents_after_automated_run(task_id: &str) {
                 .and_then(|runs| runs.into_iter().next())
                 .is_some_and(|run| run.execution_mode == registry::AUTOMATED);
             if automated {
-                match codex_app_server::sync_enabled_agents_after_automated_run(
-                    &db,
-                    &CodexAppServer,
-                ) {
-                    Ok(results) => {
-                        for (id, result) in results {
-                            if let Err(error) = result {
-                                eprintln!("{id}: quota sync failed: {error}");
+                match db.list_agents() {
+                    Ok(agents) => {
+                        for agent in agents.into_iter().filter(|agent| {
+                            agent.enabled
+                                && orc::backend::provider_supports_quota(&agent.backend)
+                                && agent.profile_path.is_some()
+                        }) {
+                            if let Err(error) = orc::backend::sync_agent_quota(&db, &agent) {
+                                eprintln!("{}: quota sync failed: {error}", agent.id);
                             }
                         }
                     }
@@ -1235,7 +1237,7 @@ fn sync_enabled_agents_after_automated_run(task_id: &str) {
     }
 }
 
-fn print_synced_quota(id: &str, snapshot: &QuotaSnapshot) {
+fn print_synced_quota(id: &str, snapshot: &orc::backend::ProviderQuotaSnapshot) {
     println!("{id}:");
     println!("  remaining: {}%", snapshot.remaining_percent);
     println!(

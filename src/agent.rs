@@ -136,12 +136,25 @@ fn validate_operation_effect(
         | crate::worker_protocol::PlannedOperation::Modify
         | crate::worker_protocol::PlannedOperation::Delete
         | crate::worker_protocol::PlannedOperation::Move => {
-            let Some(target) = operation_target(&step.intent, operation) else {
+            let Some(target) = step
+                .operation_targets
+                .first()
+                .map(String::as_str)
+                .or_else(|| operation_target(&step.intent, operation))
+            else {
                 anyhow::bail!("step '{}' does not identify an operation target", step.id);
             };
-            let target_changed = after.files.iter().any(|file| file.path == target)
+            let effect_target =
+                if matches!(operation, crate::worker_protocol::PlannedOperation::Move) {
+                    target
+                        .split_once("->")
+                        .map_or(target, |(_, destination)| destination.trim())
+                } else {
+                    target
+                };
+            let target_changed = after.files.iter().any(|file| file.path == effect_target)
                 || (matches!(operation, crate::worker_protocol::PlannedOperation::Delete)
-                    && before.files.iter().any(|file| file.path == target));
+                    && before.files.iter().any(|file| file.path == effect_target));
             if !changed || !target_changed {
                 anyhow::bail!(
                     "step '{}' did not produce the declared {} effect for '{}',",
@@ -225,8 +238,9 @@ fn failed_execution_evidence(
 /// calls, and evidence have the same operation boundaries.
 fn plan_steps(
     expected_changes: &[String],
-    acceptance_criteria: &[String],
-    required_tests: &[String],
+    acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
+    required_tests: &[crate::worker_protocol::WorkerRequirement],
+    active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
     verification: &[String],
     intent: &str,
 ) -> Vec<crate::worker_protocol::PlannedStep> {
@@ -238,22 +252,70 @@ fn plan_steps(
     entries
         .into_iter()
         .enumerate()
-        .map(|(index, entry)| crate::worker_protocol::PlannedStep {
-            id: format!("execute-step-{}", index + 1),
-            intent: if entry == "no-mutation" {
-                intent.to_owned()
-            } else {
-                entry.clone()
-            },
-            operations: vec![crate::worker_protocol::operation_for_expected_change(
-                &entry,
-            )],
-            // The contract is attached to every execution unit. This keeps
-            // each unit independently auditable while preserving complete
-            // coverage when a later unit fails.
-            acceptance_criteria: acceptance_criteria.to_vec(),
-            required_tests: required_tests.to_vec(),
-            verification: verification.to_vec(),
+        .map(|(index, entry)| {
+            let operation = crate::worker_protocol::operation_for_expected_change(&entry);
+            let target = entry.split_once(':').map_or_else(
+                || {
+                    if entry.eq_ignore_ascii_case("no-mutation") {
+                        "worktree".to_owned()
+                    } else {
+                        entry.trim().to_owned()
+                    }
+                },
+                |(_, target)| target.trim().to_owned(),
+            );
+            crate::worker_protocol::PlannedStep {
+                id: format!("execute-step-{}", index + 1),
+                objective: intent.to_owned(),
+                intent: if entry == "no-mutation" {
+                    intent.to_owned()
+                } else {
+                    entry
+                },
+                operations: vec![operation],
+                operation_targets: vec![target],
+                // Every step is independently auditable and the ordered plan
+                // remains complete even if a later step fails.
+                acceptance_criteria: acceptance_criteria
+                    .iter()
+                    .map(|requirement| requirement.id.clone())
+                    .collect(),
+                required_tests: required_tests
+                    .iter()
+                    .map(|requirement| requirement.id.clone())
+                    .collect(),
+                active_review_blockers: active_review_blockers
+                    .iter()
+                    .map(|blocker| blocker.id.clone())
+                    .collect(),
+                verification: verification.to_vec(),
+            }
+        })
+        .collect()
+}
+
+fn worker_requirements(
+    values: &[String],
+    prefix: &str,
+) -> Vec<crate::worker_protocol::WorkerRequirement> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, text)| crate::worker_protocol::WorkerRequirement {
+            id: format!("{prefix}-{}", index + 1),
+            text: text.clone(),
+        })
+        .collect()
+}
+
+fn blocker_requirements(
+    blockers: &[crate::storage::db::ReviewBlockerRecord],
+) -> Vec<crate::worker_protocol::ReviewBlockerRequirement> {
+    blockers
+        .iter()
+        .map(|blocker| crate::worker_protocol::ReviewBlockerRequirement {
+            id: blocker.blocker_id.clone(),
+            text: blocker.acceptance_condition.clone(),
         })
         .collect()
 }
@@ -311,22 +373,54 @@ fn run_validation_with_retries(
 }
 
 fn task_contract_effort(
-    db: &Database,
+    _db: &Database,
     task: &crate::task::Task,
 ) -> Result<Option<ReasoningEffort>> {
-    if let Some(proposal) = db.get_task_proposal_metadata(&task.id)? {
-        let value = proposal
-            .execution_hints
-            .effort
-            .as_deref()
-            .context("persisted task proposal has no execution effort")?;
-        let effort = ReasoningEffort::parse(value)?;
-        if effort == ReasoningEffort::None {
-            bail!("persisted task proposal has invalid execution effort '{value}'")
-        }
-        return Ok(Some(effort));
-    }
     Ok(task.reasoning_effort)
+}
+
+/// Build the execution contract from the authoritative persisted Task row.
+/// Proposal metadata is intentionally not consulted here: it is only retained
+/// as provenance for how a Task was created.
+fn worker_task_contract(
+    db: &Database,
+    task: &Task,
+) -> Result<(crate::protocol::TaskProposal, bool)> {
+    let task_contract = db
+        .get_task_contract(&task.id)?
+        .unwrap_or_else(|| crate::task::TaskContract::defaults(&task.objective));
+    let proposal = crate::protocol::TaskProposal {
+        local_id: task.id.clone(),
+        title: task.title.clone(),
+        objective: task.objective.clone(),
+        role: task.role.clone(),
+        priority: task.priority,
+        depends_on: vec![],
+        capabilities: task.required_capabilities(),
+        scope_mode: task.scope_mode,
+        context_files: task.context_files.clone(),
+        expected_changes: task.expected_changes.clone(),
+        unchanged: task_contract.unchanged,
+        acceptance_criteria: task_contract.acceptance_criteria,
+        required_tests: task_contract.required_tests,
+        validation: task_contract.validation,
+        execution_hints: crate::protocol::ExecutionHints {
+            effort: Some(
+                task.reasoning_effort
+                    .unwrap_or(ReasoningEffort::Low)
+                    .as_str()
+                    .to_owned(),
+            ),
+            effort_reason: task.effort_reason.clone(),
+            ..Default::default()
+        },
+        risk_factors: task.risk_factors.clone(),
+    };
+    let strict_protocol = !task.expected_changes.is_empty();
+    // Existing manually-created tasks retain their original worker seam. A
+    // task with declared expected changes has the complete persisted contract
+    // and enters the strict operation/evidence protocol.
+    Ok((proposal, strict_protocol))
 }
 
 fn apply_task_effort(
@@ -682,51 +776,34 @@ pub fn dispatch_with_worker_on_db_cancellable(
     // mutation.  The snapshot is captured from the authoritative repository.
     let snapshot = git::inspect_worktree(repo_path, repo_path)
         .context("failed to inspect repository during Worker PREPARE")?;
-    let persisted_proposal = db.get_task_proposal_metadata(task_id)?;
-    let enforce_worker_protocol = persisted_proposal.is_some();
-    let proposal = persisted_proposal.unwrap_or_else(|| crate::protocol::TaskProposal {
-        local_id: task_id.into(),
-        title: task.title.clone(),
-        objective: task.objective.clone(),
-        role: task.role.clone(),
-        priority: task.priority,
-        depends_on: vec![],
-        capabilities: task.required_capabilities(),
-        scope_mode: task.scope_mode,
-        context_files: task.context_files.clone(),
-        expected_changes: task.expected_changes.clone(),
-        unchanged: vec![],
-        acceptance_criteria: vec![task.objective.clone()],
-        required_tests: vec!["configured validation pipeline".into()],
-        validation: vec!["configured validation evidence".into()],
-        execution_hints: Default::default(),
-        risk_factors: vec![],
-    });
-    if enforce_worker_protocol {
-        proposal
-            .validate()
-            .context("persisted task contract is invalid")?;
-    }
+    let (proposal, enforce_worker_protocol) =
+        worker_task_contract(db, &task).context("persisted task contract is invalid")?;
     let proposal_effort = task_contract_effort(db, &task)?.unwrap_or(ReasoningEffort::Low);
+    let acceptance_criteria =
+        worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
+    let required_tests = worker_requirements(&proposal.required_tests, "required-test");
+    let verification = proposal.validation.clone();
     let plan = crate::worker_protocol::WorkerPlan {
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
         read_only_snapshot: serde_json::to_string(&snapshot)
             .context("failed to serialize Worker PREPARE snapshot")?,
         unchanged: proposal.unchanged.clone(),
+        acceptance_criteria: acceptance_criteria.clone(),
+        required_tests: required_tests.clone(),
+        active_review_blockers: Vec::new(),
+        resolved_review_blockers: Vec::new(),
+        verification: verification.clone(),
         steps: plan_steps(
             &proposal.expected_changes,
-            &proposal.acceptance_criteria,
-            &proposal.required_tests,
-            &proposal.validation,
+            &acceptance_criteria,
+            &required_tests,
+            &[],
+            &verification,
             &task.objective,
         ),
     };
-    plan.validate_contract(
-        &proposal.acceptance_criteria,
-        &proposal.required_tests,
-        &proposal.unchanged,
-    )
-    .context("Worker PREPARE plan is incomplete")?;
+    plan.validate_contract(&acceptance_criteria, &required_tests, &proposal.unchanged)
+        .context("Worker PREPARE plan is incomplete")?;
 
     // Set task status to active
     db.update_task_status(task_id, TaskStatus::Active)
@@ -750,6 +827,14 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let _run_finalizer = db.run_finalizer(run_id);
     db.store_worker_prepare(run_id, &plan)
         .context("failed to persist Worker PREPARE plan")?;
+    // Execution must consume the database record, not the in-memory plan that
+    // happened to be used to write it. This makes restart/inspection semantics
+    // identical to the execution semantics.
+    let plan = db
+        .load_worker_protocol(run_id)
+        .context("failed to reopen persisted Worker PREPARE plan")?
+        .context("persisted Worker PREPARE plan disappeared")?
+        .0;
     db.record_lifecycle_event(
         "worker_prepare",
         Some(task_id),
@@ -1511,65 +1596,87 @@ pub fn revise_with_worker_on_db_with_overrides(
     }
     let revision_snapshot = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect revision worktree during Worker PREPARE")?;
-    let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
-    let persisted_proposal = db.get_task_proposal_metadata(task_id)?;
-    let enforce_worker_protocol = persisted_proposal.is_some();
-    let proposal = persisted_proposal.unwrap_or_else(|| crate::protocol::TaskProposal {
-        local_id: task_id.into(),
-        title: task.title.clone(),
-        objective: task.objective.clone(),
-        role: task.role.clone(),
-        priority: task.priority,
-        depends_on: vec![],
-        capabilities: task.required_capabilities(),
-        scope_mode: task.scope_mode,
-        context_files: task.context_files.clone(),
-        expected_changes: task.expected_changes.clone(),
-        unchanged: vec![],
-        acceptance_criteria: vec![task.objective.clone()],
-        required_tests: vec!["configured validation pipeline".into()],
-        validation: vec!["configured validation evidence".into()],
-        execution_hints: Default::default(),
-        risk_factors: vec![],
-    });
-    let mut revision_requirements = proposal.acceptance_criteria.clone();
-    revision_requirements.extend(
+    let (proposal, enforce_worker_protocol) =
+        worker_task_contract(db, &task).context("persisted task contract is invalid")?;
+    let active_blockers = if revision_contract.active_blockers.is_empty() {
         revision_contract
             .unresolved
             .iter()
             .chain(&revision_contract.regressions)
-            .chain(&revision_contract.regression_constraints)
-            .map(|b| b.finding.clone()),
-    );
-    let review_summary = crate::review::build_review(db, task_id, repo_path)?;
-    for feedback in review_summary
-        .prior_reviews
-        .iter()
-        .filter_map(|review| review.revision_feedback.as_deref())
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        revision_contract.active_blockers.clone()
+    };
+    let resolved_blockers = if revision_contract.resolved_blockers.is_empty() {
+        revision_contract.regression_constraints.clone()
+    } else {
+        revision_contract.resolved_blockers.clone()
+    };
+    let original_acceptance = if revision_contract
+        .original_task_requirements
+        .acceptance_criteria
+        .is_empty()
     {
-        if !feedback.trim().is_empty() {
-            revision_requirements.push(feedback.to_owned());
-        }
-    }
+        proposal.acceptance_criteria.clone()
+    } else {
+        revision_contract
+            .original_task_requirements
+            .acceptance_criteria
+            .clone()
+    };
+    let original_tests = if revision_contract
+        .original_task_requirements
+        .required_tests
+        .is_empty()
+    {
+        proposal.required_tests.clone()
+    } else {
+        revision_contract
+            .original_task_requirements
+            .required_tests
+            .clone()
+    };
+    let verification = if revision_contract
+        .original_task_requirements
+        .validation
+        .is_empty()
+    {
+        proposal.validation.clone()
+    } else {
+        revision_contract
+            .original_task_requirements
+            .validation
+            .clone()
+    };
+    let acceptance_criteria = worker_requirements(&original_acceptance, "acceptance-criterion");
+    let required_tests = worker_requirements(&original_tests, "required-test");
+    let active_review_blockers = blocker_requirements(&active_blockers);
     let revision_plan = crate::worker_protocol::WorkerPlan {
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
         read_only_snapshot: serde_json::to_string(&revision_snapshot)?,
         unchanged: proposal.unchanged.clone(),
+        acceptance_criteria: acceptance_criteria.clone(),
+        required_tests: required_tests.clone(),
+        active_review_blockers: active_review_blockers.clone(),
+        resolved_review_blockers: resolved_blockers
+            .iter()
+            .map(|blocker| blocker.blocker_id.clone())
+            .collect(),
+        verification: verification.clone(),
         steps: plan_steps(
             &proposal.expected_changes,
-            &revision_requirements,
-            &proposal.required_tests,
-            &proposal.validation,
+            &acceptance_criteria,
+            &required_tests,
+            &active_review_blockers,
+            &verification,
             "Address the persisted revision requirements",
         ),
     };
     revision_plan
-        .validate_contract(
-            &revision_requirements,
-            &proposal.required_tests,
-            &proposal.unchanged,
-        )
+        .validate_contract(&acceptance_criteria, &required_tests, &proposal.unchanged)
         .context("Worker revision PREPARE is incomplete")?;
+    let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
     let agent = db
         .list_agents()?
         .into_iter()
@@ -1603,6 +1710,11 @@ pub fn revise_with_worker_on_db_with_overrides(
     let _run_finalizer = db.run_finalizer(run_id);
     db.store_worker_prepare(run_id, &revision_plan)
         .context("failed to persist Worker revision PREPARE")?;
+    let revision_plan = db
+        .load_worker_protocol(run_id)
+        .context("failed to reopen persisted Worker revision PREPARE plan")?
+        .context("persisted Worker revision PREPARE plan disappeared")?
+        .0;
     db.update_task_status(task_id, TaskStatus::Active)?;
     db.record_lifecycle_event(
         "review_revision",

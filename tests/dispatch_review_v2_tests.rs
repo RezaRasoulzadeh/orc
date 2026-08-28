@@ -3055,6 +3055,63 @@ fn canonical_worker_operation_matrix_executes_and_reopens_structured_evidence() 
 }
 
 #[test]
+fn worker_contract_ignores_stale_proposal_metadata_after_task_persistence() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: authoritative.txt");
+
+    let db_path = dir.path().join(".orc/orc.db");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let mut proposal: serde_json::Value = connection
+        .query_row(
+            "SELECT proposal FROM task_proposal_metadata WHERE task_id = ?1",
+            [&task],
+            |row| {
+                let value: String = row.get(0)?;
+                serde_json::from_str(&value)
+                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))
+            },
+        )
+        .unwrap();
+    proposal["acceptance_criteria"] = serde_json::json!(["stale proposal criterion"]);
+    proposal["required_tests"] = serde_json::json!(["stale proposal test"]);
+    proposal["validation"] = serde_json::json!(["stale proposal validation"]);
+    proposal["unchanged"] = serde_json::json!(["stale proposal constraint"]);
+    connection
+        .execute(
+            "UPDATE task_proposal_metadata SET proposal = ?1 WHERE task_id = ?2",
+            rusqlite::params![proposal.to_string(), task],
+        )
+        .unwrap();
+    drop(connection);
+
+    let worker = ProtocolOperationWorker {
+        operation: "create",
+        verify: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        db_path.to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let (plan, _) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+    assert_eq!(
+        plan.acceptance_criteria[0].text,
+        "the declared operation is performed"
+    );
+    assert_eq!(
+        plan.required_tests[0].text,
+        "configured validation pipeline"
+    );
+    assert_eq!(plan.verification, vec!["configured validation evidence"]);
+    assert_eq!(plan.unchanged, vec!["untouched.txt"]);
+}
+
+#[test]
 fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() {
     let (dir, db, task) = setup();
     canonicalize_task(&db, &task, "create: failed-verification.txt");

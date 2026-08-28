@@ -16,6 +16,266 @@ use crate::validation::{
 };
 use crate::worker::{Worker, WorkerOutcome};
 
+/// Evidence observations come from the worker output and post-execution
+/// checks; declarations in PREPARE are never observations.
+fn worker_observations(
+    output: Option<&str>,
+    validation: &str,
+    worktree: &git::WorktreeChanges,
+    verification: &[String],
+    allow_aggregate_validation: bool,
+) -> Vec<String> {
+    let mut observations = output
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let files = worktree
+        .files
+        .iter()
+        .map(|file| format!("{} {}", file.status, file.path))
+        .collect::<Vec<_>>();
+    let file_summary = if files.is_empty() {
+        "clean".to_owned()
+    } else {
+        files.join(", ")
+    };
+    observations.push(format!(
+        "post-step worktree inspection observed {} affected file(s): {}",
+        files.len(),
+        file_summary
+    ));
+    if !validation.trim().is_empty() {
+        observations.push(format!("configured validation observed: {validation}"));
+    }
+    // A declaration in the plan is not evidence. A marker must be observed in
+    // provider output; aggregate validation cannot prove a step-specific check.
+    observations.extend(verification.iter().filter_map(|check| {
+        (crate::worker_protocol::reported_verifications(output.unwrap_or_default())
+            .iter()
+            .any(|reported| reported == check)
+            || (allow_aggregate_validation
+                && check.trim() == "configured validation evidence"
+                && validation.contains("PASS")))
+        .then_some(format!("verification passed: {check}"))
+    }));
+    observations
+}
+
+fn performed_operations_for_step(
+    step: &crate::worker_protocol::PlannedStep,
+    output: Option<&str>,
+    enforce_protocol: bool,
+) -> Result<Vec<crate::worker_protocol::PlannedOperation>> {
+    let output = output.unwrap_or_default();
+    let reported = crate::worker_protocol::parse_reported_operations(output)?;
+    if reported.is_empty() {
+        if enforce_protocol {
+            anyhow::bail!(
+                "worker did not report the performed operation for step '{}'",
+                step.id
+            );
+        }
+        // Rows created before the canonical TaskProposal was persisted use the
+        // original Worker seam. They remain executable, but never enter the
+        // strict protocol path used by canonical task contracts.
+        return Ok(step.operations.clone());
+    }
+    if reported != step.operations {
+        anyhow::bail!("worker did not report the persisted step operations in order")
+    }
+    Ok(reported)
+}
+
+fn operation_target<'a>(
+    intent: &'a str,
+    operation: &crate::worker_protocol::PlannedOperation,
+) -> Option<&'a str> {
+    let value = intent.trim();
+    let Some((_, target)) = value.split_once(':') else {
+        return matches!(operation, crate::worker_protocol::PlannedOperation::Modify)
+            .then_some(value);
+    };
+    let target = target.trim();
+    if matches!(operation, crate::worker_protocol::PlannedOperation::Move) {
+        target
+            .split_once("->")
+            .map(|(_, destination)| destination.trim())
+    } else {
+        Some(target)
+    }
+}
+
+fn validate_operation_effect(
+    step: &crate::worker_protocol::PlannedStep,
+    before: &git::WorktreeChanges,
+    after: &git::WorktreeChanges,
+    enforce_protocol: bool,
+) -> Result<()> {
+    if !enforce_protocol {
+        return Ok(());
+    }
+    let Some(operation) = step.operations.first() else {
+        anyhow::bail!("step '{}' has no operation", step.id);
+    };
+    let changed = before.files != after.files || before.diff != after.diff;
+    match operation {
+        crate::worker_protocol::PlannedOperation::NoMutation
+        | crate::worker_protocol::PlannedOperation::Inspect
+        | crate::worker_protocol::PlannedOperation::Validate => {
+            if changed {
+                anyhow::bail!(
+                    "step '{}' changed project state for a non-mutating operation",
+                    step.id
+                );
+            }
+        }
+        crate::worker_protocol::PlannedOperation::Create
+        | crate::worker_protocol::PlannedOperation::Modify
+        | crate::worker_protocol::PlannedOperation::Delete
+        | crate::worker_protocol::PlannedOperation::Move => {
+            let Some(target) = operation_target(&step.intent, operation) else {
+                anyhow::bail!("step '{}' does not identify an operation target", step.id);
+            };
+            let target_changed = after.files.iter().any(|file| file.path == target)
+                || (matches!(operation, crate::worker_protocol::PlannedOperation::Delete)
+                    && before.files.iter().any(|file| file.path == target));
+            if !changed || !target_changed {
+                anyhow::bail!(
+                    "step '{}' did not produce the declared {} effect for '{}',",
+                    step.id,
+                    crate::worker_protocol::operation_name(operation),
+                    target
+                );
+            }
+        }
+        crate::worker_protocol::PlannedOperation::Command => {}
+    }
+    Ok(())
+}
+
+fn failed_execution_evidence(
+    plan: &crate::worker_protocol::WorkerPlan,
+    outputs: &[Option<String>],
+    snapshots: &[(git::WorktreeChanges, git::WorktreeChanges)],
+    configured_validation: &[String],
+    issue: &str,
+    enforce_protocol: bool,
+) -> crate::worker_protocol::WorkerExecutionResult {
+    let performed_operations = plan
+        .steps
+        .iter()
+        .enumerate()
+        .flat_map(|(index, step)| {
+            let output = outputs
+                .get(index)
+                .and_then(Option::as_deref)
+                .unwrap_or_default();
+            let reported =
+                crate::worker_protocol::parse_reported_operations(output).unwrap_or_default();
+            if reported.is_empty() && !enforce_protocol {
+                step.operations.clone()
+            } else {
+                reported
+            }
+        })
+        .collect();
+    let focused_verification = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let (_before, after) = snapshots.get(index)?;
+            let output = outputs.get(index).and_then(Option::as_deref);
+            Some(crate::worker_protocol::StepEvidence {
+                step_id: step.id.clone(),
+                observed: worker_observations(output, "", after, &step.verification, false),
+                verification: step.verification.clone(),
+                passed: false,
+            })
+        })
+        .collect();
+    crate::worker_protocol::WorkerExecutionResult {
+        protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
+        performed_operations,
+        affected_files: snapshots
+            .last()
+            .map(|(_, after)| after.files.iter().map(|file| file.path.clone()).collect())
+            .unwrap_or_default(),
+        requirement_coverage: plan
+            .steps
+            .iter()
+            .flat_map(|step| {
+                step.acceptance_criteria
+                    .iter()
+                    .chain(step.required_tests.iter())
+                    .map(move |requirement| (requirement.clone(), step.id.clone()))
+            })
+            .collect(),
+        focused_verification,
+        configured_validation: configured_validation.to_vec(),
+        unresolved_issues: vec![issue.to_owned()],
+    }
+}
+
+/// Build the ordered execution units from the authoritative contract.  Each
+/// expected-change entry is a distinct unit so the persisted plan, backend
+/// calls, and evidence have the same operation boundaries.
+fn plan_steps(
+    expected_changes: &[String],
+    acceptance_criteria: &[String],
+    required_tests: &[String],
+    verification: &[String],
+    intent: &str,
+) -> Vec<crate::worker_protocol::PlannedStep> {
+    let entries = if expected_changes.is_empty() {
+        vec!["no-mutation".to_owned()]
+    } else {
+        expected_changes.to_vec()
+    };
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| crate::worker_protocol::PlannedStep {
+            id: format!("execute-step-{}", index + 1),
+            intent: if entry == "no-mutation" {
+                intent.to_owned()
+            } else {
+                entry.clone()
+            },
+            operations: vec![crate::worker_protocol::operation_for_expected_change(
+                &entry,
+            )],
+            // The contract is attached to every execution unit. This keeps
+            // each unit independently auditable while preserving complete
+            // coverage when a later unit fails.
+            acceptance_criteria: acceptance_criteria.to_vec(),
+            required_tests: required_tests.to_vec(),
+            verification: verification.to_vec(),
+        })
+        .collect()
+}
+
+fn performed_operations_for_plan(
+    steps: &[crate::worker_protocol::PlannedStep],
+    outputs: &[Option<String>],
+    enforce_protocol: bool,
+) -> Result<Vec<crate::worker_protocol::PlannedOperation>> {
+    steps
+        .iter()
+        .enumerate()
+        .try_fold(Vec::new(), |mut all, (index, step)| {
+            all.extend(performed_operations_for_step(
+                step,
+                outputs.get(index).and_then(Option::as_deref),
+                enforce_protocol,
+            )?);
+            Ok(all)
+        })
+}
+
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
 const MAX_VALIDATION_REPAIRS: usize = 3;
@@ -308,6 +568,49 @@ pub fn dispatch_with_worker_on_db_cancellable(
     crate::queue::ensure_dispatchable(db, task_id)
         .map_err(|e| anyhow::anyhow!("dispatch eligibility check failed: {e}"))?;
 
+    // PREPARE is intentionally completed before task status, run, or worktree
+    // mutation.  The snapshot is captured from the authoritative repository.
+    let snapshot = git::inspect_worktree(repo_path, repo_path)
+        .context("failed to inspect repository during Worker PREPARE")?;
+    let persisted_proposal = db.get_task_proposal_metadata(task_id)?;
+    let enforce_worker_protocol = persisted_proposal.is_some();
+    let proposal = persisted_proposal.unwrap_or_else(|| crate::protocol::TaskProposal {
+        local_id: task_id.into(),
+        title: task.title.clone(),
+        objective: task.objective.clone(),
+        role: task.role.clone(),
+        priority: task.priority,
+        depends_on: vec![],
+        capabilities: task.required_capabilities(),
+        scope_mode: task.scope_mode,
+        context_files: task.context_files.clone(),
+        expected_changes: task.expected_changes.clone(),
+        unchanged: vec![],
+        acceptance_criteria: vec![task.objective.clone()],
+        required_tests: vec!["configured validation pipeline".into()],
+        validation: vec!["configured validation evidence".into()],
+        execution_hints: Default::default(),
+    });
+    let plan = crate::worker_protocol::WorkerPlan {
+        protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
+        read_only_snapshot: serde_json::to_string(&snapshot)
+            .context("failed to serialize Worker PREPARE snapshot")?,
+        unchanged: proposal.unchanged.clone(),
+        steps: plan_steps(
+            &proposal.expected_changes,
+            &proposal.acceptance_criteria,
+            &proposal.required_tests,
+            &proposal.validation,
+            &task.objective,
+        ),
+    };
+    plan.validate_contract(
+        &proposal.acceptance_criteria,
+        &proposal.required_tests,
+        &proposal.unchanged,
+    )
+    .context("Worker PREPARE plan is incomplete")?;
+
     // Set task status to active
     db.update_task_status(task_id, TaskStatus::Active)
         .with_context(|| "failed to set task status to active")?;
@@ -317,6 +620,15 @@ pub fn dispatch_with_worker_on_db_cancellable(
         .create_agent_run_with_mode(project_id, task_id, agent_id, registry::AUTOMATED)
         .with_context(|| "failed to create agent run")?;
     let _run_finalizer = db.run_finalizer(run_id);
+    db.store_worker_prepare(run_id, &plan)
+        .context("failed to persist Worker PREPARE plan")?;
+    db.record_lifecycle_event(
+        "worker_prepare",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&serde_json::to_string(&plan)?),
+    )?;
 
     // Create a worktree for the task
     let (branch_name, worktree_path) = match git::ensure_worktree(task_id, repo_path) {
@@ -355,22 +667,76 @@ pub fn dispatch_with_worker_on_db_cancellable(
         anyhow::bail!("{}", error_msg);
     }
 
-    let prompt = build_worker_prompt(&contract, &project_name, &task);
+    let prompt = format!(
+        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below. Do not perform any operation outside a listed step. After each step, perform and report its declared verification before continuing. For every operation, emit exactly `OPERATION PERFORMED: <inspect|create|modify|delete|move|command|validate|no_mutation>` in the planned order. Emit `VERIFICATION PASSED: <check>` only after actually observing that check.\n{}",
+        build_worker_prompt(&contract, &project_name, &task),
+        serde_json::to_string_pretty(&plan).context("failed to serialize execution plan")?
+    );
 
     // Execute the worker in the worktree directory
     let worktree_dir = repo_path.join(&worktree_path);
     progress("worker spawned");
     progress("worker running");
-    let execution = match cancellation {
-        Some(cancellation) => worker.execute_with_progress_and_usage_cancellable(
-            &prompt,
-            &worktree_dir,
-            &|line| worker_output(line),
-            cancellation,
-        ),
-        None => worker
-            .execute_with_progress_and_usage(&prompt, &worktree_dir, &|line| worker_output(line)),
-    };
+    // Each persisted step is a separate backend invocation. This makes the
+    // persisted order an execution invariant and gives every operation an
+    // actual execution boundary (including inspection/validation steps).
+    let mut execution = Ok(crate::worker::WorkerExecution {
+        outcome: WorkerOutcome::Success,
+        output: None,
+        token_usage: None,
+    });
+    let mut outputs = Vec::new();
+    let mut step_outputs: Vec<Option<String>> = Vec::new();
+    let mut step_snapshots = Vec::new();
+    for step in &plan.steps {
+        let before = git::inspect_worktree(&worktree_dir, repo_path)
+            .context("failed to inspect worktree before Worker plan step")?;
+        let result = match cancellation {
+            Some(cancellation) => worker.execute_planned_step_cancellable(
+                step,
+                &prompt,
+                &worktree_dir,
+                &crate::automated::revision_handoff_schema(),
+                &|line| worker_output(line),
+                cancellation,
+            ),
+            None => worker.execute_planned_step(
+                step,
+                &prompt,
+                &worktree_dir,
+                &crate::automated::revision_handoff_schema(),
+                &|line| worker_output(line),
+            ),
+        };
+        match result {
+            Ok(step_execution) => {
+                step_outputs.push(step_execution.output.clone());
+                let after = git::inspect_worktree(&worktree_dir, repo_path)
+                    .context("failed to inspect worktree after Worker plan step")?;
+                step_snapshots.push((before, after));
+                if let Some(output) = step_execution.output.as_deref() {
+                    outputs.push(output.to_owned());
+                }
+                if matches!(step_execution.outcome, WorkerOutcome::Failure(_)) {
+                    execution = Ok(step_execution);
+                    break;
+                }
+                execution = Ok(step_execution);
+            }
+            Err(error) => {
+                step_outputs.push(None);
+                let after = git::inspect_worktree(&worktree_dir, repo_path).ok();
+                if let Some(after) = after {
+                    step_snapshots.push((before, after));
+                }
+                execution = Err(error);
+                break;
+            }
+        }
+    }
+    if let Ok(result) = &mut execution {
+        result.output = (!outputs.is_empty()).then(|| outputs.join("\n\n"));
+    }
     match execution {
         Ok(execution) => {
             let outcome = execution.outcome;
@@ -396,21 +762,82 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             anyhow::bail!("could not inspect task worktree after worker completion")
                         }
                     };
+                    if enforce_worker_protocol {
+                        let protocol_check =
+                            plan.steps.iter().enumerate().try_for_each(|(index, step)| {
+                                let (before, after) =
+                                    step_snapshots.get(index).with_context(|| {
+                                        format!(
+                                            "Worker did not execute persisted step '{}'",
+                                            step.id
+                                        )
+                                    })?;
+                                performed_operations_for_step(
+                                    step,
+                                    step_outputs.get(index).and_then(Option::as_deref),
+                                    true,
+                                )?;
+                                validate_operation_effect(step, before, after, true)
+                            });
+                        if let Err(error) = protocol_check {
+                            let evidence = failed_execution_evidence(
+                                &plan,
+                                &step_outputs,
+                                &step_snapshots,
+                                &[],
+                                &error.to_string(),
+                                true,
+                            );
+                            db.store_worker_execution(run_id, &evidence)?;
+                            let message = format!("Worker plan verification failed: {error:#}");
+                            db.update_agent_run_status_with_usage(
+                                run_id,
+                                "failed",
+                                Some(&message),
+                                token_usage,
+                            )?;
+                            db.update_task_status(task_id, TaskStatus::Blocked)?;
+                            anyhow::bail!(message);
+                        }
+                    }
                     if changes.files.is_empty() {
                         let output = format!(
                             "{}\n\nDispatch result: no meaningful project changes.",
                             output.as_deref().unwrap_or_default()
                         );
-                        db.update_agent_run_status_with_usage(
-                            run_id,
-                            "no_changes",
-                            Some(&output),
-                            token_usage,
-                        )?;
-                        db.update_task_status(task_id, TaskStatus::Blocked)?;
-                        anyhow::bail!(
-                            "worker completed without meaningful project changes; task remains blocked"
-                        );
+                        let explicitly_no_mutation = if enforce_worker_protocol {
+                            plan.steps.iter().all(|step| {
+                                step.operations.iter().all(|operation| {
+                                    matches!(
+                                        operation,
+                                        crate::worker_protocol::PlannedOperation::NoMutation
+                                            | crate::worker_protocol::PlannedOperation::Inspect
+                                            | crate::worker_protocol::PlannedOperation::Command
+                                            | crate::worker_protocol::PlannedOperation::Validate
+                                    )
+                                })
+                            })
+                        } else {
+                            proposal.expected_changes.iter().any(|value| {
+                                value.trim().eq_ignore_ascii_case("no-mutation")
+                                    || value
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                        .starts_with("no-mutation:")
+                            })
+                        };
+                        if !explicitly_no_mutation {
+                            db.update_agent_run_status_with_usage(
+                                run_id,
+                                "no_changes",
+                                Some(&output),
+                                token_usage,
+                            )?;
+                            db.update_task_status(task_id, TaskStatus::Blocked)?;
+                            anyhow::bail!(
+                                "worker completed without meaningful project changes; task remains blocked"
+                            );
+                        }
                     }
                     db.store_change_evidence(run_id, &changes)?;
                     let validation_config = match ValidationConfig::load(&worktree_dir) {
@@ -552,12 +979,17 @@ pub fn dispatch_with_worker_on_db_cancellable(
                     }
                     progress("validation completed");
                     let validation_summary = report.summary();
+                    let validation_observation = if validation_summary.trim().is_empty() {
+                        "PASS (configured validation completed successfully)"
+                    } else {
+                        validation_summary.as_str()
+                    };
                     let combined_output = if validation_summary.is_empty() {
-                        output.unwrap_or_default()
+                        output.clone().unwrap_or_default()
                     } else {
                         format!(
                             "{}\n\nValidation:\n{}",
-                            output.unwrap_or_default(),
+                            output.clone().unwrap_or_default(),
                             validation_summary
                         )
                     };
@@ -568,6 +1000,15 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             )?;
                     }
                     if !report.is_success() {
+                        let evidence = failed_execution_evidence(
+                            &plan,
+                            &step_outputs,
+                            &step_snapshots,
+                            &validation_config.commands,
+                            &combined_output,
+                            enforce_worker_protocol,
+                        );
+                        db.store_worker_execution(run_id, &evidence)?;
                         db.update_agent_run_status_with_usage(
                             run_id,
                             "failed",
@@ -580,6 +1021,93 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         db.update_task_status(task_id, TaskStatus::Review)?;
                         anyhow::bail!("validation failed for task {task_id}; task requires review");
                     }
+                    let performed_operations = performed_operations_for_plan(
+                        &plan.steps,
+                        &step_outputs,
+                        enforce_worker_protocol,
+                    )
+                    .context("Worker operation evidence failed")?;
+                    let evidence = crate::worker_protocol::WorkerExecutionResult {
+                        protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
+                        performed_operations,
+                        affected_files: changes
+                            .files
+                            .iter()
+                            .map(|file| file.path.clone())
+                            .collect(),
+                        requirement_coverage: plan
+                            .steps
+                            .iter()
+                            .flat_map(|step| {
+                                step.acceptance_criteria
+                                    .iter()
+                                    .chain(step.required_tests.iter())
+                                    .map(move |criterion| (criterion.clone(), step.id.clone()))
+                            })
+                            .collect(),
+                        focused_verification: plan
+                            .steps
+                            .iter()
+                            .enumerate()
+                            .map(|(index, step)| {
+                                let step_output =
+                                    step_outputs.get(index).and_then(Option::as_deref);
+                                crate::worker_protocol::StepEvidence {
+                                    step_id: step.id.clone(),
+                                    observed: worker_observations(
+                                        step_output,
+                                        if index + 1 == plan.steps.len() {
+                                            validation_observation
+                                        } else {
+                                            ""
+                                        },
+                                        step_snapshots
+                                            .get(index)
+                                            .map(|(_, after)| after)
+                                            .unwrap_or(&changes),
+                                        &step.verification,
+                                        !enforce_worker_protocol,
+                                    ),
+                                    verification: step.verification.clone(),
+                                    passed: report.is_success()
+                                        && step.verification.iter().all(|check| {
+                                            crate::worker_protocol::reported_verifications(
+                                                step_output.unwrap_or_default(),
+                                            )
+                                            .iter()
+                                            .any(|reported| reported == check)
+                                                || (!enforce_worker_protocol
+                                                    && check.trim()
+                                                        == "configured validation evidence"
+                                                    && validation_observation.contains("PASS"))
+                                        }),
+                                }
+                            })
+                            .collect(),
+                        configured_validation: validation_config.commands.clone(),
+                        unresolved_issues: Vec::new(),
+                    };
+                    if let Err(error) = evidence.validate_against_plan(&plan) {
+                        db.store_worker_execution(run_id, &evidence)?;
+                        let message = format!("Worker verification evidence failed: {error:#}");
+                        db.update_agent_run_status_with_usage(
+                            run_id,
+                            "failed",
+                            Some(&message),
+                            token_usage,
+                        )?;
+                        db.update_task_status(task_id, TaskStatus::Blocked)?;
+                        anyhow::bail!(message);
+                    }
+                    db.store_worker_execution(run_id, &evidence)
+                        .context("failed to persist Worker execution evidence")?;
+                    db.record_lifecycle_event(
+                        "worker_execution_evidence",
+                        Some(task_id),
+                        Some(run_id),
+                        Some(agent_id),
+                        Some(&serde_json::to_string(&evidence)?),
+                    )?;
                     db.update_agent_run_status_with_usage(
                         run_id,
                         "completed",
@@ -832,6 +1360,65 @@ pub fn revise_with_worker_on_db_with_overrides(
     if !worktree_dir.exists() {
         anyhow::bail!("task worktree does not exist: {}", worktree_dir.display());
     }
+    let revision_snapshot = git::inspect_worktree(&worktree_dir, repo_path)
+        .context("failed to inspect revision worktree during Worker PREPARE")?;
+    let persisted_proposal = db.get_task_proposal_metadata(task_id)?;
+    let enforce_worker_protocol = persisted_proposal.is_some();
+    let proposal = persisted_proposal.unwrap_or_else(|| crate::protocol::TaskProposal {
+        local_id: task_id.into(),
+        title: task.title.clone(),
+        objective: task.objective.clone(),
+        role: task.role.clone(),
+        priority: task.priority,
+        depends_on: vec![],
+        capabilities: task.required_capabilities(),
+        scope_mode: task.scope_mode,
+        context_files: task.context_files.clone(),
+        expected_changes: task.expected_changes.clone(),
+        unchanged: vec![],
+        acceptance_criteria: vec![task.objective.clone()],
+        required_tests: vec!["configured validation pipeline".into()],
+        validation: vec!["configured validation evidence".into()],
+        execution_hints: Default::default(),
+    });
+    let mut revision_requirements = proposal.acceptance_criteria.clone();
+    revision_requirements.extend(
+        revision_contract
+            .unresolved
+            .iter()
+            .chain(&revision_contract.regressions)
+            .chain(&revision_contract.regression_constraints)
+            .map(|b| b.finding.clone()),
+    );
+    let review_summary = crate::review::build_review(db, task_id, repo_path)?;
+    for feedback in review_summary
+        .prior_reviews
+        .iter()
+        .filter_map(|review| review.revision_feedback.as_deref())
+    {
+        if !feedback.trim().is_empty() {
+            revision_requirements.push(feedback.to_owned());
+        }
+    }
+    let revision_plan = crate::worker_protocol::WorkerPlan {
+        protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
+        read_only_snapshot: serde_json::to_string(&revision_snapshot)?,
+        unchanged: proposal.unchanged.clone(),
+        steps: plan_steps(
+            &proposal.expected_changes,
+            &revision_requirements,
+            &proposal.required_tests,
+            &proposal.validation,
+            "Address the persisted revision requirements",
+        ),
+    };
+    revision_plan
+        .validate_contract(
+            &revision_requirements,
+            &proposal.required_tests,
+            &proposal.unchanged,
+        )
+        .context("Worker revision PREPARE is incomplete")?;
     let agent = db
         .list_agents()?
         .into_iter()
@@ -858,6 +1445,8 @@ pub fn revise_with_worker_on_db_with_overrides(
         },
     )?;
     let _run_finalizer = db.run_finalizer(run_id);
+    db.store_worker_prepare(run_id, &revision_plan)
+        .context("failed to persist Worker revision PREPARE")?;
     db.update_task_status(task_id, TaskStatus::Active)?;
     db.record_lifecycle_event(
         "review_revision",
@@ -885,6 +1474,11 @@ pub fn revise_with_worker_on_db_with_overrides(
         crate::automated::format_revision_contract(&revision_contract),
         feedback
     );
+    let prompt = format!(
+        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory): execute the persisted revision PREPARE plan in exact order and verify each step before continuing.\n{}",
+        prompt,
+        serde_json::to_string_pretty(&revision_plan)?
+    );
     let fail = |message: String| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
             "worker timeout"
@@ -897,12 +1491,53 @@ pub fn revise_with_worker_on_db_with_overrides(
     progress("worker running");
     let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to capture pre-revision change evidence")?;
-    let execution = match worker.execute_structured_with_progress_and_usage(
-        &prompt,
-        &worktree_dir,
-        &crate::automated::revision_handoff_schema(),
-        &|line| worker_output(line),
-    ) {
+    let mut execution = Ok(crate::worker::WorkerExecution {
+        outcome: WorkerOutcome::Success,
+        output: None,
+        token_usage: None,
+    });
+    let mut outputs = Vec::new();
+    let mut revision_step_outputs: Vec<Option<String>> = Vec::new();
+    let mut revision_step_snapshots = Vec::new();
+    for step in &revision_plan.steps {
+        let before = git::inspect_worktree(&worktree_dir, repo_path)
+            .context("failed to inspect worktree before Worker revision step")?;
+        let result = worker.execute_planned_step(
+            step,
+            &prompt,
+            &worktree_dir,
+            &crate::automated::revision_handoff_schema(),
+            &|line| worker_output(line),
+        );
+        match result {
+            Ok(step_execution) => {
+                revision_step_outputs.push(step_execution.output.clone());
+                let after = git::inspect_worktree(&worktree_dir, repo_path)
+                    .context("failed to inspect worktree after Worker revision step")?;
+                revision_step_snapshots.push((before, after));
+                if let Some(output) = step_execution.output.as_deref() {
+                    outputs.push(output.to_owned());
+                }
+                let failed = matches!(step_execution.outcome, WorkerOutcome::Failure(_));
+                execution = Ok(step_execution);
+                if failed {
+                    break;
+                }
+            }
+            Err(error) => {
+                revision_step_outputs.push(None);
+                if let Ok(after) = git::inspect_worktree(&worktree_dir, repo_path) {
+                    revision_step_snapshots.push((before, after));
+                }
+                execution = Err(error);
+                break;
+            }
+        }
+    }
+    if let Ok(result) = &mut execution {
+        result.output = (!outputs.is_empty()).then(|| outputs.join("\n\n"));
+    }
+    let execution = match execution {
         Ok(result) => result,
         Err(error) => {
             progress("worker failed");
@@ -931,6 +1566,42 @@ pub fn revise_with_worker_on_db_with_overrides(
         Ok(changes) => git::changes_since(&baseline_changes, &changes),
         Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
     };
+    if enforce_worker_protocol {
+        let protocol_check =
+            revision_plan
+                .steps
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, step)| {
+                    let (before, after) =
+                        revision_step_snapshots.get(index).with_context(|| {
+                            format!(
+                                "Worker did not execute persisted revision step '{}'",
+                                step.id
+                            )
+                        })?;
+                    performed_operations_for_step(
+                        step,
+                        revision_step_outputs.get(index).and_then(Option::as_deref),
+                        true,
+                    )?;
+                    validate_operation_effect(step, before, after, true)
+                });
+        if let Err(error) = protocol_check {
+            let evidence = failed_execution_evidence(
+                &revision_plan,
+                &revision_step_outputs,
+                &revision_step_snapshots,
+                &[],
+                &error.to_string(),
+                true,
+            );
+            db.store_worker_execution(run_id, &evidence)?;
+            return fail(format!(
+                "Worker revision plan verification failed: {error:#}"
+            ));
+        }
+    }
     if changes.files.is_empty() {
         return fail("Revision completed without meaningful project changes.".into());
     }
@@ -972,10 +1643,91 @@ pub fn revise_with_worker_on_db_with_overrides(
         Some(agent_id),
         Some(&revision_validation_evidence),
     )?;
-    let combined = format!("{}\n\nValidation:\n{}", output.unwrap_or_default(), summary);
+    let combined = format!(
+        "{}\n\nValidation:\n{}",
+        output.clone().unwrap_or_default(),
+        summary
+    );
     if !report.is_success() {
+        let evidence = failed_execution_evidence(
+            &revision_plan,
+            &revision_step_outputs,
+            &revision_step_snapshots,
+            &config.commands,
+            &combined,
+            enforce_worker_protocol,
+        );
+        db.store_worker_execution(run_id, &evidence)?;
         return fail(combined);
     }
+    let performed_operations = performed_operations_for_plan(
+        &revision_plan.steps,
+        &revision_step_outputs,
+        enforce_worker_protocol,
+    )
+    .context("Worker revision operation evidence failed")?;
+    let revision_evidence = crate::worker_protocol::WorkerExecutionResult {
+        protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
+        performed_operations,
+        affected_files: changes.files.iter().map(|file| file.path.clone()).collect(),
+        requirement_coverage: revision_plan
+            .steps
+            .iter()
+            .flat_map(|step| {
+                step.acceptance_criteria
+                    .iter()
+                    .chain(step.required_tests.iter())
+                    .map(move |criterion| (criterion.clone(), step.id.clone()))
+            })
+            .collect(),
+        focused_verification: revision_plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let step_output = revision_step_outputs.get(index).and_then(Option::as_deref);
+                crate::worker_protocol::StepEvidence {
+                    step_id: step.id.clone(),
+                    observed: worker_observations(
+                        step_output,
+                        if index + 1 == revision_plan.steps.len() {
+                            &summary
+                        } else {
+                            ""
+                        },
+                        revision_step_snapshots
+                            .get(index)
+                            .map(|(_, after)| after)
+                            .unwrap_or(&changes),
+                        &step.verification,
+                        !enforce_worker_protocol,
+                    ),
+                    verification: step.verification.clone(),
+                    passed: report.is_success()
+                        && step.verification.iter().all(|check| {
+                            crate::worker_protocol::reported_verifications(
+                                step_output.unwrap_or_default(),
+                            )
+                            .iter()
+                            .any(|reported| reported == check)
+                                || (!enforce_worker_protocol
+                                    && check.trim() == "configured validation evidence"
+                                    && summary.contains("PASS"))
+                        }),
+                }
+            })
+            .collect(),
+        configured_validation: config.commands.clone(),
+        unresolved_issues: Vec::new(),
+    };
+    if let Err(error) = revision_evidence.validate_against_plan(&revision_plan) {
+        db.store_worker_execution(run_id, &revision_evidence)?;
+        return fail(format!(
+            "Worker revision verification evidence failed: {error:#}"
+        ));
+    }
+    db.store_worker_execution(run_id, &revision_evidence)
+        .context("failed to persist Worker revision execution evidence")?;
     // The subsequent automated review is authoritative for blocker
     // resolution.  Consume and link the source review only after the
     // revision has produced changes and passed the configured validation.

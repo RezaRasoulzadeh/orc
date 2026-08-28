@@ -371,6 +371,39 @@ pub trait Worker: Send + Sync {
     ) -> Result<WorkerExecution, String> {
         self.execute_with_progress_and_usage(prompt, cwd, progress)
     }
+
+    /// Execute exactly one persisted PREPARE step.  This is the execution seam
+    /// for the provider-independent protocol; callers must invoke it in plan
+    /// order and may not collapse a plan into one provider request.
+    fn execute_planned_step(
+        &self,
+        step: &crate::worker_protocol::PlannedStep,
+        context: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let prompt = format!(
+            "{context}\n\nWORKER PLAN STEP (execute only this step):\n{}",
+            serde_json::to_string_pretty(step).map_err(|e| e.to_string())?
+        );
+        self.execute_structured_with_progress_and_usage(&prompt, cwd, schema, progress)
+    }
+
+    /// Cancellable counterpart that retains the persisted-step execution seam.
+    /// Backends which support cooperative cancellation may override this; the
+    /// default preserves correctness by still executing exactly one step.
+    fn execute_planned_step_cancellable(
+        &self,
+        step: &crate::worker_protocol::PlannedStep,
+        context: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        _cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        self.execute_planned_step(step, context, cwd, schema, progress)
+    }
 }
 
 /// Copilot worker implementation

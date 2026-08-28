@@ -1211,11 +1211,25 @@ fn run_review_mode(
                                 bail!("prior_blocker_id '{canonical_id}' is referenced by duplicate findings")
                             }
                             blocker.prior_blocker_id = Some(canonical_id.clone());
-                            blocker.id = canonical_id;
-                            blocker.status = if old.status == "resolved" {
-                                "regression"
-                            } else {
-                                "unresolved"
+                            blocker.id = canonical_id.clone();
+                            // The reviewer may resolve an actionable prior blocker, but
+                            // cannot author its lifecycle arbitrarily.  A resolved blocker
+                            // recurring is always a regression; unresolved/regression
+                            // blockers may remain actionable or become resolved.
+                            blocker.status = match (old.status.as_str(), blocker.status.as_str()) {
+                                ("resolved", _) => "regression",
+                                ("new" | "unresolved" | "regression", "resolved") => "resolved",
+                                ("new" | "unresolved" | "regression", "unresolved") => "unresolved",
+                                ("new" | "unresolved" | "regression", _) => {
+                                    bail!(
+                                        "invalid status transition for prior blocker '{}'",
+                                        canonical_id
+                                    )
+                                }
+                                (_, _) => bail!(
+                                    "invalid persisted status '{}' for prior blocker '{}'",
+                                    old.status, canonical_id
+                                ),
                             }
                             .into();
                         } else {

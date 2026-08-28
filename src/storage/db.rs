@@ -24,6 +24,7 @@ pub struct PersistedPlan {
     pub status: PlanStatus,
     pub response: crate::protocol::PlanResponse,
     pub created_at: String,
+    pub superseded_by_plan_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,6 +44,7 @@ pub struct PlanReview {
     pub decision: crate::lead::LeadDecisionKind,
     pub details: String,
     pub created_at: String,
+    pub superseded_by_review_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -569,6 +571,12 @@ impl Database {
             params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
         )?;
         let id = transaction.last_insert_rowid();
+        if let Some(parent_plan_id) = parent_plan_id {
+            transaction.execute(
+                "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND project_id = ?3 AND status IN ('proposed', 'under_review', 'revision_requested', 'approved')",
+                params![id, parent_plan_id, project_id],
+            )?;
+        }
         for task in &response.tasks {
             for dependency in &task.depends_on {
                 transaction.execute(
@@ -621,6 +629,12 @@ impl Database {
         let canonical = serde_json::to_string(response)?;
         transaction.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical])?;
         let id = transaction.last_insert_rowid();
+        if let Some(parent_plan_id) = parent_plan_id {
+            transaction.execute(
+                "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND project_id = ?3 AND status IN ('proposed', 'under_review', 'revision_requested', 'approved')",
+                params![id, parent_plan_id, project_id],
+            )?;
+        }
         for task in &response.tasks {
             for dependency in &task.depends_on {
                 transaction.execute("INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1, ?2, ?3)", params![id, task.local_id, dependency])?;
@@ -638,9 +652,9 @@ impl Database {
 
     pub fn get_plan(&self, id: i64) -> Result<Option<PersistedPlan>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at FROM plans WHERE id = ?1",
+            "SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
             [id],
-            |row| Ok(PersistedPlan { id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, parent_plan_id: row.get(3)?, source_lead_decision_id: row.get(4)?, source_planner_run_id: row.get(5)?, status: PlanStatus::parse(row.get(6)?)?, response: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?, created_at: row.get(8)? }))
+            |row| Ok(PersistedPlan { id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, parent_plan_id: row.get(3)?, source_lead_decision_id: row.get(4)?, source_planner_run_id: row.get(5)?, status: PlanStatus::parse(row.get(6)?)?, response: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?, created_at: row.get(8)?, superseded_by_plan_id: row.get(9)? }))
         .optional()?)
     }
 
@@ -701,7 +715,7 @@ impl Database {
     }
 
     pub fn list_plan_reviews(&self, project_id: i64) -> Result<Vec<PlanReview>, DbError> {
-        let mut statement = self.conn.prepare("SELECT r.id, r.plan_id, r.lead_run_id, r.lead_decision_id, r.decision, r.details, r.created_at FROM plan_reviews r JOIN plans p ON p.id = r.plan_id WHERE p.project_id = ?1 ORDER BY r.id")?;
+        let mut statement = self.conn.prepare("SELECT r.id, r.plan_id, r.lead_run_id, r.lead_decision_id, r.decision, r.details, r.created_at, r.superseded_by_review_id FROM plan_reviews r JOIN plans p ON p.id = r.plan_id WHERE p.project_id = ?1 ORDER BY r.id")?;
         Ok(statement
             .query_map([project_id], |row| {
                 Ok(PlanReview {
@@ -712,6 +726,7 @@ impl Database {
                     decision: parse_lead_decision_kind(&row.get::<_, String>(4)?)?,
                     details: row.get(5)?,
                     created_at: row.get(6)?,
+                    superseded_by_review_id: row.get(7)?,
                 })
             })?
             .collect::<Result<_, _>>()?)
@@ -942,7 +957,7 @@ impl Database {
     ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let plan = self.conn.query_row("SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at FROM plans WHERE project_id=?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id], |r| Ok(PersistedPlan { id:r.get(0)?, project_id:r.get(1)?, version:r.get(2)?, parent_plan_id:r.get(3)?, source_lead_decision_id:r.get(4)?, source_planner_run_id:r.get(5)?, status:PlanStatus::parse(r.get(6)?)?, response:serde_json::from_str(&r.get::<_,String>(7)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?, created_at:r.get(8)? })).optional()?.ok_or_else(|| DbError::Scheduler("no Planner plan found".into()))?;
+            let plan = self.conn.query_row("SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE project_id=?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id], |r| Ok(PersistedPlan { id:r.get(0)?, project_id:r.get(1)?, version:r.get(2)?, parent_plan_id:r.get(3)?, source_lead_decision_id:r.get(4)?, source_planner_run_id:r.get(5)?, status:PlanStatus::parse(r.get(6)?)?, response:serde_json::from_str(&r.get::<_,String>(7)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?, created_at:r.get(8)?, superseded_by_plan_id:r.get(9)? })).optional()?.ok_or_else(|| DbError::Scheduler("no Planner plan found".into()))?;
             if plan.status != PlanStatus::Approved {
                 return Err(DbError::Scheduler(
                     "current Planner plan is not approved".into(),
@@ -1079,6 +1094,7 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'proposed',
                 response TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                superseded_by_plan_id INTEGER REFERENCES plans(id),
                 UNIQUE(project_id, version)
             );
             CREATE TABLE IF NOT EXISTS plan_dependencies (
@@ -1895,7 +1911,11 @@ impl Database {
     }
 
     fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT, snapshot TEXT, run_id INTEGER, source_request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', resolution TEXT);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS lead_turns (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS lead_decisions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, proposal TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), applying_at TEXT, resolved_at TEXT, snapshot TEXT, run_id INTEGER, source_request TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', resolution TEXT, superseded_by_id INTEGER REFERENCES lead_decisions(id));")?;
+        let has_supersession: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('lead_decisions') WHERE name='superseded_by_id'", [], |r| r.get(0)).unwrap_or(0);
+        if has_supersession == 0 {
+            conn.execute("ALTER TABLE lead_decisions ADD COLUMN superseded_by_id INTEGER REFERENCES lead_decisions(id)", [])?;
+        }
         let columns = conn
             .prepare("PRAGMA table_info(lead_decisions)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -1966,8 +1986,36 @@ impl Database {
 
     fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));",
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id)); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id));",
         )?;
+        for (table, column, definition) in [
+            (
+                "plans",
+                "superseded_by_plan_id",
+                "INTEGER REFERENCES plans(id)",
+            ),
+            (
+                "plan_reviews",
+                "superseded_by_review_id",
+                "INTEGER REFERENCES plan_reviews(id)",
+            ),
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{column}'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if exists == 0 {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1987,17 +2035,21 @@ impl Database {
         ) {
             return Err(DbError::Scheduler("invalid plan review decision".into()));
         }
-        self.conn.execute("INSERT INTO plan_reviews (plan_id, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan_id, lead_run_id, decision_id, lead_decision_kind(*decision), details])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO plan_reviews (plan_id, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan_id, lead_run_id, decision_id, lead_decision_kind(*decision), details])?;
+        let review_id = tx.last_insert_rowid();
+        tx.execute("UPDATE plan_reviews SET superseded_by_review_id = ?1 WHERE plan_id = ?2 AND id <> ?1 AND superseded_by_review_id IS NULL", params![review_id, plan_id])?;
         let status = match decision {
             crate::lead::LeadDecisionKind::Approve => "approved",
             crate::lead::LeadDecisionKind::RevisePlan => "revision_requested",
             _ => "under_review",
         };
-        self.conn.execute(
+        tx.execute(
             "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
             params![status, plan_id],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        tx.commit()?;
+        Ok(review_id)
     }
 
     pub fn get_plan_review_for_decision(
@@ -2048,6 +2100,10 @@ impl Database {
         )?;
         tx.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,'proposed',?6)", params![project_id, parent_version + 1, parent_id, decision_id, planner_run_id, serde_json::to_string(response)?])?;
         let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND superseded_by_plan_id IS NULL",
+            params![id, parent_id],
+        )?;
         for task in &response.tasks {
             for dependency in &task.depends_on {
                 tx.execute("INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1,?2,?3)", params![id, task.local_id, dependency])?;
@@ -2071,10 +2127,10 @@ impl Database {
         metadata: LeadDecisionMetadata<'_>,
     ) -> Result<i64, DbError> {
         let transaction = self.conn.unchecked_transaction()?;
-        transaction.execute("UPDATE lead_decisions SET status = 'superseded', resolved_at = CURRENT_TIMESTAMP WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')", params![project_id])?;
         let payload = serde_json::to_string(details)?;
         transaction.execute("INSERT INTO lead_decisions (project_id, kind, proposal, snapshot, run_id, source_request, summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id, lead_decision_kind(*kind), payload, metadata.snapshot, metadata.run_id, metadata.source_request, metadata.summary])?;
         let id = transaction.last_insert_rowid();
+        transaction.execute("UPDATE lead_decisions SET status = 'superseded', resolved_at = CURRENT_TIMESTAMP, superseded_by_id = ?2 WHERE project_id = ?1 AND id <> ?2 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')", params![project_id, id])?;
         transaction.commit()?;
         Ok(id)
     }
@@ -2083,9 +2139,9 @@ impl Database {
         &self,
         project_id: i64,
     ) -> Result<Option<crate::lead::PersistedLeadDecision>, DbError> {
-        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
+        Ok(self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at, superseded_by_id FROM lead_decisions WHERE project_id = ?1 AND status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id DESC LIMIT 1", params![project_id], |r| {
             let status: String = r.get(4)?;
-            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status, resolution: r.get(9)?, resolved_at: r.get(10)? })
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, actionable: status == "pending", status, resolution: r.get(9)?, resolved_at: r.get(10)?, superseded_by_id: r.get(11)? })
         }).optional()?)
     }
 
@@ -2106,9 +2162,9 @@ impl Database {
                 "USER_DECISION_REQUIRED decision is missing or already resolved".into(),
             ));
         }
-        self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE id = ?1", [decision_id], |r| {
+        self.conn.query_row("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at, superseded_by_id FROM lead_decisions WHERE id = ?1", [decision_id], |r| {
             let status: String = r.get(4)?;
-            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, status: status.clone(), actionable: false, resolution: r.get(9)?, resolved_at: r.get(10)? })
+            Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, status: status.clone(), actionable: false, resolution: r.get(9)?, resolved_at: r.get(10)?, superseded_by_id: r.get(11)? })
         }).map_err(DbError::from)
     }
 
@@ -2137,10 +2193,10 @@ impl Database {
             tx.execute("UPDATE plans SET status='cancelled' WHERE id=?1 AND project_id=?2 AND status IN ('proposed','under_review','revision_requested','approved')", params![plan_id, project_id])?;
         }
         let result = tx.query_row(
-            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE id=?1",
+            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at, superseded_by_id FROM lead_decisions WHERE id=?1",
             [decision_id], |r| {
                 let status: String = r.get(4)?;
-                Ok(crate::lead::PersistedLeadDecision { id:r.get(0)?, kind:parse_lead_decision_kind(&r.get::<_,String>(1)?)?, details:r.get(2)?, snapshot:r.get(3)?, status:status.clone(), actionable:false, run_id:r.get(5)?, created_at:r.get(6)?, source_request:r.get(7)?, summary:r.get(8)?, resolution:r.get(9)?, resolved_at:r.get(10)? })
+                Ok(crate::lead::PersistedLeadDecision { id:r.get(0)?, kind:parse_lead_decision_kind(&r.get::<_,String>(1)?)?, details:r.get(2)?, snapshot:r.get(3)?, status:status.clone(), actionable:false, run_id:r.get(5)?, created_at:r.get(6)?, source_request:r.get(7)?, summary:r.get(8)?, resolution:r.get(9)?, resolved_at:r.get(10)?, superseded_by_id:r.get(11)? })
             }).map_err(DbError::from)?;
         tx.commit()?;
         Ok(result)
@@ -2178,7 +2234,7 @@ impl Database {
     pub fn pending_lead_decision_context(
         &self,
     ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
-        let mut statement = self.conn.prepare("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id")?;
+        let mut statement = self.conn.prepare("SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at, superseded_by_id FROM lead_decisions WHERE status = 'pending' AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED') ORDER BY id")?;
         Ok(statement
             .query_map([], |r| {
                 let status: String = r.get(4)?;
@@ -2195,6 +2251,7 @@ impl Database {
                     summary: r.get(8)?,
                     resolution: r.get(9)?,
                     resolved_at: r.get(10)?,
+                    superseded_by_id: r.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -2205,7 +2262,7 @@ impl Database {
         project_id: i64,
     ) -> Result<Vec<crate::lead::PersistedLeadDecision>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions
+            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at, superseded_by_id FROM lead_decisions
              WHERE project_id = ?1 AND kind IN ('DIRECT_TASKS', 'PLAN_REQUIRED', 'USER_DECISION_REQUIRED')
              ORDER BY id ASC",
         )?;
@@ -2223,6 +2280,7 @@ impl Database {
                 actionable: status == "pending",
                 status,
                 resolution: r.get(9)?,
+                superseded_by_id: r.get(11)?,
                 resolved_at: r.get(10)?,
             })
         })?;

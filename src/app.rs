@@ -350,6 +350,7 @@ impl OrcApp {
             decision: decision.kind,
             details: decision.details.to_string(),
             created_at: String::new(),
+            superseded_by_review_id: None,
         })
     }
     pub fn automated_lead_with_backend(

@@ -57,6 +57,7 @@ pub struct PersistedLeadDecision {
     pub actionable: bool,
     pub resolution: Option<String>,
     pub resolved_at: Option<String>,
+    pub superseded_by_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

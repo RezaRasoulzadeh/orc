@@ -616,11 +616,12 @@ impl WorkerExecutionResult {
             .iter()
             .map(|(r, _)| r.trim())
             .collect();
-        for requirement in plan
-            .steps
-            .iter()
-            .flat_map(|s| s.acceptance_criteria.iter().chain(s.required_tests.iter()))
-        {
+        for requirement in plan.steps.iter().flat_map(|s| {
+            s.acceptance_criteria
+                .iter()
+                .chain(s.required_tests.iter())
+                .chain(s.active_review_blockers.iter())
+        }) {
             if !covered.contains(requirement.trim()) {
                 anyhow::bail!(
                     "execution evidence omits planned requirement '{}',",
@@ -650,6 +651,7 @@ impl WorkerExecutionResult {
                         .acceptance_criteria
                         .iter()
                         .chain(candidate.required_tests.iter())
+                        .chain(candidate.active_review_blockers.iter())
                         .any(|value| value == requirement)
             })
         }) {

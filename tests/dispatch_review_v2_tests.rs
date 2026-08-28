@@ -29,6 +29,49 @@ struct ProtocolOperationWorker {
     calls: Mutex<Vec<String>>,
 }
 
+struct CompletionRepairWorker {
+    calls: Mutex<usize>,
+}
+
+impl Worker for CompletionRepairWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        Err("unplanned Worker execution was invoked".into())
+    }
+
+    fn execute_planned_step(
+        &self,
+        step: &orc::worker_protocol::PlannedStep,
+        _: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        let target = step
+            .operation_targets
+            .first()
+            .ok_or_else(|| "missing operation target".to_owned())?;
+        if *calls > 1 {
+            std::fs::write(cwd.join(target), "completion-gated\n")
+                .map_err(|error| error.to_string())?;
+        }
+        let verification = if *calls == 1 {
+            String::new()
+        } else {
+            "VERIFICATION PASSED: configured validation evidence\n".into()
+        };
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(format!(
+                "OPERATION PERFORMED: {}\n{verification}",
+                orc::worker_protocol::operation_name(&step.operations[0])
+            )),
+            token_usage: None,
+        })
+    }
+}
+
 impl Worker for ProtocolOperationWorker {
     fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         Err("unplanned Worker execution was invoked".into())
@@ -768,6 +811,18 @@ fn test_only_blocker_evidence_completes_the_real_revision_path() {
     assert_eq!(
         changes.files[0].path,
         "tests/revision_contract_lifecycle.rs"
+    );
+    let execution = db
+        .load_worker_protocol(summary.run_id)
+        .unwrap()
+        .unwrap()
+        .1
+        .expect("revision execution evidence");
+    assert!(
+        execution
+            .requirement_coverage
+            .iter()
+            .any(|(requirement, _)| requirement == "BLK-revision-e2e")
     );
     assert!(db.source_review_run_id(summary.run_id).unwrap().is_some());
     assert!(db.actionable_revision_review(&task).unwrap().is_none());
@@ -3130,6 +3185,10 @@ fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() 
     )
     .unwrap_err();
     assert!(error.to_string().contains("verification"));
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
     let run = db.list_agent_runs_for_task(&task).unwrap()[0].id;
     let (_, execution) = db.load_worker_protocol(run).unwrap().unwrap();
     let execution = execution.expect("failed protocol result must be retained");
@@ -3140,9 +3199,54 @@ fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() 
             .all(|step| !step.passed)
     );
     assert!(execution.validate().is_err());
+    assert!(
+        !db.list_lifecycle_events_for_run(run, 20)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "worker_completion_gate")
+    );
     let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
     let (_, reopened_execution) = reopened.load_worker_protocol(run).unwrap().unwrap();
     assert_eq!(reopened_execution, Some(execution));
+}
+
+#[test]
+fn completion_gate_repairs_missing_step_evidence_before_review() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: completion-gated.txt");
+    let worker = CompletionRepairWorker {
+        calls: Mutex::new(0),
+    };
+
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    assert_eq!(*worker.calls.lock().unwrap(), 2);
+    assert_eq!(summary.run_status, "completed");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    let events = db
+        .list_lifecycle_events_for_run(summary.run_id, 20)
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "worker_completion_repair_started")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "worker_completion_gate")
+    );
 }
 
 #[test]

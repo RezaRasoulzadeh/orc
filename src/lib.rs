@@ -35,12 +35,16 @@ pub use queue::{
     BlockingReason, DependencyInfo, QueueCategory, QueueEntry, QueueItem, QueueReport,
     compute_queue,
 };
+pub use registry::{
+    AGENT_MODEL_VERSION, Agent, AgentCapability, AgentExecution, AgentExecutionMode,
+    AgentLifecycleState, AgentProviderConfiguration, AgentRole, GLOBAL_AGENT_SCOPE,
+};
 pub use scheduler::{
     CandidateEvaluation, CandidateStatus, RejectionReason, ScheduleDecision, SelectionReason,
     evaluate_candidate, is_backend_mode_supported, schedule, validate_override,
 };
 pub use state::*;
-pub use storage::Database;
+pub use storage::{Database, ProjectAgentReference};
 pub use task::*;
 pub use validation::{
     SystemValidationRunner, ValidationCategory, ValidationConfig, ValidationReport,

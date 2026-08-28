@@ -1,9 +1,79 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::registry::AgentDefinition;
-use crate::registry::ReasoningEffort;
+use crate::registry::{Agent, AgentDefinition, AgentExecutionMode, ReasoningEffort};
 use crate::worker::{AntigravityWorker, CodexWorker, CopilotWorker, Worker};
+
+/// Stable boundary between Orc's canonical agent contract and a provider.
+///
+/// An adapter translates an already validated Orc `Agent` into a worker. It
+/// deliberately has no lifecycle methods: run status, reservations, task
+/// transitions, and terminalization remain owned by Orc's application/storage
+/// layers.
+pub trait ProviderAdapter: Send + Sync {
+    fn provider_id(&self) -> &'static str;
+    fn build_worker(&self, agent: &Agent) -> Result<Box<dyn Worker>, String>;
+}
+
+pub struct CodexProviderAdapter;
+
+impl ProviderAdapter for CodexProviderAdapter {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn build_worker(&self, agent: &Agent) -> Result<Box<dyn Worker>, String> {
+        let profile_path = agent
+            .execution
+            .provider
+            .profile_path
+            .as_deref()
+            .ok_or_else(|| {
+                format!(
+                    "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
+                    agent.id, agent.id
+                )
+            })?;
+        Ok(Box::new(CodexWorker::with_execution(
+            PathBuf::from(profile_path),
+            agent.execution.provider.model.clone(),
+            agent.execution.provider.reasoning_effort,
+        )))
+    }
+}
+
+pub struct CopilotProviderAdapter;
+
+impl ProviderAdapter for CopilotProviderAdapter {
+    fn provider_id(&self) -> &'static str {
+        "copilot"
+    }
+
+    fn build_worker(&self, _agent: &Agent) -> Result<Box<dyn Worker>, String> {
+        Ok(Box::new(CopilotWorker))
+    }
+}
+
+pub struct AntigravityProviderAdapter;
+
+impl ProviderAdapter for AntigravityProviderAdapter {
+    fn provider_id(&self) -> &'static str {
+        "antigravity"
+    }
+
+    fn build_worker(&self, _agent: &Agent) -> Result<Box<dyn Worker>, String> {
+        Ok(Box::new(AntigravityWorker))
+    }
+}
+
+pub fn provider_adapter(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
+    match provider {
+        "codex" => Some(Box::new(CodexProviderAdapter)),
+        "copilot" => Some(Box::new(CopilotProviderAdapter)),
+        "antigravity" => Some(Box::new(AntigravityProviderAdapter)),
+        _ => None,
+    }
+}
 
 pub trait HealthCommandRunner {
     fn executable_exists(&self, executable: &str) -> bool;
@@ -67,6 +137,30 @@ pub fn check_health(
 pub struct WorkerFactory;
 
 impl WorkerFactory {
+    pub fn build_global(agent: &Agent) -> Result<Box<dyn Worker>, String> {
+        if agent.model_version != crate::registry::AGENT_MODEL_VERSION {
+            return Err(format!(
+                "unsupported agent model version {}",
+                agent.model_version
+            ));
+        }
+        if !agent.is_global() {
+            return Err(format!("agent '{}' is not globally owned", agent.id));
+        }
+        if !agent.is_available() {
+            return Err(format!("agent '{}' is not available", agent.id));
+        }
+        if agent.execution_mode() != AgentExecutionMode::Automated {
+            return Err(format!(
+                "agent '{}' is not configured for automated execution",
+                agent.id
+            ));
+        }
+        let adapter = provider_adapter(agent.provider())
+            .ok_or_else(|| format!("unsupported agent backend '{}'", agent.provider()))?;
+        adapter.build_worker(agent)
+    }
+
     pub fn build_lead(
         agent: &AgentDefinition,
         model: Option<String>,
@@ -131,27 +225,8 @@ impl WorkerFactory {
     }
 
     pub fn build(agent: &AgentDefinition) -> Result<Box<dyn Worker>, String> {
-        match agent.backend.as_str() {
-            "copilot" => Ok(Box::new(CopilotWorker)),
-            "codex" => {
-                let profile_path = agent.profile_path.as_deref().ok_or_else(|| {
-                    format!(
-                        "Codex agent '{}' requires a configured profile path; run `orc agent profile {} <path>`",
-                        agent.id, agent.id
-                    )
-                })?;
-                Ok(Box::new(CodexWorker::with_execution(
-                    PathBuf::from(profile_path),
-                    agent.model.clone(),
-                    agent.reasoning_effort,
-                )))
-            }
-            "antigravity" => Ok(Box::new(AntigravityWorker)),
-            backend => Err(format!(
-                "unsupported agent backend '{}'; supported backends: copilot, codex, antigravity",
-                backend
-            )),
-        }
+        let canonical = Agent::from_definition(agent).map_err(|error| error.to_string())?;
+        Self::build_global(&canonical)
     }
 
     pub fn build_with_codex_overrides(

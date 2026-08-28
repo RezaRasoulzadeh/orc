@@ -393,6 +393,13 @@ pub struct ApprovalRequest {
     pub resolved: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectAgentReference {
+    pub project_id: i64,
+    pub agent_id: String,
+    pub created_at: String,
+}
+
 fn lead_proposal_kind(proposal: &crate::lead::LeadProposalKind) -> &'static str {
     match proposal {
         crate::lead::LeadProposalKind::Plan(_) => "plan",
@@ -499,6 +506,8 @@ pub enum DbError {
     AgentAlreadyArchived(String),
     #[error("agent '{0}' not found")]
     AgentNotFound(String),
+    #[error("project '{0}' not found")]
+    ProjectNotFound(i64),
     #[error("agent '{0}' cannot be purged while it has an active run")]
     AgentPurgeActiveRun(String),
     #[error("task '{0}' cannot be purged while it has an active run")]
@@ -1059,6 +1068,8 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
+                model_version INTEGER NOT NULL DEFAULT 1,
+                scope TEXT NOT NULL DEFAULT 'global',
                 backend TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -1076,6 +1087,12 @@ impl Database {
                 quota_checked_at TEXT,
                 quota_source TEXT
                 , quota_limits TEXT
+            );
+            CREATE TABLE IF NOT EXISTS project_agent_references (
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (project_id, agent_id)
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -1198,6 +1215,7 @@ impl Database {
             "#,
         )?;
         Self::ensure_agent_columns(&conn)?;
+        Self::ensure_project_agent_references_table(&conn)?;
         Self::ensure_execution_templates_table(&conn)?;
         Self::ensure_agent_actions_table(&conn)?;
         Self::ensure_agent_run_columns(&conn)?;
@@ -1252,9 +1270,10 @@ impl Database {
 
     fn ensure_registry_schema(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
+            "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, model_version INTEGER NOT NULL DEFAULT 1, scope TEXT NOT NULL DEFAULT 'global', backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
         )?;
         Self::ensure_agent_columns(conn)?;
+        Self::ensure_project_agent_references_table(conn)?;
         Self::ensure_execution_templates_table(conn)?;
         Self::ensure_agent_actions_table(conn)?;
         Self::ensure_agent_run_columns(conn)?;
@@ -1279,6 +1298,18 @@ impl Database {
                 run_id INTEGER NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
                 owner_pid INTEGER,
                 acquired_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_project_agent_references_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_agent_references (
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (project_id, agent_id)
             )",
         )?;
         Ok(())
@@ -1798,6 +1829,8 @@ impl Database {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
         for (name, definition) in [
+            ("model_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("scope", "TEXT NOT NULL DEFAULT 'global'"),
             ("quota_remaining_percent", "INTEGER"),
             ("quota_reset_at", "TEXT"),
             ("quota_checked_at", "TEXT"),
@@ -2808,6 +2841,102 @@ impl Database {
             .optional()?)
     }
 
+    fn project_exists(&self, project_id: i64) -> Result<bool, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Authorize a project to consume a globally owned agent. The reference is
+    /// persisted separately from the global agent so project access never
+    /// changes global ownership or provider configuration.
+    pub fn reference_global_agent(&self, project_id: i64, agent_id: &str) -> Result<bool, DbError> {
+        if !self.project_exists(project_id)? {
+            return Err(DbError::ProjectNotFound(project_id));
+        }
+        if self.get_global_agent(agent_id)?.is_none() {
+            return Err(DbError::AgentNotFound(agent_id.to_owned()));
+        }
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO project_agent_references (project_id, agent_id) VALUES (?1, ?2)",
+            params![project_id, agent_id],
+        )? != 0)
+    }
+
+    pub fn remove_global_agent_reference(
+        &self,
+        project_id: i64,
+        agent_id: &str,
+    ) -> Result<bool, DbError> {
+        if !self.project_exists(project_id)? {
+            return Err(DbError::ProjectNotFound(project_id));
+        }
+        Ok(self.conn.execute(
+            "DELETE FROM project_agent_references WHERE project_id = ?1 AND agent_id = ?2",
+            params![project_id, agent_id],
+        )? != 0)
+    }
+
+    pub fn list_project_agent_references(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ProjectAgentReference>, DbError> {
+        if !self.project_exists(project_id)? {
+            return Err(DbError::ProjectNotFound(project_id));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT project_id, agent_id, created_at FROM project_agent_references WHERE project_id = ?1 ORDER BY agent_id",
+        )?;
+        Ok(statement
+            .query_map([project_id], |row| {
+                Ok(ProjectAgentReference {
+                    project_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Resolve only an agent explicitly authorized for this project. This is
+    /// the project-to-global boundary used by project-aware callers.
+    pub fn resolve_project_agent(
+        &self,
+        project_id: i64,
+        agent_id: &str,
+    ) -> Result<Option<crate::registry::Agent>, DbError> {
+        if !self.project_exists(project_id)? {
+            return Err(DbError::ProjectNotFound(project_id));
+        }
+        let referenced: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT agent_id FROM project_agent_references WHERE project_id = ?1 AND agent_id = ?2",
+                params![project_id, agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(referenced) = referenced else {
+            return Ok(None);
+        };
+        self.get_global_agent(&referenced)
+    }
+
+    pub fn list_project_agents(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<crate::registry::Agent>, DbError> {
+        self.list_project_agent_references(project_id)?
+            .into_iter()
+            .map(|reference| {
+                self.get_global_agent(&reference.agent_id)?
+                    .ok_or_else(|| DbError::AgentNotFound(reference.agent_id))
+            })
+            .collect()
+    }
+
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
@@ -2841,6 +2970,66 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    /// Persist the canonical versioned Agent contract. Agents are intentionally
+    /// not associated with a project; they are reusable global identities.
+    pub fn insert_global_agent(&self, agent: &crate::registry::Agent) -> Result<(), DbError> {
+        if agent.model_version != crate::registry::AGENT_MODEL_VERSION {
+            return Err(DbError::Scheduler(format!(
+                "unsupported agent model version {}",
+                agent.model_version
+            )));
+        }
+        if !agent.is_global() {
+            return Err(DbError::Scheduler(
+                "only globally owned agents can be registered".into(),
+            ));
+        }
+        self.insert_agent(&agent.to_definition())?;
+        self.conn.execute(
+            "UPDATE agents SET model_version = ?1, scope = ?2 WHERE id = ?3",
+            rusqlite::params![agent.model_version, agent.scope, agent.id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_global_agent(&self, id: &str) -> Result<Option<crate::registry::Agent>, DbError> {
+        let definition = self.get_agent(id)?;
+        let Some(definition) = definition else {
+            return Ok(None);
+        };
+        let (version, scope): (u16, String) = self.conn.query_row(
+            "SELECT model_version, scope FROM agents WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if version != crate::registry::AGENT_MODEL_VERSION
+            || scope != crate::registry::GLOBAL_AGENT_SCOPE
+        {
+            return Err(DbError::Scheduler(format!(
+                "agent '{}' has unsupported model version or ownership scope",
+                id
+            )));
+        }
+        Ok(Some(
+            crate::registry::Agent::from_definition(&definition)
+                .map_err(|error| DbError::Scheduler(error.to_string()))?,
+        ))
+    }
+
+    pub fn list_global_agents(&self) -> Result<Vec<crate::registry::Agent>, DbError> {
+        self.list_agents()?
+            .into_iter()
+            .map(|definition| {
+                self.get_global_agent(&definition.id)?.ok_or_else(|| {
+                    DbError::Scheduler(format!(
+                        "agent '{}' disappeared while listing",
+                        definition.id
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn agent_from_row(&self, row: &Row<'_>) -> rusqlite::Result<AgentDefinition> {

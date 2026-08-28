@@ -22,7 +22,7 @@ Install Rust stable, Cargo, Git, Node.js, and the native Tauri prerequisites. Fr
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File scripts/install.ps1`. `orc --ui` launches the installed packaged desktop application and returns immediately. See the [desktop installation guide](docs/desktop.md) for system-wide Linux installation, upgrades, uninstall steps, and artifact validation.
 
-Run `orc init` to create local Orc state, then `orc adopt` to bring the existing Git repository under Orc management. The desktop Import action only remembers an already adopted project; it does not create project state. See [project lifecycle and ownership](docs/project-lifecycle.md) for the document, source-control, and runtime-state rules. Automated Codex workers and the configured Lead additionally require an installed and authenticated `codex` CLI. Manual workers and provider-independent acceptance tests do not require a live AI provider.
+Run `orc init` to create local Orc state, then `orc adopt` to bring the existing Git repository under Orc management. The desktop Import action only remembers an already adopted project; it does not create project state. See [project lifecycle and ownership](docs/project-lifecycle.md) for the document, source-control, and runtime-state rules. Automated Codex or Copilot workers require the corresponding installed and authenticated CLI; the configured Lead still requires Codex. Manual workers and provider-independent acceptance tests do not require a live AI provider.
 
 ## Verified quick start
 
@@ -131,8 +131,8 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc agent available <ID>` / `unavailable <ID> <REASON>` | Mark an agent available or unavailable. |
 | `orc agent priority <ID> <PRIORITY>` | Set an agent's selection priority. |
 | `orc agent profile <ID> <PATH>` | Set an agent's configuration profile directory. |
-| `orc agent model <ID> <MODEL>` | Set an agent's model (automated Codex agents only). |
-| `orc agent effort <ID> <EFFORT>` | Set an agent's reasoning effort (automated Codex agents only). |
+| `orc agent model <ID> <MODEL>` | Set an agent's model (automated providers with execution-setting support). |
+| `orc agent effort <ID> <EFFORT>` | Set an agent's reasoning effort (automated providers with execution-setting support). |
 | `orc agent quota <ID> --remaining N [--reset TS]` | Manually set an agent's quota state. |
 | `orc agent quota-clear <ID>` | Clear an agent's manually set quota. |
 | `orc agent quota-reserve <REMAINING>` | Set the global automatic-dispatch quota reserve. |
@@ -158,7 +158,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc approvals list` | List unresolved approval requests. |
 | `orc approvals resolve <ID>` | Resolve an approval request. |
 
-The [CLI reference](docs/cli-reference.md) documents every flag, default value, and constraint (e.g. which options require `--automated`, which conflict, and which are Codex-only) in full detail.
+The [CLI reference](docs/cli-reference.md) documents every flag, default value, and constraint (e.g. which options require `--automated`, which conflict, and which remain Codex-only) in full detail.
 
 ## Agents, profiles, models, and effort
 

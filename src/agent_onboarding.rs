@@ -224,9 +224,14 @@ fn authentication_check(
 ) -> Result<(&'static str, &'static [&'static str], &'static str), String> {
     match backend {
         "codex" => Ok(("codex", &["login", "status"], "codex_login_status")),
-        // `/user` is Copilot's account inspection command. It checks the
-        // logged-in account without issuing an AI prompt.
-        "copilot" => Ok(("copilot", &["-p", "/user"], "copilot_user")),
+        // Copilot documents `/user list` as its account inspection command.
+        // Prompt mode executes this slash command without sending an AI
+        // request; silent/no-ask flags keep onboarding non-interactive.
+        "copilot" => Ok((
+            "copilot",
+            &["-p", "/user list", "-s", "--no-ask-user"],
+            "copilot_user",
+        )),
         // Antigravity has no standalone auth-status subcommand. Listing
         // models is its non-interactive authenticated API operation and also
         // avoids sending an AI prompt during onboarding.
@@ -408,7 +413,12 @@ mod tests {
     #[test]
     fn automated_provider_authentication_uses_provider_login_checks() {
         for (backend, executable, args, method) in [
-            ("copilot", "copilot", vec!["-p", "/user"], "copilot_user"),
+            (
+                "copilot",
+                "copilot",
+                vec!["-p", "/user list", "-s", "--no-ask-user"],
+                "copilot_user",
+            ),
             ("antigravity", "agy", vec!["models"], "antigravity_models"),
         ] {
             let (actual_executable, actual_args, actual_method) =

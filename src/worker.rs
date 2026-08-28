@@ -412,8 +412,76 @@ pub trait Worker: Send + Sync {
     }
 }
 
-/// Copilot worker implementation
-pub struct CopilotWorker;
+/// Copilot CLI worker.
+///
+/// Copilot's documented programmatic interface is a plain-text prompt (`-p`)
+/// that exits after completion. It has no provider-structured event format,
+/// so the generic Worker protocol remains the only structured boundary Orc
+/// relies on.
+pub struct CopilotWorker {
+    copilot_home: Option<PathBuf>,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    executable: PathBuf,
+}
+
+impl CopilotWorker {
+    pub fn with_execution(
+        copilot_home: Option<PathBuf>,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        Self {
+            copilot_home,
+            model,
+            reasoning_effort,
+            executable: PathBuf::from("copilot"),
+        }
+    }
+
+    pub fn with_executable(mut self, executable: PathBuf) -> Self {
+        self.executable = executable;
+        self
+    }
+
+    /// Build the flags documented for non-interactive Copilot CLI use.
+    pub fn command_args(
+        prompt: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-p".into(),
+            prompt.into(),
+            "-s".into(),
+            "--allow-all-tools".into(),
+            "--no-ask-user".into(),
+        ];
+        if let Some(model) = model {
+            args.extend(["--model".into(), model.into()]);
+        }
+        // Orc's `None` means provider default. Copilot's documented effort
+        // values do not include a `none` setting, so do not pass one.
+        if let Some(effort) = reasoning_effort.filter(|value| *value != ReasoningEffort::None) {
+            args.extend(["--effort".into(), effort.as_str().into()]);
+        }
+        args
+    }
+
+    fn command(&self, prompt: &str, cwd: &Path) -> Command {
+        let mut command = Command::new(&self.executable);
+        command.args(Self::command_args(
+            prompt,
+            self.model.as_deref(),
+            self.reasoning_effort,
+        ));
+        if let Some(copilot_home) = &self.copilot_home {
+            command.env("COPILOT_HOME", copilot_home);
+        }
+        backend::configure_noninteractive(&mut command, cwd);
+        command
+    }
+}
 
 impl Worker for CopilotWorker {
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
@@ -426,12 +494,8 @@ impl Worker for CopilotWorker {
         cwd: &Path,
         progress: &dyn Fn(&str),
     ) -> Result<(WorkerOutcome, Option<String>), String> {
-        let mut cmd = std::process::Command::new("copilot");
-        cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
-        backend::configure_noninteractive(&mut cmd, cwd);
-
         match run_command_with_timeout_progress(
-            cmd,
+            self.command(prompt, cwd),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
             progress,
         ) {
@@ -448,14 +512,23 @@ impl Worker for CopilotWorker {
                         .code()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "unknown".into());
-                    Err(format!("Copilot exited with non-zero status: {}", code))
+                    Err(format!("Copilot CLI exited with non-zero status: {code}"))
                 }
             }
             Err(e) => Err(format!(
-                "failed to spawn 'copilot' executable; ensure it is installed and on PATH: {}",
-                e
+                "failed to spawn 'copilot' executable; ensure it is installed and on PATH: {e}",
             )),
         }
+    }
+
+    fn execution_configuration(&self) -> (Option<&str>, Option<ReasoningEffort>) {
+        (self.model.as_deref(), self.reasoning_effort)
+    }
+
+    fn configured_environment(&self) -> Option<(&'static str, &Path)> {
+        self.copilot_home
+            .as_deref()
+            .map(|path| ("COPILOT_HOME", path))
     }
 
     fn execute_with_progress_and_usage_cancellable(
@@ -465,18 +538,15 @@ impl Worker for CopilotWorker {
         progress: &dyn Fn(&str),
         cancellation: &CancellationControl,
     ) -> Result<WorkerExecution, String> {
-        let mut cmd = Command::new("copilot");
-        cmd.arg("-p").arg(prompt).arg("--allow-all-tools");
-        backend::configure_noninteractive(&mut cmd, cwd);
         let output = run_command_with_timeout_progress_and_cancel(
-            cmd,
+            self.command(prompt, cwd),
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
             Some(cancellation),
             progress,
         )?;
         if !output.status.success() {
             return Err(format!(
-                "Copilot exited with non-zero status: {}",
+                "Copilot CLI exited with non-zero status: {}",
                 output
                     .status
                     .code()

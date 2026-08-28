@@ -60,8 +60,8 @@ Validates and atomically applies a structured `PlanResponse` JSON document, crea
 Runs an automated planning action: builds a planning request for `OBJECTIVE` and dispatches it to a supported automated agent, printing the resulting `PlanResponse` JSON. This does not apply the plan — review it and run `orc apply-plan` to persist it.
 - `OBJECTIVE` — free-text description of the high-level goal to plan for.
 - `--agent AGENT` — explicit agent ID to use instead of the deterministically selected one.
-- `--model MODEL` — override the model for this run (automated Codex agents only).
-- `--effort EFFORT` — override reasoning effort for this run: `none`, `low`, `medium`, or `high` (automated Codex agents only).
+- `--model MODEL` — override the model for this run (automated providers with execution-setting support).
+- `--effort EFFORT` — override reasoning effort for this run: `none`, `low`, `medium`, or `high` (automated providers with execution-setting support).
 
 ### `orc ask REQUEST [--agent AGENT] [--model MODEL] [--effort EFFORT]`
 Emits an `EngineeringLeadRequest` for a free-text request, addressed to the configured Lead. With a supported automated Lead agent, this also dispatches the request and prints the resulting `EngineeringLeadResponse`.
@@ -177,8 +177,8 @@ Evaluates deterministic agent selection for a task without dispatching it.
 Dispatches a task using a selected registered agent.
 - `TASK_ID` — task to dispatch (e.g., `T-0001`).
 - `--agent AGENT` — explicit agent override; selection-validity checks still apply.
-- `--model MODEL` — model override for this run (automated Codex agents only).
-- `--effort EFFORT` — reasoning-effort override for this run (automated Codex agents only).
+- `--model MODEL` — model override for this run (automated providers with execution-setting support).
+- `--effort EFFORT` — reasoning-effort override for this run (automated providers with execution-setting support).
 
 ### `orc dispatch-queue [--concurrency N]`
 Dispatches all ready automated tasks concurrently.
@@ -209,8 +209,8 @@ Reviews the latest run for a task and its worktree changes. Review never accepts
 - `TASK_ID` — task to review.
 - `--automated` — run an automated review action instead of only displaying the diff.
 - `--agent AGENT` — agent override for the automated review (requires `--automated`).
-- `--model MODEL` — model override for the automated review (requires `--automated`).
-- `--effort EFFORT` — reasoning-effort override for the automated review (requires `--automated`).
+- `--model MODEL` — model override for the automated review (requires `--automated` and provider execution-setting support).
+- `--effort EFFORT` — reasoning-effort override for the automated review (requires `--automated` and provider execution-setting support).
 - `--diff` — show the complete unified diff (conflicts with `--file`).
 - `--file PATH` — show the unified diff for one changed file only (conflicts with `--diff`).
 - Task-scoped automated review verifies the task contract; unrelated and pre-existing findings are non-blocking.
@@ -219,8 +219,8 @@ Reviews the latest run for a task and its worktree changes. Review never accepts
 Runs an unrestricted project-wide automated audit using the task's captured evidence. It may report broader architecture, latent defects, technical debt, missing tests, and adjacent concerns.
 - `TASK_ID` — task whose captured evidence seeds the audit.
 - `--agent AGENT` — explicit agent override.
-- `--model MODEL` — model override for this run (automated Codex agents only).
-- `--effort EFFORT` — reasoning-effort override for this run (automated Codex agents only).
+- `--model MODEL` — model override for this run (automated providers with execution-setting support).
+- `--effort EFFORT` — reasoning-effort override for this run (automated providers with execution-setting support).
 
 ### `orc revise TASK_ID [FEEDBACK] [--agent AGENT] [--model MODEL] [--effort EFFORT]`
 Revises a reviewed task using review feedback, redispatching it.
@@ -248,8 +248,8 @@ Registers a new agent.
 - `--action ACTION` — a supported action (`code`, `review`, `plan`, or `lead`); repeatable. Defaults to `code`.
 - `--display-name NAME` — human-readable display name (default: the agent ID).
 - `--profile PATH` — provider configuration profile directory.
-- `--model MODEL` — model to use (automated Codex agents only).
-- `--effort EFFORT` — reasoning effort: `none`, `low`, `medium`, `high` (automated Codex agents only).
+- `--model MODEL` — model to use (automated providers with execution-setting support).
+- `--effort EFFORT` — reasoning effort: `none`, `low`, `medium`, `high` (automated providers with execution-setting support).
 - `--mode MODE` — `automated` or `manual` (default: `automated`).
 
 ### `orc agent onboard ID --backend BACKEND [options]`
@@ -293,10 +293,10 @@ Sets an agent's selection priority.
 Sets the configuration profile directory for an existing agent.
 
 ### `orc agent model ID MODEL`
-Sets the model for an agent (automated Codex agents only).
+Sets the model for an agent (automated providers with execution-setting support).
 
 ### `orc agent effort ID EFFORT`
-Sets the reasoning effort for an agent (automated Codex agents only).
+Sets the reasoning effort for an agent (automated providers with execution-setting support).
 - `EFFORT` — one of `none`, `low`, `medium`, `high`.
 
 ### `orc agent quota ID --remaining N [--reset TIMESTAMP]`

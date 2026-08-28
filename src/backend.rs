@@ -234,15 +234,33 @@ impl ProviderAdapter for CopilotProviderAdapter {
         "copilot"
     }
 
+    fn supports_execution_options(&self) -> bool {
+        true
+    }
+
     fn build_worker(&self, agent: &Agent) -> Result<Box<dyn Worker>, String> {
         self.build_worker_with_options(agent, &ProviderExecutionOptions::from_agent(agent))
     }
     fn build_worker_with_options(
         &self,
-        _agent: &Agent,
-        _options: &ProviderExecutionOptions,
+        agent: &Agent,
+        options: &ProviderExecutionOptions,
     ) -> Result<Box<dyn Worker>, String> {
-        Ok(Box::new(CopilotWorker))
+        let worker = CopilotWorker::with_execution(
+            agent
+                .execution
+                .provider
+                .profile_path
+                .as_deref()
+                .map(PathBuf::from),
+            options.model.clone(),
+            options.reasoning_effort,
+        );
+        let worker = match options.executable.clone() {
+            Some(executable) => worker.with_executable(executable),
+            None => worker,
+        };
+        Ok(Box::new(worker))
     }
 
     fn build_lead(
@@ -399,12 +417,24 @@ pub fn sync_agent_quota(
 
 pub fn provider_capabilities(backend: &str) -> Vec<crate::registry::AgentCapability> {
     match backend {
-        "codex" | "copilot" | "antigravity" => vec![
+        "codex" | "antigravity" => vec![
             crate::registry::AgentCapability::Code,
             crate::registry::AgentCapability::RepositoryRead,
             crate::registry::AgentCapability::RepositoryWrite,
             crate::registry::AgentCapability::CommandExecution,
             crate::registry::AgentCapability::StructuredOutput,
+        ],
+        // Copilot CLI's documented `-s` mode returns plain text. It does not
+        // expose Orc's structured provider protocol, so that capability is
+        // intentionally absent even though the generic worker protocol can
+        // still ask it to follow a text prompt.
+        "copilot" => vec![
+            crate::registry::AgentCapability::Code,
+            crate::registry::AgentCapability::RepositoryRead,
+            crate::registry::AgentCapability::RepositoryWrite,
+            crate::registry::AgentCapability::CommandExecution,
+            crate::registry::AgentCapability::Streaming,
+            crate::registry::AgentCapability::Cancellation,
         ],
         _ => Vec::new(),
     }

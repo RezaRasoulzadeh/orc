@@ -4,7 +4,7 @@ Project lifecycle and ownership are defined in [Project lifecycle and ownership]
 
 Validation loads the first usable configuration in this order: `.orc/validation.toml`, `.orc/validation.json`, commands extracted from `.orc/engineering.md`, then the defaults `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 
-Runtime timeouts can be set with `ORC_WORKER_TIMEOUT_SECS`, `ORC_LEAD_TIMEOUT_SECS`, and `ORC_VALIDATION_TIMEOUT_SECS`. Agent profile, model, reasoning effort, capabilities, availability, and quota are configured with `orc agent` commands. Credentials remain owned by the provider CLI and are not copied into SQLite.
+Runtime timeouts can be set with `ORC_WORKER_TIMEOUT_SECS`, `ORC_LEAD_TIMEOUT_SECS`, and `ORC_VALIDATION_TIMEOUT_SECS`. Agent profile, model, reasoning effort, capabilities, availability, and quota are configured with `orc agent` commands. Credentials remain owned by the provider CLI and are not copied into SQLite. Automated Codex and Copilot workers use their documented CLI adapters; Copilot does not provide Orc's structured-output or Lead/quota protocols, so those capabilities are not advertised and those operations are rejected explicitly.
 
 Lead execution is persisted in SQLite. Use `orc lead show`, `orc lead set <agent> [--model <model>] [--effort <none|low|medium|high>]`, or `orc lead clear`. The selected agent must be an enabled automated Codex agent. v0.2.2 persists distinct code, review, plan, and lead profiles for one automated agent; explicit overrides take precedence and each action records its action, agent, resolved settings, status, token usage, and result.
 

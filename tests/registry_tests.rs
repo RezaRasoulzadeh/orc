@@ -1,8 +1,8 @@
 use orc::backend::WorkerFactory;
-use orc::registry::{self, AgentDefinition, ReasoningEffort};
+use orc::registry::{self, AgentCapability, AgentDefinition, ReasoningEffort};
 use orc::storage::Database;
 use orc::task::TaskPriority;
-use orc::worker::{AntigravityWorker, CodexWorker};
+use orc::worker::{AntigravityWorker, CodexWorker, CopilotWorker};
 use tempfile::tempdir;
 
 fn agent(id: &str, priority: i64, status: &str) -> AgentDefinition {
@@ -261,7 +261,7 @@ fn codex_dispatch_overrides_resolve_before_agent_defaults() {
     let mut definition = agent("codex-main", 100, registry::AVAILABLE);
     definition.model = Some("gpt-5.6-terra".into());
     definition.reasoning_effort = Some(ReasoningEffort::High);
-    let worker = WorkerFactory::build_with_codex_overrides(
+    let worker = WorkerFactory::build_with_overrides(
         &definition,
         Some("gpt-5.6-luna".into()),
         Some(ReasoningEffort::Low),
@@ -276,18 +276,76 @@ fn codex_dispatch_overrides_resolve_before_agent_defaults() {
 }
 
 #[test]
-fn non_codex_workers_reject_execution_overrides() {
+fn provider_without_documented_execution_options_rejects_overrides() {
+    let mut definition = agent("antigravity", 100, registry::AVAILABLE);
+    definition.backend = "antigravity".into();
+    let error =
+        match WorkerFactory::build_with_overrides(&definition, Some("gpt-5.6-luna".into()), None) {
+            Ok(_) => panic!("non-Codex worker unexpectedly accepted overrides"),
+            Err(error) => error,
+        };
+    assert!(error.contains("does not support"));
+}
+
+#[test]
+fn copilot_adapter_uses_generic_factory_and_documents_unsupported_features() {
     let mut definition = agent("copilot", 100, registry::AVAILABLE);
     definition.backend = "copilot".into();
-    let error = match WorkerFactory::build_with_codex_overrides(
+    definition.profile_path = Some("/profiles/copilot".into());
+    let worker = WorkerFactory::build_with_overrides(
         &definition,
-        Some("gpt-5.6-luna".into()),
-        None,
-    ) {
-        Ok(_) => panic!("non-Codex worker unexpectedly accepted overrides"),
-        Err(error) => error,
-    };
-    assert!(error.contains("does not support"));
+        Some("claude-sonnet-4.6".into()),
+        Some(ReasoningEffort::High),
+    )
+    .unwrap();
+
+    assert_eq!(
+        worker.execution_configuration(),
+        (Some("claude-sonnet-4.6"), Some(ReasoningEffort::High))
+    );
+    assert_eq!(
+        worker.configured_environment().map(|(_, path)| path),
+        Some(std::path::Path::new("/profiles/copilot"))
+    );
+    let capabilities = orc::backend::provider_capabilities("copilot");
+    assert!(!capabilities.contains(&AgentCapability::StructuredOutput));
+    assert!(capabilities.contains(&AgentCapability::Streaming));
+    assert!(capabilities.contains(&AgentCapability::Cancellation));
+
+    let adapter = orc::backend::provider_adapter("copilot").unwrap();
+    assert!(adapter.supports_execution_options());
+    assert!(!adapter.supports_lead());
+    assert!(!adapter.supports_quota());
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::init(directory.path().join("orc.db")).unwrap();
+    let error = adapter.sync_quota(&db, &definition).unwrap_err();
+    assert!(error.contains("does not expose quota synchronization"));
+}
+
+#[test]
+fn copilot_worker_builds_documented_noninteractive_command() {
+    assert_eq!(
+        CopilotWorker::command_args(
+            "implement the task",
+            Some("gpt-5.3-codex"),
+            Some(ReasoningEffort::High),
+        ),
+        vec![
+            "-p",
+            "implement the task",
+            "-s",
+            "--allow-all-tools",
+            "--no-ask-user",
+            "--model",
+            "gpt-5.3-codex",
+            "--effort",
+            "high",
+        ]
+    );
+    assert!(
+        !CopilotWorker::command_args("inspect", None, Some(ReasoningEffort::None))
+            .contains(&"none".into())
+    );
 }
 
 #[test]

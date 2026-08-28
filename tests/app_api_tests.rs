@@ -369,6 +369,68 @@ fn workflow_state_derives_plan_review_revision_and_ready_positions() {
     }
 }
 
+#[test]
+fn operator_cancellation_is_persistent_scoped_and_single_use() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("cancel").unwrap();
+    let other_project = db.create_project("other project").unwrap();
+    let decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::UserDecisionRequired,
+            &serde_json::json!({"choice": "x"}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+    let other_decision = db
+        .record_lead_decision(
+            other_project,
+            &LeadDecisionKind::UserDecisionRequired,
+            &serde_json::json!({"choice": "other"}),
+            LeadDecisionMetadata {
+                snapshot: "other snapshot",
+                run_id: None,
+                source_request: "other request",
+                summary: "other summary",
+            },
+        )
+        .unwrap();
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    assert!(app.cancel_lead_decision(other_decision, None).is_err());
+    assert_eq!(
+        Database::open(&db_path)
+            .unwrap()
+            .pending_lead_decision(other_project)
+            .unwrap()
+            .unwrap()
+            .id,
+        other_decision
+    );
+    let cancelled = app
+        .cancel_lead_decision(decision, Some("operator stopped"))
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(!cancelled.actionable);
+    assert_eq!(cancelled.resolution.as_deref(), Some("operator stopped"));
+    assert!(app.pending_lead_decision().unwrap().is_none());
+    assert!(app.cancel_lead_decision(decision, None).is_err());
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let history = reopened.lead_decisions().unwrap();
+    assert_eq!(history[0].id, decision);
+    assert_eq!(history[0].status, "cancelled");
+    assert_eq!(reopened.workflow_state().unwrap().position, "lead_decision");
+}
+
 fn persist_review(
     db: &Database,
     project: i64,
@@ -499,6 +561,7 @@ fn pending_plan_run_invokes_once_persists_lineage_and_is_visible_after_reopen() 
     let directory = tempdir().unwrap();
     std::fs::create_dir(directory.path().join(".orc")).unwrap();
     std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
     let db_path = directory.path().join("state.sqlite");
     let db = Database::init(&db_path).unwrap();
     let project = db.create_project("planner").unwrap();
@@ -535,6 +598,95 @@ fn pending_plan_run_invokes_once_persists_lineage_and_is_visible_after_reopen() 
     assert_eq!(plan.source_planner_run_id, result.planner_run_id);
     assert!(reopened.pending_lead_decision(project).unwrap().is_none());
     assert_eq!(reopened.list_tasks().unwrap().len(), 0);
+}
+
+#[test]
+fn cancelling_plan_review_closes_linked_plan_and_blocks_consumption() {
+    let directory = tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".orc")).unwrap();
+    std::fs::write(directory.path().join(".orc/engineering.md"), "contract").unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("cancel review").unwrap();
+    db.insert_agent(&planner()).unwrap();
+    let source = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"kind":"PLAN_REQUIRED"}),
+            LeadDecisionMetadata {
+                snapshot: "before",
+                run_id: None,
+                source_request: "requested",
+                summary: "make a plan",
+            },
+        )
+        .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let backend = CountingPlanner(AtomicUsize::new(0));
+    let run = app
+        .run_pending_plan_with_backend(
+            &ActionOverrides {
+                agent_id: Some("planner".into()),
+                ..Default::default()
+            },
+            &backend,
+        )
+        .unwrap();
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    let decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::UserDecisionRequired,
+            &serde_json::json!({"choice":"approve"}),
+            LeadDecisionMetadata {
+                snapshot: "review",
+                run_id: Some(run.planner_run_id),
+                source_request: "review",
+                summary: "review",
+            },
+        )
+        .unwrap();
+    let review = db
+        .record_plan_review(
+            run.plan_id,
+            run.planner_run_id,
+            decision,
+            &LeadDecisionKind::UserDecisionRequired,
+            "review gate",
+        )
+        .unwrap();
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    app.cancel_plan_review(review, Some("operator stopped"))
+        .unwrap();
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        app.workflow_state().unwrap().plans[0].status,
+        orc::storage::db::PlanStatus::Cancelled
+    );
+    assert_eq!(
+        app.lead_decisions()
+            .unwrap()
+            .iter()
+            .find(|d| d.id == decision)
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    assert_eq!(app.workflow_state().unwrap().plan_reviews.len(), 1);
+    assert!(app.cancel_plan_review(review, None).is_err());
+    assert!(app.apply_approved_plan().is_err());
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    assert!(
+        Database::open(&db_path)
+            .unwrap()
+            .pending_lead_decision(project)
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(source, decision);
 }
 
 #[test]

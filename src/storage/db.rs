@@ -53,6 +53,7 @@ pub enum PlanStatus {
     Approved,
     Rejected,
     Applied,
+    Cancelled,
 }
 impl PlanStatus {
     fn as_str(self) -> &'static str {
@@ -63,6 +64,7 @@ impl PlanStatus {
             Self::Approved => "approved",
             Self::Rejected => "rejected",
             Self::Applied => "applied",
+            Self::Cancelled => "cancelled",
         }
     }
     fn parse(value: String) -> rusqlite::Result<Self> {
@@ -73,6 +75,7 @@ impl PlanStatus {
             "approved" => Ok(Self::Approved),
             "rejected" => Ok(Self::Rejected),
             "applied" => Ok(Self::Applied),
+            "cancelled" => Ok(Self::Cancelled),
             _ => Err(rusqlite::Error::InvalidParameterName(format!(
                 "invalid plan status: {value}"
             ))),
@@ -2107,6 +2110,68 @@ impl Database {
             let status: String = r.get(4)?;
             Ok(crate::lead::PersistedLeadDecision { id: r.get(0)?, run_id: r.get(5)?, created_at: r.get(6)?, source_request: r.get(7)?, summary: r.get(8)?, kind: parse_lead_decision_kind(&r.get::<_, String>(1)?)?, details: r.get(2)?, snapshot: r.get(3)?, status: status.clone(), actionable: false, resolution: r.get(9)?, resolved_at: r.get(10)? })
         }).map_err(DbError::from)
+    }
+
+    /// Cancel one still-actionable Lead decision without removing its history.
+    pub fn cancel_lead_decision(
+        &self,
+        project_id: i64,
+        decision_id: i64,
+        reason: Option<&str>,
+    ) -> Result<crate::lead::PersistedLeadDecision, DbError> {
+        let resolution = reason.unwrap_or("cancelled by operator");
+        let tx = self.conn.unchecked_transaction()?;
+        let linked_plan: Option<i64> = tx.query_row(
+            "SELECT r.plan_id FROM plan_reviews r JOIN plans p ON p.id=r.plan_id WHERE r.lead_decision_id=?1 AND p.project_id=?2 AND p.status IN ('proposed','under_review','revision_requested','approved') ORDER BY r.id DESC LIMIT 1",
+            params![decision_id, project_id], |r| r.get(0)).optional()?;
+        let changed = tx.execute(
+            "UPDATE lead_decisions SET status='cancelled', resolved_at=CURRENT_TIMESTAMP, resolution=?1 WHERE id=?2 AND project_id=?3 AND status='pending' AND kind IN ('DIRECT_TASKS','PLAN_REQUIRED','USER_DECISION_REQUIRED','REVISE_PLAN')",
+            params![resolution, decision_id, project_id],
+        )?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(
+                "Lead decision is missing or no longer actionable".into(),
+            ));
+        }
+        if let Some(plan_id) = linked_plan {
+            tx.execute("UPDATE plans SET status='cancelled' WHERE id=?1 AND project_id=?2 AND status IN ('proposed','under_review','revision_requested','approved')", params![plan_id, project_id])?;
+        }
+        let result = tx.query_row(
+            "SELECT id, kind, proposal, snapshot, status, run_id, created_at, source_request, summary, resolution, resolved_at FROM lead_decisions WHERE id=?1",
+            [decision_id], |r| {
+                let status: String = r.get(4)?;
+                Ok(crate::lead::PersistedLeadDecision { id:r.get(0)?, kind:parse_lead_decision_kind(&r.get::<_,String>(1)?)?, details:r.get(2)?, snapshot:r.get(3)?, status:status.clone(), actionable:false, run_id:r.get(5)?, created_at:r.get(6)?, source_request:r.get(7)?, summary:r.get(8)?, resolution:r.get(9)?, resolved_at:r.get(10)? })
+            }).map_err(DbError::from)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Cancel a plan-review gate and its linked actionable decision atomically.
+    pub fn cancel_plan_review(
+        &self,
+        project_id: i64,
+        review_id: i64,
+        reason: Option<&str>,
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let linked: Option<(i64, i64)> = tx.query_row(
+            "SELECT r.plan_id, r.lead_decision_id FROM plan_reviews r JOIN plans p ON p.id=r.plan_id WHERE r.id=?1 AND p.project_id=?2 AND p.status IN ('proposed','under_review','revision_requested','approved')",
+            params![review_id, project_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((plan_id, decision_id)) = linked else {
+            return Err(DbError::Scheduler(
+                "plan review is missing or no longer actionable".into(),
+            ));
+        };
+        let resolution = reason.unwrap_or("cancelled by operator");
+        let changed = tx.execute("UPDATE lead_decisions SET status='cancelled', resolved_at=CURRENT_TIMESTAMP, resolution=?1 WHERE id=?2 AND status='pending'", params![resolution, decision_id])?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(
+                "linked plan-review decision is missing or no longer actionable".into(),
+            ));
+        }
+        tx.execute("UPDATE plans SET status='cancelled' WHERE id=?1 AND project_id=?2 AND status IN ('proposed','under_review','revision_requested','approved')", params![plan_id, project_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Returns pending Lead decisions for read-only consumers such as Planner.

@@ -65,6 +65,9 @@ impl OrcState {
                     scope_mode: None,
                     context_files: Vec::new(),
                     expected_changes: Vec::new(),
+                    reasoning_effort: None,
+                    effort_reason: None,
+                    risk_factors: Vec::new(),
                 });
             }
             LeadAction::RequireCtoApproval { reason } => {

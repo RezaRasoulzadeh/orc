@@ -37,7 +37,9 @@ fn plan_response() -> PlanResponse {
                     class: Some("plan".into()),
                     model: Some("model".into()),
                     effort: Some("low".into()),
+                    effort_reason: Some("isolated and well understood".into()),
                 },
+                risk_factors: vec![],
             },
             TaskProposal {
                 local_id: "second".into(),
@@ -55,6 +57,7 @@ fn plan_response() -> PlanResponse {
                 required_tests: vec!["test".into()],
                 validation: vec!["cargo test".into()],
                 execution_hints: ExecutionHints::default(),
+                risk_factors: vec![],
             },
         ],
     }
@@ -204,6 +207,79 @@ fn plan_persistence_round_trip_lineage_and_atomic_provenance_validation() {
     assert!(db.store_plan(project, decision, run, &malformed).is_err());
     assert_eq!(db.list_plan_history(project).unwrap().len(), 2);
     assert_eq!(plan_row_counts(), valid_counts);
+}
+
+#[test]
+fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let response = PlanResponse {
+        protocol_version: PROTOCOL_VERSION,
+        objective: "persist execution contract".into(),
+        assumptions: vec![],
+        risks: vec![],
+        questions: vec![],
+        tasks: vec![TaskProposal {
+            local_id: "contract".into(),
+            title: "Contract task".into(),
+            objective: "Preserve selected effort".into(),
+            role: "developer".into(),
+            priority: TaskPriority::Normal,
+            depends_on: vec![],
+            capabilities: vec![],
+            scope_mode: None,
+            context_files: vec![],
+            expected_changes: vec!["src/lib.rs".into()],
+            unchanged: vec!["unrelated behavior".into()],
+            acceptance_criteria: vec!["effort survives reopen".into()],
+            required_tests: vec!["storage test".into()],
+            validation: vec!["cargo test".into()],
+            execution_hints: ExecutionHints {
+                class: None,
+                model: None,
+                effort: Some("medium".into()),
+                effort_reason: Some("schema and data-flow verification".into()),
+            },
+            risk_factors: vec![orc::protocol::TaskRiskFactor::SchemaDataFlow],
+        }],
+    };
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("contract persistence").unwrap();
+    let mapping = db.apply_plan(project, &response).unwrap();
+    let task_id = mapping["contract"].clone();
+    let task = db.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        task.effort_reason.as_deref(),
+        Some("schema and data-flow verification")
+    );
+    assert_eq!(
+        task.risk_factors,
+        vec![orc::protocol::TaskRiskFactor::SchemaDataFlow]
+    );
+    assert_eq!(
+        db.get_task_proposal_metadata(&task_id)
+            .unwrap()
+            .unwrap()
+            .execution_hints
+            .effort
+            .as_deref(),
+        Some("medium")
+    );
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    let task = reopened.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        reopened
+            .get_task_proposal_metadata(&task_id)
+            .unwrap()
+            .unwrap()
+            .execution_hints
+            .effort_reason
+            .as_deref(),
+        Some("schema and data-flow verification")
+    );
 }
 
 #[test]

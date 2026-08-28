@@ -7,7 +7,7 @@ use orc::storage::Database;
 use orc::task::TaskStatus;
 use orc::validation::test_helpers::FakeValidationRunner;
 use orc::worker::test_helpers::{FailingSpawnWorker, FakeWorker};
-use orc::worker::{Worker, WorkerOutcome};
+use orc::worker::{Worker, WorkerExecution, WorkerOutcome};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +62,27 @@ impl Worker for CountingWorker {
         std::fs::write(cwd.join("eligibility-change.txt"), "dispatched\n")
             .map_err(|error| error.to_string())?;
         Ok((WorkerOutcome::Success, Some("executed".into())))
+    }
+
+    fn execute_planned_step(
+        &self,
+        step: &orc::worker_protocol::PlannedStep,
+        _: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::fs::write(cwd.join(&step.intent), "dispatched\n")
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(format!(
+                "OPERATION PERFORMED: {}\nVERIFICATION PASSED: configured validation evidence\n",
+                orc::worker_protocol::operation_name(&step.operations[0])
+            )),
+            token_usage: None,
+        })
     }
 }
 
@@ -1006,6 +1027,27 @@ fn ready_task_dispatches_through_worker_backed_path() {
             orc::task::TaskPriority::Normal,
         )
         .unwrap();
+    let mut proposal = orc::protocol::TaskProposal {
+        local_id: task.clone(),
+        title: "task".into(),
+        objective: "objective".into(),
+        role: "developer".into(),
+        priority: orc::task::TaskPriority::Normal,
+        depends_on: vec![],
+        capabilities: vec!["code".into(), "terminal".into()],
+        scope_mode: None,
+        context_files: vec![],
+        expected_changes: vec!["eligibility-change.txt".into()],
+        unchanged: vec!["unrelated behavior".into()],
+        acceptance_criteria: vec!["the change is written".into()],
+        required_tests: vec!["configured validation pipeline".into()],
+        validation: vec!["configured validation evidence".into()],
+        execution_hints: Default::default(),
+        risk_factors: vec![],
+    };
+    proposal.execution_hints.effort = Some("medium".into());
+    proposal.execution_hints.effort_reason = Some("moderate verification burden".into());
+    db.set_task_proposal_metadata(&task, &proposal).unwrap();
     let worker = CountingWorker::new();
 
     agent::dispatch_with_worker_on_db(
@@ -1020,6 +1062,14 @@ fn ready_task_dispatches_through_worker_backed_path() {
 
     assert_eq!(worker.calls.load(Ordering::SeqCst), 1);
     assert_eq!(db.list_agent_runs_for_task(&task).unwrap().len(), 1);
+    assert_eq!(
+        db.list_agent_runs_for_task(&task)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .resolved_reasoning_effort,
+        Some(orc::registry::ReasoningEffort::Medium)
+    );
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review

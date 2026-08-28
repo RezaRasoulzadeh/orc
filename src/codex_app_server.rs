@@ -704,6 +704,9 @@ mod tests {
             scope_mode: None,
             context_files: vec![],
             expected_changes: vec![],
+            reasoning_effort: None,
+            effort_reason: None,
+            risk_factors: vec![],
         };
         let decision = scheduler::schedule(&task, &[stored], None).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("codex-main"));

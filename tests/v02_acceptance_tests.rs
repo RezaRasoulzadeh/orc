@@ -42,6 +42,7 @@ fn task(title: &str) -> PlannedTask {
         required_tests: vec!["production path test".into()],
         validation: vec!["cargo test".into()],
         execution_hints: Default::default(),
+        risk_factors: vec![],
     }
 }
 
@@ -123,6 +124,7 @@ fn v02_shared_api_covers_planning_approvals_reports_agents_and_manual_runs() {
                 required_tests: vec!["production path test".into()],
                 validation: vec!["cargo test".into()],
                 execution_hints: Default::default(),
+                risk_factors: vec![],
             },
         ],
     };

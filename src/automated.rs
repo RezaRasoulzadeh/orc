@@ -286,9 +286,10 @@ fn schema(action: AgentAction) -> String {
             "depends_on":string_array,"capabilities":string_array,
             "scope_mode":{"type":["string","null"]},"context_files":string_array,"expected_changes":string_array,
             "unchanged":string_array,"acceptance_criteria":string_array,"required_tests":string_array,
-            "validation":string_array,"execution_hints":{"type":"object"}
+            "validation":string_array,"execution_hints":{"type":"object","additionalProperties":false,"properties":{"class":{"type":["string","null"]},"model":{"type":["string","null"]},"effort":{"type":"string","enum":["low","medium","high"]},"effort_reason":{"type":"string","minLength":1,"maxLength":240}},"required":["effort","effort_reason"]},
+            "risk_factors":{"type":"array","items":{"type":"string","enum":["state_machine_lifecycle","persistence","restart_recovery","concurrency","cross_role_protocol","schema_data_flow","verification"]}}
         },
-        "required":["local_id","title","objective","role","priority","depends_on","capabilities","scope_mode","context_files","expected_changes","unchanged","acceptance_criteria","required_tests","validation","execution_hints"]
+        "required":["local_id","title","objective","role","priority","depends_on","capabilities","scope_mode","context_files","expected_changes","unchanged","acceptance_criteria","required_tests","validation","execution_hints","risk_factors"]
     });
     let plan = serde_json::json!({
         "type":"object","additionalProperties":false,
@@ -1364,7 +1365,7 @@ pub fn run_plan(
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
     let prompt = format!(
-        "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state. Persisted Lead context (read-only): {}\n{}",
+        "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response. Persisted Lead context (read-only): {}\n{}",
         serde_json::to_string(&db.pending_lead_decision_context()?)?,
         serde_json::to_string(request)?
     );
@@ -1817,7 +1818,7 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let codex = bin.join("codex");
         let event = directory.path().join("event.jsonl");
-        let proposal = serde_json::json!({"local_id":"inspect-repo","title":"Inspect repository","objective":"Inspect the persisted project","role":"developer","priority":"normal","depends_on":[],"capabilities":["inspection"],"scope_mode":"focused","context_files":["project.txt"],"expected_changes":["project.txt"],"unchanged":["task state"],"acceptance_criteria":["context is inspected"],"required_tests":["cargo test"],"validation":["cargo test"],"execution_hints":{}});
+        let proposal = serde_json::json!({"local_id":"inspect-repo","title":"Inspect repository","objective":"Inspect the persisted project","role":"developer","priority":"normal","depends_on":[],"capabilities":["inspection"],"scope_mode":"focused","context_files":["project.txt"],"expected_changes":["project.txt"],"unchanged":["task state"],"acceptance_criteria":["context is inspected"],"required_tests":["cargo test"],"validation":["cargo test"],"execution_hints":{"effort":"low","effort_reason":"isolated inspection"},"risk_factors":[]});
         let response = serde_json::json!({"protocol_version":1,"objective":"inspect","assumptions":["lead-approved"],"risks":[],"questions":[],"tasks":[proposal]});
         std::fs::write(&event, serde_json::json!({"type":"item.completed", "item":{"type":"agent_message", "text": response.to_string()}}).to_string() + "\n").unwrap();
         let args_file = directory.path().join("args");
@@ -2328,7 +2329,7 @@ mod tests {
                             "local_id": "progress-check", "title": "Progress check", "objective": "Verify progress", "role": "developer",
                             "priority": "normal", "depends_on": [], "capabilities": [], "scope_mode": null,
                             "context_files": ["README.md"], "expected_changes": ["README.md"], "unchanged": ["task state"],
-                            "acceptance_criteria": ["progress is recorded"], "required_tests": ["cargo test"], "validation": ["cargo test"], "execution_hints": {}
+                            "acceptance_criteria": ["progress is recorded"], "required_tests": ["cargo test"], "validation": ["cargo test"], "execution_hints": {"effort":"low","effort_reason":"isolated progress check"}, "risk_factors": []
                         })]
                     })
                     .to_string(),

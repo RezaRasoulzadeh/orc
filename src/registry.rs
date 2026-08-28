@@ -132,6 +132,22 @@ impl ReasoningEffort {
             Self::High => "high",
         }
     }
+
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::None | Self::Low => Self::Medium,
+            Self::Medium | Self::High => Self::High,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

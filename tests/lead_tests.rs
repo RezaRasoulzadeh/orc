@@ -230,6 +230,7 @@ fn planned_task(title: &str) -> PlannedTask {
         required_tests: vec!["production path test".into()],
         validation: vec!["cargo test".into()],
         execution_hints: Default::default(),
+        risk_factors: vec![],
     }
 }
 

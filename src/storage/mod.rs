@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::{AgentRun, AgentRunExecution, Database, DbError, WorkerResult};
+pub use db::{AgentRun, AgentRunExecution, Database, DbError, ProjectAgentReference, WorkerResult};

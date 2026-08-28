@@ -715,6 +715,36 @@ impl OrcApp {
         Ok(self.db.list_agents()?)
     }
 
+    pub fn global_agents(&self) -> Result<Vec<registry::Agent>> {
+        Ok(self.db.list_global_agents()?)
+    }
+
+    pub fn project_agents(&self) -> Result<Vec<registry::Agent>> {
+        let project_id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        Ok(self.db.list_project_agents(project_id)?)
+    }
+
+    pub fn reference_global_agent(&self, agent_id: &str) -> Result<bool> {
+        let project_id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        Ok(self.db.reference_global_agent(project_id, agent_id)?)
+    }
+
+    pub fn remove_global_agent_reference(&self, agent_id: &str) -> Result<bool> {
+        let project_id = self
+            .db
+            .get_project_id()?
+            .context("no project found in DB")?;
+        Ok(self
+            .db
+            .remove_global_agent_reference(project_id, agent_id)?)
+    }
+
     pub fn busy_agents(&self) -> Result<std::collections::HashSet<String>> {
         Ok(self.db.list_busy_agents()?.into_iter().collect())
     }
@@ -959,6 +989,11 @@ impl OrcApp {
         {
             anyhow::bail!("backend '{}' requires --mode manual", agent.backend);
         }
+        registry::Agent::from_definition(&agent)
+            .map_err(|error| anyhow::anyhow!("invalid global agent: {error}"))?;
+        // Keep the legacy registry payload lossless for CLI/read-model
+        // consumers; the registry schema defaults every row to the current
+        // globally owned model.
         self.db.insert_agent(&agent)?;
         Ok(())
     }

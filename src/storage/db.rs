@@ -1684,6 +1684,50 @@ impl Database {
             }
         }
         Self::backfill_task_contract_columns(conn)?;
+        Self::backfill_task_effort_columns(conn)?;
+        Ok(())
+    }
+
+    fn backfill_task_effort_columns(conn: &Connection) -> Result<(), DbError> {
+        let has_proposals: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_proposal_metadata')",
+            [],
+            |row| row.get(0),
+        )?;
+        let rows = if has_proposals {
+            let mut statement = conn.prepare(
+                "SELECT t.id, p.proposal FROM tasks t JOIN task_proposal_metadata p ON p.task_id = t.id WHERE t.reasoning_effort IS NULL OR t.effort_reason IS NULL OR t.risk_factors IS NULL",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let transaction = conn.unchecked_transaction()?;
+        for (task_id, proposal_json) in rows {
+            let proposal = serde_json::from_str::<crate::protocol::TaskProposal>(&proposal_json)
+                .map_err(DbError::Serde)?;
+            transaction.execute(
+                "UPDATE tasks SET reasoning_effort = COALESCE(reasoning_effort, ?1), effort_reason = COALESCE(effort_reason, ?2), risk_factors = COALESCE(risk_factors, ?3) WHERE id = ?4",
+                params![
+                    proposal.execution_hints.effort,
+                    proposal.execution_hints.effort_reason,
+                    serde_json::to_string(&proposal.risk_factors)?,
+                    task_id,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE tasks SET reasoning_effort = COALESCE(reasoning_effort, ?1), effort_reason = COALESCE(effort_reason, ?2), risk_factors = COALESCE(risk_factors, '[]')",
+            params![
+                Task::DEFAULT_REASONING_EFFORT.as_str(),
+                Task::DEFAULT_EFFORT_REASON,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -3405,7 +3449,7 @@ impl Database {
         let result = (|| {
             let id = self.allocate_task_id()?;
             let priority_str = priority_string(priority);
-            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog')", params![id, project_id, title, objective, role, priority_str])?;
+            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, reasoning_effort, effort_reason, risk_factors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, '[]')", params![id, project_id, title, objective, role, priority_str, Task::DEFAULT_REASONING_EFFORT.as_str(), Task::DEFAULT_EFFORT_REASON])?;
             Ok(id)
         })();
         match result {
@@ -3437,7 +3481,7 @@ impl Database {
         let result = (|| {
             let id = self.allocate_task_id()?;
             let contract = crate::task::TaskContract::defaults(&input.objective);
-            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?, serde_json::to_string(&contract.acceptance_criteria)?, serde_json::to_string(&contract.required_tests)?, serde_json::to_string(&contract.validation)?, serde_json::to_string(&contract.unchanged)?])?;
+            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, '[]', ?13, ?14, ?15, ?16)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?, Task::DEFAULT_REASONING_EFFORT.as_str(), Task::DEFAULT_EFFORT_REASON, serde_json::to_string(&contract.acceptance_criteria)?, serde_json::to_string(&contract.required_tests)?, serde_json::to_string(&contract.validation)?, serde_json::to_string(&contract.unchanged)?])?;
             for dependency in &input.dependencies {
                 self.add_task_dependency(&id, dependency)?;
             }
@@ -3490,8 +3534,17 @@ impl Database {
             TaskPriority::Critical => "critical",
         };
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog')",
-            params![id, project_id, title, objective, role, priority_str],
+            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, reasoning_effort, effort_reason, risk_factors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, '[]')",
+            params![
+                id,
+                project_id,
+                title,
+                objective,
+                role,
+                priority_str,
+                Task::DEFAULT_REASONING_EFFORT.as_str(),
+                Task::DEFAULT_EFFORT_REASON,
+            ],
         )?;
         Ok(id.to_string())
     }
@@ -3535,8 +3588,8 @@ impl Database {
                             TaskPriority::Critical => "critical",
                         };
                         self.conn.execute(
-                            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, scope_mode, context_files, expected_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9)",
-                            params![id, project_id, title, objective, role, priority_str, scope_mode.map(|v| v.to_string()), serde_json::to_string(context_files)?, serde_json::to_string(expected_changes)?],
+                            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, '[]')",
+                            params![id, project_id, title, objective, role, priority_str, scope_mode.map(|v| v.to_string()), serde_json::to_string(context_files)?, serde_json::to_string(expected_changes)?, Task::DEFAULT_REASONING_EFFORT.as_str(), Task::DEFAULT_EFFORT_REASON],
                         )?;
                         self.conn.execute(
                             "UPDATE meta SET value = ?1 WHERE key = 'next_task_id'",

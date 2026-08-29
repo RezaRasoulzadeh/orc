@@ -20,13 +20,17 @@ Task cancellation is also retained history. `orc task purge TASK_ID` is irrevers
 ### `orc --ui`
 Launches the installed desktop application and returns immediately. Cannot be combined with any other command.
 
+### `orc` (no command)
+With no subcommand and without `--ui`, Orc launches an interactive session in the current terminal: a persistent REPL that accepts the same commands as one-shot invocations (without the leading `orc`), and renders confirmations, selections, progress, and results through the same `Runtime` request/event boundary the desktop application uses. Exit with `exit`, `quit`, or Ctrl-D.
+
 ## Project and health
 
 ### `orc init`
 Bootstraps Orc local state by initializing the SQLite database at `.orc/orc.db` in the current directory and creating the project record if one does not already exist. It does not require Git and does not itself adopt a repository. Safe to run repeatedly; existing project documents and the engineering contract are preserved.
 
-### `orc adopt`
+### `orc adopt [OBJECTIVE]`
 Brings the existing Git repository in the current directory under Orc management. It requires a Git repository, initializes local Orc state if needed, creates missing project documents, and preserves every existing project document, including `.orc/engineering.md`. Adoption is idempotent. It does not install Orc or modify source files.
+- `OBJECTIVE` — optional free-text objective. When given, adoption also configures a default Engineering Lead (if none is set) and runs one automated, discovery-backed Lead assessment against it, printing the resulting `EngineeringLeadResponse` JSON. This consumes model quota; omit it to adopt without contacting a provider.
 
 ### `orc discovery-request`
 Emits a read-only repository discovery request as JSON to stdout. This request is meant to be handed to a planner/agent that inspects the repository and returns a structured discovery response — the command itself does not scan the repository or mutate state.
@@ -45,6 +49,54 @@ Prints the project name and a one-line summary (ID, status, title) for every tas
 Emits a structured `ProjectReport` JSON document to stdout, intended for a manual/external planner.
 - `--full` — include architecture facts (modules, boundaries, and raw discovery data) captured by a prior `orc apply-discovery`. Without this flag, architecture fields are empty.
 
+## Orchestration and workflow
+
+Orc can run a whole objective end to end as one persisted, resumable workflow, instead of driving planning, dispatch, and review as separate manual steps. A workflow is created by `orc orchestrate`, advanced by `orc continue`, and always inspectable read-only with `orc workflow-state`/`orc workflow-history`.
+
+### `orc orchestrate OBJECTIVE [--auto-accept] [--user-plan-approval]`
+Starts a new persisted workflow for `OBJECTIVE` and advances it as far as its policy allows in one call, printing the resulting workflow state as JSON.
+- `OBJECTIVE` — free-text high-level goal for the workflow.
+- `--auto-accept` — automatically accept tasks after authoritative validation and a PASS review, instead of waiting for an explicit `orc task accept`. Default: require human acceptance.
+- `--user-plan-approval` — require an explicit human gate after Lead approves a Planner plan. Default: an agent-approved plan proceeds automatically.
+
+### `orc continue [ID]`
+Advances a persisted workflow as far as its policy currently allows, printing the resulting workflow state as JSON.
+- `ID` — workflow ID to continue. When omitted, continues the current project's single active workflow; fails if there is none.
+
+### `orc workflow-state [--json]` (alias: `orc workflow`)
+Shows the derived, read-only orchestration position for the current project: Lead decisions, plans, plan reviews, tasks, runs, and user decisions.
+- `--json` — print the complete `WorkflowState` as JSON instead of a one-line summary.
+
+### `orc workflow-history [--json]`
+Shows the chronological, read-only history of workflow events for the current project.
+- `--json` — print the complete history as JSON instead of `TIMESTAMP  KIND  SUMMARY` lines.
+
+### `orc workflow-resolve ID RESOLUTION`
+Resolves a persisted workflow's pending user/acceptance gate and continues it, printing the resulting workflow state as JSON.
+- `ID` — workflow ID.
+- `RESOLUTION` — free-text resolution for the pending gate.
+
+### `orc workflow-cancel ID [-r/--reason REASON]`
+Cancels a non-terminal persisted workflow, printing the resulting workflow state as JSON.
+- `ID` — workflow ID.
+- `--reason REASON` — optional free-text cancellation reason.
+
+### `orc apply-approved-plan`
+Applies the current approved Planner plan exactly once, creating its tasks atomically — outside the `orc orchestrate`/`orc continue` loop.
+
+### `orc cancel TARGET ID [-r/--reason REASON]`
+Cancels one actionable workflow gate directly, outside the `orc orchestrate`/`orc continue` loop.
+- `TARGET` — `lead` (cancel a pending Lead decision; prints the resulting decision as JSON) or `plan-review` (cancel a pending plan review; prints a confirmation line).
+- `ID` — the Lead decision ID or plan review ID to cancel.
+- `--reason REASON` — optional free-text cancellation reason.
+
+### `orc new-project OBJECTIVE [--agent AGENT] [--model MODEL] [--effort EFFORT]`
+Gathers a new-project objective and a fresh discovery snapshot, then runs one automated Lead assessment against them, printing the resulting decision. Intended as the first Lead call on a freshly adopted, otherwise-empty project.
+- `OBJECTIVE` — free-text objective; must not be empty.
+- `--agent AGENT` — explicit agent override.
+- `--model MODEL` — model override for this run (automated providers with execution-setting support).
+- `--effort EFFORT` — reasoning-effort override for this run (automated providers with execution-setting support).
+
 ## Planning and the Engineering Lead
 
 ### `orc plan-request OBJECTIVE [--full-report]`
@@ -57,11 +109,21 @@ Validates and atomically applies a structured `PlanResponse` JSON document, crea
 - `PATH` — path to the plan response JSON file, or `-` for stdin.
 
 ### `orc plan OBJECTIVE [--agent AGENT] [--model MODEL] [--effort EFFORT]`
-Runs an automated planning action: builds a planning request for `OBJECTIVE` and dispatches it to a supported automated agent, printing the resulting `PlanResponse` JSON. This does not apply the plan — review it and run `orc apply-plan` to persist it.
+Runs an ad hoc automated planning action: builds a planning request for `OBJECTIVE` and dispatches it to a supported automated agent, printing the resulting `PlanResponse` JSON. This does not persist the plan or consume a pending Lead decision — review it and run `orc apply-plan` to persist it.
 - `OBJECTIVE` — free-text description of the high-level goal to plan for.
 - `--agent AGENT` — explicit agent ID to use instead of the deterministically selected one.
 - `--model MODEL` — override the model for this run (automated providers with execution-setting support).
 - `--effort EFFORT` — override reasoning effort for this run: `none`, `low`, `medium`, or `high` (automated providers with execution-setting support).
+
+### `orc plan run [--agent AGENT] [--model MODEL] [--effort EFFORT]`
+Runs the configured Planner once for the current actionable pending Lead `DIRECT_TASKS` decision and persists the resulting plan, printing a one-line summary (plan ID, task count, source Lead decision ID, Planner run ID).
+- `--agent AGENT` / `--model MODEL` / `--effort EFFORT` — same overrides as `orc plan OBJECTIVE`.
+
+### `orc plan revise [--agent AGENT] [--model MODEL] [--effort EFFORT]`
+Revises the current persisted plan for an actionable pending `REVISE_PLAN` decision and persists the revision, printing the same one-line summary as `orc plan run`.
+- `--agent AGENT` / `--model MODEL` / `--effort EFFORT` — same overrides as `orc plan OBJECTIVE`.
+
+Note: `orc plan` requires either `OBJECTIVE` or a `run`/`revise` subcommand.
 
 ### `orc ask REQUEST [--agent AGENT] [--model MODEL] [--effort EFFORT]`
 Emits an `EngineeringLeadRequest` for a free-text request, addressed to the configured Lead. With a supported automated Lead agent, this also dispatches the request and prints the resulting `EngineeringLeadResponse`.
@@ -74,14 +136,42 @@ Emits an `EngineeringLeadRequest` for a free-text request, addressed to the conf
 Validates and persists an `EngineeringLeadResponse` JSON document (for example, one produced manually in response to `orc ask`).
 - `PATH` — path to the response JSON file, or `-` for stdin.
 
+### `orc lead run REQUEST`
+Runs one read-only Lead assessment for a free-text request against the configured Lead and persists its decision, printing the decision kind, the Lead's response text, and how many proposals (if any) were persisted pending operator review.
+- `REQUEST` — free-text request to the Engineering Lead.
+
+### `orc lead review PLAN_ID [--agent AGENT] [--model MODEL] [--effort EFFORT]`
+Runs the configured Lead's review of one persisted plan, printing the resulting review as JSON.
+- `PLAN_ID` — ID of the plan to review.
+- `--agent AGENT` — explicit agent override.
+- `--model MODEL` — model override for this run (Codex only).
+- `--effort EFFORT` — reasoning-effort override for this run (Codex only).
+
+### `orc lead pending`
+Prints the current actionable pending Lead decision as JSON, or `null` if there is none.
+
+### `orc lead history`
+Prints every persisted Lead decision as JSON without changing workflow state.
+
+### `orc lead resolve ID RESOLUTION`
+Resolves one `USER_DECISION_REQUIRED` Lead decision without advancing overall workflow state, printing the resolved decision as JSON.
+- `ID` — Lead decision ID.
+- `RESOLUTION` — free-text resolution.
+
+### `orc lead apply`
+Applies the pending `DIRECT_TASKS` Lead decision, creating its tasks atomically, and prints the result as JSON.
+
+### `orc lead consume`
+Consumes (dismisses) the pending Lead decision without applying it, and prints the result as JSON.
+
 ### `orc lead show`
 Prints the currently configured Engineering Lead agent, if any.
 
 ### `orc lead set AGENT [--model MODEL] [--effort EFFORT]`
 Configures the Engineering Lead agent.
-- `AGENT` — agent ID to use as the Engineering Lead.
-- `--model MODEL` — model override for Lead actions (automated Codex agents only).
-- `--effort EFFORT` — reasoning effort override for Lead actions (automated Codex agents only).
+- `AGENT` — agent ID to use as the Engineering Lead. Must be an enabled automated Codex agent.
+- `--model MODEL` — model override for Lead actions (Codex only).
+- `--effort EFFORT` — reasoning effort override for Lead actions (Codex only).
 
 ### `orc lead clear`
 Clears the configured Engineering Lead.
@@ -213,6 +303,9 @@ Reviews the latest run for a task and its worktree changes. Review never accepts
 - `--effort EFFORT` — reasoning-effort override for the automated review (requires `--automated` and provider execution-setting support).
 - `--diff` — show the complete unified diff (conflicts with `--file`).
 - `--file PATH` — show the unified diff for one changed file only (conflicts with `--diff`).
+- `--history` — emit the persisted automated review history for the task as JSON (conflicts with `--diff`, `--file`, `--review-id`, `--full`).
+- `--review-id ID` — inspect one persisted automated review run by ID, printed as JSON (conflicts with `--diff`, `--file`, `--history`, `--full`).
+- `--full` — emit the complete persisted review read model as JSON instead of the formatted diff view (conflicts with `--diff`, `--file`, `--history`, `--review-id`).
 - Task-scoped automated review verifies the task contract; unrelated and pre-existing findings are non-blocking.
 
 ### `orc project-review TASK_ID [--agent AGENT] [--model MODEL] [--effort EFFORT]`
@@ -355,20 +448,40 @@ Resolves an approval request.
 
 ```
 orc --ui
+orc                                     # interactive session (no command, no --ui)
 
 orc init
-orc adopt
+orc adopt [OBJECTIVE]
 orc discovery-request
 orc apply-discovery <PATH>
 orc doctor
 orc status
 orc report [--full]
 
+orc orchestrate <OBJECTIVE> [--auto-accept] [--user-plan-approval]
+orc continue [ID]
+orc workflow-state [--json]            # alias: orc workflow
+orc workflow-history [--json]
+orc workflow-resolve <ID> <RESOLUTION>
+orc workflow-cancel <ID> [--reason REASON]
+orc apply-approved-plan
+orc cancel <lead|plan-review> <ID> [--reason REASON]
+orc new-project <OBJECTIVE> [--agent ID] [--model NAME] [--effort LEVEL]
+
 orc plan-request <OBJECTIVE> [--full-report]
 orc apply-plan <PATH>
 orc plan <OBJECTIVE> [--agent ID] [--model NAME] [--effort LEVEL]
+orc plan run [--agent ID] [--model NAME] [--effort LEVEL]
+orc plan revise [--agent ID] [--model NAME] [--effort LEVEL]
 orc ask <REQUEST> [--agent ID] [--model NAME] [--effort LEVEL]
 orc apply-response <PATH>
+orc lead run <REQUEST>
+orc lead review <PLAN_ID> [--agent ID] [--model NAME] [--effort LEVEL]
+orc lead pending
+orc lead history
+orc lead resolve <ID> <RESOLUTION>
+orc lead apply
+orc lead consume
 orc lead show
 orc lead set <AGENT> [--model NAME] [--effort LEVEL]
 orc lead clear
@@ -403,7 +516,8 @@ orc run submit <RUN_ID> [--file PATH]
 orc run submit-patch <RUN_ID> <PATCH_FILE>
 orc run fail <RUN_ID> [REASON]
 
-orc review <TASK_ID> [--automated] [--agent ID] [--model NAME] [--effort LEVEL] [--diff | --file PATH]
+orc review <TASK_ID> [--automated] [--agent ID] [--model NAME] [--effort LEVEL]
+           [--diff | --file PATH | --history | --review-id ID | --full]
 orc project-review <TASK_ID> [--agent ID] [--model NAME] [--effort LEVEL]
 orc revise <TASK_ID> [FEEDBACK] [--agent ID] [--model NAME] [--effort LEVEL]
 

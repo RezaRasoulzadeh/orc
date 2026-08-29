@@ -39,6 +39,8 @@ orc queue --explain
 
 Register an agent with `orc agent add`, inspect eligibility with `orc schedule TASK_ID --explain`, and dispatch with `orc dispatch TASK_ID` or `orc dispatch-queue --concurrency 2`. Use `orc --help` and the [complete CLI reference](docs/cli-reference.md) for exact options and command-specific usage.
 
+Running `orc` with no command (and without `--ui`) launches an interactive session in the current terminal instead of the one-shot commands below; it accepts the same commands without the leading `orc`. To run a whole objective end to end instead of driving planning, dispatch, and review by hand, use `orc orchestrate OBJECTIVE` (see [Orchestration and workflow](#orchestration-and-workflow)).
+
 ## CLI commands
 
 The tables below cover every `orc` command. Flags are summarized; see the [complete CLI reference](docs/cli-reference.md) for every argument, default, and constraint, or run `orc <command> --help`.
@@ -48,12 +50,26 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | Command | Description |
 |---|---|
 | `orc init` | Initialize the Orc SQLite database in the current repository. |
-| `orc adopt` | Adopt the current Git repository: record identity and write the engineering contract. |
+| `orc adopt [OBJECTIVE]` | Adopt the current Git repository: record identity and write the engineering contract. With `OBJECTIVE`, also runs one automated Lead assessment (consumes quota). |
 | `orc discovery-request` | Emit a read-only repository discovery request as JSON. |
 | `orc apply-discovery <PATH\|->` | Apply a structured discovery response to project state. |
 | `orc doctor` | Diagnose project and agent health without consuming model quota. |
 | `orc status` | Print project name and a one-line summary of every task. |
 | `orc report [--full]` | Emit a structured project report JSON for a manual planner. |
+
+### Orchestration and workflow
+
+| Command | Description |
+|---|---|
+| `orc orchestrate <OBJECTIVE> [--auto-accept] [--user-plan-approval]` | Start a persisted workflow for an objective and advance it as far as policy allows. |
+| `orc continue [ID]` | Advance a persisted workflow (the active one by default) as far as policy allows. |
+| `orc workflow-state [--json]` | Show the current project's derived orchestration position. Alias: `orc workflow`. |
+| `orc workflow-history [--json]` | Show the chronological workflow event history. |
+| `orc workflow-resolve <ID> <RESOLUTION>` | Resolve a workflow's pending user/acceptance gate and continue it. |
+| `orc workflow-cancel <ID> [--reason]` | Cancel a non-terminal persisted workflow. |
+| `orc apply-approved-plan` | Apply the current approved Planner plan exactly once, outside the workflow loop. |
+| `orc cancel <lead\|plan-review> <ID> [--reason]` | Cancel one actionable workflow gate directly. |
+| `orc new-project <OBJECTIVE> [--agent] [--model] [--effort]` | Run the first Lead assessment on a freshly adopted, empty project. |
 
 ### Planning and Engineering Lead
 
@@ -61,11 +77,20 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 |---|---|
 | `orc plan-request <OBJECTIVE> [--full-report]` | Emit a read-only planning request JSON for an objective. |
 | `orc apply-plan <PATH\|->` | Validate and atomically apply a plan response, creating tasks. |
-| `orc plan <OBJECTIVE> [--agent] [--model] [--effort]` | Run an automated planning action and print the plan response. |
+| `orc plan <OBJECTIVE> [--agent] [--model] [--effort]` | Run an ad hoc automated planning action and print the plan response (not persisted). |
+| `orc plan run [--agent] [--model] [--effort]` | Run the Planner for the pending `DIRECT_TASKS` Lead decision and persist the plan. |
+| `orc plan revise [--agent] [--model] [--effort]` | Revise the persisted plan for a pending `REVISE_PLAN` Lead decision. |
 | `orc ask <REQUEST> [--agent] [--model] [--effort]` | Address a request to the Engineering Lead. |
 | `orc apply-response <PATH\|->` | Validate and persist an Engineering Lead response. |
+| `orc lead run <REQUEST>` | Run and persist one Lead assessment for a free-text request. |
+| `orc lead review <PLAN_ID> [--agent] [--model] [--effort]` | Run the Lead's review of one persisted plan. |
+| `orc lead pending` | Show the current actionable pending Lead decision. |
+| `orc lead history` | Show every persisted Lead decision. |
+| `orc lead resolve <ID> <RESOLUTION>` | Resolve a `USER_DECISION_REQUIRED` Lead decision. |
+| `orc lead apply` | Apply the pending `DIRECT_TASKS` decision, creating its tasks. |
+| `orc lead consume` | Dismiss the pending Lead decision without applying it. |
 | `orc lead show` | Show the configured Engineering Lead agent. |
-| `orc lead set <AGENT> [--model] [--effort]` | Configure the Engineering Lead agent. |
+| `orc lead set <AGENT> [--model] [--effort]` | Configure the Engineering Lead agent (must be an automated Codex agent). |
 | `orc lead clear` | Clear the configured Engineering Lead. |
 
 ### Tasks
@@ -112,7 +137,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 
 | Command | Description |
 |---|---|
-| `orc review <TASK_ID> [--automated] [--agent] [--model] [--effort] [--diff \| --file PATH]` | Review a task contract, latest run, and worktree changes. |
+| `orc review <TASK_ID> [--automated] [--agent] [--model] [--effort] [--diff\|--file PATH\|--history\|--review-id ID\|--full]` | Review a task contract, latest run, and worktree changes. |
 | `orc project-review <TASK_ID> [--agent] [--model] [--effort]` | Run an unrestricted project-wide audit using captured task evidence. |
 | `orc revise <TASK_ID> [FEEDBACK] [--agent] [--model] [--effort]` | Redispatch a reviewed task using optional feedback and execution overrides. |
 
@@ -182,7 +207,9 @@ Review does not accept or merge work. Send feedback with `orc revise TASK_ID "fe
 
 ## Planning, Lead, review, and approvals
 
-`orc report` and `orc report --full` provide structured project state for a manual planner. `orc plan-request OBJECTIVE` emits a read-only `PlanningRequest`; a human reviews the returned `PlanResponse` and explicitly applies it with `orc apply-plan FILE`. The Engineering Lead protocol works similarly: `orc ask REQUEST` emits an `EngineeringLeadRequest`, and `orc apply-response FILE` validates and persists the response. `orc plan` and `orc review --automated` can run supported automated actions, but their results still follow the review and approval boundaries.
+`orc report` and `orc report --full` provide structured project state for a manual planner. `orc plan-request OBJECTIVE` emits a read-only `PlanningRequest`; a human reviews the returned `PlanResponse` and explicitly applies it with `orc apply-plan FILE`. The Engineering Lead protocol works similarly: `orc ask REQUEST` emits an `EngineeringLeadRequest`, and `orc apply-response FILE` validates and persists the response. `orc plan`, `orc lead run`, and `orc review --automated` can run supported automated actions, but their results still follow the review and approval boundaries.
+
+`orc orchestrate OBJECTIVE` drives the same Lead → plan → dispatch → review sequence as one persisted, resumable workflow instead of separate manual steps; `orc continue` advances it, and `orc workflow-state`/`orc workflow-history` inspect it read-only at any point. `--user-plan-approval` and the default of requiring `orc task accept` (unless `--auto-accept` is passed) keep the same human gates available to the manual flow.
 
 Planner and Lead exchanges use structured, versioned protocols. Invalid versions, actions, plans, or responses fail without mutating state. Proposals that require approval are listed with `orc approvals list` and resolved explicitly with `orc approvals resolve APPROVAL_ID`.
 

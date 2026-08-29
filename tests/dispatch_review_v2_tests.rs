@@ -764,6 +764,30 @@ fn seed_actionable_revision_review(db: &Database, task: &str) {
     .unwrap();
 }
 
+fn seed_current_pass_review(db: &Database, task: &str, repo: &Path) -> i64 {
+    let project = db.get_project_id().unwrap().unwrap();
+    let run = db
+        .create_agent_run_with_execution(
+            project,
+            task,
+            "fake",
+            AUTOMATED,
+            AgentRunExecution {
+                class: "review",
+                model: None,
+                effort: None,
+                source: "test",
+            },
+        )
+        .unwrap();
+    let (_, worktree_path) = db.get_worktree_metadata(task).unwrap().unwrap();
+    let changes = orc::git::inspect_worktree(&repo.join(worktree_path), repo).unwrap();
+    db.store_change_evidence(run, &changes).unwrap();
+    db.commit_task_review_result(task, run, &[], None, true, r#"{"verdict":"PASS"}"#, None)
+        .unwrap();
+    run
+}
+
 fn seed_blocked_revision_review(db: &Database, task: &str) -> i64 {
     let project = db.get_project_id().unwrap().unwrap();
     let run = db
@@ -2970,6 +2994,7 @@ fn consumed_review_cannot_be_reused_twice() {
 #[test]
 fn accept_preserves_review_history_and_closes_revision() {
     let (dir, db, task, review_id) = revision_fixture();
+    seed_current_pass_review(&db, &task, dir.path());
     accept_task(&db, &task, dir.path()).unwrap();
     assert!(db.get_agent_run(review_id).unwrap().is_some());
     assert_eq!(
@@ -3513,6 +3538,7 @@ fn accept_integrates_and_reject_preserves_worktree() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+    seed_current_pass_review(&db, &task, dir.path());
     accept_task(&db, &task, dir.path()).unwrap();
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
@@ -3564,6 +3590,37 @@ fn accept_integrates_and_reject_preserves_worktree() {
 }
 
 #[test]
+fn accept_requires_a_current_pass_for_the_exact_worktree() {
+    let (dir, db, task) = setup();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    let missing = accept_task(&db, &task, dir.path()).unwrap_err();
+    assert!(format!("{missing:#}").contains("no completed review"));
+    seed_current_pass_review(&db, &task, dir.path());
+
+    let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
+    std::fs::write(
+        dir.path().join(worktree_path).join("feature.txt"),
+        "changed later\n",
+    )
+    .unwrap();
+    let stale = accept_task(&db, &task, dir.path()).unwrap_err();
+    assert!(format!("{stale:#}").contains("PASS review is stale"));
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+}
+
+#[test]
 fn workflow_resolve_cli_accepts_persisted_gate_without_provider_invocation() {
     let (dir, db, task) = setup();
     db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
@@ -3581,6 +3638,7 @@ fn workflow_resolve_cli_accepts_persisted_gate_without_provider_invocation() {
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review
     );
+    seed_current_pass_review(&db, &task, dir.path());
     let project = db.get_project_id().unwrap().unwrap();
     let current = db
         .start_workflow(
@@ -3707,6 +3765,7 @@ fn accept_merges_diverged_non_conflicting_main_and_aborts_conflicts_safely() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+    seed_current_pass_review(&db, &task, dir.path());
     std::fs::write(dir.path().join("main-only.txt"), "main\n").unwrap();
     cmd(dir.path(), &["add", "main-only.txt"]);
     cmd(dir.path(), &["commit", "-m", "main changes"]);
@@ -3738,6 +3797,7 @@ fn accept_merges_diverged_non_conflicting_main_and_aborts_conflicts_safely() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
+    seed_current_pass_review(&db, &conflicting_task, dir.path());
     std::fs::write(dir.path().join("README.md"), "main version\n").unwrap();
     cmd(dir.path(), &["add", "README.md"]);
     cmd(dir.path(), &["commit", "-m", "conflicting main changes"]);

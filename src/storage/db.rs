@@ -315,6 +315,32 @@ mod reservation_lifecycle_tests {
     }
 
     #[test]
+    fn execution_failure_rolls_back_if_task_cannot_be_blocked() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Active).unwrap();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_task_block
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.id = OLD.id AND NEW.status = 'blocked'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected task block failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(db.fail_run(run, "provider failed").is_err());
+        assert_eq!(db.get_agent_run(run).unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Active
+        );
+        assert!(db.get_worker_result(run).unwrap().is_none());
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+    }
+
+    #[test]
     fn revision_completion_consumes_review_and_contract_with_publication() {
         let (_directory, _path, db, project, task) = fixture();
         db.update_task_status(&task, TaskStatus::Active).unwrap();
@@ -1297,6 +1323,13 @@ impl Database {
                     )?;
                 }
             }
+            self.record_lifecycle_event(
+                "plan_applied",
+                None,
+                None,
+                None,
+                Some(&format!("{{\"task_count\":{}}}", response.tasks.len())),
+            )?;
             Ok::<_, DbError>(mapping)
         })();
         match result {
@@ -1346,6 +1379,7 @@ impl Database {
             "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1, ?2)",
             params![id, serde_json::to_string(&persisted_proposal)?],
         )?;
+        self.record_lifecycle_event("task_created", Some(id), None, None, None)?;
         Ok(())
     }
     pub fn apply_approved_plan(
@@ -5759,19 +5793,7 @@ impl Database {
             params![run_id],
             |row| row.get(0),
         )?;
-        let transaction = self.conn.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE agent_runs SET status = 'completed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status = 'waiting_external'",
-            params![output, run_id])?;
-        if changed == 0 {
-            return Err(DbError::InvalidRunStatus(run_id));
-        }
-        transaction.execute(
-            "DELETE FROM execution_reservations WHERE run_id = ?1",
-            [run_id],
-        )?;
-        transaction.commit()?;
-        self.record_worker_result(run_id, "completed", Some(output), None)?;
+        self.complete_agent_run_for_review(&task_id, run_id, output, None)?;
         Ok(task_id)
     }
 
@@ -5790,8 +5812,24 @@ impl Database {
             "DELETE FROM execution_reservations WHERE run_id = ?1",
             [run_id],
         )?;
+        if transaction.execute(
+            "UPDATE tasks SET status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            [&task_id],
+        )? == 0
+        {
+            return Err(DbError::TaskNotFound(task_id));
+        }
+        let event = Self::persist_worker_result_and_event(
+            &transaction,
+            run_id,
+            "failed",
+            Some(reason),
+            None,
+        )?;
         transaction.commit()?;
-        self.record_worker_result(run_id, "failed", Some(reason), None)?;
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
         Ok(task_id)
     }
 

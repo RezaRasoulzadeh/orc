@@ -57,11 +57,7 @@ pub fn run(command: RunCommand, db_path: &str) -> Result<()> {
                     println!("Patch: valid");
                     println!("Worktree: {}", outcome.worktree_path.display());
                     println!("Applied: yes\n");
-                    println!("Validation:");
-                    for step in &outcome.validation_report.steps {
-                        let status = if step.passed { "PASS" } else { "FAIL" };
-                        println!("  {:<42} {}", step.command, status);
-                    }
+                    println!("Validation: deferred to review");
                     println!("\nRun: completed");
                     println!("Task {}: review", outcome.task_id);
                 }

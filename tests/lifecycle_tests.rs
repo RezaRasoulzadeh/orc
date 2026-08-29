@@ -498,6 +498,9 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
     let db_path = repo_dir.join(".orc/orc.db");
     let db = Database::init(&db_path).unwrap();
     let project = db.create_project("validation-e2e").unwrap();
+    let mut discovery = orc::discovery::build_snapshot(&repo_dir).unwrap();
+    discovery.fingerprint = "manual-lifecycle".into();
+    db.store_discovery_snapshot(project, &discovery).unwrap();
     register_eligible_agent(&db);
     db.insert_agent(&AgentDefinition {
         id: "eligible-reviewer".into(),
@@ -583,6 +586,16 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
     assert!(worktree.exists());
     assert!(db.actionable_revision_contract(&task).unwrap().is_none());
 
+    let (_, pass) = app
+        .automated_review_with_backend(
+            &task,
+            &overrides,
+            &PassIgnoringValidationReviewBackend,
+            &FakeValidationRunner::success(),
+        )
+        .unwrap();
+    assert_eq!(pass.verdict, "PASS");
+
     let accepted = agent::accept_task(&db, &task, &repo_dir);
     assert!(
         accepted.is_ok(),
@@ -591,6 +604,11 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Done
+    );
+    assert!(
+        db.load_discovery_snapshot(project, "manual-lifecycle")
+            .unwrap()
+            .is_some()
     );
     assert!(review_run > 0);
 }

@@ -5,8 +5,7 @@ use orc::protocol::{ExecutionHints, PROTOCOL_VERSION, PlanResponse, PlannedTask}
 use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
 use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database};
-use orc::task::TaskPriority;
-use orc::task::TaskScopeMode;
+use orc::task::{CreateTaskInput, TaskPriority, TaskScopeMode};
 use orc::validation::test_helpers::FakeValidationRunner;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -746,6 +745,84 @@ fn plan_run_preserves_canonical_proposals_and_dependencies_without_creating_task
         vec![("second".into(), "first".into())]
     );
     assert!(reopened.list_tasks().unwrap().is_empty());
+
+    let approval = reopened
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::Approve,
+            &serde_json::json!({"kind":"APPROVE"}),
+            LeadDecisionMetadata {
+                snapshot: "approved",
+                run_id: Some(result.planner_run_id),
+                source_request: "explicit plan review",
+                summary: "approve",
+            },
+        )
+        .unwrap();
+    reopened
+        .record_plan_review(
+            result.plan_id,
+            result.planner_run_id,
+            approval,
+            &LeadDecisionKind::Approve,
+            "approved for explicit application",
+        )
+        .unwrap();
+    let mapping = OrcApp::open(&db_path, directory.path())
+        .unwrap()
+        .apply_approved_plan()
+        .unwrap();
+    assert_eq!(mapping.len(), 2);
+    assert_eq!(reopened.list_tasks().unwrap().len(), 2);
+    let events = reopened.list_lifecycle_events(20).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "task_created")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "plan_applied")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn direct_task_creation_does_not_require_planner() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("state.sqlite");
+    let db = Database::init(&db_path).unwrap();
+    db.create_project("direct").unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let task = app
+        .create_task(CreateTaskInput {
+            title: "Direct task".into(),
+            objective: "Create without planning".into(),
+            role: "developer".into(),
+            priority: TaskPriority::Normal,
+            required_capabilities: Vec::new(),
+            scope_mode: None,
+            context_files: Vec::new(),
+            expected_changes: Vec::new(),
+            dependencies: Vec::new(),
+        })
+        .unwrap();
+    assert!(db.get_task(&task).unwrap().is_some());
+    assert!(
+        db.list_agent_runs(db.get_project_id().unwrap().unwrap(), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.list_lifecycle_events_for_task(&task, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "task_created")
+    );
 }
 
 #[test]

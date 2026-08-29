@@ -11,9 +11,7 @@ use crate::registry::{self, AgentDefinition, ReasoningEffort};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
 use crate::task::{Task, TaskScopeMode, TaskStatus};
-use crate::validation::{
-    self, SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
-};
+use crate::validation::{SystemValidationRunner, ValidationRunner};
 use crate::worker::{Worker, WorkerOutcome};
 
 /// Evidence observations come from the worker output and post-execution
@@ -2447,6 +2445,34 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
             task.status
         );
     }
+    let review_run = db
+        .list_agent_runs_for_task(task_id)?
+        .into_iter()
+        .find(|run| run.execution_class == "review" && run.status == "completed")
+        .context("task has no completed review")?;
+    let review: crate::automated::ReviewResult = serde_json::from_str(
+        review_run
+            .output
+            .as_deref()
+            .context("completed review has no verdict")?,
+    )
+    .context("completed review verdict is invalid")?;
+    if !review.verdict.eq_ignore_ascii_case("pass") {
+        anyhow::bail!(
+            "task {} requires a current PASS review before acceptance (latest verdict: {})",
+            task_id,
+            review.verdict
+        );
+    }
+    if db
+        .list_agent_runs_for_task(task_id)?
+        .into_iter()
+        .any(|run| {
+            run.id > review_run.id && run.execution_class != "review" && run.status == "completed"
+        })
+    {
+        anyhow::bail!("task {task_id} PASS review is stale after a newer implementation");
+    }
     let (branch, path) = db
         .get_worktree_metadata(task_id)?
         .context("task has no worktree")?;
@@ -2454,11 +2480,15 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
     if !worktree.exists() {
         anyhow::bail!("task worktree does not exist: {}", worktree.display());
     }
-    if git::inspect_worktree(&worktree, repo_path)?
-        .files
-        .is_empty()
-    {
+    let current_changes = git::inspect_worktree(&worktree, repo_path)?;
+    if current_changes.files.is_empty() {
         anyhow::bail!("task {task_id} has no meaningful changes to accept");
+    }
+    let reviewed_changes = db
+        .get_change_evidence(review_run.id)?
+        .context("current PASS review has no change evidence")?;
+    if reviewed_changes != current_changes {
+        anyhow::bail!("task {task_id} PASS review is stale because the implementation changed");
     }
     git::commit_worktree_changes(&worktree, task_id, &task.title)?;
     git::merge_task_branch(repo_path, &branch, task_id)?;
@@ -2560,8 +2590,7 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
             Some(&serde_json::to_string(&handoff)?),
         )?;
     }
-    db.complete_manual_run(run_id, output)?;
-    db.update_task_status(&task_id, TaskStatus::Review)?;
+    db.complete_agent_run_for_review(&task_id, run_id, output, None)?;
     Ok(task_id)
 }
 
@@ -2571,7 +2600,6 @@ pub fn fail_run(db: &Database, run_id: i64, reason: &str) -> Result<String> {
         anyhow::bail!("run {} is not a waiting manual run", run_id);
     }
     let task_id = db.fail_run(run_id, reason)?;
-    db.update_task_status(&task_id, TaskStatus::Blocked)?;
     Ok(task_id)
 }
 
@@ -2581,7 +2609,6 @@ pub struct PatchSubmissionOutcome {
     pub task_id: String,
     pub worktree_path: PathBuf,
     pub branch_name: String,
-    pub validation_report: ValidationReport,
 }
 
 pub fn submit_patch(
@@ -2604,7 +2631,7 @@ pub fn submit_patch_with_runner(
     run_id: i64,
     patch_content: &str,
     repo_path: impl AsRef<Path>,
-    validation_runner: &dyn ValidationRunner,
+    _validation_runner: &dyn ValidationRunner,
 ) -> Result<PatchSubmissionOutcome> {
     let repo_path = repo_path.as_ref();
     let run = db
@@ -2680,8 +2707,6 @@ pub fn submit_patch_with_runner(
         let err_msg = format!("patch apply failed: {:#}", e);
         db.fail_run(run_id, &err_msg)
             .context("failed to mark patch submission run as failed")?;
-        db.update_task_status(&task_id, TaskStatus::Blocked)
-            .context("failed to block task after patch apply failure")?;
         anyhow::bail!("{}", err_msg);
     }
 
@@ -2697,58 +2722,22 @@ pub fn submit_patch_with_runner(
         Some(&change_evidence),
     )?;
 
-    // 3. Run project validation pipeline
-    let validation_config = ValidationConfig::load(repo_path)?;
-    let report = validation::run_validation_pipeline(
-        validation_runner,
-        &validation_config.commands,
-        &absolute_worktree,
-    )?;
-    let validation_evidence =
-        serde_json::to_string(&report).context("failed to serialize validation result")?;
-    db.record_lifecycle_event(
-        "validation_result",
-        Some(&task_id),
-        Some(run_id),
-        Some(&run.agent),
-        Some(&validation_evidence),
-    )?;
-
-    if !report.is_success() {
-        let failure_summary = format!(
-            "Worktree: {}\nApplied: yes\n\nValidation:\n{}\nFailure: project validation",
-            worktree_path.display(),
-            report.summary()
-        );
-        db.fail_run(run_id, &failure_summary)
-            .context("failed to mark patch validation run as failed")?;
-        db.update_task_status(&task_id, TaskStatus::Review)
-            .context("failed to set task to review after patch validation failure")?;
-        anyhow::bail!(
-            "Validation failed after applying patch to {}:\n{}",
-            worktree_path.display(),
-            report.summary()
-        );
-    }
-
-    // 4. Success: persist output and transition lifecycle
+    // Validation belongs to the explicit review command. Patch submission is
+    // one execution attempt and publishes its evidence for later review.
     let success_output = format!(
-        "Worktree: {}\nApplied: yes\n\nValidation:\n{}\nPatch:\n{}",
+        "Worktree: {}\nApplied: yes\n\nValidation: deferred to review\nPatch:\n{}",
         worktree_path.display(),
-        report.summary(),
         patch_content
     );
     let changes = git::inspect_worktree(&absolute_worktree, repo_path)?;
     db.store_change_evidence(run_id, &changes)?;
-    db.complete_manual_run(run_id, &success_output)?;
-    db.update_task_status(&task_id, TaskStatus::Review)?;
+    db.complete_agent_run_for_review(&task_id, run_id, &success_output, None)?;
 
     Ok(PatchSubmissionOutcome {
         run_id,
         task_id,
         worktree_path,
         branch_name,
-        validation_report: report,
     })
 }
 
@@ -3043,7 +3032,7 @@ new file mode 100644
 
         assert_eq!(outcome.run_id, run_id);
         assert_eq!(outcome.task_id, task_id);
-        assert!(outcome.validation_report.is_success());
+        assert!(runner.executed_commands().is_empty());
 
         // Check task status moved to review
         let task = db.get_task(&task_id).unwrap().unwrap();

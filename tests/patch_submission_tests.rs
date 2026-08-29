@@ -125,7 +125,7 @@ new file mode 100644
 
     assert_eq!(outcome.run_id, run.id);
     assert_eq!(outcome.task_id, task_id);
-    assert!(outcome.validation_report.is_success());
+    assert!(runner.executed_commands().is_empty());
 
     let updated_run = db.get_agent_run(run.id).unwrap().unwrap();
     assert_eq!(updated_run.status, "completed");
@@ -345,7 +345,7 @@ new file mode 100644
 }
 
 #[test]
-fn test_validation_commands_run_after_apply() {
+fn test_patch_submission_defers_configured_validation_to_review() {
     let (dir, db, task_id) = setup_test_env();
 
     // Create custom .orc/validation.toml
@@ -369,15 +369,18 @@ new file mode 100644
     let outcome =
         submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).expect("submit patch");
 
-    assert_eq!(outcome.validation_report.steps.len(), 2);
-    assert_eq!(
-        runner.executed_commands(),
-        vec!["cargo fmt --check", "cargo test --lib"]
+    assert_eq!(outcome.task_id, task_id);
+    assert!(runner.executed_commands().is_empty());
+    assert!(
+        db.list_lifecycle_events_for_run(run_id, 20)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "validation_result")
     );
 }
 
 #[test]
-fn test_failed_validation_lifecycle_and_worktree_preserved() {
+fn test_failing_validation_runner_is_not_invoked_during_patch_submission() {
     let (dir, db, task_id) = setup_test_env();
 
     std::fs::write(
@@ -396,28 +399,24 @@ new file mode 100644
 @@ -0,0 +1 @@
 +applied content
 ";
-    // Runner fails on cargo test
     let runner = FakeValidationRunner::failing_on("cargo test");
-    let err = submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap_err();
-    assert!(err.to_string().contains("Validation failed"));
-
-    // Run status must be failed
+    submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap();
+    assert!(runner.executed_commands().is_empty());
     let run = db.get_agent_run(run_id).unwrap().unwrap();
-    assert_eq!(run.status, "failed");
-    assert!(run.output.unwrap().contains("Validation:\n  cargo test"));
+    assert_eq!(run.status, "completed");
+    assert!(
+        run.output
+            .unwrap()
+            .contains("Validation: deferred to review")
+    );
     let events = db.list_lifecycle_events_for_run(run_id, 20).unwrap();
-    let validation = events
-        .iter()
-        .find(|event| event.kind == "validation_result")
-        .unwrap();
-    assert!(validation.payload.as_deref().unwrap().contains("steps"));
+    assert!(events.iter().all(|event| event.kind != "validation_result"));
     let changes = events
         .iter()
         .find(|event| event.kind == "change_evidence")
         .unwrap();
     assert!(changes.payload.as_deref().unwrap().contains("applied.txt"));
 
-    // Failed validation is reviewable work, not an execution failure.
     let task = db.get_task(&task_id).unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Review);
 
@@ -429,7 +428,7 @@ new file mode 100644
         .join("applied.txt");
     assert!(
         worktree_file.exists(),
-        "applied patch files must be preserved in worktree after validation failure"
+        "applied patch files must be preserved for review"
     );
     assert_eq!(
         std::fs::read_to_string(worktree_file).unwrap(),
@@ -465,7 +464,12 @@ new file mode 100644
     let run = reopened.get_agent_run(run_id).unwrap().unwrap();
     assert_eq!(run.status, "completed");
     assert!(run.output.as_ref().unwrap().contains("persisted data"));
-    assert!(run.output.as_ref().unwrap().contains("PASS"));
+    assert!(
+        run.output
+            .as_ref()
+            .unwrap()
+            .contains("Validation: deferred to review")
+    );
 
     let meta = reopened.get_worktree_metadata(&task_id).unwrap().unwrap();
     assert_eq!(meta.0, format!("orc/task/{}", task_id));

@@ -1614,6 +1614,7 @@ fn run_review_mode(
                 Ok(result) => {
                     let persisted_output = serde_json::to_string(&result)?;
                     if !project_review {
+                        db.store_change_evidence(run, &summary.changes)?;
                         let contract = if result.verdict.eq_ignore_ascii_case("revise") {
                             let records = result.blockers.iter().map(|blocker| {
                                 crate::storage::db::ReviewBlockerRecord {

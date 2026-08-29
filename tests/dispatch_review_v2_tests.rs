@@ -3064,6 +3064,134 @@ fn validation_repair_is_bounded_and_infrastructure_only_retries_validation() {
 }
 
 #[test]
+fn revision_validation_failure_repairs_once_and_publishes_to_review() {
+    let (dir, db, task, review_id) = revision_fixture();
+    let marker = "BROAD_REVISION_CONTRACT_MARKER";
+    let diagnostics = "REVISION_VALIDATION_DIAGNOSTICS";
+    std::fs::write(dir.path().join(".orc/engineering.md"), marker).unwrap();
+    let worker = RepairWorker::new();
+    let runner = SequenceValidationRunner::new(vec![
+        validation_result(ValidationCategory::Test, diagnostics),
+        validation_result(ValidationCategory::Success, ""),
+    ]);
+
+    let summary = revise_with_worker_on_db(
+        &task,
+        "preserve blocker authority",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap();
+
+    let calls = worker.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[1].0.contains(marker));
+    assert!(!calls[1].0.contains("## Instruction precedence"));
+    assert!(!calls[1].0.contains("## Review feedback"));
+    assert!(
+        calls[1]
+            .0
+            .contains("## Focused automatic validation repair")
+    );
+    assert!(calls[1].0.contains(diagnostics));
+    let invocations = db.provider_invocations(summary.run_id).unwrap();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[0].purpose, "revision");
+    assert_eq!(invocations[1].purpose, "validation_repair");
+    assert_eq!(invocations[1].attempt, 1);
+    assert_eq!(invocations[1].effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        db.get_agent_run(summary.run_id).unwrap().unwrap().status,
+        "completed"
+    );
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    assert_eq!(
+        db.source_review_run_id(summary.run_id).unwrap(),
+        Some(review_id)
+    );
+    assert!(db.actionable_revision_review(&task).unwrap().is_none());
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+}
+
+#[test]
+fn revision_validation_repair_stops_at_existing_bound() {
+    let (dir, db, task, _) = revision_fixture();
+    let worker = RepairWorker::new();
+    let runner = SequenceValidationRunner::new(
+        (0..4)
+            .map(|_| validation_result(ValidationCategory::Lint, "revision lint failed"))
+            .collect(),
+    );
+
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "repair validation only",
+            &worker,
+            &db,
+            dir.path(),
+            "fake",
+            &runner,
+        )
+        .is_err()
+    );
+
+    assert_eq!(worker.calls.lock().unwrap().len(), 4);
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    let invocations = db.provider_invocations(run.id).unwrap();
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|invocation| invocation.purpose == "validation_repair")
+            .count(),
+        3
+    );
+    assert_eq!(run.status, "failed");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+}
+
+#[test]
+fn revision_validation_repair_budget_exhaustion_prevents_provider_call() {
+    let (dir, db, task, _) = revision_fixture();
+    let worker = TokenBudgetWorker {
+        calls: Mutex::new(0),
+    };
+
+    let error = revise_with_worker_on_db(
+        &task,
+        "repair within budget",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &SequenceValidationRunner::new(vec![validation_result(
+            ValidationCategory::Test,
+            "revision budget failure",
+        )]),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("token budget exhausted"));
+    assert_eq!(*worker.calls.lock().unwrap(), 1);
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
+    assert_eq!(run.status, "failed");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+}
+
+#[test]
 fn accept_integrates_and_reject_preserves_worktree() {
     let (dir, db, task) = setup();
     let db_path = dir.path().join(".orc/orc.db");

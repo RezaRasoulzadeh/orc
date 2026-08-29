@@ -14,7 +14,7 @@ use crate::task::{Task, TaskScopeMode, TaskStatus};
 use crate::validation::{
     self, SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
 };
-use crate::worker::{Worker, WorkerOutcome};
+use crate::worker::{TokenUsage, Worker, WorkerOutcome};
 
 /// Evidence observations come from the worker output and post-execution
 /// checks; declarations in PREPARE are never observations.
@@ -597,6 +597,132 @@ fn repair_prompt(diff: &str, diagnostics: &str, attempt: usize) -> String {
     format!(
         "## Focused automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree and fix only the exact failed command/requirement. Do not reset, clean, recreate, or replace the worktree.\n\n## Relevant current worktree diff\n\n{diff}\n\n## Exact failed command and diagnostics\n\n{diagnostics}\n\nAfter repairing, leave changes in this worktree and report only the focused repair."
     )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared repair boundary needs execution, persistence, and progress context"
+)]
+fn run_validation_repair_loop(
+    validation_runner: &dyn ValidationRunner,
+    commands: &[String],
+    worker: &dyn Worker,
+    db: &Database,
+    worktree: &Path,
+    repo_path: &Path,
+    task_id: &str,
+    run_id: i64,
+    agent_id: &str,
+    output: &mut Option<String>,
+    token_usage: &mut Option<TokenUsage>,
+    progress: &dyn Fn(&str),
+    worker_output: &dyn Fn(&str),
+    cancellation: Option<&crate::worker::CancellationControl>,
+) -> Result<ValidationReport> {
+    let reports = run_validation_with_retries(validation_runner, commands, worktree);
+    for (index, report) in reports.iter().enumerate() {
+        persist_validation_attempt(db, task_id, run_id, agent_id, report, 0, index + 1)?;
+    }
+    let mut report = reports
+        .into_iter()
+        .last()
+        .expect("validation always produces a report");
+    let mut repair_attempt = 0;
+    while !report.is_success()
+        && !report.is_infrastructure_failure()
+        && repair_attempt < MAX_VALIDATION_REPAIRS
+    {
+        repair_attempt += 1;
+        let diagnostics = validation_diagnostics(&report);
+        let diff = git::inspect_worktree(worktree, repo_path)?.diff;
+        let repair = repair_prompt(&diff, &diagnostics, repair_attempt);
+        db.record_lifecycle_event(
+            "validation_repair_started",
+            Some(task_id),
+            Some(run_id),
+            Some(agent_id),
+            Some(
+                &serde_json::json!({
+                    "repair_attempt": repair_attempt,
+                    "prompt": repair,
+                })
+                .to_string(),
+            ),
+        )?;
+        progress(&format!("validation repair attempt {repair_attempt}"));
+        let repair_invocation = start_provider_invocation_bounded(
+            db,
+            run_id,
+            task_id,
+            "validation_repair",
+            repair_attempt,
+            ReasoningEffort::Low,
+        )?;
+        let repair_execution = worker.execute_repair_with_progress_and_usage(
+            &repair,
+            worktree,
+            &crate::worker_protocol::repair_completion_schema(),
+            worker_output,
+            cancellation,
+        );
+        db.finish_provider_invocation(
+            repair_invocation,
+            if repair_execution.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            repair_execution
+                .as_ref()
+                .ok()
+                .and_then(|value| value.token_usage),
+        )?;
+        let execution = repair_execution
+            .map_err(|error| anyhow::anyhow!("Validation repair worker failed: {error}"))?;
+        db.record_lifecycle_event(
+            "validation_repair_completed",
+            Some(task_id),
+            Some(run_id),
+            Some(agent_id),
+            Some(
+                &serde_json::json!({
+                    "repair_attempt": repair_attempt,
+                    "outcome": match &execution.outcome {
+                        WorkerOutcome::Success => "success",
+                        WorkerOutcome::Failure(_) => "failure",
+                    },
+                    "output": execution.output,
+                })
+                .to_string(),
+            ),
+        )?;
+        if let WorkerOutcome::Failure(error) = execution.outcome {
+            anyhow::bail!("Validation repair worker failed: {error}");
+        }
+        if execution.output.is_some() {
+            *output = execution.output;
+        }
+        if execution.token_usage.is_some() {
+            *token_usage = execution.token_usage;
+        }
+        let reports = run_validation_with_retries(validation_runner, commands, worktree);
+        for (index, report) in reports.iter().enumerate() {
+            persist_validation_attempt(
+                db,
+                task_id,
+                run_id,
+                agent_id,
+                report,
+                repair_attempt,
+                index + 1,
+            )?;
+        }
+        report = reports
+            .into_iter()
+            .last()
+            .expect("validation always produces a report");
+    }
+    Ok(report)
 }
 
 fn architecture_decisions(output: &str) -> Vec<&str> {
@@ -1248,105 +1374,25 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         }
                     };
                     progress("validation started");
-                    let reports = run_validation_with_retries(
+                    let report = match run_validation_repair_loop(
                         validation_runner,
                         &validation_config.commands,
+                        worker,
+                        db,
                         &worktree_dir,
-                    );
-                    for (index, report) in reports.iter().enumerate() {
-                        persist_validation_attempt(
-                            db,
-                            task_id,
-                            run_id,
-                            agent_id,
-                            report,
-                            0,
-                            index + 1,
-                        )?;
-                    }
-                    let mut report = reports
-                        .into_iter()
-                        .last()
-                        .expect("validation always produces a report");
-                    let mut repair_attempt = 0;
-                    while !report.is_success()
-                        && !report.is_infrastructure_failure()
-                        && repair_attempt < MAX_VALIDATION_REPAIRS
-                    {
-                        repair_attempt += 1;
-                        let diagnostics = validation_diagnostics(&report);
-                        let diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
-                        let repair = repair_prompt(&diff, &diagnostics, repair_attempt);
-                        let repair_started = serde_json::json!({
-                            "repair_attempt": repair_attempt,
-                            "prompt": repair,
-                        });
-                        db.record_lifecycle_event(
-                            "validation_repair_started",
-                            Some(task_id),
-                            Some(run_id),
-                            Some(agent_id),
-                            Some(&repair_started.to_string()),
-                        )?;
-                        progress(&format!("validation repair attempt {repair_attempt}"));
-                        let repair_invocation = start_provider_invocation_bounded(
-                            db,
-                            run_id,
-                            task_id,
-                            "validation_repair",
-                            repair_attempt,
-                            ReasoningEffort::Low,
-                        )?;
-                        let repair_execution = worker.execute_repair_with_progress_and_usage(
-                            &repair,
-                            &worktree_dir,
-                            &crate::worker_protocol::repair_completion_schema(),
-                            &|line| worker_output(line),
-                            cancellation,
-                        );
-                        db.finish_provider_invocation(
-                            repair_invocation,
-                            if repair_execution.is_ok() {
-                                "completed"
-                            } else {
-                                "failed"
-                            },
-                            repair_execution
-                                .as_ref()
-                                .ok()
-                                .and_then(|value| value.token_usage),
-                        )?;
-                        let execution = match repair_execution {
-                            Ok(execution) => execution,
-                            Err(error) => {
-                                let message = format!("Validation repair worker failed: {error}");
-                                db.update_agent_run_status_with_usage(
-                                    run_id,
-                                    "failed",
-                                    Some(&message),
-                                    token_usage,
-                                )?;
-                                db.update_task_status(task_id, TaskStatus::Blocked)?;
-                                anyhow::bail!(message);
-                            }
-                        };
-                        let repair_completed = serde_json::json!({
-                            "repair_attempt": repair_attempt,
-                            "outcome": match &execution.outcome {
-                                WorkerOutcome::Success => "success",
-                                WorkerOutcome::Failure(_) => "failure",
-                            },
-                            "output": execution.output,
-                        });
-                        db.record_lifecycle_event(
-                            "validation_repair_completed",
-                            Some(task_id),
-                            Some(run_id),
-                            Some(agent_id),
-                            Some(&repair_completed.to_string()),
-                        )?;
-                        if let WorkerOutcome::Failure(error) = execution.outcome {
-                            let message = format!("Validation repair worker failed: {error}");
+                        repo_path,
+                        task_id,
+                        run_id,
+                        agent_id,
+                        &mut output,
+                        &mut token_usage,
+                        &progress,
+                        &worker_output,
+                        cancellation,
+                    ) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            let message = format!("{error:#}");
                             db.update_agent_run_status_with_usage(
                                 run_id,
                                 "failed",
@@ -1356,35 +1402,9 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             db.update_task_status(task_id, TaskStatus::Blocked)?;
                             anyhow::bail!(message);
                         }
-                        if execution.output.is_some() {
-                            output = execution.output;
-                        }
-                        if execution.token_usage.is_some() {
-                            token_usage = execution.token_usage;
-                        }
-                        changes = git::inspect_worktree(&worktree_dir, repo_path)
-                            .context("failed to inspect worktree after validation repair")?;
-                        let reports = run_validation_with_retries(
-                            validation_runner,
-                            &validation_config.commands,
-                            &worktree_dir,
-                        );
-                        for (index, report) in reports.iter().enumerate() {
-                            persist_validation_attempt(
-                                db,
-                                task_id,
-                                run_id,
-                                agent_id,
-                                report,
-                                repair_attempt,
-                                index + 1,
-                            )?;
-                        }
-                        report = reports
-                            .into_iter()
-                            .last()
-                            .expect("validation always produces a report");
-                    }
+                    };
+                    changes = git::inspect_worktree(&worktree_dir, repo_path)
+                        .context("failed to inspect worktree after validation")?;
                     progress("validation completed");
                     let validation_summary = report.summary();
                     let validation_observation = if validation_summary.trim().is_empty() {
@@ -2097,14 +2117,20 @@ pub fn revise_with_worker_on_db_with_overrides(
     };
     let outcome = execution.outcome;
     let mut output = execution.output;
-    let token_usage = execution.token_usage;
+    let initial_token_usage = execution.token_usage;
+    let mut token_usage = initial_token_usage;
     let fail = |message: String| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
             "worker timeout"
         } else {
             "revision failed"
         });
-        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
+        db.update_agent_run_status_with_usage(
+            run_id,
+            "failed",
+            Some(&message),
+            initial_token_usage,
+        )?;
         db.update_task_status(task_id, TaskStatus::Blocked)?;
         anyhow::bail!("{message}")
     };
@@ -2232,7 +2258,7 @@ pub fn revise_with_worker_on_db_with_overrides(
             )?;
         }
     }
-    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(current) => git::changes_since(&baseline_changes, &current),
         Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
     };
@@ -2245,25 +2271,52 @@ pub fn revise_with_worker_on_db_with_overrides(
         Err(error) => return fail(format!("Validation setup failed: {error:#}")),
     };
     progress("validation started");
-    let report = match validation::run_validation_pipeline(
+    let report = match run_validation_repair_loop(
         validation_runner,
         &config.commands,
+        worker,
+        db,
         &worktree_dir,
+        repo_path,
+        task_id,
+        run_id,
+        agent_id,
+        &mut output,
+        &mut token_usage,
+        &progress,
+        &worker_output,
+        None,
     ) {
         Ok(report) => report,
-        Err(error) => return fail(format!("Validation execution failed: {error:#}")),
+        Err(error) => {
+            let message = format!("{error:#}");
+            progress(if message.to_ascii_lowercase().contains("timeout") {
+                "worker timeout"
+            } else {
+                "revision failed"
+            });
+            db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
+            db.update_task_status(task_id, TaskStatus::Blocked)?;
+            anyhow::bail!(message)
+        }
     };
+    let fail = |message: String| -> Result<DispatchSummary> {
+        progress(if message.to_ascii_lowercase().contains("timeout") {
+            "worker timeout"
+        } else {
+            "revision failed"
+        });
+        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
+        db.update_task_status(task_id, TaskStatus::Blocked)?;
+        anyhow::bail!(message)
+    };
+    changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+        Ok(current) => git::changes_since(&baseline_changes, &current),
+        Err(error) => return fail(format!("Post-validation inspection failed: {error:#}")),
+    };
+    db.store_change_evidence(run_id, &changes)?;
     progress("validation completed");
     let summary = report.summary();
-    let validation_evidence =
-        serde_json::to_string(&report).context("failed to serialize validation result")?;
-    db.record_lifecycle_event(
-        "validation_result",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&validation_evidence),
-    )?;
     let revision_validation_evidence =
         serde_json::to_string(&crate::automated::RevisionValidationEvidence {
             evidence_id: format!("revision-validation-{run_id}"),

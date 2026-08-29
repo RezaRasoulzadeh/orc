@@ -922,6 +922,16 @@ impl OrcApp {
             "plan_review"
         } else if tasks
             .iter()
+            .any(|t| t.status == crate::task::TaskStatus::RevisionRequired)
+        {
+            "task_revision_required"
+        } else if tasks
+            .iter()
+            .any(|t| t.status == crate::task::TaskStatus::AcceptanceReady)
+        {
+            "task_acceptance_ready"
+        } else if tasks
+            .iter()
             .any(|t| t.status == crate::task::TaskStatus::Review)
         {
             "task_review"

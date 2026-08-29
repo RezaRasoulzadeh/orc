@@ -341,6 +341,120 @@ mod reservation_lifecycle_tests {
     }
 
     #[test]
+    fn legacy_review_state_migration_is_safe_and_runs_once() {
+        let (_directory, path, db, project, revision_task) = fixture();
+        db.update_task_status(&revision_task, TaskStatus::Review)
+            .unwrap();
+        let review = db
+            .create_agent_run_with_execution(
+                project,
+                &revision_task,
+                "reviewer",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "review",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.update_agent_run_status(review, "completed", Some(r#"{"verdict":"REVISE"}"#))
+            .unwrap();
+        db.persist_revision_contract(&revision_task, review, "contract")
+            .unwrap();
+        let pass_task = db
+            .insert_task(
+                project,
+                "legacy pass",
+                "requires a fresh evidence snapshot",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        db.update_task_status(&pass_task, TaskStatus::Review).unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM meta WHERE key='task_review_status_v2_migrated'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.get_task(&revision_task).unwrap().unwrap().status,
+            TaskStatus::RevisionRequired
+        );
+        assert_eq!(
+            reopened.get_task(&pass_task).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
+        reopened
+            .update_task_status(&revision_task, TaskStatus::Review)
+            .unwrap();
+        drop(reopened);
+        let reopened_again = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened_again
+                .get_task(&revision_task)
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Review
+        );
+    }
+
+    #[test]
+    fn review_verdict_and_task_state_roll_back_together() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Review).unwrap();
+        let review = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "reviewer",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "review",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_acceptance_ready
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.id = OLD.id AND NEW.status = 'acceptance_ready'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected acceptance publication failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.commit_task_review_result(
+                &task,
+                review,
+                &[],
+                None,
+                true,
+                r#"{"verdict":"PASS"}"#,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(db.get_agent_run(review).unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
+        assert!(db.get_worker_result(review).unwrap().is_none());
+    }
+
+    #[test]
     fn revision_completion_consumes_review_and_contract_with_publication() {
         let (_directory, _path, db, project, task) = fixture();
         db.update_task_status(&task, TaskStatus::Active).unwrap();
@@ -1638,6 +1752,7 @@ impl Database {
         Self::ensure_task_columns(&conn)?;
         Self::ensure_task_execution_conditions_table(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
+        Self::normalize_legacy_review_states(&conn)?;
         let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('agent_registry_path', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1860,6 +1975,7 @@ impl Database {
         Self::ensure_task_columns(conn)?;
         Self::ensure_task_execution_conditions_table(conn)?;
         Self::ensure_approval_request_columns(conn)?;
+        Self::normalize_legacy_review_states(conn)?;
         Ok(())
     }
 
@@ -3065,6 +3181,36 @@ impl Database {
         Ok(())
     }
 
+    fn normalize_legacy_review_states(conn: &Connection) -> Result<(), DbError> {
+        let tx = conn.unchecked_transaction()?;
+        let already_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='task_review_status_v2_migrated')",
+            [],
+            |row| row.get(0),
+        )?;
+        if already_migrated {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'revision_required', updated_at = CURRENT_TIMESTAMP
+             WHERE status = 'review'
+               AND EXISTS (
+                   SELECT 1 FROM revision_contracts
+                   WHERE revision_contracts.task_id = tasks.id
+                     AND revision_contracts.status = 'actionable'
+               )",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('task_review_status_v2_migrated', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn persist_revision_contract(
         &self,
         task_id: &str,
@@ -3184,6 +3330,13 @@ impl Database {
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
+        let destination = if supersedes_with_pass {
+            "acceptance_ready"
+        } else if revision_contract.is_some() {
+            "revision_required"
+        } else {
+            "review"
+        };
         for blocker in blockers {
             tx.execute("INSERT OR IGNORE INTO review_blocker_observations (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
             tx.execute("INSERT INTO review_blocker_ledger (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(task_id, blocker_id) DO UPDATE SET run_id=excluded.run_id, blocker_key=excluded.blocker_key, status=excluded.status, evidence=excluded.evidence, requirement_ref=excluded.requirement_ref, acceptance_condition=excluded.acceptance_condition, finding=excluded.finding, last_seen=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
@@ -3202,8 +3355,26 @@ impl Database {
             "DELETE FROM execution_reservations WHERE run_id=?1",
             [run_id],
         )?;
+        if tx.execute(
+            "UPDATE tasks SET status=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND status='review'",
+            params![destination, task_id],
+        )? != 1
+        {
+            return Err(DbError::Scheduler(format!(
+                "task '{task_id}' is not awaiting review"
+            )));
+        }
+        let event = Self::persist_worker_result_and_event(
+            &tx,
+            run_id,
+            "completed",
+            Some(output),
+            token_usage,
+        )?;
         tx.commit()?;
-        self.record_worker_result(run_id, "completed", Some(output), token_usage)?;
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
         Ok(())
     }
 
@@ -4608,6 +4779,8 @@ impl Database {
             "ready" => TaskStatus::Ready,
             "active" => TaskStatus::Active,
             "review" => TaskStatus::Review,
+            "acceptance_ready" => TaskStatus::AcceptanceReady,
+            "revision_required" => TaskStatus::RevisionRequired,
             "blocked" => TaskStatus::Blocked,
             "done" => TaskStatus::Done,
             "cancelled" => TaskStatus::Cancelled,

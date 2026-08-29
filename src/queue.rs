@@ -15,6 +15,8 @@ pub enum QueueCategory {
     Blocked,
     Active,
     Review,
+    AcceptanceReady,
+    RevisionRequired,
     Done,
     Cancelled,
     Backlog,
@@ -27,6 +29,8 @@ impl fmt::Display for QueueCategory {
             Self::Blocked => "BLOCKED",
             Self::Active => "ACTIVE",
             Self::Review => "REVIEW",
+            Self::AcceptanceReady => "ACCEPTANCE READY",
+            Self::RevisionRequired => "REVISION REQUIRED",
             Self::Done => "DONE",
             Self::Cancelled => "CANCELLED",
             Self::Backlog => "BACKLOG",
@@ -104,6 +108,8 @@ pub struct QueueReport {
     pub blocked: Vec<QueueEntry>,
     pub active: Vec<QueueEntry>,
     pub review: Vec<QueueEntry>,
+    pub acceptance_ready: Vec<QueueEntry>,
+    pub revision_required: Vec<QueueEntry>,
     pub done: Vec<QueueEntry>,
     pub cancelled: Vec<QueueEntry>,
     pub backlog: Vec<QueueEntry>,
@@ -115,6 +121,8 @@ impl QueueReport {
             && self.blocked.is_empty()
             && self.active.is_empty()
             && self.review.is_empty()
+            && self.acceptance_ready.is_empty()
+            && self.revision_required.is_empty()
             && self.done.is_empty()
             && self.cancelled.is_empty()
             && self.backlog.is_empty()
@@ -128,6 +136,8 @@ impl QueueReport {
         items.extend(&self.backlog);
         items.extend(&self.ready);
         items.extend(&self.review);
+        items.extend(&self.acceptance_ready);
+        items.extend(&self.revision_required);
         items.extend(&self.active);
         items
     }
@@ -146,6 +156,8 @@ impl QueueReport {
             ("BACKLOG", &self.backlog),
             ("READY", &self.ready),
             ("REVIEW", &self.review),
+            ("ACCEPTANCE READY", &self.acceptance_ready),
+            ("REVISION REQUIRED", &self.revision_required),
             ("ACTIVE", &self.active),
         ];
         for (name, items) in categories {
@@ -195,6 +207,8 @@ impl QueueReport {
             (QueueCategory::Backlog, &self.backlog),
             (QueueCategory::Ready, &self.ready),
             (QueueCategory::Review, &self.review),
+            (QueueCategory::AcceptanceReady, &self.acceptance_ready),
+            (QueueCategory::RevisionRequired, &self.revision_required),
             (QueueCategory::Active, &self.active),
         ];
 
@@ -415,6 +429,32 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                     waiting_on,
                     blocking_reasons: Vec::new(),
                     active_agent,
+                    recommended_agent: None,
+                    schedule_decision: None,
+                    recommended_execution: Some(persisted_execution.clone()),
+                });
+            }
+            TaskStatus::AcceptanceReady => {
+                report.acceptance_ready.push(QueueItem {
+                    task,
+                    category: QueueCategory::AcceptanceReady,
+                    dependencies,
+                    waiting_on,
+                    blocking_reasons: Vec::new(),
+                    active_agent: None,
+                    recommended_agent: None,
+                    schedule_decision: None,
+                    recommended_execution: Some(persisted_execution.clone()),
+                });
+            }
+            TaskStatus::RevisionRequired => {
+                report.revision_required.push(QueueItem {
+                    task,
+                    category: QueueCategory::RevisionRequired,
+                    dependencies,
+                    waiting_on,
+                    blocking_reasons: Vec::new(),
+                    active_agent: None,
                     recommended_agent: None,
                     schedule_decision: None,
                     recommended_execution: Some(persisted_execution.clone()),

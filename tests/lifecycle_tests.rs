@@ -353,7 +353,7 @@ fn successful_worker_transitions_active_to_review() {
 }
 
 #[test]
-fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
+fn validation_failure_requires_revision_with_evidence_and_cannot_be_requeued() {
     let dir = TempDir::new().unwrap();
     let repo_dir = dir.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -455,6 +455,10 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
         )
         .unwrap();
     assert_eq!(review.verdict, "REVISE");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::RevisionRequired
+    );
     assert_eq!(review.blockers.len(), 1);
     assert!(
         review.blockers[0]
@@ -471,7 +475,10 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
 
     let requeue = app.requeue(&task).unwrap_err().to_string();
     assert!(requeue.contains("cannot be requeued") || requeue.contains("not active"));
-    assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    assert_eq!(
+        app.task(&task).unwrap().unwrap().status,
+        TaskStatus::RevisionRequired
+    );
 }
 
 #[test]
@@ -568,6 +575,10 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
         .unwrap();
     assert_eq!(review.verdict, "REVISE");
     assert!(db.actionable_revision_contract(&task).unwrap().is_some());
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::RevisionRequired
+    );
 
     agent::revise_with_worker_on_db(
         &task,
@@ -595,6 +606,10 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
         )
         .unwrap();
     assert_eq!(pass.verdict, "PASS");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::AcceptanceReady
+    );
 
     let accepted = agent::accept_task(&db, &task, &repo_dir);
     assert!(

@@ -762,6 +762,8 @@ fn seed_actionable_revision_review(db: &Database, task: &str) {
         Some(r#"{"verdict":"REVISE","revision_feedback":"test feedback"}"#),
     )
     .unwrap();
+    db.update_task_status(task, TaskStatus::RevisionRequired)
+        .unwrap();
 }
 
 fn seed_current_pass_review(db: &Database, task: &str, repo: &Path) -> i64 {
@@ -823,6 +825,8 @@ fn seed_blocked_revision_review(db: &Database, task: &str) -> i64 {
         "blockers": [blocker]
     });
     db.update_agent_run_status(run, "completed", Some(&output.to_string()))
+        .unwrap();
+    db.update_task_status(task, TaskStatus::RevisionRequired)
         .unwrap();
     run
 }
@@ -1245,7 +1249,7 @@ fn no_stale_reservation_or_run_blocks_retry() {
             .count(),
         1
     );
-    assert!(format!("{retry:#}").contains("actionable"));
+    assert!(format!("{retry:#}").contains("revision_required"));
     assert_eq!(completed.run_id, runs[0].id);
     assert_eq!(*worker.calls.lock().unwrap(), 1);
 }
@@ -1636,6 +1640,7 @@ fn prior_blocker_review_output_with_key(prior_blocker_id: &str, blocker_key: &st
 #[test]
 fn unique_blocker_key_canonicalizes_mistyped_prior_id() {
     let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let persisted = db.review_blocker_ledger(&task).unwrap().remove(0);
     let mistyped = &persisted.blocker_id[..persisted.blocker_id.len() - 1];
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
@@ -1665,7 +1670,8 @@ fn unique_blocker_key_canonicalizes_mistyped_prior_id() {
 
 #[test]
 fn unknown_blocker_key_with_invalid_prior_id_is_rejected() {
-    let (dir, _db, task, _) = production_contract_fixture();
+    let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
     let error = app
         .automated_review_with_backend(
@@ -1690,6 +1696,7 @@ fn unknown_blocker_key_with_invalid_prior_id_is_rejected() {
 #[test]
 fn ambiguous_blocker_key_is_rejected() {
     let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let run = db.actionable_revision_review(&task).unwrap().unwrap().0;
     let mut blockers = Vec::new();
     for id in ["BLK-ambiguous-one", "BLK-ambiguous-two"] {
@@ -1730,6 +1737,7 @@ fn ambiguous_blocker_key_is_rejected() {
 #[test]
 fn blocker_from_other_task_is_rejected() {
     let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let project = db.get_project_id().unwrap().unwrap();
     let other = db
         .insert_task(
@@ -1854,6 +1862,7 @@ fn restart_loads_actionable_contract() {
 #[test]
 fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
     let (dir, db, task, _) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
     let backend = QueuedReviewBackend {
         outputs: Mutex::new(VecDeque::from([
@@ -1870,6 +1879,7 @@ fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
         .unwrap();
     let (_, json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(json.contains("BLK-newer"));
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     assert!(db.actionable_revision_contract(&task).unwrap().is_none());
@@ -1877,8 +1887,9 @@ fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
 }
 
 #[test]
-fn failed_review_attempts_preserve_prior_actionability_until_real_revision_consumes_it() {
+fn failed_review_attempts_do_not_make_an_unreviewed_task_revision_actionable() {
     let (dir, db, task, source) = production_contract_fixture();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
     let overrides = ActionOverrides {
         agent_id: Some("fake".into()),
@@ -1923,29 +1934,27 @@ fn failed_review_attempts_preserve_prior_actionability_until_real_revision_consu
         source
     );
 
-    let (_, contract_json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
-    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json).unwrap()
-        ["unresolved"][0]["blocker_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    revise_with_worker_on_db(
+    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    let revision = revise_with_worker_on_db(
         &task,
         "",
-        &CapturingWorker::with_blocker_id(&blocker_id),
+        &WritingWorker,
         &db,
         dir.path(),
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap();
-    assert!(db.actionable_revision_review(&task).unwrap().is_none());
-    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    .unwrap_err();
+    assert!(format!("{revision:#}").contains("revision_required"));
+    assert_eq!(
+        db.actionable_revision_contract(&task).unwrap().unwrap().0,
+        source
+    );
 }
 
 #[test]
-fn failed_revision_start_reuses_same_contract_and_success_consumes_once() {
-    let (dir, db, task, source) = production_contract_fixture();
+fn failed_revision_requires_execution_recovery_before_another_revision() {
+    let (dir, db, task, _) = production_contract_fixture();
     assert!(
         revise_with_worker_on_db(
             &task,
@@ -1958,28 +1967,26 @@ fn failed_revision_start_reuses_same_contract_and_success_consumes_once() {
         )
         .is_err()
     );
-    let (_, contract_json, contract_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
-    let blocker_id = serde_json::from_str::<serde_json::Value>(&contract_json).unwrap()["unresolved"][0]["blocker_id"].as_str().unwrap().to_owned();
-    let worker = CapturingWorker::with_blocker_id(&blocker_id);
+    let (_, _, contract_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
     let retry = revise_with_worker_on_db(
         &task,
         "",
-        &worker,
+        &WritingWorker,
         &db,
         dir.path(),
         "fake",
         &FakeValidationRunner::success(),
+    )
+    .unwrap_err();
+    assert!(format!("{retry:#}").contains("revision_required"));
+    assert_eq!(
+        db.actionable_revision_contract(&task).unwrap().unwrap().2,
+        contract_id
     );
-    assert!(retry.is_ok(), "retry failed: {retry:?}");
-    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
-    assert!(!db.consume_revision_contract(contract_id).unwrap());
-    let revision = db
-        .list_agent_runs_for_task(&task)
-        .unwrap()
-        .into_iter()
-        .find(|r| r.id != source && r.execution_class != "review")
-        .unwrap();
-    assert_eq!(db.source_review_run_id(revision.id).unwrap(), Some(source));
 }
 
 #[test]
@@ -2246,8 +2253,7 @@ fn no_feedback_without_production_contract_returns_actionable_error() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("no actionable REVISE review"));
-    assert!(error.contains(&format!("orc review {task} --automated")));
+    assert!(error.contains("revision_required"));
 }
 
 #[test]
@@ -2296,6 +2302,9 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
             .unwrap()
             .is_some()
     );
+    reopened
+        .update_task_status(&task, TaskStatus::Review)
+        .unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
     app.automated_review_with_backend(
         &task,
@@ -2313,6 +2322,9 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
         .unwrap()
         .unwrap();
     assert!(newer_id > first_id && newer.contains("BLK-newer"));
+    reopened
+        .update_task_status(&task, TaskStatus::Review)
+        .unwrap();
     app.automated_review_with_backend(
         &task,
         &ActionOverrides {
@@ -2534,7 +2546,7 @@ fn production_review_revision_loop_stops_at_task_revision_bound_after_restart() 
     );
     assert_eq!(
         reopened.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Review
+        TaskStatus::RevisionRequired
     );
     assert_eq!(*review_calls.lock().unwrap(), 3);
     assert_eq!(*revision_calls.lock().unwrap(), 2);
@@ -2721,10 +2733,10 @@ fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
 }
 
 #[test]
-fn blocked_task_with_actionable_revise_review_can_revise() {
+fn blocked_task_with_actionable_revise_review_cannot_revise() {
     let (dir, db, task, _) = revision_fixture();
     db.update_task_status(&task, TaskStatus::Blocked).unwrap();
-    revise_with_worker_on_db(
+    let error = revise_with_worker_on_db(
         &task,
         "retry",
         &WritingWorker,
@@ -2733,7 +2745,8 @@ fn blocked_task_with_actionable_revise_review_can_revise() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("revision_required"));
 }
 
 #[test]
@@ -2992,14 +3005,14 @@ fn consumed_review_cannot_be_reused_twice() {
 }
 
 #[test]
-fn accept_preserves_review_history_and_closes_revision() {
+fn accept_rejects_revision_required_and_preserves_review_history() {
     let (dir, db, task, review_id) = revision_fixture();
-    seed_current_pass_review(&db, &task, dir.path());
-    accept_task(&db, &task, dir.path()).unwrap();
+    let error = accept_task(&db, &task, dir.path()).unwrap_err();
+    assert!(format!("{error:#}").contains("acceptance_ready"));
     assert!(db.get_agent_run(review_id).unwrap().is_some());
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Done
+        TaskStatus::RevisionRequired
     );
 }
 
@@ -3603,7 +3616,7 @@ fn accept_requires_a_current_pass_for_the_exact_worktree() {
     .unwrap();
 
     let missing = accept_task(&db, &task, dir.path()).unwrap_err();
-    assert!(format!("{missing:#}").contains("no completed review"));
+    assert!(format!("{missing:#}").contains("acceptance_ready"));
     seed_current_pass_review(&db, &task, dir.path());
 
     let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
@@ -3618,6 +3631,51 @@ fn accept_requires_a_current_pass_for_the_exact_worktree() {
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review
     );
+}
+
+#[test]
+fn revise_and_requeue_reject_review_and_acceptance_ready() {
+    let (dir, db, task) = setup();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let revise_review = revise_with_worker_on_db(
+        &task,
+        "",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap_err();
+    assert!(format!("{revise_review:#}").contains("revision_required"));
+    let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
+    assert!(app.requeue(&task).is_err());
+
+    seed_current_pass_review(&db, &task, dir.path());
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::AcceptanceReady
+    );
+    let revise_acceptance = revise_with_worker_on_db(
+        &task,
+        "",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap_err();
+    assert!(format!("{revise_acceptance:#}").contains("revision_required"));
+    assert!(app.requeue(&task).is_err());
 }
 
 #[test]
@@ -3814,7 +3872,7 @@ fn accept_merges_diverged_non_conflicting_main_and_aborts_conflicts_safely() {
     assert!(dir.path().join(path).exists());
     assert_eq!(
         db.get_task(&conflicting_task).unwrap().unwrap().status,
-        TaskStatus::Review
+        TaskStatus::AcceptanceReady
     );
 }
 

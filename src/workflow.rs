@@ -318,6 +318,19 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 next.stop_reason = None;
                 "external_task_ready_for_review"
             }
+            TaskStatus::AcceptanceReady => {
+                next.status = WorkflowStatus::AcceptanceReady;
+                next.stage = WorkflowStage::Acceptance;
+                next.resume_stage = Some(WorkflowStage::Acceptance);
+                next.stop_reason = Some("configured user acceptance required".into());
+                "external_task_ready_for_acceptance"
+            }
+            TaskStatus::RevisionRequired => {
+                next.status = WorkflowStatus::Running;
+                next.stage = WorkflowStage::Revision;
+                next.stop_reason = None;
+                "external_task_requires_revision"
+            }
             TaskStatus::Ready | TaskStatus::Backlog => {
                 next.status = WorkflowStatus::Running;
                 next.stage = WorkflowStage::Tasks;
@@ -746,6 +759,37 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             return Ok(NextTransition::deterministic(
                 next,
                 "review_task_selected",
+                None,
+            ));
+        }
+        if let Some(task) = tasks
+            .iter()
+            .find(|task| task.status == TaskStatus::RevisionRequired)
+        {
+            let mut next = current.clone();
+            next.stage = WorkflowStage::Revision;
+            next.current_task_id = Some(task.id.clone());
+            return Ok(NextTransition::deterministic(
+                next,
+                "revision_required_task_selected",
+                None,
+            ));
+        }
+        if let Some(task) = tasks
+            .iter()
+            .find(|task| task.status == TaskStatus::AcceptanceReady)
+        {
+            let mut next = current.clone();
+            next.stage = WorkflowStage::Acceptance;
+            next.current_task_id = Some(task.id.clone());
+            if current.policy.acceptance == AcceptancePolicy::User {
+                next.status = WorkflowStatus::AcceptanceReady;
+                next.resume_stage = Some(WorkflowStage::Acceptance);
+                next.stop_reason = Some("configured user acceptance required".into());
+            }
+            return Ok(NextTransition::deterministic(
+                next,
+                "acceptance_ready_task_selected",
                 None,
             ));
         }

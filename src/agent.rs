@@ -1575,9 +1575,9 @@ pub fn revise_with_worker_on_db_with_overrides(
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+    if task.status != TaskStatus::RevisionRequired {
         anyhow::bail!(
-            "task {} cannot be revised from terminal status {}",
+            "task {} can only be revised from revision_required (currently {})",
             task_id,
             task.status
         );
@@ -2114,9 +2114,9 @@ pub fn revise_manual(
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+    if task.status != TaskStatus::RevisionRequired {
         anyhow::bail!(
-            "task {} cannot be revised from terminal status {}",
+            "task {} can only be revised from revision_required (currently {})",
             task_id,
             task.status
         );
@@ -2438,9 +2438,9 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
 pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) -> Result<()> {
     let repo_path = repo_path.as_ref();
     let task = db.get_task(task_id)?.context("task not found")?;
-    if task.status != TaskStatus::Review {
+    if task.status != TaskStatus::AcceptanceReady {
         anyhow::bail!(
-            "task {} can only be accepted from review (currently {})",
+            "task {} can only be accepted from acceptance_ready (currently {})",
             task_id,
             task.status
         );
@@ -2449,7 +2449,7 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
         .list_agent_runs_for_task(task_id)?
         .into_iter()
         .find(|run| run.execution_class == "review" && run.status == "completed")
-        .context("task has no completed review")?;
+        .context("acceptance-ready task has no completed review")?;
     let review: crate::automated::ReviewResult = serde_json::from_str(
         review_run
             .output
@@ -2458,6 +2458,7 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
     )
     .context("completed review verdict is invalid")?;
     if !review.verdict.eq_ignore_ascii_case("pass") {
+        db.update_task_status(task_id, TaskStatus::Review)?;
         anyhow::bail!(
             "task {} requires a current PASS review before acceptance (latest verdict: {})",
             task_id,
@@ -2471,6 +2472,7 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
             run.id > review_run.id && run.execution_class != "review" && run.status == "completed"
         })
     {
+        db.update_task_status(task_id, TaskStatus::Review)?;
         anyhow::bail!("task {task_id} PASS review is stale after a newer implementation");
     }
     let (branch, path) = db
@@ -2484,10 +2486,12 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
     if current_changes.files.is_empty() {
         anyhow::bail!("task {task_id} has no meaningful changes to accept");
     }
-    let reviewed_changes = db
-        .get_change_evidence(review_run.id)?
-        .context("current PASS review has no change evidence")?;
+    let Some(reviewed_changes) = db.get_change_evidence(review_run.id)? else {
+        db.update_task_status(task_id, TaskStatus::Review)?;
+        anyhow::bail!("current PASS review has no change evidence");
+    };
     if reviewed_changes != current_changes {
+        db.update_task_status(task_id, TaskStatus::Review)?;
         anyhow::bail!("task {task_id} PASS review is stale because the implementation changed");
     }
     git::commit_worktree_changes(&worktree, task_id, &task.title)?;

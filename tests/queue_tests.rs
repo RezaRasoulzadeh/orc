@@ -896,6 +896,8 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
         blocked: vec![dispatch_entry("blocked")],
         active: vec![dispatch_entry("active")],
         review: vec![dispatch_entry("review")],
+        acceptance_ready: vec![dispatch_entry("acceptance-ready")],
+        revision_required: vec![dispatch_entry("revision-required")],
         backlog: vec![dispatch_entry("backlog")],
         done: vec![dispatch_entry("done")],
         cancelled: vec![dispatch_entry("cancelled")],
@@ -915,6 +917,8 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
             "ready-1",
             "ready-2",
             "review",
+            "acceptance-ready",
+            "revision-required",
             "active"
         ]
     );
@@ -927,6 +931,8 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
         "BACKLOG",
         "READY",
         "REVIEW",
+        "ACCEPTANCE READY",
+        "REVISION REQUIRED",
         "ACTIVE",
     ]
     .map(|section| concise.find(section).unwrap());
@@ -941,10 +947,45 @@ fn queue_display_sections_follow_requested_order_without_reordering_items() {
         "BACKLOG",
         "READY",
         "REVIEW",
+        "ACCEPTANCE READY",
+        "REVISION REQUIRED",
         "ACTIVE",
     ]
     .map(|section| explain.find(&format!("=== {section} ===")).unwrap());
     assert!(explain_sections.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn queue_distinguishes_review_acceptance_and_revision_states() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("orc.db");
+    let db = Database::init(&db_path).unwrap();
+    let project = db.create_project("review states").unwrap();
+    let review = db
+        .insert_task(project, "Review", "review", "developer", TaskPriority::Normal)
+        .unwrap();
+    let acceptance = db
+        .insert_task(project, "Accept", "accept", "developer", TaskPriority::Normal)
+        .unwrap();
+    let revision = db
+        .insert_task(project, "Revise", "revise", "developer", TaskPriority::Normal)
+        .unwrap();
+    db.update_task_status(&review, TaskStatus::Review).unwrap();
+    db.update_task_status(&acceptance, TaskStatus::AcceptanceReady)
+        .unwrap();
+    db.update_task_status(&revision, TaskStatus::RevisionRequired)
+        .unwrap();
+
+    drop(db);
+    let reopened = Database::open(&db_path).unwrap();
+    let report = compute_queue(&reopened).unwrap();
+    assert_eq!(report.review[0].task.id, review);
+    assert_eq!(report.acceptance_ready[0].task.id, acceptance);
+    assert_eq!(report.revision_required[0].task.id, revision);
+    let concise = report.format_concise();
+    assert!(concise.contains("REVIEW"));
+    assert!(concise.contains("ACCEPTANCE READY"));
+    assert!(concise.contains("REVISION REQUIRED"));
 }
 
 #[test]

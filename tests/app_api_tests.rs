@@ -214,6 +214,14 @@ fn workflow_state_is_project_scoped_and_read_only() {
 fn workflow_state_derives_each_task_lifecycle_position() {
     let cases = [
         (orc::task::TaskStatus::Review, "task_review"),
+        (
+            orc::task::TaskStatus::AcceptanceReady,
+            "task_acceptance_ready",
+        ),
+        (
+            orc::task::TaskStatus::RevisionRequired,
+            "task_revision_required",
+        ),
         (orc::task::TaskStatus::Active, "task_execution"),
         (orc::task::TaskStatus::Blocked, "blocked"),
         (orc::task::TaskStatus::Done, "complete"),
@@ -1347,6 +1355,8 @@ fn explicit_automated_review_still_invokes_backend_once() {
         )
         .unwrap();
     db.insert_agent(&reviewer()).unwrap();
+    db.update_task_status(&task, orc::task::TaskStatus::Review)
+        .unwrap();
     drop(db);
     let app = OrcApp::open(&db_path, directory.path()).unwrap();
     let backend = CountingReviewBackend(AtomicUsize::new(0));
@@ -1361,6 +1371,10 @@ fn explicit_automated_review_still_invokes_backend_once() {
         .unwrap();
 
     assert_eq!(result.verdict, "PASS");
+    assert_eq!(
+        app.task(&task).unwrap().unwrap().status,
+        orc::task::TaskStatus::AcceptanceReady
+    );
     assert_eq!(backend.calls(), 1);
     assert_eq!(app.review_history(&task).unwrap().len(), 1);
 }

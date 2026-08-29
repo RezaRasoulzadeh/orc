@@ -1431,6 +1431,13 @@ fn run_review_mode(
     project_review: bool,
     validation: Option<(&Path, &dyn ValidationRunner)>,
 ) -> Result<(i64, ReviewResult)> {
+    if !project_review && summary.task.status != crate::task::TaskStatus::Review {
+        bail!(
+            "task {} can only be reviewed from review (currently {})",
+            summary.task.id,
+            summary.task.status
+        );
+    }
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
     let run = db.create_project_action_run(
         db.get_project_id()?.context("no project found in DB")?,

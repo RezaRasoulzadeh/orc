@@ -162,6 +162,10 @@ fn cli_apply_creates_tasks_without_dispatching_them() {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(dir.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            dir.path().join(".orc/test.agents.db"),
+        )
         .args(["lead", "apply"])
         .output()
         .unwrap();

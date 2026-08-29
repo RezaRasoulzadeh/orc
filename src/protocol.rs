@@ -234,8 +234,8 @@ impl TaskRiskFactor {
 }
 
 impl TaskProposal {
-    const MAX_EXPECTED_CHANGES: usize = 8;
-    const MAX_ACCEPTANCE_CRITERIA: usize = 8;
+    pub const MAX_EXPECTED_CHANGES: usize = 8;
+    pub const MAX_ACCEPTANCE_CRITERIA: usize = 8;
 
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
@@ -338,6 +338,28 @@ impl TaskProposal {
                 self.local_id,
                 effort.as_str(),
                 minimum.as_str()
+            )
+        }
+        if self
+            .execution_hints
+            .class
+            .as_deref()
+            .is_some_and(|value| crate::execution::ExecutionClass::parse(value).is_err())
+        {
+            anyhow::bail!(
+                "task proposal '{}' has an invalid execution_hints.class",
+                self.local_id
+            )
+        }
+        if self
+            .execution_hints
+            .model
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!(
+                "task proposal '{}' execution_hints.model must not be empty",
+                self.local_id
             )
         }
         let unchanged: std::collections::HashSet<_> =

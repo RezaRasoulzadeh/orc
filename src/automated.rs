@@ -42,9 +42,13 @@ pub fn resolve_action(
     action: AgentAction,
     overrides: &ActionOverrides,
 ) -> Result<(AgentDefinition, ResolvedAction)> {
-    let agents = db.list_agents()?;
+    let agents = db.list_schedulable_agents()?;
     let agent = if let Some(id) = &overrides.agent_id {
-        let agent = registry::get_agent(db, id)?;
+        let agent = agents
+            .iter()
+            .find(|agent| agent.id == *id)
+            .cloned()
+            .with_context(|| format!("agent '{id}' is not referenced by the current project"))?;
         if agent.execution_mode != registry::AUTOMATED
             || !agent.is_selectable(&[])
             || !agent.supports_action(action)
@@ -266,9 +270,13 @@ fn schema(action: AgentAction) -> String {
             "local_id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},
             "role":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high","critical"]},
             "depends_on":string_array,"capabilities":string_array,
-            "scope_mode":{"type":["string","null"]},"context_files":string_array,"expected_changes":string_array,
-            "unchanged":string_array,"acceptance_criteria":string_array,"required_tests":string_array,
-            "validation":string_array,"execution_hints":{"type":"object","additionalProperties":false,"properties":{"class":{"type":["string","null"]},"model":{"type":["string","null"]},"effort":{"type":"string","enum":["low","medium","high"]},"effort_reason":{"type":"string","minLength":1,"maxLength":240}},"required":["effort","effort_reason"]},
+            "scope_mode":{"type":["string","null"],"enum":["focused","module","project",null]},"context_files":string_array,
+            "expected_changes":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_EXPECTED_CHANGES,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "unchanged":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "acceptance_criteria":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_ACCEPTANCE_CRITERIA,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "required_tests":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "validation":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "execution_hints":{"type":"object","additionalProperties":false,"properties":{"class":{"type":["string","null"],"enum":["coder","reviewer","architect","researcher","general",null]},"model":{"type":["string","null"],"minLength":1},"effort":{"type":"string","enum":["low","medium","high"]},"effort_reason":{"type":"string","minLength":1,"maxLength":240}},"required":["class","model","effort","effort_reason"]},
             "risk_factors":{"type":"array","items":{"type":"string","enum":["state_machine_lifecycle","persistence","restart_recovery","concurrency","cross_role_protocol","schema_data_flow","verification"]}}
         },
         "required":["local_id","title","objective","role","priority","depends_on","capabilities","scope_mode","context_files","expected_changes","unchanged","acceptance_criteria","required_tests","validation","execution_hints","risk_factors"]
@@ -300,7 +308,7 @@ fn schema(action: AgentAction) -> String {
     let value = match action {
         AgentAction::Review => serde_json::json!({
             "type":"object","additionalProperties":false,
-            "properties":{"verdict":{"type":"string"},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]},"blockers":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"prior_blocker_id":{"type":["string","null"]},"blocker_key":{"type":"string","minLength":1},"requirement_ref":{"type":"string"},"evidence":{"type":"string"},"severity":{"type":"string","enum":["low","medium","high","critical","unspecified"]},"acceptance_condition":{"type":"string"},"status":{"type":"string","enum":["new","unresolved","resolved","regression"]},"finding":{"type":"string"}},"required":["id","prior_blocker_id","blocker_key","requirement_ref","evidence","severity","acceptance_condition","status","finding"]}}},
+            "properties":{"verdict":{"type":"string","enum":["PASS","REVISE","REJECT"]},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]},"blockers":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"prior_blocker_id":{"type":["string","null"]},"blocker_key":{"type":"string","minLength":1},"requirement_ref":{"type":"string"},"evidence":{"type":"string"},"severity":{"type":"string","enum":["low","medium","high","critical","unspecified"]},"acceptance_condition":{"type":"string"},"status":{"type":"string","enum":["new","unresolved","resolved","regression"]},"finding":{"type":"string"}},"required":["id","prior_blocker_id","blocker_key","requirement_ref","evidence","severity","acceptance_condition","status","finding"]}}},
             "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback","blockers"]
         }),
         AgentAction::Plan => plan,
@@ -321,10 +329,14 @@ fn schema(action: AgentAction) -> String {
 
 /// Native provider schema for the structured result returned by a revision worker.
 pub fn revision_handoff_schema() -> String {
+    let completion: serde_json::Value =
+        serde_json::from_str(&crate::worker_protocol::plan_completion_schema())
+            .expect("canonical Worker completion schema is valid JSON");
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
+            "completion": completion,
             "claims": {
                 "type": "array",
                 "items": {
@@ -357,21 +369,9 @@ pub fn revision_handoff_schema() -> String {
                         "unresolved_risk"
                     ]
                 }
-            },
-            "worker_protocol": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "operations_performed": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": ["inspect", "create", "modify", "delete", "move", "command", "validate", "no_mutation"]}
-                    },
-                    "verification_passed": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["operations_performed", "verification_passed"]
             }
         },
-        "required": ["claims", "worker_protocol"]
+        "required": ["completion", "claims"]
     })
     .to_string()
 }
@@ -501,6 +501,10 @@ pub fn revision_worktree_fingerprint(changes: &crate::git::WorktreeChanges) -> S
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionHandoff {
+    /// Canonical Worker completion. Optional only to read provider results
+    /// persisted before the unified completion contract was introduced.
+    #[serde(default)]
+    pub completion: Option<crate::worker_protocol::ReportedPlanCompletion>,
     pub claims: Vec<RevisionClaim>,
 }
 
@@ -525,7 +529,10 @@ pub fn validate_revision_handoff_with_evidence(
     // Preserve the legacy one-shot revision path when the authoritative ledger
     // contains no active blocker work. There is no claim to validate in that case.
     if active_count == 0 {
-        return Ok(RevisionHandoff { claims: Vec::new() });
+        return Ok(RevisionHandoff {
+            completion: None,
+            claims: Vec::new(),
+        });
     }
     let mut handoff_value: serde_json::Value = serde_json::from_str(output)
         .context("revision worker did not return a structured handoff")?;
@@ -984,7 +991,7 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
     for failure in &contract.validation_failures {
         out.push_str(&format!("- {failure}\n"));
     }
-    out.push_str("\n### Required handoff\nReturn JSON {\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"evidence\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}],\"worker_protocol\":{\"operations_performed\":[\"modify\"],\"verification_passed\":[\"...\"]}} with exactly one claim for every active blocker ID. Resolved constraints require no claim. Report the actual operations and completed checks in worker_protocol. Keep changes focused.");
+    out.push_str("\n### Required handoff\nReturn JSON {\"completion\":{\"step_results\":[{\"step_id\":\"...\",\"operations_performed\":[\"modify\"],\"affected_files\":[],\"observed\":[],\"verification_passed\":[]}],\"summary\":\"...\"},\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"evidence\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. `completion` is the same checkpoint evidence contract used by initial implementation; claims add only revision blocker disposition. Keep changes focused.");
     out
 }
 
@@ -1104,6 +1111,7 @@ fn structured_blocker_key(
     }
 }
 
+#[cfg(test)]
 fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
     if reviews.is_empty() {
         return "No prior task reviews.".into();
@@ -1204,6 +1212,8 @@ fn invoke_action(
     prompt: &str,
 ) -> Result<ActionExecution> {
     announce_run(backend, run, resolved);
+    let invocation =
+        db.start_provider_invocation(run, resolved.action.as_str(), 1, resolved.reasoning_effort)?;
     db.update_agent_run_phase(run, "provider starting")?;
     backend.observe("provider starting");
     let progress = |activity: &str| {
@@ -1215,7 +1225,7 @@ fn invoke_action(
         backend.observe(activity);
     };
     let action_schema = schema(resolved.action);
-    backend.invoke_with_progress(
+    let execution = backend.invoke_with_progress(
         agent,
         resolved.action,
         prompt,
@@ -1225,7 +1235,17 @@ fn invoke_action(
             schema: &action_schema,
             callback: &progress,
         },
-    )
+    );
+    db.finish_provider_invocation(
+        invocation,
+        if execution.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        execution.as_ref().ok().and_then(|value| value.token_usage),
+    )?;
+    execution
 }
 
 fn fail_run(
@@ -1244,6 +1264,70 @@ fn parse_structured<T: for<'de> Deserialize<'de>>(output: &str, label: &str) -> 
     }
     serde_json::from_str(output)
         .with_context(|| format!("{label} returned malformed structured output"))
+}
+
+/// Build the compact, action-specific Planner contract. Full reports and Lead
+/// snapshots remain in SQLite and are referenced by their persisted IDs.
+pub fn planner_packet(db: &Database, request: &PlanningRequest) -> Result<serde_json::Value> {
+    let decision = db.pending_lead_decision_context()?;
+    Ok(serde_json::json!({
+        "protocol_version": request.protocol_version,
+        "kind": request.kind,
+        "objective": request.objective,
+        "project": request.project,
+        "engineering_contract": request.engineering_contract,
+        "constraints": request.constraints,
+        "non_goals": request.non_goals,
+        "deliverables": request.deliverables,
+        "definition_of_done": request.definition_of_done,
+        "role_boundaries": request.role_boundaries,
+        "planning_constraints": request.planning_constraints,
+        "approval_requirements": request.approval_requirements,
+        "current_state": request.current_state,
+        "discovery_snapshot": request.discovery_snapshot,
+        "source_lead_decision": decision,
+        "response_schema": request.response_schema,
+    }))
+}
+
+/// Build the compact Review contract without the duplicated
+/// `prior_reviews`/`automated_reviews` projections from the read model.
+pub fn review_packet(db: &Database, summary: &ReviewSummary) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "task": summary.task,
+        "task_contract": db.get_task_contract(&summary.task.id)?,
+        "implementation_run_id": summary.run.as_ref().map(|run| run.id),
+        "worktree_path": summary.worktree_path,
+        "changes": summary.changes,
+        "change_evidence": summary.change_evidence,
+        "validation_evidence": summary.validation_evidence,
+        "blocker_ledger": db.review_blocker_ledger(&summary.task.id)?,
+    }))
+}
+
+fn lead_packet(context: &LeadContext, message: &str) -> serde_json::Value {
+    let active_tasks = context
+        .tasks
+        .iter()
+        .filter(|task| !task.status.is_terminal())
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "request": message,
+        "project": {
+            "id": context.project_id,
+            "name": context.project_name,
+            "repository": context.repository_path,
+        },
+        "discovery": context.discovery,
+        "engineering_contract": context.engineering_contract,
+        "architecture": context.architecture,
+        "facts": context.facts,
+        "planning_state": context.state,
+        "active_tasks": active_tasks,
+        "dependencies": context.dependencies,
+        "queue": context.queue,
+        "pending_approvals": context.approvals.iter().filter(|item| !item.resolved).collect::<Vec<_>>(),
+    })
 }
 
 pub fn run_review(
@@ -1290,14 +1374,9 @@ fn run_review_mode(
     } else {
         TASK_REVIEW_INSTRUCTIONS
     };
-    let history = if project_review {
-        String::new()
-    } else {
-        review_resolution_ledger(&summary.prior_reviews)
-    };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the ledger, including every hexadecimal character; never shorten, regenerate, or retype an ID from memory. Do not accept or merge the task.\nCurrent blocker ledger (IDs are authoritative):\n{history}\nReview packet:\n{}",
-        serde_json::to_string(summary)?
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. Do not accept or merge the task.\nReview packet:\n{}",
+        serde_json::to_string(&review_packet(db, summary)?)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
     match execution {
@@ -1546,10 +1625,10 @@ pub fn run_plan(
     let (agent, resolved) = resolve_action(db, AgentAction::Plan, overrides)?;
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
+    let packet = planner_packet(db, request)?;
     let prompt = format!(
-        "Produce a plan for this request. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response. Persisted Lead context (read-only): {}\n{}",
-        serde_json::to_string(&db.pending_lead_decision_context()?)?,
-        serde_json::to_string(request)?
+        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response.\n{}",
+        serde_json::to_string(&packet)?
     );
     let planner_backend = PlannerActionBackend::new(backend);
     let execution = invoke_action(db, run, &planner_backend, &agent, &resolved, &prompt);
@@ -1600,8 +1679,8 @@ struct LeadActionAdapter<'a> {
 
 impl LeadBackend for LeadActionAdapter<'_> {
     fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String> {
-        let input =
-            serde_json::to_string(&(context, message)).map_err(|error| error.to_string())?;
+        let input = serde_json::to_string(&lead_packet(context, message))
+            .map_err(|error| error.to_string())?;
         let prompt = format!(
             "Act as Orc's project Lead. Return only JSON matching {{\"message\":string,\"proposals\":array,\"decision\":{{\"kind\":\"DIRECT_TASKS\"|\"PLAN_REQUIRED\"|\"USER_DECISION_REQUIRED\"|\"APPROVE\"|\"REVISE_PLAN\",\"details\":object}}}}. Return exactly one decision. Proposals are human-gated and must not be applied.\n{input}"
         );
@@ -1736,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_worker_schema_requires_worker_protocol_recursively() {
+    fn codex_revision_schema_layers_claims_on_canonical_completion() {
         let adapted =
             crate::worker::codex_compatible_output_schema(&revision_handoff_schema()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&adapted).unwrap();
@@ -1746,7 +1825,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == "worker_protocol")
+                .any(|value| value == "completion")
+        );
+        assert!(
+            value
+                .pointer("/properties/completion/properties/step_results")
+                .is_some()
         );
     }
 
@@ -2366,6 +2450,37 @@ mod tests {
                 output: output.to_string(),
             },
         )
+    }
+
+    #[test]
+    fn review_packet_size_is_independent_of_duplicated_read_model_history() {
+        let (db, mut summary, _) = review_fixture(serde_json::json!({}));
+        let baseline = serde_json::to_string(&review_packet(&db, &summary).unwrap()).unwrap();
+        let historical = crate::review::PriorReview {
+            run_id: 99,
+            agent: "historical-reviewer".into(),
+            status: "completed".into(),
+            started_at: "then".into(),
+            finished_at: Some("later".into()),
+            model: Some("historical-model".into()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            verdict: "REVISE".into(),
+            severity: Some("high".into()),
+            findings: vec!["duplicated historical context ".repeat(2_000)],
+            blocking_findings: vec!["duplicated historical blocker ".repeat(2_000)],
+            non_blocking_findings: Vec::new(),
+            revision_feedback: Some("old feedback ".repeat(2_000)),
+            validation_evidence: Some("old validation ".repeat(2_000)),
+            blockers: Vec::new(),
+        };
+        summary.prior_reviews = vec![historical.clone(); 20];
+        summary.automated_reviews = vec![historical; 20];
+        let packet = review_packet(&db, &summary).unwrap();
+        let expanded = serde_json::to_string(&packet).unwrap();
+        assert_eq!(expanded.len(), baseline.len());
+        assert!(packet.get("prior_reviews").is_none());
+        assert!(packet.get("automated_reviews").is_none());
+        assert!(packet.get("blocker_ledger").is_some());
     }
 
     #[test]

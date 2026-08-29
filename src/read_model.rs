@@ -280,7 +280,7 @@ pub fn dashboard(
         repository_path: repository_path.display().to_string(),
         queue: crate::queue::compute_queue(db)?,
         tasks: db.list_tasks()?,
-        agents: db.list_agents()?,
+        agents: db.list_schedulable_agents()?,
         approvals: db.list_approval_requests(project)?,
         recent_activity: db.list_lifecycle_events(activity_limit)?,
         running_agents: runs
@@ -334,7 +334,7 @@ pub fn run_details(
 
 pub fn agent_capacity(db: &crate::storage::Database) -> Result<AgentCapacity> {
     Ok(AgentCapacity {
-        agents: db.list_agents()?,
+        agents: db.list_schedulable_agents()?,
         busy: db.list_busy_agents()?,
         quota_reserve_percent: db.quota_reserve()?,
     })

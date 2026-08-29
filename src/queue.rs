@@ -319,7 +319,7 @@ impl QueueReport {
 
 pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
     let tasks = db.list_tasks()?;
-    let agents = db.list_agents()?;
+    let agents = db.list_schedulable_agents()?;
     let quota_reserve = db.quota_reserve()?;
     let busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
     let all_deps = db.list_all_dependencies()?;

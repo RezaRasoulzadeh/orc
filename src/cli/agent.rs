@@ -154,8 +154,8 @@ pub enum AgentCommand {
 }
 
 pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
-    let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
-    let app = OrcApp::open(db_path, ".")?;
+    let db = Database::open_global(db_path).map_err(|e| anyhow::anyhow!(e))?;
+    let app = OrcApp::open_global(db_path, ".")?;
     match command {
         AgentCommand::List => {
             print_agents(&db)?;

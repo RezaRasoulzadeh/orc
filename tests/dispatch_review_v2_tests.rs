@@ -181,42 +181,45 @@ impl Worker for ProtocolOperationWorker {
         _: &dyn Fn(&str),
     ) -> Result<WorkerExecution, String> {
         self.calls.lock().unwrap().push(step.id.clone());
-        let operation = if self.operation == "auto" {
-            orc::worker_protocol::operation_name(&step.operations[0])
-        } else {
-            self.operation
-        };
-        let intent = step.intent.as_str();
-        let target = intent.split_once(':').map(|(_, value)| value.trim());
-        match operation {
-            "create" => std::fs::write(cwd.join(target.unwrap()), "created\n")
-                .map_err(|error| error.to_string())?,
-            "modify" => std::fs::write(cwd.join(target.unwrap()), "modified\n")
-                .map_err(|error| error.to_string())?,
-            "delete" => std::fs::remove_file(cwd.join(target.unwrap()))
-                .map_err(|error| error.to_string())?,
-            "move" => {
-                let (source, destination) = target
-                    .unwrap()
-                    .split_once("->")
-                    .ok_or_else(|| "move intent has no destination".to_owned())?;
-                std::fs::rename(cwd.join(source.trim()), cwd.join(destination.trim()))
-                    .map_err(|error| error.to_string())?;
-            }
-            "command" => {
-                let status = Command::new("git")
-                    .arg("--version")
-                    .current_dir(cwd)
-                    .status()
-                    .map_err(|error| error.to_string())?;
-                if !status.success() {
-                    return Err("command failed".into());
+        let mut output = String::new();
+        for (planned, target) in step.operations.iter().zip(&step.operation_targets) {
+            let operation = if self.operation == "auto" {
+                orc::worker_protocol::operation_name(planned)
+            } else {
+                self.operation
+            };
+            match operation {
+                "create" => std::fs::write(cwd.join(target), "created\n")
+                    .map_err(|error| error.to_string())?,
+                "modify" => std::fs::write(cwd.join(target), "modified\n")
+                    .map_err(|error| error.to_string())?,
+                "delete" => {
+                    std::fs::remove_file(cwd.join(target)).map_err(|error| error.to_string())?
                 }
+                "move" => {
+                    let (source, destination) = target
+                        .split_once("->")
+                        .ok_or_else(|| "move intent has no destination".to_owned())?;
+                    std::fs::rename(cwd.join(source.trim()), cwd.join(destination.trim()))
+                        .map_err(|error| error.to_string())?;
+                }
+                "command" => {
+                    let status = Command::new("git")
+                        .arg("--version")
+                        .current_dir(cwd)
+                        .status()
+                        .map_err(|error| error.to_string())?;
+                    if !status.success() {
+                        return Err("command failed".into());
+                    }
+                }
+                "inspect" | "validate" | "no_mutation" => {}
+                other => return Err(format!("unknown test operation {other}")),
             }
-            "inspect" | "validate" | "no_mutation" => {}
-            other => return Err(format!("unknown test operation {other}")),
+            output.push_str(&format!(
+                "OPERATION PERFORMED: {operation}\nAFFECTED FILE: {target}\n"
+            ));
         }
-        let mut output = format!("OPERATION PERFORMED: {operation}\n");
         if self.verify {
             output.push_str("VERIFICATION PASSED: configured validation evidence\n");
         }
@@ -3235,7 +3238,7 @@ fn canonical_worker_operation_matrix_executes_and_reopens_structured_evidence() 
         )
         .unwrap();
         let persisted = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
-        assert_eq!(persisted.0.steps[0].intent, expected_change);
+        assert_eq!(persisted.0.steps[0].operation_targets.len(), 1);
         assert_eq!(persisted.1.unwrap().performed_operations.len(), 1);
         assert_eq!(
             db.get_task(&task).unwrap().unwrap().status,
@@ -3275,13 +3278,9 @@ fn six_step_plan_uses_one_initial_invocation_and_persists_checkpoint_lineage() {
     .unwrap();
 
     let (plan, execution) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
-    assert_eq!(plan.steps.len(), 6);
-    assert!(plan.steps[..5].iter().all(|step| {
-        step.acceptance_criteria.is_empty()
-            && step.required_tests.is_empty()
-            && step.verification.is_empty()
-    }));
-    assert_eq!(execution.unwrap().focused_verification.len(), 6);
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].operations.len(), 6);
+    assert_eq!(execution.unwrap().focused_verification.len(), 1);
     let invocations = db.provider_invocations(summary.run_id).unwrap();
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].purpose, "implementation");
@@ -3444,7 +3443,7 @@ fn worker_contract_ignores_stale_proposal_metadata_after_task_persistence() {
         plan.required_tests[0].text,
         "configured validation pipeline"
     );
-    assert_eq!(plan.verification, vec!["configured validation evidence"]);
+    assert!(plan.verification.is_empty());
     assert_eq!(plan.unchanged, vec!["untouched.txt"]);
 }
 
@@ -3556,10 +3555,7 @@ fn canonical_worker_follows_persisted_step_order() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    assert_eq!(
-        *worker.calls.lock().unwrap(),
-        vec!["execute-step-1", "execute-step-2"]
-    );
+    assert_eq!(*worker.calls.lock().unwrap(), vec!["implementation"]);
     let (_, execution) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
     assert_eq!(
         execution.unwrap().performed_operations,

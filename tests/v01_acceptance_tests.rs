@@ -8,6 +8,7 @@ use tempfile::TempDir;
 fn run_orc(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(root)
+        .env("ORC_GLOBAL_REGISTRY_PATH", root.join(".orc/test.agents.db"))
         .args(args)
         .output()
         .expect("run orc")

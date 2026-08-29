@@ -167,6 +167,10 @@ fn manual_cli_onboarding_lists_inspection_and_can_be_exported() {
     let directory = tempdir().unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.path().join(".orc/test.agents.db"),
+        )
         .arg("init")
         .output()
         .unwrap();
@@ -174,6 +178,10 @@ fn manual_cli_onboarding_lists_inspection_and_can_be_exported() {
 
     let onboard = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.path().join(".orc/test.agents.db"),
+        )
         .args([
             "agent",
             "onboard",
@@ -205,6 +213,10 @@ fn manual_cli_onboarding_lists_inspection_and_can_be_exported() {
 
     let list = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.path().join(".orc/test.agents.db"),
+        )
         .args(["agents"])
         .output()
         .unwrap();
@@ -216,6 +228,10 @@ fn manual_cli_onboarding_lists_inspection_and_can_be_exported() {
 
     let export = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.path().join(".orc/test.agents.db"),
+        )
         .args(["agent", "export", "manual-agent"])
         .output()
         .unwrap();

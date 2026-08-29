@@ -134,12 +134,10 @@ fn reports_missing_contract_database_unsupported_backend_and_profile() {
     let report = doctor::inspect(&root, &runner);
     assert!(report.project.iter().any(|check| check.name == "database" && matches!(check.status, CheckStatus::Failed(_))));
 
-    Database::init(root.join(".orc/orc.db"))
-        .unwrap()
-        .insert_agent(&agent(
-            "codex",
-            Some(root.join("missing").display().to_string()),
-        ))
+    let reopened = Database::init(root.join(".orc/orc.db")).unwrap();
+    assert!(reopened.get_agent("agent").unwrap().is_some());
+    reopened
+        .set_agent_profile_path("agent", &root.join("missing").display().to_string())
         .unwrap();
     let report = doctor::inspect(&root, &runner);
     assert!(matches!(

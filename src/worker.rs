@@ -405,9 +405,9 @@ pub trait Worker: Send + Sync {
         }
     }
 
-    /// Execute exactly one persisted PREPARE step.  This is the execution seam
-    /// for the provider-independent protocol; callers must invoke it in plan
-    /// order and may not collapse a plan into one provider request.
+    /// Execute one focused repair checkpoint after the canonical single plan
+    /// invocation. Initial implementation and revision never call this once
+    /// per internal checkpoint.
     fn execute_planned_step(
         &self,
         step: &crate::worker_protocol::PlannedStep,

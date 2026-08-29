@@ -242,7 +242,13 @@ pub struct ReportedPlanCompletion {
 }
 
 pub fn parse_plan_completion(output: &str) -> anyhow::Result<ReportedPlanCompletion> {
-    serde_json::from_str(output)
+    let value: serde_json::Value = serde_json::from_str(output)
+        .map_err(|error| anyhow::anyhow!("invalid structured Worker completion: {error}"))?;
+    // Revision handoffs layer blocker claims around the same canonical
+    // completion envelope used by initial implementation. Direct parsing is
+    // retained for initial Worker results and persisted legacy records.
+    let completion = value.get("completion").unwrap_or(&value).clone();
+    serde_json::from_value(completion)
         .map_err(|error| anyhow::anyhow!("invalid structured Worker completion: {error}"))
 }
 
@@ -421,13 +427,12 @@ impl WorkerPlan {
             }
         }
         let unchanged: BTreeSet<_> = self.unchanged.iter().map(|v| v.trim()).collect();
-        if self.verification.is_empty()
-            || self
-                .verification
-                .iter()
-                .any(|value| value.trim().is_empty())
+        if self
+            .verification
+            .iter()
+            .any(|value| value.trim().is_empty())
         {
-            anyhow::bail!("PREPARE must declare concrete verification evidence");
+            anyhow::bail!("PREPARE verification declarations must not be empty");
         }
         let resolved: BTreeSet<_> = self
             .resolved_review_blockers

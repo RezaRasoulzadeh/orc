@@ -120,6 +120,9 @@ pub fn ensure_default_lead(db: &Database) -> Result<()> {
             actions: vec![crate::registry::AgentAction::Lead],
         })?;
     }
+    if let Some(project_id) = db.get_project_id()? {
+        db.reference_global_agent(project_id, "codex-main")?;
+    }
     db.set_lead_provider_config(&crate::lead::LeadProviderConfig {
         agent_id: "codex-main".into(),
         model: None,

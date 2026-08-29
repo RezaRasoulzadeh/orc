@@ -323,6 +323,7 @@ printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT
     let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
     let output = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(&nested)
+        .env("ORC_GLOBAL_REGISTRY_PATH", repo.join(".orc/test.agents.db"))
         .env("PATH", path)
         .args(["adopt", "assess this existing repository"])
         .output()

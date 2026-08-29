@@ -93,7 +93,7 @@ impl fmt::Display for TaskScopeMode {
 }
 
 impl Task {
-    pub const DEFAULT_REQUIRED_CAPABILITIES: [&'static str; 2] = ["code", "terminal"];
+    pub const DEFAULT_REQUIRED_CAPABILITIES: [&'static str; 2] = ["code", "command_execution"];
     pub const DEFAULT_REASONING_EFFORT: crate::registry::ReasoningEffort =
         crate::registry::ReasoningEffort::Low;
     pub const DEFAULT_EFFORT_REASON: &'static str =
@@ -101,11 +101,14 @@ impl Task {
 
     pub fn required_capabilities(&self) -> Vec<String> {
         if !self.required_capabilities.is_empty() {
-            return self.required_capabilities.clone();
+            return crate::registry::normalize_capability_names(&self.required_capabilities);
         }
 
         match self.role.as_str() {
-            "developer" => vec!["code".into(), "terminal".into()],
+            "developer" => Self::DEFAULT_REQUIRED_CAPABILITIES
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             "reviewer" => vec!["review".into()],
             "architect" => vec!["architecture".into()],
             "researcher" => vec!["research".into()],
@@ -183,10 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn developer_defaults_to_code_and_terminal() {
+    fn developer_defaults_to_canonical_code_and_command_execution() {
         assert_eq!(
             task("developer", vec![]).required_capabilities(),
-            vec!["code", "terminal"]
+            vec!["code", "command_execution"]
         );
     }
 

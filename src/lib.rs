@@ -29,6 +29,7 @@ pub mod task;
 pub mod validation;
 pub mod worker;
 pub mod worker_protocol;
+pub mod workflow;
 
 // Re-export useful types for tests
 pub use protocol::*;

@@ -15,6 +15,11 @@ pub struct ProjectDiscoverySnapshot {
     pub architecture: ArchitectureSnapshot,
     pub technology_stack: Vec<String>,
     pub important_files: Vec<String>,
+    pub manifests: Vec<String>,
+    pub test_locations: Vec<String>,
+    pub architecture_boundaries: Vec<String>,
+    pub unknowns_and_risks: Vec<String>,
+    pub fingerprint: String,
     pub validation_commands: Vec<String>,
     pub task_state: crate::protocol::PlanningProjectState,
 }
@@ -40,6 +45,86 @@ pub struct ArchitectureSnapshot {
     pub source_directories: Vec<String>,
 }
 
+const MAX_DISCOVERY_FILES: usize = 4_000;
+const IGNORED_DIRECTORIES: &[&str] = &[".git", "target", "node_modules", "dist", "build"];
+
+fn repository_files(root: &Path) -> Result<(Vec<String>, bool)> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    let mut truncated = false;
+    while let Some(directory) = pending.pop() {
+        let mut entries = std::fs::read_dir(&directory)
+            .with_context(|| format!("failed to inspect {}", directory.display()))?
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name();
+                if IGNORED_DIRECTORIES.iter().any(|ignored| name == *ignored)
+                    || relative.starts_with(".orc/worktrees")
+                {
+                    continue;
+                }
+                pending.push(path);
+            } else if entry.file_type()?.is_file() {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if crate::git::is_runtime_artifact(&relative) {
+                    continue;
+                }
+                files.push(relative);
+                if files.len() == MAX_DISCOVERY_FILES {
+                    truncated = true;
+                    pending.clear();
+                    break;
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok((files, truncated))
+}
+
+fn snapshot_fingerprint(
+    root: &Path,
+    commit: Option<&str>,
+    changed: &[crate::git::ChangedFile],
+    files: &[String],
+) -> String {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in commit
+        .into_iter()
+        .chain(
+            changed
+                .iter()
+                .flat_map(|item| [item.status.as_str(), item.path.as_str()]),
+        )
+        .chain(files.iter().map(String::as_str))
+        .flat_map(str::bytes)
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+    }
+    // The commit identifies tracked content. Metadata for changed/untracked
+    // paths invalidates a cached snapshot without reading the whole repository
+    // into memory or provider context.
+    for item in changed {
+        if let Ok(metadata) = std::fs::metadata(root.join(&item.path)) {
+            for byte in metadata.len().to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+            }
+            if let Ok(modified) = metadata.modified()
+                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                for byte in duration.as_nanos().to_le_bytes() {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+                }
+            }
+        }
+    }
+    format!("discovery-{hash:016x}")
+}
+
 /// Collect the current repository and persisted project state without writing
 /// files, changing the database, or invoking validation commands.
 pub fn build_snapshot(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapshot> {
@@ -54,6 +139,7 @@ pub fn build_snapshot(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapsho
         .or_else(|| root.file_name().and_then(|v| v.to_str()).map(str::to_owned))
         .context("repository root has no usable project name")?;
     let contract = std::fs::read_to_string(root.join(".orc/engineering.md")).ok();
+    let (files, truncated) = repository_files(&root)?;
     let mut stack = Vec::new();
     if root.join("Cargo.toml").exists() {
         stack.push("Rust".into());
@@ -61,34 +147,96 @@ pub fn build_snapshot(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapsho
     if root.join("package.json").exists() {
         stack.push("JavaScript/TypeScript".into());
     }
-    let important_files = [
-        "README.md",
+    let manifest_names = [
         "Cargo.toml",
         "package.json",
-        ".orc/engineering.md",
-        ".orc/validation.toml",
-        ".orc/validation.json",
-    ]
-    .into_iter()
-    .filter(|file| root.join(file).is_file())
-    .map(str::to_owned)
-    .collect();
-    let entry_points = [
-        "src/main.rs",
-        "src/lib.rs",
-        "src/App.vue",
-        "index.js",
-        "index.ts",
-    ]
-    .into_iter()
-    .filter(|file| root.join(file).is_file())
-    .map(str::to_owned)
-    .collect();
-    let source_directories = ["src", "tests", "scripts"]
-        .into_iter()
-        .filter(|dir| root.join(dir).is_dir())
-        .map(str::to_owned)
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "Makefile",
+    ];
+    let manifests = files
+        .iter()
+        .filter(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|name| manifest_names.contains(&name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for manifest in &manifests {
+        match manifest.rsplit('/').next().unwrap_or_default() {
+            "pyproject.toml" => {
+                if !stack.iter().any(|item| item == "Python") {
+                    stack.push("Python".into())
+                }
+            }
+            "go.mod" => stack.push("Go".into()),
+            "pom.xml" | "build.gradle" => stack.push("Java/JVM".into()),
+            _ => {}
+        }
+    }
+    stack.sort();
+    stack.dedup();
+    let important_files = files
+        .iter()
+        .filter(|path| {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            manifests.contains(path)
+                || matches!(
+                    name,
+                    "README.md"
+                        | "ENGINEERING.md"
+                        | "AGENTS.md"
+                        | "validation.toml"
+                        | "validation.json"
+                )
+        })
+        .take(160)
+        .cloned()
         .collect();
+    let entry_points = files
+        .iter()
+        .filter(|path| {
+            matches!(
+                path.as_str(),
+                "src/main.rs" | "src/lib.rs" | "src/App.vue" | "index.js" | "index.ts"
+            ) || path.ends_with("/main.rs")
+                || path.ends_with("/lib.rs")
+        })
+        .take(80)
+        .cloned()
+        .collect();
+    let test_locations = files
+        .iter()
+        .filter(|path| {
+            path.starts_with("tests/")
+                || path.contains("/tests/")
+                || path.ends_with("_test.rs")
+                || path.ends_with(".test.ts")
+                || path.ends_with(".test.js")
+        })
+        .take(160)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut source_directories = files
+        .iter()
+        .filter_map(|path| path.split_once('/').map(|(head, _)| head.to_owned()))
+        .filter(|head| {
+            matches!(
+                head.as_str(),
+                "src" | "src-tauri" | "tests" | "scripts" | "crates" | "packages" | "apps"
+            )
+        })
+        .collect::<Vec<_>>();
+    source_directories.sort();
+    source_directories.dedup();
+    let architecture_boundaries = source_directories
+        .iter()
+        .filter(|path| !matches!(path.as_str(), "tests" | "scripts"))
+        .cloned()
+        .collect::<Vec<_>>();
     let description = root
         .join("Cargo.toml")
         .is_file()
@@ -107,12 +255,28 @@ pub fn build_snapshot(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapsho
         })
         .flatten();
     let (branch, commit) = crate::git::repository_identity(&root)?;
+    let changed_files = crate::git::changed_files(&root)?;
+    let fingerprint = snapshot_fingerprint(&root, commit.as_deref(), &changed_files, &files);
+    let mut unknowns_and_risks = Vec::new();
+    if truncated {
+        unknowns_and_risks.push(format!(
+            "repository inventory exceeded the bounded {MAX_DISCOVERY_FILES}-file discovery limit"
+        ));
+    }
+    if changed_files.is_empty() {
+        unknowns_and_risks.push("no uncommitted repository changes observed".into());
+    } else {
+        unknowns_and_risks.push(format!(
+            "{} uncommitted path(s) may affect planning",
+            changed_files.len()
+        ));
+    }
     Ok(ProjectDiscoverySnapshot {
         repository: RepositorySnapshot {
             root: root.display().to_string(),
             branch,
             commit,
-            changed_files: crate::git::changed_files(&root)?,
+            changed_files,
         },
         project: ProjectMetadata {
             name,
@@ -125,9 +289,46 @@ pub fn build_snapshot(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapsho
         },
         technology_stack: stack,
         important_files,
+        manifests,
+        test_locations,
+        architecture_boundaries,
+        unknowns_and_risks,
+        fingerprint,
         validation_commands: crate::validation::ValidationConfig::load(&root)?.commands,
         task_state,
     })
+}
+
+/// Persist the reusable discovery artifact at the explicit orchestration
+/// boundary. The underlying repository inspection remains read-only.
+pub fn discover_and_persist(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapshot> {
+    let root = repository_root(start)?;
+    let snapshot = build_snapshot(&root)?;
+    let db = Database::open(root.join(".orc/orc.db"))?;
+    let project_id = db.get_project_id()?.context("no adopted project found")?;
+    db.store_discovery_snapshot(project_id, &snapshot)?;
+    Ok(snapshot)
+}
+
+/// Return the persisted artifact when the repository fingerprint still
+/// matches; otherwise return a fresh read-only snapshot without silently
+/// writing project state.
+pub fn snapshot_for_provider(start: impl AsRef<Path>) -> Result<ProjectDiscoverySnapshot> {
+    let root = repository_root(start)?;
+    let current = build_snapshot(&root)?;
+    let db = Database::open(root.join(".orc/orc.db"))?;
+    let project_id = db.get_project_id()?.context("no adopted project found")?;
+    let mut snapshot = db
+        .load_discovery_snapshot(project_id, &current.fingerprint)?
+        .unwrap_or(current);
+    // The engineering contract is already a first-class field in Lead and
+    // Planner packets. Keep it in the persisted full snapshot, but never nest
+    // a second full copy into provider context.
+    snapshot.project.engineering_contract = None;
+    snapshot.repository.changed_files.truncate(200);
+    snapshot.important_files.truncate(120);
+    snapshot.test_locations.truncate(120);
+    Ok(snapshot)
 }
 
 pub fn build_request(start: impl AsRef<Path>) -> Result<ProjectDiscoveryRequest> {

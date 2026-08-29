@@ -33,7 +33,7 @@ pub fn run(command: RunCommand, db_path: &str) -> Result<()> {
                     output
                 }
             };
-            let task_id = OrcApp::open(db_path, ".")?.submit_manual_run(run_id, &output)?;
+            let task_id = OrcApp::open_global(db_path, ".")?.submit_manual_run(run_id, &output)?;
             println!(
                 "Run {} completed; task {} moved to review.",
                 run_id, task_id
@@ -51,7 +51,7 @@ pub fn run(command: RunCommand, db_path: &str) -> Result<()> {
                 })?
             };
 
-            match OrcApp::open(db_path, ".")?.submit_patch(run_id, &patch_content) {
+            match OrcApp::open_global(db_path, ".")?.submit_patch(run_id, &patch_content) {
                 Ok(outcome) => {
                     println!("Run {}", outcome.run_id);
                     println!("Patch: valid");
@@ -72,7 +72,7 @@ pub fn run(command: RunCommand, db_path: &str) -> Result<()> {
             }
         }
         RunCommand::Fail { run_id, reason } => {
-            let task_id = OrcApp::open(db_path, ".")?
+            let task_id = OrcApp::open_global(db_path, ".")?
                 .fail_manual_run(run_id, reason.as_deref().unwrap_or("manual run failed"))?;
             println!("Run {} failed; task {} moved to blocked.", run_id, task_id);
         }

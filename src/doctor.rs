@@ -115,6 +115,8 @@ pub fn inspect(root: impl AsRef<Path>, runner: &dyn HealthCommandRunner) -> Doct
 
     let db_path = root.join(".orc/orc.db");
     let database = Database::open(&db_path).and_then(|db| {
+        // Doctor audits the authoritative global registry itself, including
+        // agents not currently referenced by this project.
         let agents = db.list_agents()?;
         let active_tasks = db
             .list_tasks()?

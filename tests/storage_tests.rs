@@ -210,7 +210,7 @@ fn plan_persistence_round_trip_lineage_and_atomic_provenance_validation() {
 }
 
 #[test]
-fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reopen() {
+fn applied_plan_persists_complete_execution_contract_after_reopen() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("orc.db");
     let response = PlanResponse {
@@ -235,8 +235,8 @@ fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reop
             required_tests: vec!["storage test".into()],
             validation: vec!["cargo test".into()],
             execution_hints: ExecutionHints {
-                class: None,
-                model: None,
+                class: Some("coder".into()),
+                model: Some("task-selected-model".into()),
                 effort: Some("medium".into()),
                 effort_reason: Some("schema and data-flow verification".into()),
             },
@@ -249,6 +249,15 @@ fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reop
     let task_id = mapping["contract"].clone();
     let task = db.get_task(&task_id).unwrap().unwrap();
     assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        db.get_task_execution_hints(&task_id).unwrap().unwrap(),
+        ExecutionHints {
+            class: Some("coder".into()),
+            model: Some("task-selected-model".into()),
+            effort: Some("medium".into()),
+            effort_reason: Some("schema and data-flow verification".into()),
+        }
+    );
     assert_eq!(
         task.effort_reason.as_deref(),
         Some("schema and data-flow verification")
@@ -270,6 +279,18 @@ fn applied_plan_persists_effort_reason_and_risks_in_task_and_contract_after_reop
     let reopened = Database::open(&path).unwrap();
     let task = reopened.get_task(&task_id).unwrap().unwrap();
     assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        reopened
+            .get_task_execution_hints(&task_id)
+            .unwrap()
+            .unwrap(),
+        ExecutionHints {
+            class: Some("coder".into()),
+            model: Some("task-selected-model".into()),
+            effort: Some("medium".into()),
+            effort_reason: Some("schema and data-flow verification".into()),
+        }
+    );
     assert_eq!(
         reopened
             .get_task_proposal_metadata(&task_id)

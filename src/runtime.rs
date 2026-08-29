@@ -107,13 +107,33 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn open(db_path: impl AsRef<Path>, repo_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(db_path, repo_path, None::<PathBuf>)
+    }
+
+    pub fn open_with_registry(
+        db_path: impl AsRef<Path>,
+        repo_path: impl AsRef<Path>,
+        registry_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            db_path,
+            repo_path,
+            Some(registry_path.as_ref().to_path_buf()),
+        )
+    }
+
+    fn open_inner(
+        db_path: impl AsRef<Path>,
+        repo_path: impl AsRef<Path>,
+        registry_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let (requests, incoming) = mpsc::channel();
         let (outgoing, events) = mpsc::channel();
         let db_path = db_path.as_ref().to_path_buf();
         let repo_path = repo_path.as_ref().to_path_buf();
         thread::Builder::new()
             .name("orc-app-owner".into())
-            .spawn(move || owner(incoming, outgoing, db_path, repo_path))?;
+            .spawn(move || owner(incoming, outgoing, db_path, repo_path, registry_path))?;
         Ok(Self {
             requests,
             events: std::sync::Mutex::new(events),
@@ -155,12 +175,24 @@ fn owner(
     outgoing: mpsc::Sender<RuntimeEvent>,
     db: PathBuf,
     repo: PathBuf,
+    registry: Option<PathBuf>,
 ) {
-    let app = match OrcApp::open(&db, &repo) {
+    let open = || match registry.as_deref() {
+        Some(registry) => OrcApp::open_with_registry(&db, &repo, registry),
+        None => OrcApp::open_global(&db, &repo),
+    };
+    let app = match open() {
         Ok(app) => app,
         Err(_) => match (|| -> anyhow::Result<OrcApp> {
-            Database::init(&db)?;
-            OrcApp::open(&db, &repo)
+            match registry.as_deref() {
+                Some(registry) => {
+                    Database::init_with_registry(&db, registry)?;
+                }
+                None => {
+                    Database::init_global(&db)?;
+                }
+            }
+            open()
         })() {
             Ok(app) => app,
             Err(error) => {
@@ -359,7 +391,12 @@ mod tests {
         )
         .unwrap();
         let database = directory.path().join("orc.db");
-        let runtime = Runtime::open(&database, directory.path()).unwrap();
+        let runtime = Runtime::open_with_registry(
+            &database,
+            directory.path(),
+            directory.path().join("orc.agents.db"),
+        )
+        .unwrap();
         (directory, runtime)
     }
 

@@ -76,6 +76,7 @@ fn patches_by_path(changes: &WorktreeChanges) -> std::collections::BTreeMap<&str
 
 pub fn is_runtime_artifact(path: &str) -> bool {
     RUNTIME_ARTIFACTS.contains(&path)
+        || (path.starts_with(".orc/") && path.contains(".agents.db"))
         || path == ".orc/worktrees"
         || path.starts_with(".orc/worktrees/")
 }
@@ -195,6 +196,7 @@ pub fn inspect_worktree(
         ":(exclude).orc/orc.db".to_owned(),
         ":(exclude).orc/orc.db-wal".to_owned(),
         ":(exclude).orc/orc.db-shm".to_owned(),
+        ":(exclude).orc/*.agents.db*".to_owned(),
         ":(exclude).orc/worktrees/**".to_owned(),
     ];
     let mut diff = git_output_owned(worktree, &diff_args)?;
@@ -209,6 +211,7 @@ pub fn inspect_worktree(
         ":(exclude).orc/orc.db".to_owned(),
         ":(exclude).orc/orc.db-wal".to_owned(),
         ":(exclude).orc/orc.db-shm".to_owned(),
+        ":(exclude).orc/*.agents.db*".to_owned(),
         ":(exclude).orc/worktrees/**".to_owned(),
     ];
     let mut files = parse_name_status(&git_output_owned(worktree, &names_args)?);
@@ -237,6 +240,7 @@ pub fn inspect_worktree(
             ":(exclude).orc/orc.db".to_owned(),
             ":(exclude).orc/orc.db-wal".to_owned(),
             ":(exclude).orc/orc.db-shm".to_owned(),
+            ":(exclude).orc/*.agents.db*".to_owned(),
             ":(exclude).orc/worktrees/**".to_owned(),
         ];
         let mut text = git_output_owned(worktree, &stat_args)?;
@@ -577,6 +581,7 @@ pub fn commit_worktree_changes(
             ":(exclude).orc/orc.db",
             ":(exclude).orc/orc.db-wal",
             ":(exclude).orc/orc.db-shm",
+            ":(exclude).orc/*.agents.db*",
             ":(exclude).orc/worktrees/**",
         ],
     )?;

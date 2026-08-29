@@ -15,6 +15,7 @@ fn plan_run_cli_success_persists_and_terminates_without_repository_or_task_mutat
     assert!(
         Command::new(env!("CARGO_BIN_EXE_orc"))
             .current_dir(root)
+            .env("ORC_GLOBAL_REGISTRY_PATH", root.join(".orc/test.agents.db"))
             .arg("init")
             .output()
             .unwrap()
@@ -25,6 +26,7 @@ fn plan_run_cli_success_persists_and_terminates_without_repository_or_task_mutat
     fs::write(&profile, "profile").unwrap();
     let add = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(root)
+        .env("ORC_GLOBAL_REGISTRY_PATH", root.join(".orc/test.agents.db"))
         .args([
             "agent",
             "add",
@@ -75,6 +77,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
     let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
     let output = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(root)
+        .env("ORC_GLOBAL_REGISTRY_PATH", root.join(".orc/test.agents.db"))
         .env("PATH", path)
         .env("ORC_PLANNER_CALLS", &count)
         .args(["plan", "run", "--agent", "planner"])
@@ -102,6 +105,10 @@ fn plan_run_cli_rejects_missing_actionable_plan_decision_and_terminates() {
     let dir = tempdir().unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(dir.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            dir.path().join(".orc/test.agents.db"),
+        )
         .arg("init")
         .output()
         .unwrap();
@@ -124,6 +131,10 @@ fn plan_run_cli_rejects_missing_actionable_plan_decision_and_terminates() {
     drop(db);
     let result = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(dir.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            dir.path().join(".orc/test.agents.db"),
+        )
         .args(["plan", "run"])
         .output()
         .unwrap();

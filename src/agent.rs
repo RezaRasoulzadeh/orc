@@ -25,13 +25,10 @@ fn worker_observations(
     verification: &[String],
     allow_aggregate_validation: bool,
 ) -> Vec<String> {
-    let mut observations = output
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    // Provider output is retained on the run as reported evidence, but is not
+    // promoted into Orc-observed evidence. Only independent worktree and
+    // validation observations enter this collection.
+    let mut observations = Vec::new();
     let files = worktree
         .files
         .iter()
@@ -164,15 +161,15 @@ fn requirement_coverage(plan: &crate::worker_protocol::WorkerPlan) -> Vec<(Strin
         .collect()
 }
 
-/// Build the ordered execution units from the authoritative contract.  Each
-/// expected-change entry is a distinct unit so the persisted plan, backend
-/// calls, and evidence have the same operation boundaries.
+/// Build one semantic implementation checkpoint from the authoritative task
+/// contract. `expected_changes` describes scope; it is not an execution plan
+/// and must never multiply provider calls or fabricate checkpoint boundaries.
 fn plan_steps(
     expected_changes: &[String],
-    _acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
-    _required_tests: &[crate::worker_protocol::WorkerRequirement],
-    _active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
-    _verification: &[String],
+    acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
+    required_tests: &[crate::worker_protocol::WorkerRequirement],
+    active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
+    verification: &[String],
     intent: &str,
 ) -> Vec<crate::worker_protocol::PlannedStep> {
     let entries = if expected_changes.is_empty() {
@@ -180,10 +177,9 @@ fn plan_steps(
     } else {
         expected_changes.to_vec()
     };
-    entries
+    let (operations, operation_targets) = entries
         .into_iter()
-        .enumerate()
-        .map(|(index, entry)| {
+        .map(|entry| {
             let operation = crate::worker_protocol::operation_for_expected_change(&entry);
             let target = entry.split_once(':').map_or_else(
                 || {
@@ -195,23 +191,26 @@ fn plan_steps(
                 },
                 |(_, target)| target.trim().to_owned(),
             );
-            crate::worker_protocol::PlannedStep {
-                id: format!("execute-step-{}", index + 1),
-                objective: intent.to_owned(),
-                intent: if entry == "no-mutation" {
-                    intent.to_owned()
-                } else {
-                    entry
-                },
-                operations: vec![operation],
-                operation_targets: vec![target],
-                acceptance_criteria: Vec::new(),
-                required_tests: Vec::new(),
-                active_review_blockers: Vec::new(),
-                verification: Vec::new(),
-            }
+            (operation, target)
         })
-        .collect()
+        .unzip();
+    vec![crate::worker_protocol::PlannedStep {
+        id: "implementation".into(),
+        objective: intent.to_owned(),
+        intent: intent.to_owned(),
+        operations,
+        operation_targets,
+        acceptance_criteria: acceptance_criteria
+            .iter()
+            .map(|item| item.id.clone())
+            .collect(),
+        required_tests: required_tests.iter().map(|item| item.id.clone()).collect(),
+        active_review_blockers: active_review_blockers
+            .iter()
+            .map(|item| item.id.clone())
+            .collect(),
+        verification: verification.to_vec(),
+    }]
 }
 
 fn worker_requirements(
@@ -344,6 +343,9 @@ fn worker_task_contract(
     let task_contract = db
         .get_task_contract(&task.id)?
         .unwrap_or_else(|| crate::task::TaskContract::defaults(&task.objective));
+    let execution_hints = db
+        .get_task_execution_hints(&task.id)?
+        .context("task disappeared while loading execution hints")?;
     let proposal = crate::protocol::TaskProposal {
         local_id: task.id.clone(),
         title: task.title.clone(),
@@ -361,8 +363,7 @@ fn worker_task_contract(
         validation: task_contract.validation,
         execution_hints: crate::protocol::ExecutionHints {
             effort: Some(effort.as_str().to_owned()),
-            effort_reason: task.effort_reason.clone(),
-            ..Default::default()
+            ..execution_hints
         },
         risk_factors: task.risk_factors.clone(),
     };
@@ -592,9 +593,9 @@ fn persist_validation_attempt(
     Ok(())
 }
 
-fn repair_prompt(diff: &str, previous: &str, diagnostics: &str, attempt: usize) -> String {
+fn repair_prompt(diff: &str, diagnostics: &str, attempt: usize) -> String {
     format!(
-        "## Focused automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree and fix only the exact failed command/requirement. Do not reset, clean, recreate, or replace the worktree.\n\n## Current worktree diff\n\n{diff}\n\n## Previous worker result\n\n{previous}\n\n## Exact failed command and diagnostics\n\n{diagnostics}\n\nAfter repairing, leave changes in this worktree and report only the focused repair."
+        "## Focused automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree and fix only the exact failed command/requirement. Do not reset, clean, recreate, or replace the worktree.\n\n## Relevant current worktree diff\n\n{diff}\n\n## Exact failed command and diagnostics\n\n{diagnostics}\n\nAfter repairing, leave changes in this worktree and report only the focused repair."
     )
 }
 
@@ -645,7 +646,7 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         })
         .unwrap_or_default();
     format!(
-        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run any relevant checks and tests (e.g., cargo test) and fix failures you encounter. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
+        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run focused checks and production-path tests relevant to the changed area and fix failures you encounter. Orc owns and will run the complete configured project validation gate after your single implementation session, so do not repeatedly run that full pipeline. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         contract = contract,
         project = project,
@@ -826,7 +827,10 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let acceptance_criteria =
         worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
     let required_tests = worker_requirements(&proposal.required_tests, "required-test");
-    let verification = proposal.validation.clone();
+    // The Worker may run focused checks while implementing, but configured
+    // validation is Orc's authoritative final gate and is not provider-
+    // reported evidence.
+    let verification = Vec::new();
     let plan = crate::worker_protocol::WorkerPlan {
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
         read_only_snapshot: serde_json::to_string(&snapshot)
@@ -837,11 +841,8 @@ pub fn dispatch_with_worker_on_db_cancellable(
         active_review_blockers: Vec::new(),
         resolved_review_blockers: Vec::new(),
         verification: verification.clone(),
-        plan_acceptance_criteria: acceptance_criteria
-            .iter()
-            .map(|item| item.id.clone())
-            .collect(),
-        plan_required_tests: required_tests.iter().map(|item| item.id.clone()).collect(),
+        plan_acceptance_criteria: Vec::new(),
+        plan_required_tests: Vec::new(),
         plan_review_blockers: Vec::new(),
         steps: plan_steps(
             &proposal.expected_changes,
@@ -938,6 +939,8 @@ pub fn dispatch_with_worker_on_db_cancellable(
 
     // Execute the worker in the worktree directory
     let worktree_dir = repo_path.join(&worktree_path);
+    let before_plan = git::inspect_worktree(&worktree_dir, repo_path)
+        .context("failed to inspect worktree before Worker plan")?;
     progress("worker spawned");
     progress("worker running");
     let invocation_id = start_provider_invocation_bounded(
@@ -978,7 +981,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
         .context("failed to inspect worktree after Worker plan")?;
     // The provider session owns the checkpoint boundaries. Orc verifies the
     // resulting aggregate worktree, but does not invent per-step snapshots.
-    let mut step_snapshots = vec![(after_plan.clone(), after_plan); plan.steps.len()];
+    let mut step_snapshots = vec![(before_plan, after_plan)];
     let mut step_outputs = vec![None; plan.steps.len()];
     if let Ok(result) = &execution
         && let Some(full_output) = result.output.as_deref()
@@ -1273,12 +1276,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         repair_attempt += 1;
                         let diagnostics = validation_diagnostics(&report);
                         let diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
-                        let repair = repair_prompt(
-                            &diff,
-                            output.as_deref().unwrap_or_default(),
-                            &diagnostics,
-                            repair_attempt,
-                        );
+                        let repair = repair_prompt(&diff, &diagnostics, repair_attempt);
                         let repair_started = serde_json::json!({
                             "repair_attempt": repair_attempt,
                             "prompt": repair,
@@ -1635,9 +1633,79 @@ where
     ) -> Result<Box<dyn Worker>, String>,
 {
     let db = Database::open(db_path)?;
+    revise_with_factory_on_db_as_with_runner(
+        task_id,
+        feedback,
+        &db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        overrides,
+        factory,
+    )
+}
+
+/// Operator-facing revision entry point backed by the authoritative global
+/// agent registry. The existing path-based helper remains isolated for tests
+/// and embedders which explicitly own their registry path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the CLI revision seam explicit"
+)]
+pub fn revise_with_factory_and_global_db_as_with_runner<F>(
+    task_id: &str,
+    feedback: &str,
+    db_path: &str,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+    factory: F,
+) -> Result<DispatchSummary>
+where
+    F: FnOnce(
+        &AgentDefinition,
+        Option<String>,
+        Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String>,
+{
+    let db = Database::open_global(db_path)?;
+    revise_with_factory_on_db_as_with_runner(
+        task_id,
+        feedback,
+        &db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        overrides,
+        factory,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared revision resolution boundary"
+)]
+fn revise_with_factory_on_db_as_with_runner<F>(
+    task_id: &str,
+    feedback: &str,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+    factory: F,
+) -> Result<DispatchSummary>
+where
+    F: FnOnce(
+        &AgentDefinition,
+        Option<String>,
+        Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String>,
+{
     let task = db.get_task(task_id)?.context("task not found")?;
     let agent = db
-        .list_agents()?
+        .list_schedulable_agents()?
         .into_iter()
         .find(|candidate| candidate.id == agent_id)
         .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
@@ -1645,14 +1713,23 @@ where
         .actionable_revision_review(task_id)?
         .map(|(id, _)| id)
         .context("task has no actionable revision review")?;
-    let revision_effort =
-        effective_revision_effort(&db, &task, source_review_id, overrides.effort)?;
+    let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
+    let task_hints = db
+        .get_task_execution_hints(&task.id)?
+        .context("task execution hints are missing")?;
+    let execution_class = task_hints
+        .class
+        .as_deref()
+        .map(crate::execution::ExecutionClass::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
     let resolution = crate::execution::resolve_with_template(
-        &task.role,
-        &db.execution_template(crate::execution::class_for_role(&task.role))?,
+        execution_class.as_str(),
+        &db.execution_template(execution_class)?,
         agent.model.as_deref(),
         agent.reasoning_effort,
-        overrides.model.clone(),
+        overrides.model.clone().or_else(|| task_hints.model.clone()),
         overrides.effort,
     );
     let resolution = if overrides.effort == Some(revision_effort) {
@@ -1670,7 +1747,7 @@ where
         task_id,
         feedback,
         worker.as_ref(),
-        &db,
+        db,
         repo_path,
         agent_id,
         validation_runner,
@@ -1837,18 +1914,9 @@ pub fn revise_with_worker_on_db_with_overrides(
             .required_tests
             .clone()
     };
-    let verification = if revision_contract
-        .original_task_requirements
-        .validation
-        .is_empty()
-    {
-        proposal.validation.clone()
-    } else {
-        revision_contract
-            .original_task_requirements
-            .validation
-            .clone()
-    };
+    // Initial implementation and revision share validation ownership: Orc
+    // executes the complete configured gate after the single provider call.
+    let verification = Vec::new();
     let acceptance_criteria = worker_requirements(&original_acceptance, "acceptance-criterion");
     let required_tests = worker_requirements(&original_tests, "required-test");
     let active_review_blockers = blocker_requirements(&active_blockers);
@@ -1864,15 +1932,9 @@ pub fn revise_with_worker_on_db_with_overrides(
             .map(|blocker| blocker.blocker_id.clone())
             .collect(),
         verification: verification.clone(),
-        plan_acceptance_criteria: acceptance_criteria
-            .iter()
-            .map(|item| item.id.clone())
-            .collect(),
-        plan_required_tests: required_tests.iter().map(|item| item.id.clone()).collect(),
-        plan_review_blockers: active_review_blockers
-            .iter()
-            .map(|item| item.id.clone())
-            .collect(),
+        plan_acceptance_criteria: Vec::new(),
+        plan_required_tests: Vec::new(),
+        plan_review_blockers: Vec::new(),
         steps: plan_steps(
             &proposal.expected_changes,
             &acceptance_criteria,
@@ -1887,16 +1949,26 @@ pub fn revise_with_worker_on_db_with_overrides(
         .context("Worker revision PREPARE is incomplete")?;
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
     let agent = db
-        .list_agents()?
+        .list_schedulable_agents()?
         .into_iter()
         .find(|agent| agent.id == agent_id)
         .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
+    let task_hints = db
+        .get_task_execution_hints(&task.id)?
+        .context("task execution hints are missing")?;
+    let execution_class = task_hints
+        .class
+        .as_deref()
+        .map(crate::execution::ExecutionClass::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
     let resolution = crate::execution::resolve_with_template(
-        &task.role,
-        &db.execution_template(crate::execution::class_for_role(&task.role))?,
+        execution_class.as_str(),
+        &db.execution_template(execution_class)?,
         agent.model.as_deref(),
         agent.reasoning_effort,
-        overrides.model.clone(),
+        overrides.model.clone().or_else(|| task_hints.model.clone()),
         overrides.effort,
     );
     let resolution = if overrides.effort == Some(revision_effort) {
@@ -1988,8 +2060,7 @@ pub fn revise_with_worker_on_db_with_overrides(
     )?;
     let after_revision = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect worktree after Worker revision")?;
-    let mut revision_step_snapshots =
-        vec![(after_revision.clone(), after_revision); revision_plan.steps.len()];
+    let mut revision_step_snapshots = vec![(baseline_changes.clone(), after_revision)];
     let mut revision_step_outputs = vec![None; revision_plan.steps.len()];
     let revision_output = execution
         .as_ref()
@@ -2416,7 +2487,7 @@ pub fn dispatch_selected_with_options(
     effort_override: Option<crate::registry::ReasoningEffort>,
 ) -> Result<DispatchSummary> {
     let db_path = ".orc/orc.db";
-    let db = Database::open(db_path)
+    let db = Database::open_global(db_path)
         .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
     dispatch_selected_with_db_and_repo(
         &db,
@@ -2465,7 +2536,13 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     let task_effort = task_contract_effort(db, &task)?;
     let explicit_effort = effort_override.is_some();
     let agent = if let Some(agent_id) = requested_agent {
-        let agent = registry::get_agent(db, agent_id)?;
+        let agent = db
+            .list_schedulable_agents()?
+            .into_iter()
+            .find(|agent| agent.id == agent_id)
+            .with_context(|| {
+                format!("agent '{agent_id}' is not referenced by the current project")
+            })?;
         let busy_agents = db.list_busy_agents()?.into_iter().collect();
         crate::scheduler::validate_override_with_constraints(
             &agent,
@@ -2475,7 +2552,7 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
         )?;
         agent
     } else {
-        let agents = db.list_agents()?;
+        let agents = db.list_schedulable_agents()?;
         let busy_agents = db.list_busy_agents()?.into_iter().collect();
         let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
             &task,
@@ -2528,12 +2605,22 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
             changes: Default::default(),
         });
     }
+    let task_hints = db
+        .get_task_execution_hints(&task.id)?
+        .context("task execution hints are missing")?;
+    let execution_class = task_hints
+        .class
+        .as_deref()
+        .map(crate::execution::ExecutionClass::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
     let resolution = crate::execution::resolve_with_template(
-        &task.role,
-        &db.execution_template(crate::execution::class_for_role(&task.role))?,
+        execution_class.as_str(),
+        &db.execution_template(execution_class)?,
         agent.model.as_deref(),
         agent.reasoning_effort,
-        model_override,
+        model_override.or(task_hints.model),
         effort_override,
     );
     let resolution = if explicit_effort {
@@ -2603,9 +2690,9 @@ pub fn plan_dispatch_assignments(
 pub type DispatchQueueOutcomes = BTreeMap<String, Result<DispatchSummary, String>>;
 
 pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcomes> {
-    let db = Database::open(".orc/orc.db")?;
+    let db = Database::open_global(".orc/orc.db")?;
     let report = crate::queue::compute_queue(&db)?;
-    let agents = db.list_agents()?;
+    let agents = db.list_schedulable_agents()?;
     let quota_reserve = db.quota_reserve()?;
     let assignments = plan_dispatch_assignments(
         &report.ready,

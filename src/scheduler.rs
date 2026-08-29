@@ -181,10 +181,19 @@ pub fn evaluate_candidate_with_quota_reserve(
 
     // 4. required task capabilities must be satisfied
     let required = task.required_capabilities();
+    let available = agent
+        .capabilities
+        .iter()
+        .map(|value| crate::registry::AgentCapability::parse(value))
+        .collect::<std::collections::HashSet<_>>();
     let missing: Vec<String> = required
         .iter()
-        .filter(|cap| !agent.capabilities.contains(cap))
-        .cloned()
+        .filter(|cap| !available.contains(&crate::registry::AgentCapability::parse(cap)))
+        .map(|cap| {
+            crate::registry::AgentCapability::parse(cap)
+                .as_str()
+                .to_owned()
+        })
         .collect();
     if !missing.is_empty() {
         return make_eval(CandidateStatus::Rejected(
@@ -790,7 +799,7 @@ mod tests {
         assert_eq!(
             decision.candidates[0].status,
             CandidateStatus::Rejected(RejectionReason::MissingCapability {
-                capability: "terminal".to_string()
+                capability: "command_execution".to_string()
             })
         );
     }

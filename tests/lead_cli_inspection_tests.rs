@@ -7,6 +7,7 @@ use tempfile::tempdir;
 fn command(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(dir)
+        .env("ORC_GLOBAL_REGISTRY_PATH", dir.join(".orc/test.agents.db"))
         .args(args)
         .output()
         .unwrap()

@@ -133,7 +133,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {value}"))
                 })
                 .transpose()?;
-            let id = OrcApp::open(db_path, ".")?.create_task(CreateTaskInput {
+            let id = OrcApp::open_global(db_path, ".")?.create_task(CreateTaskInput {
                 title,
                 objective,
                 role,
@@ -146,7 +146,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             })?;
             println!("Created task {id}");
         }
-        TaskCommand::List => match Database::open(db_path) {
+        TaskCommand::List => match Database::open_global(db_path) {
             Ok(db) => {
                 let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
                 for task in tasks {
@@ -158,14 +158,14 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             }
         },
         TaskCommand::Purge { task_id, force } => {
-            OrcApp::open(db_path, ".")?.purge_task(&task_id, force)?;
+            OrcApp::open_global(db_path, ".")?.purge_task(&task_id, force)?;
             println!("Purged task {}", task_id);
         }
         TaskCommand::Requeue { task_id } => {
-            OrcApp::open(db_path, ".")?.requeue(&task_id)?;
+            OrcApp::open_global(db_path, ".")?.requeue(&task_id)?;
             println!("Requeued task {task_id}");
         }
-        TaskCommand::Show { task_id } => match Database::open(db_path) {
+        TaskCommand::Show { task_id } => match Database::open_global(db_path) {
             Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {
                 Some(task) => {
                     println!("ID:           {}", task.id);
@@ -225,7 +225,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             task_id,
             capabilities,
         } => {
-            let app = OrcApp::open(db_path, ".")?;
+            let app = OrcApp::open_global(db_path, ".")?;
             if !app.set_task_required_capabilities(&task_id, &capabilities)? {
                 anyhow::bail!("task '{}' not found in DB", task_id);
             }
@@ -236,12 +236,12 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             );
         }
         TaskCommand::Cancel { task_id, reason } => {
-            let app = OrcApp::open(db_path, ".")?;
+            let app = OrcApp::open_global(db_path, ".")?;
             if let Err(error) = app.cancel(&task_id, reason.as_deref()) {
                 match error {
                     CancelError::Database(error) => return Err(error.into()),
                     CancelError::Invalid(_) => {
-                        let db = Database::open(db_path).map_err(|e| anyhow::anyhow!(e))?;
+                        let db = Database::open_global(db_path).map_err(|e| anyhow::anyhow!(e))?;
                         let task = db.get_task(&task_id)?;
                         match task {
                             None => anyhow::bail!("task '{}' not found", task_id),
@@ -258,41 +258,41 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Scope { task_id, mode } => {
             let scope = TaskScopeMode::parse(&mode)
                 .ok_or_else(|| anyhow::anyhow!("invalid scope mode: {mode}"))?;
-            if !OrcApp::open(db_path, ".")?.set_task_scope(&task_id, scope)? {
+            if !OrcApp::open_global(db_path, ".")?.set_task_scope(&task_id, scope)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::ContextAdd { task_id, paths } => {
-            if !OrcApp::open(db_path, ".")?.add_task_context(&task_id, &paths)? {
+            if !OrcApp::open_global(db_path, ".")?.add_task_context(&task_id, &paths)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::ExpectChange { task_id, paths } => {
-            if !OrcApp::open(db_path, ".")?.add_expected_changes(&task_id, &paths)? {
+            if !OrcApp::open_global(db_path, ".")?.add_expected_changes(&task_id, &paths)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::ContextClear { task_id } => {
-            if !OrcApp::open(db_path, ".")?.clear_task_context(&task_id)? {
+            if !OrcApp::open_global(db_path, ".")?.clear_task_context(&task_id)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::ExpectClear { task_id } => {
-            if !OrcApp::open(db_path, ".")?.clear_expected_changes(&task_id)? {
+            if !OrcApp::open_global(db_path, ".")?.clear_expected_changes(&task_id)? {
                 anyhow::bail!("task '{task_id}' not found");
             }
         }
         TaskCommand::Diff { task_id } => show_diff(db_path, &task_id)?,
         TaskCommand::Worktree { task_id } => show_worktree(db_path, &task_id)?,
         TaskCommand::Accept { task_id } => {
-            OrcApp::open(db_path, ".")?.accept(&task_id)?;
+            OrcApp::open_global(db_path, ".")?.accept(&task_id)?;
             println!(
                 "Accepted task {}; changes integrated and task marked done.",
                 task_id
             );
         }
         TaskCommand::Reject { task_id, reason } => {
-            OrcApp::open(db_path, ".")?.reject(&task_id, reason.as_deref())?;
+            OrcApp::open_global(db_path, ".")?.reject(&task_id, reason.as_deref())?;
             println!(
                 "Rejected task {}; worktree preserved and task moved to ready.",
                 task_id
@@ -302,14 +302,14 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             task_id,
             dependency_id,
         } => {
-            OrcApp::open(db_path, ".")?.add_dependency(&task_id, &dependency_id)?;
+            OrcApp::open_global(db_path, ".")?.add_dependency(&task_id, &dependency_id)?;
             println!("Added dependency: {} depends on {}", task_id, dependency_id);
         }
         TaskCommand::Undepend {
             task_id,
             dependency_id,
         } => {
-            if !OrcApp::open(db_path, ".")?.remove_dependency(&task_id, &dependency_id)? {
+            if !OrcApp::open_global(db_path, ".")?.remove_dependency(&task_id, &dependency_id)? {
                 anyhow::bail!("dependency '{}' -> '{}' not found", task_id, dependency_id);
             }
             println!(
@@ -322,7 +322,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
 }
 
 fn show_diff(db_path: &str, task_id: &str) -> Result<()> {
-    match Database::open(db_path) {
+    match Database::open_global(db_path) {
         Ok(db) => match db
             .get_worktree_metadata(task_id)
             .map_err(|e| anyhow::anyhow!(e))?
@@ -345,7 +345,7 @@ fn show_diff(db_path: &str, task_id: &str) -> Result<()> {
 }
 
 fn show_worktree(db_path: &str, task_id: &str) -> Result<()> {
-    match Database::open(db_path) {
+    match Database::open_global(db_path) {
         Ok(db) => match db
             .get_worktree_metadata(task_id)
             .map_err(|e| anyhow::anyhow!(e))?

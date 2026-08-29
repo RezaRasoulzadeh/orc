@@ -51,6 +51,10 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
     let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
     let output = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory.path())
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.path().join(".orc/test.agents.db"),
+        )
         .env("PATH", path)
         .args(["lead", "run", "assess"])
         .output()
@@ -112,6 +116,10 @@ fn dispatch_queue_concurrency_parser_rejects_zero_and_invalid_text() {
 fn orc_command(directory: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(directory)
+        .env(
+            "ORC_GLOBAL_REGISTRY_PATH",
+            directory.join(".orc/test.agents.db"),
+        )
         .args(args)
         .output()
         .unwrap()
@@ -195,7 +203,7 @@ fn agent_actions_can_be_added_removed_and_reopened() {
     );
     let show = orc_command(directory.path(), &["agent", "show", "multi"]);
     let show_text = String::from_utf8_lossy(&show.stdout);
-    assert!(show_text.contains("Capabilities:        code, terminal"));
+    assert!(show_text.contains("Capabilities:        code, command_execution"));
     assert!(show_text.contains("Actions:             plan, review"));
     let actions = orc_command(directory.path(), &["agent", "actions", "multi"]);
     let actions_text = String::from_utf8_lossy(&actions.stdout);

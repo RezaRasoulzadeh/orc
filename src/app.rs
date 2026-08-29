@@ -51,6 +51,64 @@ pub enum CancelError {
 }
 
 impl OrcApp {
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
+    }
+
+    pub(crate) fn repo_path(&self) -> &Path {
+        &self.repo_path
+    }
+
+    pub fn start_workflow(
+        &self,
+        objective: &str,
+        policy: crate::workflow::WorkflowPolicy,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let project_id = self.lead().project_id()?;
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions)
+            .start(project_id, objective, policy)
+    }
+
+    pub fn continue_workflow(&self, id: i64) -> Result<crate::workflow::WorkflowRun> {
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions).continue_run(id)
+    }
+
+    pub fn resolve_workflow(
+        &self,
+        id: i64,
+        resolution: &str,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions).resolve_user_gate(id, resolution)
+    }
+
+    pub fn cancel_workflow(
+        &self,
+        id: i64,
+        reason: Option<&str>,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions).cancel(id, reason)
+    }
+
+    pub fn workflow_run(&self, id: i64) -> Result<Option<crate::workflow::WorkflowRun>> {
+        Ok(self.db.get_workflow(id)?)
+    }
+
+    pub fn active_workflow(&self) -> Result<Option<crate::workflow::WorkflowRun>> {
+        let project_id = self.lead().project_id()?;
+        Ok(self.db.active_workflow(project_id)?)
+    }
+
+    pub fn workflow_transitions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<crate::workflow::WorkflowTransitionRecord>> {
+        Ok(self.db.workflow_transitions(id)?)
+    }
+
     pub fn lead(&self) -> crate::lead::LeadService<'_> {
         crate::lead::LeadService::new(&self.db, &self.repo_path)
     }
@@ -319,6 +377,16 @@ impl OrcApp {
         overrides: &crate::automated::ActionOverrides,
         backend: &dyn crate::automated::ActionBackend,
     ) -> Result<crate::storage::db::PlanReview> {
+        self.review_plan_with_backend_and_resolution(plan_id, overrides, backend, None)
+    }
+
+    pub fn review_plan_with_backend_and_resolution(
+        &self,
+        plan_id: i64,
+        overrides: &crate::automated::ActionOverrides,
+        backend: &dyn crate::automated::ActionBackend,
+        user_resolution: Option<&str>,
+    ) -> Result<crate::storage::db::PlanReview> {
         let plan = self
             .db
             .get_plan(plan_id)?
@@ -327,8 +395,11 @@ impl OrcApp {
         if !self.db.is_current_valid_planner_plan(project_id, &plan)? {
             anyhow::bail!("plan {plan_id} is not the current valid Planner plan");
         }
+        let resolution = user_resolution
+            .map(|value| format!(" Persisted user response to your prior question: {value}."))
+            .unwrap_or_default();
         let prompt = format!(
-            "Review exactly this current valid Planner plan and the supplied project context. Return exactly one decision: APPROVE, REVISE_PLAN, or USER_DECISION_REQUIRED. Do not invoke another workflow stage, apply changes, or dispatch work. Plan: {}",
+            "Review exactly this current valid Planner plan and the supplied project context.{resolution} Return exactly one decision: APPROVE, REVISE_PLAN, or USER_DECISION_REQUIRED. Do not invoke another workflow stage, apply changes, or dispatch work. Plan: {}",
             serde_json::to_string(&plan)?
         );
         let (run_id, response) = self.automated_lead_with_backend(&prompt, overrides, backend)?;
@@ -419,7 +490,7 @@ impl OrcApp {
         if objective.trim().is_empty() {
             anyhow::bail!("new-project objective must not be empty");
         }
-        let snapshot = crate::discovery::build_snapshot(&self.repo_path)?;
+        let snapshot = crate::discovery::snapshot_for_provider(&self.repo_path)?;
         let request = serde_json::json!({
             "kind": "new_project_intake",
             "objective": objective,
@@ -579,8 +650,29 @@ impl OrcApp {
         Ok(())
     }
     pub fn open(db_path: impl AsRef<Path>, repo_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_database(Database::open(db_path)?, repo_path)
+    }
+
+    pub fn open_with_registry(
+        db_path: impl AsRef<Path>,
+        repo_path: impl AsRef<Path>,
+        registry_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_with_database(
+            Database::open_with_registry(db_path, registry_path)?,
+            repo_path,
+        )
+    }
+
+    /// Open an operator-facing Orc application against the authoritative
+    /// global agent registry. Tests and embedders that require an isolated
+    /// registry can continue to use `open` or `Database::open_with_registry`.
+    pub fn open_global(db_path: impl AsRef<Path>, repo_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_database(Database::open_global(db_path)?, repo_path)
+    }
+
+    fn open_with_database(mut db: Database, repo_path: impl AsRef<Path>) -> Result<Self> {
         let events = crate::events::EventHub::new();
-        let mut db = Database::open(db_path)?;
         let sink = events.clone();
         db.set_lifecycle_sink(Some(std::sync::Arc::new(move |event| {
             sink.publish(crate::events::AppEvent::from_lifecycle(event));
@@ -694,7 +786,7 @@ impl OrcApp {
             approval_requirements: report.approval_requirements.clone(),
             current_state: Some(self.planning_state()?),
             full_report: Some(report),
-            discovery_snapshot: crate::discovery::build_snapshot(&self.repo_path).ok(),
+            discovery_snapshot: crate::discovery::snapshot_for_provider(&self.repo_path).ok(),
         })
     }
     pub fn validate_plan_json(&self, json: &str) -> Result<PlanResponse> {

@@ -47,6 +47,9 @@ pub struct TaskExecutionCondition {
 pub struct ProviderInvocation {
     pub id: i64,
     pub parent_run_id: i64,
+    pub workflow_id: Option<i64>,
+    pub workflow_stage: Option<String>,
+    pub workflow_version: Option<i64>,
     pub purpose: String,
     pub lineage: String,
     pub attempt: usize,
@@ -54,6 +57,9 @@ pub struct ProviderInvocation {
     pub finished_at: Option<String>,
     pub outcome: String,
     pub effort: Option<ReasoningEffort>,
+    pub selected_agent: Option<String>,
+    pub selected_model: Option<String>,
+    pub escalation_reason: Option<String>,
     pub total_tokens: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -239,7 +245,7 @@ mod reservation_lifecycle_tests {
     #[test]
     fn manually_unavailable_agent_stays_unavailable_after_execution_cleanup() {
         let (_directory, _path, db, project, task) = fixture();
-        db.conn.execute(
+        db.registry.execute(
             "INSERT INTO agents(id, backend, display_name, enabled, priority, capabilities, status) VALUES ('codex-main', 'codex', 'Codex', 1, 1, '[]', 'unavailable')",
             [],
         ).unwrap();
@@ -545,6 +551,7 @@ pub enum DbError {
 
 pub struct Database {
     conn: Connection,
+    registry: Connection,
     lifecycle_sink: Option<std::sync::Arc<dyn Fn(LifecycleEvent) + Send + Sync>>,
 }
 
@@ -825,7 +832,7 @@ impl Database {
             .collect();
         let busy: std::collections::HashSet<_> = self.list_busy_agents()?.into_iter().collect();
         let agents = self
-            .list_agents()?
+            .list_schedulable_agents()?
             .into_iter()
             .map(|agent| crate::protocol::ReportAgent {
                 id: agent.id.clone(),
@@ -912,7 +919,7 @@ impl Database {
         let busy_agents = self.list_busy_agents()?;
         let busy: std::collections::HashSet<_> = busy_agents.iter().cloned().collect();
         let usable_agents = self
-            .list_agents()?
+            .list_schedulable_agents()?
             .into_iter()
             .filter(|agent| {
                 agent.enabled && agent.status == "available" && !busy.contains(&agent.id)
@@ -1003,8 +1010,9 @@ impl Database {
             task.execution_hints.effort.as_deref().ok_or_else(|| {
                 DbError::Scheduler("task proposal has no execution effort".into())
             })?;
+        let capabilities = crate::registry::normalize_capability_names(&task.capabilities);
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 id,
                 project_id,
@@ -1012,10 +1020,12 @@ impl Database {
                 task.objective,
                 task.role,
                 priority_string(task.priority),
-                serde_json::to_string(&task.capabilities)?,
+                serde_json::to_string(&capabilities)?,
                 task.scope_mode.map(|value| value.to_string()),
                 serde_json::to_string(&task.context_files)?,
                 serde_json::to_string(&task.expected_changes)?,
+                task.execution_hints.class,
+                task.execution_hints.model,
                 effort,
                 task.execution_hints.effort_reason,
                 serde_json::to_string(&task.risk_factors)?,
@@ -1025,9 +1035,11 @@ impl Database {
                 serde_json::to_string(&task.unchanged)?,
             ],
         )?;
+        let mut persisted_proposal = task.clone();
+        persisted_proposal.capabilities = capabilities;
         self.conn.execute(
             "INSERT INTO task_proposal_metadata (task_id, proposal) VALUES (?1, ?2)",
-            params![id, serde_json::to_string(task)?],
+            params![id, serde_json::to_string(&persisted_proposal)?],
         )?;
         Ok(())
     }
@@ -1071,6 +1083,14 @@ impl Database {
     }
 
     pub fn init(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let registry_path = Self::companion_registry_path(path.as_ref());
+        Self::init_with_registry(path, registry_path)
+    }
+
+    pub fn init_with_registry(
+        path: impl AsRef<Path>,
+        registry_path: impl AsRef<Path>,
+    ) -> Result<Self, DbError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1090,6 +1110,12 @@ impl Database {
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (project_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS discovery_snapshots (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                fingerprint TEXT NOT NULL,
+                snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             );
             CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
@@ -1115,7 +1141,7 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS project_agent_references (
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 PRIMARY KEY (project_id, agent_id)
             );
@@ -1139,6 +1165,8 @@ impl Database {
                 scope_mode TEXT,
                 context_files TEXT,
                 expected_changes TEXT,
+                execution_class TEXT,
+                execution_model TEXT,
                 reasoning_effort TEXT,
                 effort_reason TEXT,
                 risk_factors TEXT,
@@ -1248,6 +1276,7 @@ impl Database {
             "#,
         )?;
         Self::ensure_agent_columns(&conn)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS discovery_snapshots (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))")?;
         Self::ensure_project_agent_references_table(&conn)?;
         Self::ensure_execution_templates_table(&conn)?;
         Self::ensure_agent_actions_table(&conn)?;
@@ -1257,6 +1286,7 @@ impl Database {
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_worker_protocol_results_table(&conn)?;
         Self::ensure_provider_invocations_table(&conn)?;
+        Self::ensure_workflow_tables(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
@@ -1268,8 +1298,16 @@ impl Database {
         Self::ensure_task_columns(&conn)?;
         Self::ensure_task_execution_conditions_table(&conn)?;
         Self::ensure_approval_request_columns(&conn)?;
+        let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('agent_registry_path', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [registry_path.to_string_lossy().as_ref()],
+        )?;
+        let registry = Self::open_registry(&registry_path, true)?;
+        Self::migrate_legacy_registry(path.as_ref(), &registry)?;
         let db = Self {
             conn,
+            registry,
             lifecycle_sink: None,
         };
         db.reconcile_execution_reservations()?;
@@ -1277,6 +1315,15 @@ impl Database {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let registry_path = Self::persisted_registry_path(path.as_ref())?
+            .unwrap_or_else(|| Self::companion_registry_path(path.as_ref()));
+        Self::open_with_registry(path, registry_path)
+    }
+
+    pub fn open_with_registry(
+        path: impl AsRef<Path>,
+        registry_path: impl AsRef<Path>,
+    ) -> Result<Self, DbError> {
         if !path.as_ref().exists() {
             return Err(DbError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1289,8 +1336,17 @@ impl Database {
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_plan_tables(&conn)?;
+        Self::ensure_workflow_tables(&conn)?;
+        let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('agent_registry_path', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [registry_path.to_string_lossy().as_ref()],
+        )?;
+        let registry = Self::open_registry(&registry_path, true)?;
+        Self::migrate_legacy_registry(path.as_ref(), &registry)?;
         let db = Self {
             conn,
+            registry,
             lifecycle_sink: None,
         };
         db.reconcile_execution_reservations()?;
@@ -1303,9 +1359,148 @@ impl Database {
         Ok(())
     }
 
+    fn companion_registry_path(project_db: &Path) -> std::path::PathBuf {
+        let file = project_db
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("orc");
+        project_db.with_file_name(format!("{file}.agents.db"))
+    }
+
+    fn absolute_registry_path(path: &Path) -> Result<std::path::PathBuf, DbError> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    }
+
+    fn persisted_registry_path(project_db: &Path) -> Result<Option<std::path::PathBuf>, DbError> {
+        if !project_db.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(project_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let value = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='agent_registry_path'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional();
+        match value {
+            Ok(value) => Ok(value.map(std::path::PathBuf::from)),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn default_global_registry_path() -> std::path::PathBuf {
+        if let Some(path) = std::env::var_os("ORC_GLOBAL_REGISTRY_PATH") {
+            return path.into();
+        }
+        if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+            return std::path::PathBuf::from(path).join("orc/agents.db");
+        }
+        std::env::var_os("HOME").map_or_else(
+            || std::path::PathBuf::from(".orc-global/agents.db"),
+            |home| std::path::PathBuf::from(home).join(".local/share/orc/agents.db"),
+        )
+    }
+
+    pub fn init_global(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::init_with_registry(path, Self::default_global_registry_path())
+    }
+
+    pub fn open_global(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_with_registry(path, Self::default_global_registry_path())
+    }
+
+    fn open_registry(path: &Path, create: bool) -> Result<Connection, DbError> {
+        if create && let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let registry = if create {
+            Connection::open(path)?
+        } else {
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
+        };
+        Self::configure(&registry)?;
+        registry.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY, model_version INTEGER NOT NULL DEFAULT 1,
+                scope TEXT NOT NULL DEFAULT 'global', backend TEXT NOT NULL,
+                display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT,
+                profile_path TEXT, model TEXT, reasoning_effort TEXT, config_metadata TEXT,
+                execution_mode TEXT NOT NULL DEFAULT 'automated', quota_remaining_percent INTEGER,
+                quota_reset_at TEXT, quota_checked_at TEXT, quota_source TEXT, quota_limits TEXT
+            );
+            CREATE TABLE IF NOT EXISTS agent_action_profiles (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                action TEXT NOT NULL, model TEXT, reasoning_effort TEXT,
+                PRIMARY KEY(agent_id, action)
+            );
+            CREATE TABLE IF NOT EXISTS agent_authorizations (
+                agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                permissions TEXT NOT NULL DEFAULT '[]', authenticated INTEGER NOT NULL DEFAULT 0,
+                authentication_method TEXT NOT NULL DEFAULT 'unknown', authentication_detail TEXT,
+                verified_at TEXT
+            );",
+        )?;
+        Self::ensure_agent_columns(&registry)?;
+        Ok(registry)
+    }
+
+    fn migrate_legacy_registry(project_db: &Path, registry: &Connection) -> Result<(), DbError> {
+        registry.execute(
+            "ATTACH DATABASE ?1 AS legacy_project",
+            [project_db.to_string_lossy().as_ref()],
+        )?;
+        let result = registry.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO agents
+             SELECT id, model_version, scope, backend, display_name, enabled, priority,
+                    capabilities, status, unavailable_reason, profile_path, model,
+                    reasoning_effort, config_metadata, execution_mode, quota_remaining_percent,
+                    quota_reset_at, quota_checked_at, quota_source, quota_limits
+             FROM legacy_project.agents
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM legacy_project.meta WHERE key='agent_registry_migrated'
+             );
+             INSERT OR IGNORE INTO agent_action_profiles
+             SELECT p.agent_id, p.action, p.model, p.reasoning_effort
+             FROM legacy_project.agent_action_profiles p JOIN agents a ON a.id=p.agent_id
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM legacy_project.meta WHERE key='agent_registry_migrated'
+             );
+             INSERT OR IGNORE INTO agent_authorizations
+             SELECT x.agent_id, x.permissions, x.authenticated, x.authentication_method,
+                    x.authentication_detail, x.verified_at
+             FROM legacy_project.agent_authorizations x JOIN agents a ON a.id=x.agent_id
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM legacy_project.meta WHERE key='agent_registry_migrated'
+             );
+             INSERT INTO legacy_project.meta(key, value) VALUES ('agent_registry_migrated', '1')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+             COMMIT;",
+        );
+        if result.is_err() {
+            let _ = registry.execute_batch("ROLLBACK");
+        }
+        let detach = registry.execute_batch("DETACH DATABASE legacy_project");
+        result?;
+        detach?;
+        Ok(())
+    }
+
     fn ensure_registry_schema(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, model_version INTEGER NOT NULL DEFAULT 1, scope TEXT NOT NULL DEFAULT 'global', backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
+            "CREATE TABLE IF NOT EXISTS project_facts (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key)); CREATE TABLE IF NOT EXISTS discovery_snapshots (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)); CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, model_version INTEGER NOT NULL DEFAULT 1, scope TEXT NOT NULL DEFAULT 'global', backend TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, capabilities TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, profile_path TEXT, config_metadata TEXT);",
         )?;
         Self::ensure_agent_columns(conn)?;
         Self::ensure_project_agent_references_table(conn)?;
@@ -1344,11 +1539,34 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS project_agent_references (
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 PRIMARY KEY (project_id, agent_id)
             )",
         )?;
+        let legacy_agent_fk: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('project_agent_references') WHERE \"table\"='agents'",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy_agent_fk != 0 {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let migration = conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE project_agent_references RENAME TO project_agent_references_legacy;
+                 CREATE TABLE project_agent_references (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    agent_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    PRIMARY KEY (project_id, agent_id)
+                 );
+                 INSERT INTO project_agent_references SELECT project_id, agent_id, created_at FROM project_agent_references_legacy;
+                 DROP TABLE project_agent_references_legacy;
+                 COMMIT;",
+            );
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
+        }
         Ok(())
     }
 
@@ -1468,7 +1686,7 @@ impl Database {
     }
 
     pub fn agent_action_profiles(&self, id: &str) -> Result<Vec<AgentActionProfile>, DbError> {
-        let mut s = self.conn.prepare("SELECT action, model, reasoning_effort FROM agent_action_profiles WHERE agent_id = ?1 ORDER BY action")?;
+        let mut s = self.registry.prepare("SELECT action, model, reasoning_effort FROM agent_action_profiles WHERE agent_id = ?1 ORDER BY action")?;
         Ok(s.query_map([id], |r| {
             Ok(AgentActionProfile {
                 action: AgentAction::parse(&r.get::<_, String>(0)?)
@@ -1491,7 +1709,7 @@ impl Database {
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
     ) -> Result<bool, DbError> {
-        Ok(self.conn.execute("INSERT INTO agent_action_profiles(agent_id, action, model, reasoning_effort) VALUES(?1, ?2, ?3, ?4) ON CONFLICT(agent_id, action) DO UPDATE SET model=excluded.model, reasoning_effort=excluded.reasoning_effort", params![id, action.as_str(), model, effort.map(|v| v.as_str())])? != 0)
+        Ok(self.registry.execute("INSERT INTO agent_action_profiles(agent_id, action, model, reasoning_effort) VALUES(?1, ?2, ?3, ?4) ON CONFLICT(agent_id, action) DO UPDATE SET model=excluded.model, reasoning_effort=excluded.reasoning_effort", params![id, action.as_str(), model, effort.map(|v| v.as_str())])? != 0)
     }
 
     pub fn clear_agent_action_profile(
@@ -1499,7 +1717,7 @@ impl Database {
         id: &str,
         action: AgentAction,
     ) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "DELETE FROM agent_action_profiles WHERE agent_id=?1 AND action=?2",
             params![id, action.as_str()],
         )? != 0)
@@ -1757,6 +1975,8 @@ impl Database {
             ("context_files", "TEXT"),
             ("expected_changes", "TEXT"),
             ("reasoning_effort", "TEXT"),
+            ("execution_class", "TEXT"),
+            ("execution_model", "TEXT"),
             ("effort_reason", "TEXT"),
             ("risk_factors", "TEXT"),
             ("cancellation_reason", "TEXT"),
@@ -1974,6 +2194,9 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS provider_invocations (
                 id INTEGER PRIMARY KEY,
                 parent_run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                workflow_id INTEGER REFERENCES workflow_runs(id) ON DELETE SET NULL,
+                workflow_stage TEXT,
+                workflow_version INTEGER,
                 purpose TEXT NOT NULL,
                 lineage TEXT NOT NULL DEFAULT 'root',
                 attempt INTEGER NOT NULL,
@@ -1981,6 +2204,9 @@ impl Database {
                 finished_at TEXT,
                 outcome TEXT NOT NULL DEFAULT 'running',
                 effort TEXT,
+                selected_agent TEXT,
+                selected_model TEXT,
+                escalation_reason TEXT,
                 total_tokens INTEGER,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
@@ -1988,8 +2214,17 @@ impl Database {
             )",
         )?;
         for (column, definition) in [
+            (
+                "workflow_id",
+                "INTEGER REFERENCES workflow_runs(id) ON DELETE SET NULL",
+            ),
+            ("workflow_stage", "TEXT"),
+            ("workflow_version", "INTEGER"),
             ("lineage", "TEXT NOT NULL DEFAULT 'root'"),
             ("effort", "TEXT"),
+            ("selected_agent", "TEXT"),
+            ("selected_model", "TEXT"),
+            ("escalation_reason", "TEXT"),
             ("total_tokens", "INTEGER"),
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
@@ -2004,6 +2239,38 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_workflow_tables(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workflow_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                objective TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
+            CREATE INDEX IF NOT EXISTS workflow_runs_project_status
+                ON workflow_runs(project_id, status, id);
+            CREATE TABLE IF NOT EXISTS workflow_transitions (
+                id INTEGER PRIMARY KEY,
+                workflow_id INTEGER NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+                from_stage TEXT NOT NULL,
+                to_stage TEXT NOT NULL,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                edge TEXT NOT NULL,
+                deterministic INTEGER NOT NULL,
+                provider_run_id INTEGER REFERENCES agent_runs(id),
+                details TEXT,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );",
+        )?;
+        Ok(())
+    }
+
     pub fn start_provider_invocation(
         &self,
         parent_run_id: i64,
@@ -2015,6 +2282,7 @@ impl Database {
             "implementation" | "revision" => 1,
             "completion_repair" => 2,
             "validation_repair" => 3,
+            "lead" | "plan" | "review" => 1,
             _ => 0,
         };
         let used: usize = self.conn.query_row(
@@ -2051,10 +2319,37 @@ impl Database {
                 "provider invocation budget exhausted for phase '{purpose}'"
             )));
         }
+        let workflow_match: Option<(i64, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT w.id, w.stage, w.version FROM workflow_runs w
+                 JOIN agent_runs r ON r.project_id=w.project_id
+                 WHERE r.id=?1 AND w.status='running' AND (
+                    (?2='lead' AND w.stage IN ('lead','plan_review')) OR
+                    (?2='plan' AND w.stage IN ('planner','planner_revision')) OR
+                    (?2 IN ('implementation','completion_repair','validation_repair') AND w.stage='dispatch') OR
+                    (?2='review' AND w.stage='review') OR
+                    (?2 IN ('revision','completion_repair','validation_repair') AND w.stage='revision')
+                 ) ORDER BY w.id DESC LIMIT 1",
+                params![parent_run_id, purpose],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (workflow_id, workflow_stage, workflow_version) = workflow_match
+            .map(|(id, stage, version)| (Some(id), Some(stage), Some(version)))
+            .unwrap_or((None, None, None));
         self.conn.execute(
-            "INSERT INTO provider_invocations(parent_run_id, purpose, lineage, attempt, effort) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![parent_run_id, purpose, format!("{purpose}:{attempt}"), attempt, effort.map(|value| value.as_str())],
+            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason)
+             SELECT ?1, ?6, ?7, ?8, ?2, ?3, ?4, ?5, agent, resolved_model,
+                    CASE WHEN ?4 = 1 THEN 'initial semantic invocation' ELSE 'bounded evidence-backed repair' END
+             FROM agent_runs WHERE id = ?1",
+            params![parent_run_id, purpose, format!("{purpose}:{attempt}"), attempt, effort.map(|value| value.as_str()), workflow_id, workflow_stage, workflow_version],
         )?;
+        if self.conn.changes() != 1 {
+            return Err(DbError::Scheduler(format!(
+                "provider invocation parent run {parent_run_id} does not exist"
+            )));
+        }
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -2075,25 +2370,251 @@ impl Database {
         parent_run_id: i64,
     ) -> Result<Vec<ProviderInvocation>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, parent_run_id, purpose, lineage, attempt, started_at, finished_at, outcome, effort, total_tokens, input_tokens, output_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
+            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
         )?;
         Ok(statement
             .query_map([parent_run_id], |row| {
                 Ok(ProviderInvocation {
                     id: row.get(0)?,
                     parent_run_id: row.get(1)?,
-                    purpose: row.get(2)?,
-                    lineage: row.get(3)?,
-                    attempt: row.get(4)?,
-                    started_at: row.get(5)?,
-                    finished_at: row.get(6)?,
-                    outcome: row.get(7)?,
+                    workflow_id: row.get(2)?,
+                    workflow_stage: row.get(3)?,
+                    workflow_version: row.get(4)?,
+                    purpose: row.get(5)?,
+                    lineage: row.get(6)?,
+                    attempt: row.get(7)?,
+                    started_at: row.get(8)?,
+                    finished_at: row.get(9)?,
+                    outcome: row.get(10)?,
                     effort: row
-                        .get::<_, Option<String>>(8)?
+                        .get::<_, Option<String>>(11)?
                         .and_then(|v| ReasoningEffort::parse(&v).ok()),
-                    total_tokens: row.get(9)?,
-                    input_tokens: row.get(10)?,
-                    output_tokens: row.get(11)?,
+                    selected_agent: row.get(12)?,
+                    selected_model: row.get(13)?,
+                    escalation_reason: row.get(14)?,
+                    total_tokens: row.get(15)?,
+                    input_tokens: row.get(16)?,
+                    output_tokens: row.get(17)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn completed_workflow_provider_run(
+        &self,
+        workflow_id: i64,
+        workflow_stage: &str,
+        workflow_version: i64,
+        purpose: &str,
+    ) -> Result<Option<i64>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT parent_run_id FROM provider_invocations
+             WHERE workflow_id=?1 AND workflow_stage=?2 AND workflow_version=?3
+               AND purpose=?4 AND outcome='completed'
+             ORDER BY id DESC LIMIT 1",
+                params![workflow_id, workflow_stage, workflow_version, purpose],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn start_workflow(
+        &self,
+        project_id: i64,
+        objective: &str,
+        policy: &crate::workflow::WorkflowPolicy,
+    ) -> Result<crate::workflow::WorkflowRun, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+            [project_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(DbError::ProjectNotFound(project_id));
+        }
+        let active = {
+            let mut statement = tx.prepare(
+                "SELECT state FROM workflow_runs WHERE project_id=?1 AND status IN ('running','waiting_user','acceptance_ready','waiting_external') ORDER BY id",
+            )?;
+            statement
+                .query_map([project_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for state in active {
+            let mut old: crate::workflow::WorkflowRun = serde_json::from_str(&state)?;
+            let from_status = old.status;
+            old.status = crate::workflow::WorkflowStatus::Superseded;
+            old.stop_reason = Some("superseded by a newer workflow".into());
+            old.version += 1;
+            old.transition_count += 1;
+            old.updated_at = tx.query_row("SELECT CURRENT_TIMESTAMP", [], |row| row.get(0))?;
+            tx.execute(
+                "UPDATE workflow_runs SET status='superseded', version=?2, state=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+                params![old.id, old.version, serde_json::to_string(&old)?],
+            )?;
+            tx.execute(
+                "INSERT INTO workflow_transitions(workflow_id, from_stage, to_stage, from_status, to_status, edge, deterministic, details)
+                 VALUES (?1, ?2, ?2, ?3, 'superseded', 'superseded', 1, ?4)",
+                params![old.id, old.stage.as_str(), from_status.as_str(), old.stop_reason],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO workflow_runs(project_id, objective, status, stage, state) VALUES (?1, ?2, 'running', 'discovery', '{}')",
+            params![project_id, objective.trim()],
+        )?;
+        let id = tx.last_insert_rowid();
+        let created_at: String = tx.query_row(
+            "SELECT created_at FROM workflow_runs WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let run = crate::workflow::WorkflowRun {
+            id,
+            project_id,
+            objective: objective.trim().to_owned(),
+            status: crate::workflow::WorkflowStatus::Running,
+            stage: crate::workflow::WorkflowStage::Discovery,
+            version: 0,
+            policy: policy.clone(),
+            transition_count: 0,
+            plan_revision_count: 0,
+            task_revision_count: 0,
+            current_task_id: None,
+            lead_decision_id: None,
+            plan_id: None,
+            provider_run_id: None,
+            revision_feedback: None,
+            resume_stage: None,
+            user_resolution: None,
+            discovery_fingerprint: None,
+            stop_reason: None,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        };
+        tx.execute(
+            "UPDATE workflow_runs SET state=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&run)?],
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn get_workflow(&self, id: i64) -> Result<Option<crate::workflow::WorkflowRun>, DbError> {
+        let state: Option<String> = self
+            .conn
+            .query_row("SELECT state FROM workflow_runs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        state
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(DbError::from)
+    }
+
+    pub fn active_workflow(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<crate::workflow::WorkflowRun>, DbError> {
+        let state: Option<String> = self.conn.query_row(
+            "SELECT state FROM workflow_runs WHERE project_id=?1 AND status IN ('running','waiting_user','acceptance_ready','waiting_external') ORDER BY id DESC LIMIT 1",
+            [project_id], |row| row.get(0)).optional()?;
+        state
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(DbError::from)
+    }
+
+    pub fn commit_workflow_transition(
+        &self,
+        current: &crate::workflow::WorkflowRun,
+        proposed: &crate::workflow::WorkflowRun,
+        edge: &str,
+        deterministic: bool,
+        provider_run_id: Option<i64>,
+        details: Option<&str>,
+    ) -> Result<crate::workflow::WorkflowRun, DbError> {
+        if current.id != proposed.id || current.project_id != proposed.project_id {
+            return Err(DbError::Scheduler(
+                "workflow transition changed workflow identity".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut committed = proposed.clone();
+        committed.version = current.version + 1;
+        committed.transition_count = current.transition_count + 1;
+        committed.updated_at = tx.query_row("SELECT CURRENT_TIMESTAMP", [], |row| row.get(0))?;
+        let changed = tx.execute(
+            "UPDATE workflow_runs
+             SET status=?1, stage=?2, version=?3, state=?4, updated_at=CURRENT_TIMESTAMP
+             WHERE id=?5 AND project_id=?6 AND status=?7 AND stage=?8 AND version=?9",
+            params![
+                committed.status.as_str(),
+                committed.stage.as_str(),
+                committed.version,
+                serde_json::to_string(&committed)?,
+                current.id,
+                current.project_id,
+                current.status.as_str(),
+                current.stage.as_str(),
+                current.version,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DbError::Scheduler(
+                "workflow changed while committing transition; reload and continue".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO workflow_transitions(workflow_id, from_stage, to_stage, from_status, to_status, edge, deterministic, provider_run_id, details)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                current.id,
+                current.stage.as_str(),
+                committed.stage.as_str(),
+                current.status.as_str(),
+                committed.status.as_str(),
+                edge,
+                deterministic,
+                provider_run_id,
+                details,
+            ],
+        )?;
+        if let Some(provider_run_id) = provider_run_id {
+            tx.execute(
+                "UPDATE provider_invocations SET workflow_id=?1 WHERE parent_run_id=?2 AND workflow_id IS NULL",
+                params![current.id, provider_run_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(committed)
+    }
+
+    pub fn workflow_transitions(
+        &self,
+        workflow_id: i64,
+    ) -> Result<Vec<crate::workflow::WorkflowTransitionRecord>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, workflow_id, from_stage, to_stage, from_status, to_status, edge, deterministic, provider_run_id, details, created_at
+             FROM workflow_transitions WHERE workflow_id=?1 ORDER BY id",
+        )?;
+        Ok(statement
+            .query_map([workflow_id], |row| {
+                Ok(crate::workflow::WorkflowTransitionRecord {
+                    id: row.get(0)?,
+                    workflow_id: row.get(1)?,
+                    from_stage: row.get(2)?,
+                    to_stage: row.get(3)?,
+                    from_status: row.get(4)?,
+                    to_status: row.get(5)?,
+                    edge: row.get(6)?,
+                    deterministic: row.get(7)?,
+                    provider_run_id: row.get(8)?,
+                    details: row.get(9)?,
+                    created_at: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -3123,7 +3644,19 @@ impl Database {
     }
 
     pub fn insert_agent(&self, agent: &AgentDefinition) -> Result<(), DbError> {
-        self.conn.execute(
+        self.insert_agent_definition(agent)?;
+        if let Some(project_id) = self.get_project_id()? {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO project_agent_references (project_id, agent_id) VALUES (?1, ?2)",
+                params![project_id, agent.id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_agent_definition(&self, agent: &AgentDefinition) -> Result<(), DbError> {
+        let capabilities = crate::registry::normalize_capability_names(&agent.capabilities);
+        self.registry.execute(
             "INSERT INTO agents (id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 agent.id,
@@ -3131,7 +3664,7 @@ impl Database {
                 agent.display_name,
                 agent.enabled,
                 agent.priority,
-                serde_json::to_string(&agent.capabilities)?,
+                serde_json::to_string(&capabilities)?,
                 agent.status,
                 agent.unavailable_reason,
                 agent.profile_path,
@@ -3154,7 +3687,7 @@ impl Database {
                 agent.reasoning_effort,
             )?;
         }
-        self.conn.execute(
+        self.registry.execute(
             "INSERT OR IGNORE INTO agent_authorizations (agent_id) VALUES (?1)",
             [&agent.id],
         )?;
@@ -3175,8 +3708,8 @@ impl Database {
                 "only globally owned agents can be registered".into(),
             ));
         }
-        self.insert_agent(&agent.to_definition())?;
-        self.conn.execute(
+        self.insert_agent_definition(&agent.to_definition())?;
+        self.registry.execute(
             "UPDATE agents SET model_version = ?1, scope = ?2 WHERE id = ?3",
             rusqlite::params![agent.model_version, agent.scope, agent.id],
         )?;
@@ -3203,7 +3736,7 @@ impl Database {
             ));
         }
         let definition = agent.to_definition();
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = self.registry.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO agents (id, model_version, scope, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
@@ -3258,7 +3791,7 @@ impl Database {
     }
 
     pub fn agent_authorization(&self, id: &str) -> Result<Option<AgentAuthorization>, DbError> {
-        self.conn
+        self.registry
             .query_row(
                 "SELECT authenticated, authentication_method, authentication_detail FROM agent_authorizations WHERE agent_id = ?1",
                 [id],
@@ -3279,7 +3812,7 @@ impl Database {
         id: &str,
     ) -> Result<Vec<crate::registry::OperatorPermission>, DbError> {
         let permissions: Option<String> = self
-            .conn
+            .registry
             .query_row(
                 "SELECT permissions FROM agent_authorizations WHERE agent_id = ?1",
                 [id],
@@ -3298,7 +3831,7 @@ impl Database {
         id: &str,
         permissions: &[crate::registry::OperatorPermission],
     ) -> Result<bool, DbError> {
-        let changed = self.conn.execute(
+        let changed = self.registry.execute(
             "UPDATE agent_authorizations SET permissions = ?1 WHERE agent_id = ?2",
             params![serde_json::to_string(permissions)?, id],
         )?;
@@ -3310,7 +3843,7 @@ impl Database {
         let Some(definition) = definition else {
             return Ok(None);
         };
-        let (version, scope): (u16, String) = self.conn.query_row(
+        let (version, scope): (u16, String) = self.registry.query_row(
             "SELECT model_version, scope FROM agents WHERE id = ?1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -3345,9 +3878,13 @@ impl Database {
 
     fn agent_from_row(&self, row: &Row<'_>) -> rusqlite::Result<AgentDefinition> {
         let capabilities_json: String = row.get(5)?;
-        let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!("invalid agent capabilities: {error}"))
-        })?;
+        let capabilities: Vec<String> =
+            serde_json::from_str(&capabilities_json).map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!(
+                    "invalid agent capabilities: {error}"
+                ))
+            })?;
+        let capabilities = crate::registry::normalize_capability_names(&capabilities);
         let quota_limits_json: Option<String> = row.get(17)?;
         let quota_limits = quota_limits_json
             .map(|value| serde_json::from_str(&value))
@@ -3403,7 +3940,7 @@ impl Database {
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentDefinition>, DbError> {
         Ok(self
-            .conn
+            .registry
             .query_row(
                 "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents WHERE id = ?1",
                 params![id],
@@ -3413,7 +3950,7 @@ impl Database {
     }
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.registry.prepare(
             "SELECT id, backend, display_name, enabled, priority, capabilities, status, unavailable_reason, profile_path, model, reasoning_effort, config_metadata, execution_mode, quota_remaining_percent, quota_reset_at, quota_checked_at, quota_source, quota_limits FROM agents ORDER BY id",
         )?;
         Ok(statement
@@ -3421,8 +3958,24 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Resolve the current project's references against the authoritative
+    /// registry at read time. Scheduling and semantic actions use this view;
+    /// registry administration continues to use `list_agents`.
+    pub fn list_schedulable_agents(&self) -> Result<Vec<AgentDefinition>, DbError> {
+        let Some(project_id) = self.get_project_id()? else {
+            return Ok(Vec::new());
+        };
+        self.list_project_agent_references(project_id)?
+            .into_iter()
+            .map(|reference| {
+                self.get_agent(&reference.agent_id)?
+                    .ok_or(DbError::AgentNotFound(reference.agent_id))
+            })
+            .collect()
+    }
+
     pub fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET enabled = ?1 WHERE id = ?2",
             params![enabled, id],
         )? != 0)
@@ -3430,7 +3983,7 @@ impl Database {
 
     pub fn archive_agent(&self, id: &str) -> Result<(), DbError> {
         let status: Option<String> = self
-            .conn
+            .registry
             .query_row(
                 "SELECT status FROM agents WHERE id = ?1",
                 params![id],
@@ -3451,7 +4004,7 @@ impl Database {
         if active != 0 {
             return Err(DbError::AgentHasActiveRun(id.to_owned()));
         }
-        self.conn.execute(
+        self.registry.execute(
             "UPDATE agents SET status = 'archived', enabled = 0, unavailable_reason = 'archived' WHERE id = ?1",
             params![id],
         )?;
@@ -3459,7 +4012,7 @@ impl Database {
     }
 
     pub fn purge_agent(&self, id: &str) -> Result<(), DbError> {
-        let exists: bool = self.conn.query_row(
+        let exists: bool = self.registry.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
             [id],
             |r| r.get(0),
@@ -3475,7 +4028,11 @@ impl Database {
         let result = (|| {
             self.conn
                 .execute("DELETE FROM lead_provider_config WHERE agent_id = ?1", [id])?;
-            self.conn
+            self.conn.execute(
+                "DELETE FROM project_agent_references WHERE agent_id = ?1",
+                [id],
+            )?;
+            self.registry
                 .execute("DELETE FROM agents WHERE id = ?1", [id])?;
             self.conn.execute_batch("COMMIT")?;
             Ok(())
@@ -3487,21 +4044,21 @@ impl Database {
     }
 
     pub fn set_agent_priority(&self, id: &str, priority: i64) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET priority = ?1 WHERE id = ?2",
             params![priority, id],
         )? != 0)
     }
 
     pub fn set_agent_profile_path(&self, id: &str, profile_path: &str) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET profile_path = ?1 WHERE id = ?2",
             params![profile_path, id],
         )? != 0)
     }
 
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET model = ?1 WHERE id = ?2",
             params![model, id],
         )? != 0)
@@ -3512,7 +4069,7 @@ impl Database {
         id: &str,
         effort: ReasoningEffort,
     ) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET reasoning_effort = ?1 WHERE id = ?2",
             params![effort.as_str(), id],
         )? != 0)
@@ -3523,7 +4080,7 @@ impl Database {
         id: &str,
         execution_mode: &str,
     ) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET execution_mode = ?1 WHERE id = ?2",
             params![execution_mode, id],
         )? != 0)
@@ -3538,7 +4095,7 @@ impl Database {
         if !(0..=100).contains(&remaining_percent) {
             return Err(DbError::InvalidQuota(remaining_percent));
         }
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = 'manual', quota_limits = NULL WHERE id = ?3",
             params![remaining_percent, reset_at, id],
         )? != 0)
@@ -3586,14 +4143,14 @@ impl Database {
         if !(0..=100).contains(&remaining_percent) {
             return Err(DbError::InvalidQuota(remaining_percent));
         }
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET quota_remaining_percent = ?1, quota_reset_at = ?2, quota_checked_at = CURRENT_TIMESTAMP, quota_source = ?3, quota_limits = ?4 WHERE id = ?5",
             params![remaining_percent, reset_at, source, serde_json::to_string(limits)?, id],
         )? != 0)
     }
 
     pub fn clear_agent_quota(&self, id: &str) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET quota_remaining_percent = NULL, quota_reset_at = NULL, quota_checked_at = NULL, quota_source = NULL, quota_limits = NULL WHERE id = ?1",
             params![id],
         )? != 0)
@@ -3605,7 +4162,7 @@ impl Database {
         status: &str,
         reason: Option<&str>,
     ) -> Result<bool, DbError> {
-        Ok(self.conn.execute(
+        Ok(self.registry.execute(
             "UPDATE agents SET status = ?1, unavailable_reason = ?2 WHERE id = ?3",
             params![status, reason, id],
         )? != 0)
@@ -3656,6 +4213,43 @@ impl Database {
         Ok(())
     }
 
+    pub fn store_discovery_snapshot(
+        &self,
+        project_id: i64,
+        snapshot: &crate::discovery::ProjectDiscoverySnapshot,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO discovery_snapshots(project_id, fingerprint, snapshot) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET fingerprint=excluded.fingerprint, snapshot=excluded.snapshot, created_at=CURRENT_TIMESTAMP",
+            params![project_id, snapshot.fingerprint, serde_json::to_string(snapshot)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_discovery_snapshot(
+        &self,
+        project_id: i64,
+        fingerprint: &str,
+    ) -> Result<Option<crate::discovery::ProjectDiscoverySnapshot>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT snapshot FROM discovery_snapshots WHERE project_id=?1 AND fingerprint=?2",
+                params![project_id, fingerprint],
+                |row| {
+                    let value: String = row.get(0)?;
+                    serde_json::from_str(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
     fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         let priority: String = row.get(4)?;
         let status: String = row.get(5)?;
@@ -3685,7 +4279,7 @@ impl Database {
             }
         };
         let required_capabilities_json: Option<String> = row.get(6)?;
-        let required_capabilities = match required_capabilities_json {
+        let required_capabilities: Vec<String> = match required_capabilities_json {
             Some(json_str) if !json_str.trim().is_empty() => serde_json::from_str(&json_str)
                 .map_err(|error| {
                     rusqlite::Error::InvalidParameterName(format!(
@@ -3694,6 +4288,8 @@ impl Database {
                 })?,
             _ => Vec::new(),
         };
+        let required_capabilities =
+            crate::registry::normalize_capability_names(&required_capabilities);
         let scope_mode = match row.get::<_, Option<String>>(7)? {
             Some(value) => Some(TaskScopeMode::parse(&value).ok_or_else(|| {
                 rusqlite::Error::InvalidParameterName(format!("invalid task scope mode: {value}"))
@@ -3708,7 +4304,7 @@ impl Database {
                 None => Ok(Vec::new()),
             }
         };
-        let reasoning_effort = match row.get::<_, Option<String>>(11)? {
+        let reasoning_effort = match row.get::<_, Option<String>>(13)? {
             Some(value) => Some(ReasoningEffort::parse(&value).map_err(|error| {
                 rusqlite::Error::InvalidParameterName(format!("invalid task effort: {error}"))
             })?),
@@ -3727,8 +4323,8 @@ impl Database {
             context_files: list(8)?,
             expected_changes: list(9)?,
             reasoning_effort,
-            effort_reason: row.get(12)?,
-            risk_factors: match row.get::<_, Option<String>>(13)? {
+            effort_reason: row.get(14)?,
+            risk_factors: match row.get::<_, Option<String>>(15)? {
                 Some(value) => serde_json::from_str(&value).map_err(|error| {
                     rusqlite::Error::InvalidParameterName(format!("invalid task risks: {error}"))
                 })?,
@@ -3739,7 +4335,7 @@ impl Database {
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -3748,7 +4344,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: i64) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE project_id = ?1 ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE project_id = ?1 ORDER BY created_at",
         )?;
         Ok(stmt
             .query_map(params![project_id], Self::task_from_row)?
@@ -3820,6 +4416,29 @@ impl Database {
         Ok(contract.flatten())
     }
 
+    /// Return the complete persisted execution selection contract. These
+    /// fields are stored on the Task row, not recovered from proposal history.
+    pub fn get_task_execution_hints(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::protocol::ExecutionHints>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT execution_class, execution_model, reasoning_effort, effort_reason FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| {
+                    Ok(crate::protocol::ExecutionHints {
+                        class: row.get(0)?,
+                        model: row.get(1)?,
+                        effort: row.get(2)?,
+                        effort_reason: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
     /// Persist the canonical task contract used by Worker PREPARE.  This is a
     /// separate operation from execution so callers can create a task and
     /// retain the exact Lead proposal that authorized it.
@@ -3849,7 +4468,7 @@ impl Database {
                 DbError::Scheduler("task proposal has no execution effort".into())
             })?;
         self.conn.execute(
-            "UPDATE tasks SET reasoning_effort = ?1, effort_reason = ?2, risk_factors = ?3, expected_changes = ?4, acceptance_criteria = ?5, required_tests = ?6, validation = ?7, unchanged = ?8 WHERE id = ?9",
+            "UPDATE tasks SET reasoning_effort = ?1, effort_reason = ?2, risk_factors = ?3, expected_changes = ?4, acceptance_criteria = ?5, required_tests = ?6, validation = ?7, unchanged = ?8, execution_class = ?9, execution_model = ?10 WHERE id = ?11",
             params![
                 effort,
                 proposal.execution_hints.effort_reason,
@@ -3859,6 +4478,8 @@ impl Database {
                 serde_json::to_string(&proposal.required_tests)?,
                 serde_json::to_string(&proposal.validation)?,
                 serde_json::to_string(&proposal.unchanged)?,
+                proposal.execution_hints.class,
+                proposal.execution_hints.model,
                 task_id
             ],
         )?;
@@ -3981,7 +4602,9 @@ impl Database {
         let result = (|| {
             let id = self.allocate_task_id()?;
             let contract = crate::task::TaskContract::defaults(&input.objective);
-            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, '[]', ?13, ?14, ?15, ?16)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&input.required_capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?, Task::DEFAULT_REASONING_EFFORT.as_str(), Task::DEFAULT_EFFORT_REASON, serde_json::to_string(&contract.acceptance_criteria)?, serde_json::to_string(&contract.required_tests)?, serde_json::to_string(&contract.validation)?, serde_json::to_string(&contract.unchanged)?])?;
+            let capabilities =
+                crate::registry::normalize_capability_names(&input.required_capabilities);
+            self.conn.execute("INSERT INTO tasks (id, project_id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, reasoning_effort, effort_reason, risk_factors, acceptance_criteria, required_tests, validation, unchanged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'backlog', ?7, ?8, ?9, ?10, ?11, ?12, '[]', ?13, ?14, ?15, ?16)", params![id, project_id, input.title, input.objective, input.role, priority_string(input.priority), serde_json::to_string(&capabilities)?, input.scope_mode.map(|value| value.to_string()), serde_json::to_string(&input.context_files)?, serde_json::to_string(&input.expected_changes)?, Task::DEFAULT_REASONING_EFFORT.as_str(), Task::DEFAULT_EFFORT_REASON, serde_json::to_string(&contract.acceptance_criteria)?, serde_json::to_string(&contract.required_tests)?, serde_json::to_string(&contract.validation)?, serde_json::to_string(&contract.unchanged)?])?;
             for dependency in &input.dependencies {
                 self.add_task_dependency(&id, dependency)?;
             }
@@ -4123,7 +4746,7 @@ impl Database {
         Ok(self
             .conn
             .query_row(
-                    "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE id = ?1",
+                    "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE id = ?1",
                 params![id],
                 Self::task_from_row,
             )
@@ -4135,7 +4758,8 @@ impl Database {
         id: &str,
         capabilities: &[String],
     ) -> Result<bool, DbError> {
-        let json = serde_json::to_string(capabilities)?;
+        let json =
+            serde_json::to_string(&crate::registry::normalize_capability_names(capabilities))?;
         let changed = self.conn.execute(
             "UPDATE tasks SET required_capabilities = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![json, id],

@@ -116,6 +116,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start and automatically continue a persisted end-to-end workflow.
+    Orchestrate {
+        objective: String,
+        /// Automatically accept tasks after authoritative validation and review PASS.
+        #[arg(long)]
+        auto_accept: bool,
+        /// Require a user gate after Lead approves a Planner plan.
+        #[arg(long)]
+        user_plan_approval: bool,
+    },
+    /// Continue the active persisted workflow, or a specific workflow ID.
+    Continue {
+        id: Option<i64>,
+    },
+    /// Resolve a persisted workflow user/acceptance gate and continue.
+    WorkflowResolve {
+        id: i64,
+        resolution: String,
+    },
+    /// Cancel a non-terminal persisted workflow.
+    WorkflowCancel {
+        id: i64,
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
     /// Emit a structured project report for a manual planner.
     Report {
         #[arg(long)]
@@ -403,7 +428,7 @@ fn run(cli: Cli) -> Result<()> {
     {
         Command::Init => {
             // initialize sqlite DB
-            let db = Database::init(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::init_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             adoption::ensure_adoption_files(std::path::Path::new(".orc"))?;
             let pid = match db.get_project_id().map_err(|e| anyhow::anyhow!(e))? {
                 Some(id) => id,
@@ -414,10 +439,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Adopt { objective } => {
             let root = adoption::adopt(".")?;
             if let Some(objective) = objective {
-                let db =
-                    Database::open(root.join(".orc/orc.db")).map_err(|e| anyhow::anyhow!(e))?;
+                let db = Database::open_global(root.join(".orc/orc.db"))
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 adoption::ensure_default_lead(&db)?;
-                let app = orc::app::OrcApp::open(root.join(".orc/orc.db"), &root)?;
+                let app = orc::app::OrcApp::open_global(root.join(".orc/orc.db"), &root)?;
                 let response =
                     app.invoke_persisted_lead_with_required_discovery(&objective, 100)?;
                 if response.decision.is_none() {
@@ -446,14 +471,14 @@ fn run(cli: Cli) -> Result<()> {
             println!("Applied repository discovery.");
         }
         Command::Agents { sync } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             if sync {
                 sync_enabled_agents(&db);
             }
             print_agents(&db)?;
         }
         Command::Doctor => print_doctor(&doctor::inspect(".", &doctor::SystemHealthRunner)),
-        Command::Status => match Database::open(DB_PATH) {
+        Command::Status => match Database::open_global(DB_PATH) {
             Ok(db) => {
                 let project = db.get_project_name().map_err(|e| anyhow::anyhow!(e))?;
                 if let Some(name) = project {
@@ -474,7 +499,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::WorkflowState { json } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             let state = app.workflow_state()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);
@@ -495,7 +520,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::WorkflowHistory { json } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             let history = app.workflow_history()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&history)?);
@@ -505,8 +530,60 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Orchestrate {
+            objective,
+            auto_accept,
+            user_plan_approval,
+        } => {
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
+            let policy = orc::workflow::WorkflowPolicy {
+                acceptance: if auto_accept {
+                    orc::workflow::AcceptancePolicy::Automatic
+                } else {
+                    orc::workflow::AcceptancePolicy::User
+                },
+                plan_approval: if user_plan_approval {
+                    orc::workflow::ApprovalPolicy::User
+                } else {
+                    orc::workflow::ApprovalPolicy::Agent
+                },
+                ..Default::default()
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.start_workflow(&objective, policy)?)?
+            );
+        }
+        Command::Continue { id } => {
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
+            let id = match id {
+                Some(id) => id,
+                None => app
+                    .active_workflow()?
+                    .map(|workflow| workflow.id)
+                    .ok_or_else(|| anyhow::anyhow!("no active workflow to continue"))?,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.continue_workflow(id)?)?
+            );
+        }
+        Command::WorkflowResolve { id, resolution } => {
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.resolve_workflow(id, &resolution)?)?
+            );
+        }
+        Command::WorkflowCancel { id, reason } => {
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.cancel_workflow(id, reason.as_deref())?)?
+            );
+        }
         Command::Approvals { command } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project_id = db
                 .get_project_id()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
@@ -529,7 +606,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Report { full } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db
                 .get_project_name()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
@@ -569,7 +646,7 @@ fn run(cli: Cli) -> Result<()> {
             full_report,
             objective,
         } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project = db
                 .get_project_name()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
@@ -634,7 +711,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project_id = db
                 .get_project_id()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
@@ -642,7 +719,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&mapping)?);
         }
         Command::ApplyApprovedPlan => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let project_id = db
                 .get_project_id()?
                 .ok_or_else(|| anyhow::anyhow!("no project found"))?;
@@ -652,7 +729,7 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Cancel { target, id, reason } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             match target.as_str() {
                 "lead" => println!(
                     "{}",
@@ -676,7 +753,7 @@ fn run(cli: Cli) -> Result<()> {
             model,
             effort,
         } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             if let Some(objective) = objective {
                 let mut request = app.planning_request()?;
                 request.objective = objective;
@@ -727,7 +804,7 @@ fn run(cli: Cli) -> Result<()> {
                 result.planner_run_id
             );
         }
-        Command::Queue { explain } => match Database::open(DB_PATH) {
+        Command::Queue { explain } => match Database::open_global(DB_PATH) {
             Ok(db) => {
                 let report = orc::queue::compute_queue(&db).map_err(|e| anyhow::anyhow!(e))?;
                 if explain {
@@ -741,7 +818,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Template { command } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             match command {
                 TemplateCommand::List => {
                     for (class, template) in db.execution_templates()? {
@@ -767,7 +844,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Lead { command } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             match command {
                 LeadCommand::Review {
                     plan_id,
@@ -865,7 +942,7 @@ fn run(cli: Cli) -> Result<()> {
             model,
             effort,
         } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             let (_, response) = app.automated_lead(
                 &request,
                 &orc::automated::ActionOverrides {
@@ -885,7 +962,7 @@ fn run(cli: Cli) -> Result<()> {
             if objective.trim().is_empty() {
                 anyhow::bail!("new-project objective must not be empty");
             }
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             let (run_id, response) = app.new_project_intake(
                 objective.trim(),
                 &orc::automated::ActionOverrides {
@@ -914,7 +991,7 @@ fn run(cli: Cli) -> Result<()> {
             let response: EngineeringLeadResponse = serde_json::from_str(&data)?;
 
             // persist to sqlite
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
 
             let project_id = match db.get_project_id().map_err(|e| anyhow::anyhow!(e))? {
                 Some(id) => id,
@@ -980,7 +1057,7 @@ fn run(cli: Cli) -> Result<()> {
             full,
         } => {
             if automated {
-                let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+                let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
                 let (_, result) = app.automated_review(
                     &task_id,
                     &orc::automated::ActionOverrides {
@@ -992,7 +1069,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             if let Some(run_id) = review_id {
                 let review = app.review_for_run(&task_id, run_id)?;
                 println!("{}", serde_json::to_string_pretty(&review)?);
@@ -1025,7 +1102,7 @@ fn run(cli: Cli) -> Result<()> {
             model,
             effort,
         } => {
-            let app = orc::app::OrcApp::open(DB_PATH, ".")?;
+            let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             let (_, result) = app.automated_project_review_with_backend(
                 &task_id,
                 &orc::automated::ActionOverrides {
@@ -1044,7 +1121,7 @@ fn run(cli: Cli) -> Result<()> {
             effort,
             feedback,
         } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let task = db
                 .get_task(&task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found"))?;
@@ -1070,7 +1147,7 @@ fn run(cli: Cli) -> Result<()> {
                     ".",
                 )?;
             } else {
-                let summary = orc::agent::revise_with_factory_and_db_as_with_runner(
+                let summary = orc::agent::revise_with_factory_and_global_db_as_with_runner(
                     &task_id,
                     feedback.as_deref().unwrap_or(""),
                     DB_PATH,
@@ -1092,12 +1169,14 @@ fn run(cli: Cli) -> Result<()> {
             explain,
             mode,
         } => {
-            let db = Database::open(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
+            let db = Database::open_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
             let task = db
                 .get_task(&task_id)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .ok_or_else(|| anyhow::anyhow!("task '{}' not found in DB", task_id))?;
-            let agents = db.list_agents().map_err(|e| anyhow::anyhow!(e))?;
+            let agents = db
+                .list_schedulable_agents()
+                .map_err(|e| anyhow::anyhow!(e))?;
             let reserve = db.quota_reserve().map_err(|e| anyhow::anyhow!(e))?;
             let decision = orc::scheduler::schedule_with_quota_reserve(
                 &task,
@@ -1121,7 +1200,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Run { command } => orc::cli::run::run(command, DB_PATH)?,
         Command::Agent { command } => orc::cli::agent::run(command, DB_PATH)?,
         Command::Task { command } => orc::cli::task::run(command, DB_PATH)?,
-        Command::Runs { task_id } => match Database::open(DB_PATH) {
+        Command::Runs { task_id } => match Database::open_global(DB_PATH) {
             Ok(db) => {
                 let runs = if let Some(tid) = task_id {
                     // Show runs for specific task
@@ -1209,7 +1288,7 @@ fn sync_enabled_agents(db: &Database) {
 }
 
 fn sync_enabled_agents_after_automated_run(task_id: &str) {
-    match Database::open(DB_PATH) {
+    match Database::open_global(DB_PATH) {
         Ok(db) => {
             let automated = db
                 .list_agent_runs_for_task(task_id)
@@ -1388,6 +1467,10 @@ mod cli_tests {
             Command::Status => "Status",
             Command::WorkflowState { .. } => "WorkflowState",
             Command::WorkflowHistory { .. } => "WorkflowHistory",
+            Command::Orchestrate { .. } => "Orchestrate",
+            Command::Continue { .. } => "Continue",
+            Command::WorkflowResolve { .. } => "WorkflowResolve",
+            Command::WorkflowCancel { .. } => "WorkflowCancel",
             Command::Report { .. } => "Report",
             Command::PlanRequest { .. } => "PlanRequest",
             Command::Plan { .. } => "Plan",

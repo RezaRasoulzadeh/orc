@@ -144,6 +144,16 @@ impl AgentCapability {
     }
 }
 
+pub fn normalize_capability_names(values: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    values
+        .iter()
+        .map(|value| AgentCapability::parse(value))
+        .filter(|capability| seen.insert(capability.clone()))
+        .map(|capability| capability.as_str().to_owned())
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentExecutionMode {

@@ -10,6 +10,9 @@ pub enum ExecutionClass {
 }
 
 impl ExecutionClass {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        value.parse()
+    }
     pub const fn all() -> [Self; 5] {
         [
             Self::Coder,
@@ -36,10 +39,10 @@ impl std::str::FromStr for ExecutionClass {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "coder" => Ok(Self::Coder),
-            "reviewer" => Ok(Self::Reviewer),
-            "architect" => Ok(Self::Architect),
-            "researcher" => Ok(Self::Researcher),
+            "coder" | "code" | "developer" | "focused" | "implementation" => Ok(Self::Coder),
+            "reviewer" | "review" => Ok(Self::Reviewer),
+            "architect" | "plan" | "planner" => Ok(Self::Architect),
+            "researcher" | "research" => Ok(Self::Researcher),
             "general" => Ok(Self::General),
             _ => Err("expected coder, reviewer, architect, researcher, or general".into()),
         }

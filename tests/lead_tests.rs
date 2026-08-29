@@ -276,7 +276,8 @@ fn new_project_intake_validates_objective_and_persists_read_only_lead_decision()
     let input = backend.input.borrow().clone().unwrap();
     let lead_input = input.rsplit_once('\n').unwrap().1;
     let envelope: serde_json::Value = serde_json::from_str(lead_input).unwrap();
-    let request: serde_json::Value = serde_json::from_str(envelope[1].as_str().unwrap()).unwrap();
+    let request: serde_json::Value =
+        serde_json::from_str(envelope["request"].as_str().unwrap()).unwrap();
     assert_eq!(request["kind"], "new_project_intake");
     assert_eq!(request["objective"], "Ship the first release");
     let snapshot = request["discovery_snapshot"].as_object().unwrap();

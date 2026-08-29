@@ -153,6 +153,72 @@ fn project_reference_rejects_non_global_agents_and_unknown_projects() {
 }
 
 #[test]
+fn global_registry_survives_project_database_reset_without_authoritative_agent_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_db = directory.path().join("project.db");
+    let registry_db = directory.path().join("global-agents.db");
+    let db = Database::init_with_registry(&project_db, &registry_db).unwrap();
+    let project = db.create_project("first").unwrap();
+    let agent = Agent::from_definition(&definition("shared-after-reset")).unwrap();
+    db.insert_global_agent(&agent).unwrap();
+    db.reference_global_agent(project, &agent.id).unwrap();
+    drop(db);
+
+    std::fs::remove_file(&project_db).unwrap();
+    let reopened = Database::init_with_registry(&project_db, &registry_db).unwrap();
+    let replacement = reopened.create_project("replacement").unwrap();
+    assert_eq!(
+        reopened.get_global_agent(&agent.id).unwrap(),
+        Some(agent.clone())
+    );
+    assert!(
+        reopened
+            .reference_global_agent(replacement, &agent.id)
+            .unwrap()
+    );
+    assert_eq!(
+        reopened.list_project_agents(replacement).unwrap(),
+        vec![agent]
+    );
+
+    let project_only = rusqlite::Connection::open(&project_db).unwrap();
+    let local_agent_rows: i64 = project_only
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(local_agent_rows, 0, "project DB must not own global agents");
+}
+
+#[test]
+fn one_time_legacy_migration_cannot_resurrect_a_purged_global_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_db = directory.path().join("project.db");
+    let registry_db = directory.path().join("global-agents.db");
+    let db = Database::init_with_registry(&project_db, &registry_db).unwrap();
+    db.create_project("legacy").unwrap();
+    drop(db);
+
+    let project_only = rusqlite::Connection::open(&project_db).unwrap();
+    project_only
+        .execute("DELETE FROM meta WHERE key='agent_registry_migrated'", [])
+        .unwrap();
+    project_only
+        .execute(
+            "INSERT INTO agents(id, backend, display_name, capabilities) VALUES (?1, 'codex', 'Legacy', '[]')",
+            ["legacy-global"],
+        )
+        .unwrap();
+    drop(project_only);
+
+    let migrated = Database::open_with_registry(&project_db, &registry_db).unwrap();
+    assert!(migrated.get_agent("legacy-global").unwrap().is_some());
+    migrated.purge_agent("legacy-global").unwrap();
+    drop(migrated);
+
+    let reopened = Database::open_with_registry(&project_db, &registry_db).unwrap();
+    assert!(reopened.get_agent("legacy-global").unwrap().is_none());
+}
+
+#[test]
 fn provider_adapter_translates_execution_but_not_lifecycle() {
     let agent = Agent::from_definition(&definition("codex")).unwrap();
     let adapter = provider_adapter(agent.provider()).unwrap();

@@ -401,14 +401,14 @@ impl<'a> LeadService<'a> {
         Ok(LeadContext {
             discovery: if self.require_discovery {
                 Some(
-                    crate::discovery::build_snapshot(self.repo_path).map_err(|error| {
+                    crate::discovery::snapshot_for_provider(self.repo_path).map_err(|error| {
                         DbError::Scheduler(format!(
                             "structured project discovery failed: {error:#}"
                         ))
                     })?,
                 )
             } else {
-                crate::discovery::build_snapshot(self.repo_path).ok()
+                crate::discovery::snapshot_for_provider(self.repo_path).ok()
             },
             project_id,
             project_name: self.db.get_project_name()?.unwrap_or_default(),
@@ -425,7 +425,7 @@ impl<'a> LeadService<'a> {
             runs,
             results,
             approvals: self.db.list_approval_requests(project_id)?,
-            agents: self.db.list_agents()?,
+            agents: self.db.list_schedulable_agents()?,
             turns,
             proposals,
         })

@@ -7,6 +7,7 @@ use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database};
 use orc::task::TaskPriority;
 use orc::task::TaskScopeMode;
+use orc::validation::test_helpers::FakeValidationRunner;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -1274,7 +1275,12 @@ fn explicit_automated_review_still_invokes_backend_once() {
     let backend = CountingReviewBackend(AtomicUsize::new(0));
 
     let (_, result) = app
-        .automated_review_with_backend(&task, &ActionOverrides::default(), &backend)
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides::default(),
+            &backend,
+            &FakeValidationRunner::success(),
+        )
         .unwrap();
 
     assert_eq!(result.verdict, "PASS");

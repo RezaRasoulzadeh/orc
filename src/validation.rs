@@ -9,6 +9,8 @@ pub struct ValidationConfig {
     pub commands: Vec<String>,
     #[serde(default)]
     pub groups: Vec<ValidationGroup>,
+    #[serde(default)]
+    pub boundaries: Vec<ValidationBoundary>,
 }
 
 /// A named, deterministically selectable subset of the configured validation
@@ -19,6 +21,20 @@ pub struct ValidationConfig {
 pub struct ValidationGroup {
     pub name: String,
     pub commands: Vec<String>,
+}
+
+/// An explicit override for a single path that legitimately crosses more
+/// than one validation group's boundary - e.g. the Tauri command surface
+/// consumed by the frontend, or a hand-mirrored shared type/schema file -
+/// where a single-group path heuristic would be unsafe. A changed file
+/// matching `path` contributes every listed group instead of the one
+/// `group_for_path` would otherwise infer. This is deliberately explicit,
+/// per-project data rather than an attempt to infer cross-boundary impact
+/// from file contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationBoundary {
+    pub path: String,
+    pub groups: Vec<String>,
 }
 
 /// The outcome of selecting task-specific validation commands: which
@@ -87,6 +103,23 @@ impl ValidationConfig {
         self.groups.iter().find(|group| group.name == name)
     }
 
+    /// Classify a single changed file into the validation group(s) whose
+    /// commands protect it. An explicit `[[boundaries]]` entry (see
+    /// [`ValidationBoundary`]) takes precedence and can contribute more than
+    /// one group; otherwise falls back to the path/extension heuristic in
+    /// [`group_for_path`], which only ever contributes one.
+    fn groups_for_path(&self, path: &str) -> Vec<&str> {
+        let normalized = path.split_once(" -> ").map_or(path, |(_, dst)| dst);
+        if let Some(boundary) = self
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.path == normalized)
+        {
+            return boundary.groups.iter().map(String::as_str).collect();
+        }
+        group_for_path(normalized).into_iter().collect()
+    }
+
     /// Select the smallest authoritative set of configured validation
     /// commands relevant to a task, given its changed files and any
     /// explicit task-required validation commands.
@@ -111,11 +144,19 @@ impl ValidationConfig {
             let mut matched_groups = std::collections::BTreeSet::new();
             let mut unclassified = false;
             for file in changed_files {
-                match group_for_path(file) {
-                    Some(name) if self.group(name).is_some() => {
+                let groups = self.groups_for_path(file);
+                if groups.is_empty() {
+                    unclassified = true;
+                }
+                for name in groups {
+                    if self.group(name).is_some() {
                         matched_groups.insert(name);
+                    } else {
+                        // A boundary (or, in principle, a future heuristic)
+                        // named a group that isn't configured. Selection
+                        // cannot be narrowed safely.
+                        unclassified = true;
                     }
-                    _ => unclassified = true,
                 }
             }
             if unclassified || matched_groups.is_empty() {
@@ -502,6 +543,7 @@ impl ValidationConfig {
                 return Ok(Self {
                     commands,
                     groups: parse_groups_from_toml(&content),
+                    boundaries: parse_boundaries_from_toml(&content),
                 });
             }
         }
@@ -525,6 +567,7 @@ impl ValidationConfig {
             return Ok(Self {
                 commands,
                 groups: Vec::new(),
+                boundaries: Vec::new(),
             });
         }
 
@@ -532,6 +575,7 @@ impl ValidationConfig {
         Ok(Self {
             commands: Self::default_commands(),
             groups: Vec::new(),
+            boundaries: Vec::new(),
         })
     }
 }
@@ -701,6 +745,109 @@ fn parse_groups_from_toml(content: &str) -> Vec<ValidationGroup> {
     groups
 }
 
+/// Parse `[[boundaries]]` array-of-tables from `.orc/validation.toml`. Each
+/// boundary has a `path` and a `groups` array, using the same lightweight
+/// bracket parsing as `[[groups]]`.
+fn parse_boundaries_from_toml(content: &str) -> Vec<ValidationBoundary> {
+    let mut boundaries = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_groups: Vec<String> = Vec::new();
+    let mut in_boundary = false;
+    let mut in_groups = false;
+
+    fn flush(
+        boundaries: &mut Vec<ValidationBoundary>,
+        path: &mut Option<String>,
+        groups: &mut Vec<String>,
+    ) {
+        if let Some(path) = path.take() {
+            boundaries.push(ValidationBoundary {
+                path,
+                groups: std::mem::take(groups),
+            });
+        } else {
+            groups.clear();
+        }
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[[boundaries]]" {
+            flush(&mut boundaries, &mut current_path, &mut current_groups);
+            in_boundary = true;
+            in_groups = false;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            flush(&mut boundaries, &mut current_path, &mut current_groups);
+            in_boundary = false;
+            in_groups = false;
+            continue;
+        }
+        if !in_boundary {
+            continue;
+        }
+        if in_groups {
+            if trimmed.ends_with(']') || trimmed == "]" {
+                let inner = trimmed.trim_end_matches(']');
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_groups.push(s.to_string());
+                    }
+                }
+                in_groups = false;
+            } else {
+                for item in trimmed.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_groups.push(s.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("path") && trimmed.contains('=') {
+            let Some((_, after_eq)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let value = after_eq.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                current_path = Some(value.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with("groups") && trimmed.contains('=') {
+            let Some((_, after_eq)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let after_eq = after_eq.trim();
+            if after_eq.starts_with('[') && after_eq.ends_with(']') {
+                let inner = &after_eq[1..after_eq.len() - 1];
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_groups.push(s.to_string());
+                    }
+                }
+            } else if let Some(inner) = after_eq.strip_prefix('[') {
+                in_groups = true;
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() && s != "]" {
+                        current_groups.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut boundaries, &mut current_path, &mut current_groups);
+    boundaries
+}
+
 fn extract_commands_from_engineering_contract(content: &str) -> Option<Vec<String>> {
     let mut capturing = false;
     let mut commands = Vec::new();
@@ -861,6 +1008,28 @@ commands = [
     }
 
     #[test]
+    fn this_repo_validation_toml_declares_the_tauri_frontend_boundary() {
+        // Regression guard tying the parser to the real .orc/validation.toml:
+        // the Tauri command surface and its hand-mirrored frontend contract
+        // must stay declared as a boundary, or a change to either would be
+        // under-validated as a single-subsystem change.
+        let cfg = ValidationConfig::load(Path::new(".")).unwrap();
+        let lib_rs = cfg
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.path == "src-tauri/src/lib.rs")
+            .expect("src-tauri/src/lib.rs boundary is configured");
+        assert!(lib_rs.groups.contains(&"tauri".to_string()));
+        assert!(lib_rs.groups.contains(&"frontend".to_string()));
+        for group in &lib_rs.groups {
+            assert!(
+                cfg.groups.iter().any(|g| &g.name == group),
+                "boundary references unconfigured group '{group}'"
+            );
+        }
+    }
+
+    #[test]
     fn parse_groups_from_toml_reads_named_command_sets() {
         let toml = r#"
 commands = ["cargo fmt --check"]
@@ -887,6 +1056,34 @@ commands = [
         );
     }
 
+    #[test]
+    fn parse_boundaries_from_toml_reads_multi_group_paths() {
+        let toml = r#"
+commands = ["cargo fmt --check"]
+
+[[groups]]
+name = "rust-core"
+commands = ["cargo test"]
+
+[[boundaries]]
+path = "src-tauri/src/lib.rs"
+groups = ["tauri", "frontend"]
+
+[[boundaries]]
+path = "src/shared/schema.rs"
+groups = [
+  "rust-core",
+  "frontend",
+]
+"#;
+        let boundaries = parse_boundaries_from_toml(toml);
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].path, "src-tauri/src/lib.rs");
+        assert_eq!(boundaries[0].groups, vec!["tauri", "frontend"]);
+        assert_eq!(boundaries[1].path, "src/shared/schema.rs");
+        assert_eq!(boundaries[1].groups, vec!["rust-core", "frontend"]);
+    }
+
     fn grouped_config() -> ValidationConfig {
         ValidationConfig {
             commands: vec!["cargo fmt --check".into()],
@@ -904,6 +1101,10 @@ commands = [
                     commands: vec!["cargo test --manifest-path src-tauri/Cargo.toml".into()],
                 },
                 ValidationGroup {
+                    name: "packaging".into(),
+                    commands: vec!["npm run validate:package".into()],
+                },
+                ValidationGroup {
                     name: "integration".into(),
                     commands: vec![
                         "cargo fmt --check".into(),
@@ -914,6 +1115,10 @@ commands = [
                     ],
                 },
             ],
+            boundaries: vec![ValidationBoundary {
+                path: "src-tauri/src/lib.rs".into(),
+                groups: vec!["tauri".into(), "frontend".into()],
+            }],
         }
     }
 
@@ -959,6 +1164,57 @@ commands = [
             selection
                 .commands
                 .contains(&"cargo test --manifest-path src-tauri/Cargo.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn tauri_command_boundary_file_alone_selects_tauri_and_frontend_not_full_integration() {
+        // src-tauri/src/lib.rs is the Tauri command surface consumed by the
+        // frontend; a path heuristic alone (starts_with("src-tauri/")) would
+        // under-select just "tauri" and miss that the frontend depends on
+        // this exact contract. The explicit [[boundaries]] entry fixes that
+        // without escalating to the full "integration" group.
+        let config = grouped_config();
+        let selection = config.select_for_task(&["src-tauri/src/lib.rs".into()], &[]);
+        assert_eq!(selection.groups, vec!["frontend", "tauri"]);
+        assert!(selection.commands.contains(&"npm run typecheck".to_string()));
+        assert!(
+            selection
+                .commands
+                .contains(&"cargo test --manifest-path src-tauri/Cargo.toml".to_string())
+        );
+        assert!(!selection.groups.contains(&"integration".to_string()));
+        assert!(!selection.groups.contains(&"packaging".to_string()));
+    }
+
+    #[test]
+    fn boundary_file_alongside_unrelated_rust_change_unions_exactly_the_affected_groups() {
+        // A shared-contract change plus an ordinary rust-core change must
+        // select the union of directly affected groups, not escalate to the
+        // full pipeline merely because more than one group is involved.
+        let config = grouped_config();
+        let selection = config.select_for_task(
+            &["src-tauri/src/lib.rs".into(), "src/storage/db.rs".into()],
+            &[],
+        );
+        assert_eq!(selection.groups, vec!["frontend", "rust-core", "tauri"]);
+        assert!(!selection.groups.contains(&"integration".to_string()));
+    }
+
+    #[test]
+    fn packaging_only_change_selects_only_packaging_validation() {
+        let config = grouped_config();
+        let selection = config.select_for_task(&["packaging/orc.nsi".into()], &[]);
+        assert_eq!(selection.groups, vec!["packaging"]);
+        assert_eq!(
+            selection.commands,
+            vec!["npm run validate:package".to_string()]
+        );
+        assert!(
+            !selection
+                .commands
+                .iter()
+                .any(|command| command.starts_with("cargo") || command.starts_with("npm run typecheck"))
         );
     }
 

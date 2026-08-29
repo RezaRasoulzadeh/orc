@@ -1265,6 +1265,7 @@ fn select_and_run_review_validation(
         .unwrap_or_else(|_| crate::validation::ValidationConfig {
             commands: Vec::new(),
             groups: Vec::new(),
+            boundaries: Vec::new(),
         });
     let changed_files: Vec<String> = summary
         .changes
@@ -1380,29 +1381,18 @@ fn append_validation_failure_blocker(
     result.blocking_findings.push(finding);
 }
 
+/// Task review: produces the PASS/REVISE/REJECT verdict that gates task
+/// acceptance. This is the only public entry point for a task review, and it
+/// always determines, executes, and persists task-specific validation (see
+/// [`select_and_run_review_validation`]) before producing a verdict —
+/// dispatch and revision no longer run configured validation themselves, so
+/// there must be no task-review path that can skip it. Callers that
+/// genuinely have no worktree to validate (e.g. tests exercising only the
+/// verdict/blocker machinery) still pass a `repo_path`/`validation_runner`;
+/// validation is then a no-op because there is nothing to select against
+/// (see `select_and_run_review_validation`'s worktree check), not because
+/// the caller opted out.
 pub fn run_review(
-    db: &Database,
-    summary: &ReviewSummary,
-    overrides: &ActionOverrides,
-    backend: &dyn ActionBackend,
-) -> Result<(i64, ReviewResult)> {
-    run_review_mode(db, summary, overrides, backend, false, None)
-}
-
-pub fn run_project_review(
-    db: &Database,
-    summary: &ReviewSummary,
-    overrides: &ActionOverrides,
-    backend: &dyn ActionBackend,
-) -> Result<(i64, ReviewResult)> {
-    run_review_mode(db, summary, overrides, backend, true, None)
-}
-
-/// Task review that additionally owns and executes task-specific project
-/// validation (see [`select_and_run_review_validation`]) before producing a
-/// verdict. This is the authoritative production review path: dispatch and
-/// revision no longer run configured validation themselves.
-pub fn run_review_with_validation(
     db: &Database,
     summary: &ReviewSummary,
     overrides: &ActionOverrides,
@@ -1418,6 +1408,19 @@ pub fn run_review_with_validation(
         false,
         Some((repo_path, validation_runner)),
     )
+}
+
+/// Project-wide audit. Unlike [`run_review`], this never gates task
+/// acceptance (it only ever persists as a completed action run, never a
+/// PASS/REVISE/REJECT task verdict via `commit_task_review_result`), so it
+/// has no task-specific validation to own.
+pub fn run_project_review(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+) -> Result<(i64, ReviewResult)> {
+    run_review_mode(db, summary, overrides, backend, true, None)
 }
 
 fn run_review_mode(
@@ -2402,7 +2405,12 @@ mod tests {
         assert_eq!(lead.proposals.len(), 1);
         assert_eq!(app.approvals().unwrap().len(), 0);
         let review = app
-            .automated_review_with_backend(&task, &ActionOverrides::default(), &backend)
+            .automated_review_with_backend(
+                &task,
+                &ActionOverrides::default(),
+                &backend,
+                &RecordingValidationRunner::new(&[]),
+            )
             .unwrap()
             .1;
         assert_eq!(review.verdict, "revise");
@@ -2527,7 +2535,7 @@ mod tests {
 
     /// A review fixture with a real worktree directory configured with the
     /// given `.orc/validation.toml` and changed files, for exercising
-    /// [`run_review_with_validation`].
+    /// [`run_review`].
     fn validation_review_fixture(
         output: serde_json::Value,
         validation_toml: &str,
@@ -2577,7 +2585,7 @@ commands = ["npm run typecheck", "npm run build"]
             &["src/agent.rs"],
         );
         let runner = RecordingValidationRunner::new(&[]);
-        let (run_id, result) = run_review_with_validation(
+        let (run_id, result) = run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2619,7 +2627,7 @@ commands = ["npm run typecheck", "npm run build"]
             &["src/storage/db.rs"],
         );
         let runner = RecordingValidationRunner::new(&[]);
-        run_review_with_validation(
+        run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2647,7 +2655,7 @@ commands = ["npm run typecheck", "npm run build"]
             &["src/App.vue", "package.json"],
         );
         let runner = RecordingValidationRunner::new(&[]);
-        run_review_with_validation(
+        run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2673,7 +2681,7 @@ commands = ["npm run typecheck", "npm run build"]
             &["src/agent.rs"],
         );
         let runner = RecordingValidationRunner::new(&["cargo fmt --check"]);
-        let (run_id, result) = run_review_with_validation(
+        let (run_id, result) = run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2751,7 +2759,7 @@ commands = ["npm run typecheck", "npm run build"]
         .unwrap();
 
         let runner = RecordingValidationRunner::new(&["cargo fmt --check"]);
-        let (_, result) = run_review_with_validation(
+        let (_, result) = run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2772,7 +2780,7 @@ commands = ["npm run typecheck", "npm run build"]
         }));
         let runner = RecordingValidationRunner::new(&[]);
         let directory = tempdir().unwrap();
-        let (run_id, result) = run_review_with_validation(
+        let (run_id, result) = run_review(
             &db,
             &summary,
             &ActionOverrides::default(),
@@ -2884,9 +2892,16 @@ commands = ["npm run typecheck", "npm run build"]
             "severity": "low",
             "revision_feedback": null
         }));
-        let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
-            .unwrap()
-            .1;
+        let result = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap()
+        .1;
         assert_eq!(result.verdict, "PASS");
         assert_eq!(result.non_blocking_findings.len(), 1);
     }
@@ -2902,9 +2917,16 @@ commands = ["npm run typecheck", "npm run build"]
                 "severity": "high",
                 "revision_feedback": finding
             }));
-            let result = run_review(&db, &summary, &ActionOverrides::default(), &backend)
-                .unwrap()
-                .1;
+            let result = run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap()
+            .1;
             assert_eq!(result.verdict, "REVISE");
             assert_eq!(result.blocking_findings, vec![finding]);
         }
@@ -2937,7 +2959,15 @@ commands = ["npm run typecheck", "npm run build"]
             "severity": null,
             "revision_feedback": null
         }));
-        let (run_id, _) = run_review(&db, &summary, &ActionOverrides::default(), &backend).unwrap();
+        let (run_id, _) = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap();
         let run = db.get_agent_run(run_id).unwrap().unwrap();
         assert_eq!(run.task_id.as_deref(), Some(summary.task.id.as_str()));
         assert_eq!(run.execution_class, "review");
@@ -2970,7 +3000,15 @@ commands = ["npm run typecheck", "npm run build"]
             .unwrap();
         db.update_agent_run_status(implementation_run, "completed", Some("implemented"))
             .unwrap();
-        run_review(&db, &summary, &ActionOverrides::default(), &backend).unwrap();
+        run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap();
 
         let next = crate::review::build_review(&db, &summary.task.id, Path::new(".")).unwrap();
         assert_eq!(next.run.unwrap().id, implementation_run);

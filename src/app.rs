@@ -974,21 +974,15 @@ impl OrcApp {
     pub fn review_for_run(&self, task_id: &str, run_id: i64) -> Result<ReviewSummary> {
         crate::review::build_review_for_task_run(&self.db, task_id, run_id, &self.repo_path)
     }
+    /// Task review: always determines, executes, and persists task-specific
+    /// validation against the reviewed worktree before producing a verdict
+    /// (see `automated::run_review`). There is no lower-level "review
+    /// without validation" primitive exposed here — a caller that has no
+    /// real worktree to validate (e.g. a test exercising only the
+    /// verdict/blocker machinery) still supplies a `validation_runner`;
+    /// validation is then a no-op because there is nothing to select
+    /// against, not because it was skipped by choice.
     pub fn automated_review_with_backend(
-        &self,
-        task_id: &str,
-        overrides: &crate::automated::ActionOverrides,
-        backend: &dyn crate::automated::ActionBackend,
-    ) -> Result<(i64, crate::automated::ReviewResult)> {
-        let summary = self.review(task_id)?;
-        crate::automated::run_review(&self.db, &summary, overrides, backend)
-    }
-    /// Task review that also owns and executes task-specific project
-    /// validation against the reviewed worktree. This is the path used by
-    /// production automated review; `automated_review_with_backend` remains
-    /// available for callers (and tests) that only need the verdict/blocker
-    /// machinery without executing validation commands.
-    pub fn automated_review_with_backend_and_validation(
         &self,
         task_id: &str,
         overrides: &crate::automated::ActionOverrides,
@@ -996,7 +990,7 @@ impl OrcApp {
         validation_runner: &dyn crate::validation::ValidationRunner,
     ) -> Result<(i64, crate::automated::ReviewResult)> {
         let summary = self.review(task_id)?;
-        crate::automated::run_review_with_validation(
+        crate::automated::run_review(
             &self.db,
             &summary,
             overrides,
@@ -1011,7 +1005,7 @@ impl OrcApp {
         overrides: &crate::automated::ActionOverrides,
     ) -> Result<(i64, crate::automated::ReviewResult)> {
         let backend = crate::automated::WorkerActionBackend::new(&self.repo_path);
-        self.automated_review_with_backend_and_validation(
+        self.automated_review_with_backend(
             task_id,
             overrides,
             &backend,

@@ -1400,6 +1400,7 @@ impl WorkflowActions for ProductionReviewWorkflowActions<'_> {
                 reasoning_effort: None,
             },
             self.review_backend,
+            &FakeValidationRunner::success(),
         )?;
         Ok(ReviewOutcome {
             provider_run_id: run,
@@ -1504,7 +1505,7 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         reasoning_effort: None,
     };
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     revise_with_worker_on_db(
         &task,
@@ -1516,7 +1517,7 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
 
     let (_, contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
@@ -1570,7 +1571,7 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     let (_, contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(contract.contains(&a_id));
@@ -1628,6 +1629,7 @@ fn unique_blocker_key_canonicalizes_mistyped_prior_id() {
                     &persisted.blocker_key,
                 )])),
             },
+            &FakeValidationRunner::success(),
         )
         .unwrap();
     assert_eq!(result.blockers[0].id, persisted.blocker_id);
@@ -1655,6 +1657,7 @@ fn unknown_blocker_key_with_invalid_prior_id_is_rejected() {
                     "unknown",
                 )])),
             },
+            &FakeValidationRunner::success(),
         )
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to task"));
@@ -1694,6 +1697,7 @@ fn ambiguous_blocker_key_is_rejected() {
                     "ambiguous",
                 )])),
             },
+            &FakeValidationRunner::success(),
         )
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to task"));
@@ -1746,6 +1750,7 @@ fn blocker_from_other_task_is_rejected() {
                     "foreign",
                 )])),
             },
+            &FakeValidationRunner::success(),
         )
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to task"));
@@ -1781,6 +1786,7 @@ fn production_contract_fixture() -> (TempDir, Database, String, i64) {
                 Some("BLK-production"),
             )])),
         },
+        &FakeValidationRunner::success(),
     )
     .unwrap();
     let (source, _, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
@@ -1836,11 +1842,11 @@ fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
         model: None,
         reasoning_effort: None,
     };
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     let (_, json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(json.contains("BLK-newer"));
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     assert!(db.actionable_revision_contract(&task).unwrap().is_none());
     assert_eq!(db.revision_contract_history_count(&task).unwrap(), 2);
@@ -1862,7 +1868,7 @@ fn failed_review_attempts_preserve_prior_actionability_until_real_revision_consu
         )])),
     };
     let error = app
-        .automated_review_with_backend(&task, &overrides, &invalid)
+        .automated_review_with_backend(&task, &overrides, &invalid, &FakeValidationRunner::success())
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to task"));
     let failed = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
@@ -1878,14 +1884,14 @@ fn failed_review_attempts_preserve_prior_actionability_until_real_revision_consu
     );
 
     assert!(
-        app.automated_review_with_backend(&task, &overrides, &FailingReviewBackend)
+        app.automated_review_with_backend(&task, &overrides, &FailingReviewBackend, &FakeValidationRunner::success())
             .is_err()
     );
     let malformed = QueuedReviewBackend {
         outputs: Mutex::new(VecDeque::from(["not json".into()])),
     };
     assert!(
-        app.automated_review_with_backend(&task, &overrides, &malformed)
+        app.automated_review_with_backend(&task, &overrides, &malformed, &FakeValidationRunner::success())
             .is_err()
     );
     assert_eq!(
@@ -2253,6 +2259,7 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
             reasoning_effort: None,
         },
         &backend,
+        &FakeValidationRunner::success(),
     )
     .unwrap();
     let (_, json, first_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
@@ -2274,6 +2281,7 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
             reasoning_effort: None,
         },
         &backend,
+        &FakeValidationRunner::success(),
     )
     .unwrap();
     let (_, newer, newer_id) = reopened
@@ -2289,6 +2297,7 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
             reasoning_effort: None,
         },
         &backend,
+        &FakeValidationRunner::success(),
     )
     .unwrap();
     assert!(
@@ -2332,7 +2341,7 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
         reasoning_effort: None,
     };
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     let (_, first_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(first_contract.contains(&a_id) && first_contract.contains(&b_id));
@@ -2347,7 +2356,7 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     let (_, second_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     let second: serde_json::Value = serde_json::from_str(&second_contract).unwrap();
@@ -2400,7 +2409,7 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
     )
     .unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend)
+    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
     assert!(
         reopened
@@ -3288,7 +3297,7 @@ fn non_coding_action_does_not_receive_coder_contract_layer() {
     };
     OrcApp::open(dir.path().join(".orc/orc.db"), dir.path())
         .unwrap()
-        .automated_review_with_backend(&task, &overrides, &backend)
+        .automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
         .unwrap();
 
     let prompts = backend.prompts.lock().unwrap();

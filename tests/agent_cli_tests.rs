@@ -6,6 +6,7 @@ use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewResu
 use orc::registry::{AgentAction, AgentDefinition, ReasoningEffort};
 use orc::storage::Database;
 use orc::task::TaskPriority;
+use orc::validation::test_helpers::FakeValidationRunner;
 use orc::worker::TokenUsage;
 use tempfile::tempdir;
 
@@ -473,7 +474,12 @@ fn cli_configured_review_action_is_selected_for_automated_review() {
 
     let app = orc::app::OrcApp::open(&db_path, directory.path()).unwrap();
     let (_, result) = app
-        .automated_review_with_backend(&task, &ActionOverrides::default(), &ReviewBackend)
+        .automated_review_with_backend(
+            &task,
+            &ActionOverrides::default(),
+            &ReviewBackend,
+            &FakeValidationRunner::success(),
+        )
         .unwrap();
     assert_eq!(result.verdict, "accept");
 }

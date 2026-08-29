@@ -59,3 +59,18 @@ commands = [
   "cargo test",
   "cargo test --manifest-path src-tauri/Cargo.toml",
 ]
+
+# Boundaries override the path/extension group heuristic for specific files
+# that legitimately cross the Rust/frontend contract, so a single-subsystem
+# heuristic can't under-select validation for them. Every #[tauri::command]
+# handler is registered in src-tauri/src/lib.rs (the IPC command surface),
+# and src/lib/api.ts hand-mirrors that surface's types on the frontend side;
+# a change to either one can silently break the other without either side's
+# own tests failing.
+[[boundaries]]
+path = "src-tauri/src/lib.rs"
+groups = ["tauri", "frontend"]
+
+[[boundaries]]
+path = "src/lib/api.ts"
+groups = ["tauri", "frontend"]

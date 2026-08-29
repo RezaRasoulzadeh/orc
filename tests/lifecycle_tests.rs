@@ -447,7 +447,7 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
         ..ActionOverrides::default()
     };
     let (review_run, review) = app
-        .automated_review_with_backend_and_validation(
+        .automated_review_with_backend(
             &task,
             &overrides,
             &PassIgnoringValidationReviewBackend,
@@ -556,7 +556,7 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
         ..ActionOverrides::default()
     };
     let (review_run, review) = app
-        .automated_review_with_backend_and_validation(
+        .automated_review_with_backend(
             &task,
             &overrides,
             &ValidationLifecycleReviewBackend,

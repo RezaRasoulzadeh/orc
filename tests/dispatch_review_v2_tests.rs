@@ -36,6 +36,12 @@ struct CompletionRepairWorker {
     calls: Mutex<usize>,
 }
 
+struct PartialCompletionMetadataWorker {
+    reported_files: Vec<String>,
+}
+
+struct NoImplementationEffectWorker;
+
 struct CancellingStructuredWorker;
 impl Worker for CancellingStructuredWorker {
     fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
@@ -181,6 +187,71 @@ impl Worker for CompletionRepairWorker {
                 }], "summary":"repaired"})
                 .to_string(),
             ),
+        })
+    }
+}
+
+impl Worker for PartialCompletionMetadataWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        unreachable!()
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let plan = prompt_plan(prompt);
+        let step = &plan.steps[0];
+        for target in &step.operation_targets {
+            std::fs::write(cwd.join(target), "implemented\n").map_err(|error| error.to_string())?;
+        }
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(
+                serde_json::json!({"step_results":[{
+                    "step_id": step.id,
+                    "operations_performed": [],
+                    "affected_files": self.reported_files,
+                    "observed": ["implementation completed"],
+                    "verification_passed": [],
+                }], "summary":"done"})
+                .to_string(),
+            ),
+            token_usage: None,
+        })
+    }
+}
+
+impl Worker for NoImplementationEffectWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        Ok((WorkerOutcome::Success, Some("no implementation".into())))
+    }
+
+    fn execute_planned_step_repair(
+        &self,
+        step: &orc::worker_protocol::PlannedStep,
+        _: &str,
+        _: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+        _: Option<&orc::worker::CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(
+                serde_json::json!({"step_results":[{
+                    "step_id": step.id,
+                    "operations_performed": [],
+                    "affected_files": [],
+                    "observed": ["no implementation"],
+                    "verification_passed": [],
+                }], "summary":"still empty"})
+                .to_string(),
+            ),
+            token_usage: None,
         })
     }
 }
@@ -4319,12 +4390,13 @@ fn configured_validation_is_owned_by_the_final_plan_gate() {
 }
 
 #[test]
-fn completion_gate_repairs_missing_step_evidence_before_review() {
+fn completion_gate_repairs_missing_implementation_effect_without_validation() {
     let (dir, db, task) = setup();
     canonicalize_task(&db, &task, "create: completion-gated.txt");
     let worker = CompletionRepairWorker {
         calls: Mutex::new(0),
     };
+    let runner = SequenceValidationRunner::new(vec![]);
 
     let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
@@ -4332,7 +4404,7 @@ fn completion_gate_repairs_missing_step_evidence_before_review() {
         dir.path().join(".orc/orc.db").to_str().unwrap(),
         dir.path(),
         "fake",
-        &FakeValidationRunner::success(),
+        &runner,
     )
     .unwrap();
 
@@ -4359,6 +4431,73 @@ fn completion_gate_repairs_missing_step_evidence_before_review() {
             .iter()
             .any(|event| event.kind == "worker_completion_gate")
     );
+}
+
+#[test]
+fn dispatch_uses_worktree_changes_when_completion_omits_affected_files() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: omitted-from-metadata.rs");
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &PartialCompletionMetadataWorker {
+            reported_files: vec![],
+        },
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(summary.run_status, "completed");
+    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    let evidence = db.get_change_evidence(summary.run_id).unwrap().unwrap();
+    assert!(
+        evidence
+            .files
+            .iter()
+            .any(|file| file.path == "omitted-from-metadata.rs")
+    );
+}
+
+#[test]
+fn dispatch_accepts_subset_completion_metadata_when_worktree_has_all_changes() {
+    let (dir, db, task) = setup();
+    canonicalize_task_with_expected_changes(
+        &db,
+        &task,
+        &["create: first.rs", "create: second.rs"],
+    );
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &PartialCompletionMetadataWorker {
+            reported_files: vec!["first.rs".into()],
+        },
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    let evidence = db.get_change_evidence(summary.run_id).unwrap().unwrap();
+    assert_eq!(evidence.files.len(), 2);
+    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+}
+
+#[test]
+fn dispatch_still_blocks_when_worker_has_no_implementation_effect() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: missing.rs");
+    let error = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &NoImplementationEffectWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("worktree implementation effect"));
+    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Blocked);
 }
 
 #[test]

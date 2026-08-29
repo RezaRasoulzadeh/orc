@@ -2370,13 +2370,16 @@ pub fn revise_with_worker_on_db_with_overrides(
     // The subsequent automated review is authoritative for blocker
     // resolution.  Consume and link the source review only after the
     // revision has produced changes and passed the configured validation.
-    if !db.start_revision_execution(run_id, source_review_id)? {
+    if !db.complete_revision_run_for_review(
+        task_id,
+        run_id,
+        source_review_id,
+        contract_id,
+        &combined,
+        token_usage,
+    )? {
         return fail("Revision review was consumed before successful validation.".into());
     }
-    if let Some(id) = contract_id {
-        db.consume_revision_contract(id)?;
-    }
-    db.complete_agent_run_for_review(task_id, run_id, &combined, token_usage)?;
     progress("review transition");
     Ok(DispatchSummary {
         task: db

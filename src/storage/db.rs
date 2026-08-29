@@ -267,6 +267,163 @@ mod reservation_lifecycle_tests {
     }
 
     #[test]
+    fn revision_completion_consumes_review_and_contract_with_publication() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Active).unwrap();
+        let review = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "reviewer",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "review",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.update_agent_run_status(review, "completed", Some("review"))
+            .unwrap();
+        db.persist_revision_contract(&task, review, "contract")
+            .unwrap();
+        let contract = db.actionable_revision_contract(&task).unwrap().unwrap().2;
+        let revision = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "codex-main",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "revision",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+
+        assert!(
+            db.complete_revision_run_for_review(
+                &task,
+                revision,
+                review,
+                Some(contract),
+                "validated",
+                None,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(db.source_review_run_id(revision).unwrap(), Some(review));
+        let consumed: bool = db
+            .conn
+            .query_row(
+                "SELECT review_consumed FROM agent_runs WHERE id = ?1",
+                [review],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed);
+        assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+        assert_eq!(
+            db.get_agent_run(revision).unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Review
+        );
+    }
+
+    #[test]
+    fn revision_publication_failure_preserves_review_and_contract_actionability() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Active).unwrap();
+        let review = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "reviewer",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "review",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.update_agent_run_status(review, "completed", Some("review"))
+            .unwrap();
+        db.persist_revision_contract(&task, review, "contract")
+            .unwrap();
+        let contract = db.actionable_revision_contract(&task).unwrap().unwrap().2;
+        let revision = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "codex-main",
+                crate::registry::AUTOMATED,
+                AgentRunExecution {
+                    class: "revision",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_revision_publication
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.id = OLD.id AND NEW.status = 'review'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected revision publication failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.complete_revision_run_for_review(
+                &task,
+                revision,
+                review,
+                Some(contract),
+                "validated",
+                None,
+            )
+            .is_err()
+        );
+
+        assert_eq!(db.source_review_run_id(revision).unwrap(), None);
+        let consumed: bool = db
+            .conn
+            .query_row(
+                "SELECT review_consumed FROM agent_runs WHERE id = ?1",
+                [review],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!consumed);
+        assert_eq!(
+            db.actionable_revision_contract(&task).unwrap().unwrap().2,
+            contract
+        );
+        assert_eq!(
+            db.get_agent_run(revision).unwrap().unwrap().status,
+            "running"
+        );
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Active
+        );
+        assert!(db.get_worker_result(revision).unwrap().is_none());
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+    }
+
+    #[test]
     fn failed_dispatch_releases_agent() {
         assert_terminal_releases("failed");
     }
@@ -5192,7 +5349,25 @@ impl Database {
         review_run_id: i64,
     ) -> Result<bool, DbError> {
         let transaction = self.conn.unchecked_transaction()?;
-        let changed = transaction.execute(
+        let changed = Self::link_revision_to_review_in_transaction(
+            &transaction,
+            revision_run_id,
+            review_run_id,
+        )?;
+        if !changed {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    fn link_revision_to_review_in_transaction(
+        conn: &Connection,
+        revision_run_id: i64,
+        review_run_id: i64,
+    ) -> Result<bool, DbError> {
+        let changed = conn.execute(
             "UPDATE agent_runs
              SET source_review_run_id = ?1
              WHERE id = ?2
@@ -5208,17 +5383,15 @@ impl Database {
             params![review_run_id, revision_run_id],
         )?;
         if changed != 0 {
-            let consumed = transaction.execute(
+            let consumed = conn.execute(
                 "UPDATE agent_runs SET review_consumed = 1
                  WHERE id = ?1 AND review_consumed = 0",
                 [review_run_id],
             )?;
             if consumed == 0 {
-                transaction.rollback()?;
                 return Ok(false);
             }
         }
-        transaction.commit()?;
         Ok(changed != 0)
     }
 
@@ -5315,7 +5488,67 @@ impl Database {
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<(), DbError> {
         let transaction = self.conn.unchecked_transaction()?;
-        let changed = transaction.execute(
+        let event = Self::complete_agent_run_for_review_in_transaction(
+            &transaction,
+            task_id,
+            run_id,
+            output,
+            token_usage,
+        )?;
+        transaction.commit()?;
+
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
+        Ok(())
+    }
+
+    /// Atomically consumes the revision inputs and publishes its successful
+    /// run and task for review.
+    pub fn complete_revision_run_for_review(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        source_review_id: i64,
+        contract_id: Option<i64>,
+        output: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<bool, DbError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        if !Self::link_revision_to_review_in_transaction(&transaction, run_id, source_review_id)? {
+            return Ok(false);
+        }
+        if let Some(contract_id) = contract_id {
+            transaction.execute(
+                "UPDATE revision_contracts
+                 SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status = 'actionable'",
+                [contract_id],
+            )?;
+        }
+        let event = Self::complete_agent_run_for_review_in_transaction(
+            &transaction,
+            task_id,
+            run_id,
+            output,
+            token_usage,
+        )?;
+        transaction.commit()?;
+
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
+        Ok(true)
+    }
+
+    fn complete_agent_run_for_review_in_transaction(
+        conn: &Connection,
+        task_id: &str,
+        run_id: i64,
+        output: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<LifecycleEvent, DbError> {
+        let changed = conn.execute(
             "UPDATE agent_runs
              SET status = 'completed', output = ?1, error = NULL,
                  finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP
@@ -5327,30 +5560,18 @@ impl Database {
         if changed == 0 {
             return Err(DbError::InvalidRunStatus(run_id));
         }
-        transaction.execute(
+        conn.execute(
             "DELETE FROM execution_reservations WHERE run_id = ?1",
             [run_id],
         )?;
-        let task_changed = transaction.execute(
+        let task_changed = conn.execute(
             "UPDATE tasks SET status = 'review', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             [task_id],
         )?;
         if task_changed == 0 {
             return Err(DbError::TaskNotFound(task_id.to_owned()));
         }
-        let event = Self::persist_worker_result_and_event(
-            &transaction,
-            run_id,
-            "completed",
-            Some(output),
-            token_usage,
-        )?;
-        transaction.commit()?;
-
-        if let Some(sink) = &self.lifecycle_sink {
-            sink(event);
-        }
-        Ok(())
+        Self::persist_worker_result_and_event(conn, run_id, "completed", Some(output), token_usage)
     }
 
     pub fn update_agent_run_failure(

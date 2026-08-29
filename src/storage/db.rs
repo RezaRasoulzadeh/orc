@@ -167,6 +167,105 @@ mod reservation_lifecycle_tests {
     fn successful_dispatch_releases_agent() {
         assert_terminal_releases("completed");
     }
+
+    #[test]
+    fn successful_dispatch_and_revision_completion_publish_run_and_task_together() {
+        for class in ["implementation", "revision"] {
+            let (_directory, _path, db, project, task) = fixture();
+            db.update_task_status(&task, TaskStatus::Active).unwrap();
+            let run = db
+                .create_agent_run_with_execution(
+                    project,
+                    &task,
+                    "codex-main",
+                    crate::registry::AUTOMATED,
+                    AgentRunExecution {
+                        class,
+                        model: None,
+                        effort: None,
+                        source: "test",
+                    },
+                )
+                .unwrap();
+            let usage = crate::worker::TokenUsage {
+                total_tokens: 30,
+                input_tokens: Some(20),
+                output_tokens: Some(10),
+            };
+
+            db.complete_agent_run_for_review(&task, run, "validated", Some(usage))
+                .unwrap();
+
+            assert_eq!(db.get_agent_run(run).unwrap().unwrap().status, "completed");
+            assert_eq!(
+                db.get_task(&task).unwrap().unwrap().status,
+                TaskStatus::Review
+            );
+            let result = db.get_worker_result(run).unwrap().unwrap();
+            assert_eq!(result.outcome, "success");
+            assert_eq!(result.failure_category, None);
+            assert_eq!(
+                result.metadata.as_deref(),
+                Some(r#"{"run_status":"completed"}"#)
+            );
+            assert_eq!(result.total_tokens, Some(30));
+            assert_eq!(result.input_tokens, Some(20));
+            assert_eq!(result.output_tokens, Some(10));
+            let events = db.list_lifecycle_events_for_run(run, 10).unwrap();
+            let worker_events = events
+                .iter()
+                .filter(|event| event.kind == "worker_result")
+                .collect::<Vec<_>>();
+            assert_eq!(worker_events.len(), 1);
+            assert_eq!(worker_events[0].task_id.as_deref(), Some(task.as_str()));
+            assert_eq!(worker_events[0].agent_id.as_deref(), Some("codex-main"));
+            assert_eq!(
+                worker_events[0].payload.as_deref(),
+                Some(r#"{"outcome":"success"}"#)
+            );
+            assert!(db.list_busy_agents().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn review_publication_failure_rolls_back_run_completion_and_usage() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Active).unwrap();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_review_publication
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.id = OLD.id AND NEW.status = 'review'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected review publication failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.complete_agent_run_for_review(&task, run, "validated", None)
+                .is_err()
+        );
+
+        assert_eq!(db.get_agent_run(run).unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Active
+        );
+        assert!(db.get_worker_result(run).unwrap().is_none());
+        assert_eq!(db.list_busy_agents().unwrap(), vec!["codex-main"]);
+        let event_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_events WHERE run_id = ?1 AND kind = 'worker_result'",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
     #[test]
     fn failed_dispatch_releases_agent() {
         assert_terminal_releases("failed");
@@ -5206,6 +5305,54 @@ impl Database {
         Ok(changed != 0)
     }
 
+    /// Atomically completes a successful implementation or revision run and
+    /// publishes the task for review.
+    pub fn complete_agent_run_for_review(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        output: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<(), DbError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE agent_runs
+             SET status = 'completed', output = ?1, error = NULL,
+                 finished_at = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP
+             WHERE id = ?2
+               AND task_id = ?3
+               AND status IN ('running', 'waiting_external')",
+            params![output, run_id, task_id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::InvalidRunStatus(run_id));
+        }
+        transaction.execute(
+            "DELETE FROM execution_reservations WHERE run_id = ?1",
+            [run_id],
+        )?;
+        let task_changed = transaction.execute(
+            "UPDATE tasks SET status = 'review', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            [task_id],
+        )?;
+        if task_changed == 0 {
+            return Err(DbError::TaskNotFound(task_id.to_owned()));
+        }
+        let event = Self::persist_worker_result_and_event(
+            &transaction,
+            run_id,
+            "completed",
+            Some(output),
+            token_usage,
+        )?;
+        transaction.commit()?;
+
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
+        Ok(())
+    }
+
     pub fn update_agent_run_failure(
         &self,
         run_id: i64,
@@ -5231,13 +5378,13 @@ impl Database {
         Ok(changed != 0)
     }
 
-    fn record_worker_result(
-        &self,
+    fn persist_worker_result_and_event(
+        conn: &Connection,
         run_id: i64,
         status: &str,
         output: Option<&str>,
         token_usage: Option<crate::worker::TokenUsage>,
-    ) -> Result<(), DbError> {
+    ) -> Result<LifecycleEvent, DbError> {
         let outcome = match status {
             "completed" => "success",
             "no_changes" => "no_changes",
@@ -5251,22 +5398,50 @@ impl Database {
             "success" | "no_changes" => None,
             value => Some(value),
         };
-        self.conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4, ?5, ?6, ?7 FROM agent_runs WHERE id = ?1",
             params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}"), token_usage.map(|usage| usage.total_tokens), token_usage.and_then(|usage| usage.input_tokens), token_usage.and_then(|usage| usage.output_tokens)],
         )?;
-        let (task_id, agent_id): (Option<String>, String) = self.conn.query_row(
+        let (task_id, agent_id): (Option<String>, String) = conn.query_row(
             "SELECT task_id, agent FROM agent_runs WHERE id = ?1",
             params![run_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        self.record_lifecycle_event(
-            "worker_result",
-            task_id.as_deref(),
-            Some(run_id),
-            Some(&agent_id),
-            Some(&format!("{{\"outcome\":\"{outcome}\"}}")),
+        let payload = format!("{{\"outcome\":\"{outcome}\"}}");
+        conn.execute(
+            "INSERT INTO lifecycle_events (kind, task_id, run_id, agent_id, payload)
+             VALUES ('worker_result', ?1, ?2, ?3, ?4)",
+            params![task_id, run_id, agent_id, payload],
         )?;
+        let id = conn.last_insert_rowid();
+        let timestamp = conn.query_row(
+            "SELECT timestamp FROM lifecycle_events WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(LifecycleEvent {
+            id,
+            timestamp,
+            kind: "worker_result".to_owned(),
+            task_id,
+            run_id: Some(run_id),
+            agent_id: Some(agent_id),
+            payload: Some(payload),
+        })
+    }
+
+    fn record_worker_result(
+        &self,
+        run_id: i64,
+        status: &str,
+        output: Option<&str>,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<(), DbError> {
+        let event =
+            Self::persist_worker_result_and_event(&self.conn, run_id, status, output, token_usage)?;
+        if let Some(sink) = &self.lifecycle_sink {
+            sink(event);
+        }
         Ok(())
     }
 

@@ -1521,15 +1521,13 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         Some(agent_id),
                         Some(&serde_json::to_string(&evidence)?),
                     )?;
-                    db.update_agent_run_status_with_usage(
+                    db.complete_agent_run_for_review(
+                        task_id,
                         run_id,
-                        "completed",
-                        Some(&combined_output),
+                        &combined_output,
                         token_usage,
                     )
-                    .with_context(|| "failed to update agent run status to completed")?;
-                    db.update_task_status(task_id, TaskStatus::Review)
-                        .with_context(|| "failed to set task status to review")?;
+                    .with_context(|| "failed to complete agent run and publish task for review")?;
                     progress("review transition");
                     let task = db
                         .get_task(task_id)?
@@ -2378,8 +2376,7 @@ pub fn revise_with_worker_on_db_with_overrides(
     if let Some(id) = contract_id {
         db.consume_revision_contract(id)?;
     }
-    db.update_agent_run_status_with_usage(run_id, "completed", Some(&combined), token_usage)?;
-    db.update_task_status(task_id, TaskStatus::Review)?;
+    db.complete_agent_run_for_review(task_id, run_id, &combined, token_usage)?;
     progress("review transition");
     Ok(DispatchSummary {
         task: db

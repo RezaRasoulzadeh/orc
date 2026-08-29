@@ -148,6 +148,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc agents [--sync]` | List registered agents, optionally syncing quota first. |
 | `orc agent list` | List registered agents. |
 | `orc agent add <ID> --backend NAME [options]` | Register an agent (`--priority`, `--capability`, repeatable `--action` (`code`, `review`, `plan`, `lead`), `--display-name`, `--profile`, `--model`, `--effort`, `--mode`). |
+| `orc agent attach <ID>` / `orc agent detach <ID>` | Associate an existing global agent with the current project, or remove only that project association. |
 | `orc agent onboard <ID> --backend NAME [options]` | Inspect provider login and capabilities, then persist only with `--approve`; supports repeatable `--permission` and `--role`. |
 | `orc agent export <ID> [--output PATH]` | Export a versioned agent configuration without provider credentials. |
 | `orc agent import PATH` / `update <ID> PATH` | Validate and atomically import or update a versioned global agent configuration. |

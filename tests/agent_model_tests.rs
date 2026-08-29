@@ -126,6 +126,29 @@ fn project_reference_resolves_only_explicitly_authorized_global_agents() {
             .unwrap()
             .is_none()
     );
+
+    db.reference_global_agent(first_project, &agent.id).unwrap();
+    let task = db
+        .insert_task(
+            first_project,
+            "Active ownership",
+            "Keep the reference",
+            "developer",
+            orc::task::TaskPriority::Normal,
+        )
+        .unwrap();
+    let run = db
+        .create_agent_run(first_project, &task, &agent.id)
+        .unwrap();
+    let detach_error = db
+        .remove_global_agent_reference(first_project, &agent.id)
+        .unwrap_err();
+    assert!(detach_error.to_string().contains("active run"));
+    db.update_agent_run_status(run, "completed", None).unwrap();
+    assert!(
+        db.remove_global_agent_reference(first_project, &agent.id)
+            .unwrap()
+    );
 }
 
 #[test]

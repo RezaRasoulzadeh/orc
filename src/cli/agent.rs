@@ -7,6 +7,14 @@ use clap::Subcommand;
 #[derive(Subcommand)]
 pub enum AgentCommand {
     List,
+    /// Associate an existing global agent with the current project.
+    Attach {
+        id: String,
+    },
+    /// Remove the current project's association with a global agent.
+    Detach {
+        id: String,
+    },
     Add {
         id: String,
         #[arg(long)]
@@ -159,6 +167,20 @@ pub fn run(command: AgentCommand, db_path: &str) -> Result<()> {
     match command {
         AgentCommand::List => {
             print_agents(&db)?;
+        }
+        AgentCommand::Attach { id } => {
+            let created = app.reference_global_agent(&id)?;
+            if created {
+                println!("Attached agent {id}");
+            } else {
+                println!("Agent {id} is already attached");
+            }
+        }
+        AgentCommand::Detach { id } => {
+            if !app.remove_global_agent_reference(&id)? {
+                anyhow::bail!("agent '{}' is not attached to this project", id);
+            }
+            println!("Detached agent {id}");
         }
         AgentCommand::Add {
             id,

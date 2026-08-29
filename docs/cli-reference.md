@@ -345,6 +345,14 @@ Registers a new agent.
 - `--effort EFFORT` — reasoning effort: `none`, `low`, `medium`, `high` (automated providers with execution-setting support).
 - `--mode MODE` — `automated` or `manual` (default: `automated`).
 
+### `orc agent attach ID`
+
+Associates an already-registered global agent with the current project. The command is idempotent and stores only a project-to-agent reference; it does not contact the provider or copy agent configuration.
+
+### `orc agent detach ID`
+
+Removes only the current project's reference. The global agent remains registered. Detach is refused while the agent owns an active run in the project.
+
 ### `orc agent onboard ID --backend BACKEND [options]`
 Inspects and optionally registers a globally reusable agent. Provider login is checked without making an AI request; discovered provider capabilities, operator permissions, and Orc roles are displayed separately.
 - `--approve` — explicitly approve the inspection and persist the configuration. Without it, onboarding is preview-only.

@@ -126,6 +126,119 @@ fn orc_command(directory: &std::path::Path, args: &[&str]) -> std::process::Outp
 }
 
 #[test]
+fn agent_attach_and_detach_control_project_scheduler_eligibility() {
+    let directory = tempdir().unwrap();
+    assert!(orc_command(directory.path(), &["init"]).status.success());
+
+    let db_path = directory.path().join(".orc/orc.db");
+    let db = Database::open(&db_path).unwrap();
+    let project_id = db.get_project_id().unwrap().unwrap();
+    for reference in db.list_project_agent_references(project_id).unwrap() {
+        db.remove_global_agent_reference(project_id, &reference.agent_id)
+            .unwrap();
+    }
+    let agent = orc::registry::Agent::from_definition(&AgentDefinition {
+        id: "existing-global".into(),
+        backend: "codex".into(),
+        execution_mode: "automated".into(),
+        display_name: "Existing Global".into(),
+        enabled: true,
+        priority: 10,
+        capabilities: vec![],
+        status: "available".into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        quota_remaining_percent: None,
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+        actions: vec![AgentAction::Code],
+    })
+    .unwrap();
+    db.insert_global_agent(&agent).unwrap();
+    drop(db);
+
+    assert!(
+        orc_command(
+            directory.path(),
+            &["task", "create", "Attach test", "Exercise scheduler"]
+        )
+        .status
+        .success()
+    );
+    let before = orc_command(
+        directory.path(),
+        &["schedule", "T-0001", "--explain", "--mode", "automated"],
+    );
+    assert!(before.status.success());
+    let before_stdout = String::from_utf8_lossy(&before.stdout);
+    assert!(before_stdout.contains("Candidates:\n\nReason:"));
+
+    let unknown = orc_command(directory.path(), &["agent", "attach", "unknown"]);
+    assert!(!unknown.status.success());
+
+    let attach = orc_command(directory.path(), &["agent", "attach", "existing-global"]);
+    assert!(
+        attach.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    assert!(
+        orc_command(directory.path(), &["agent", "attach", "existing-global"])
+            .status
+            .success()
+    );
+
+    let reopened = Database::open(&db_path).unwrap();
+    assert_eq!(
+        reopened
+            .list_project_agent_references(project_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let project_only = rusqlite::Connection::open(&db_path).unwrap();
+    let local_agents: i64 = project_only
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(local_agents, 0);
+    drop(project_only);
+    drop(reopened);
+
+    let after = orc_command(
+        directory.path(),
+        &["schedule", "T-0001", "--explain", "--mode", "automated"],
+    );
+    assert!(after.status.success());
+    assert!(String::from_utf8_lossy(&after.stdout).contains("existing-global"));
+
+    assert!(
+        orc_command(directory.path(), &["agent", "detach", "existing-global"])
+            .status
+            .success()
+    );
+    let detached = Database::open(&db_path).unwrap();
+    assert!(detached.list_project_agents(project_id).unwrap().is_empty());
+    assert!(
+        detached
+            .get_global_agent("existing-global")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        detached
+            .list_project_agent_references(project_id)
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn lead_run_without_configuration_explains_how_to_configure_it() {
     let directory = tempdir().unwrap();
     assert!(orc_command(directory.path(), &["init"]).status.success());

@@ -3835,6 +3835,14 @@ impl Database {
         if !self.project_exists(project_id)? {
             return Err(DbError::ProjectNotFound(project_id));
         }
+        let active: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id = ?1 AND agent = ?2 AND status IN ('running', 'waiting_external'))",
+            params![project_id, agent_id],
+            |row| row.get(0),
+        )?;
+        if active {
+            return Err(DbError::AgentHasActiveRun(agent_id.to_owned()));
+        }
         Ok(self.conn.execute(
             "DELETE FROM project_agent_references WHERE project_id = ?1 AND agent_id = ?2",
             params![project_id, agent_id],

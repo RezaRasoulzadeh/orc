@@ -84,6 +84,38 @@ fn performed_operations_for_step(
     Ok(reported)
 }
 
+/// Convert the canonical structured completion envelope into the per-step
+/// protocol evidence consumed by the strict self-check. Both initial Worker
+/// results and completion repairs must use this representation.
+fn completion_step_evidence(
+    reported: crate::worker_protocol::ReportedStepCompletion,
+) -> String {
+    let mut evidence = reported.observed.join("\n");
+    for operation in reported.operations_performed {
+        evidence.push_str(&format!(
+            "\nOPERATION PERFORMED: {}",
+            crate::worker_protocol::operation_name(&operation)
+        ));
+    }
+    for path in reported.affected_files {
+        evidence.push_str(&format!("\nAFFECTED FILE: {path}"));
+    }
+    for check in reported.verification_passed {
+        evidence.push_str(&format!("\nVERIFICATION PASSED: {check}"));
+    }
+    evidence
+}
+
+fn normalized_completion_step_output(output: &str, step_id: &str) -> Result<String> {
+    let completion = crate::worker_protocol::parse_plan_completion(output)?;
+    let reported = completion
+        .step_results
+        .into_iter()
+        .find(|reported| reported.step_id == step_id)
+        .with_context(|| format!("structured completion repair did not report step '{step_id}'"))?;
+    Ok(completion_step_evidence(reported))
+}
+
 fn failed_execution_evidence(
     plan: &crate::worker_protocol::WorkerPlan,
     outputs: &[Option<String>],
@@ -505,7 +537,7 @@ fn completion_repair_prompt(
     attempt: usize,
 ) -> String {
     format!(
-        "WORKER COMPLETION SELF-CHECK REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the exact failed checkpoint below. Preserve the existing worktree and unrelated changes.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP AND NECESSARY CONSTRAINTS:\n{}\n\nAfter inspecting the worktree, emit the required operation, `AFFECTED FILE: <path>`, and verification protocol lines. Do not claim a check from the plan alone.",
+        "WORKER COMPLETION SELF-CHECK REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the exact failed checkpoint below. Preserve the existing worktree and unrelated changes.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP AND NECESSARY CONSTRAINTS:\n{}\n\nReturn a structured Worker completion object using the canonical `step_results` envelope. For this step, `operations_performed` MUST echo exactly the persisted `operations` list in the same order. Do not add incidental inspection, command, or verification activity to `operations_performed`; record that activity only in `observed` or `verification_passed`. Do not claim a check from the plan alone.",
         serde_json::to_string_pretty(step).unwrap_or_else(|_| step.id.clone())
     )
 }
@@ -882,7 +914,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
     }
 
     let prompt = format!(
-        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below. Do not perform any operation outside a listed step. After each step, perform and report its declared verification before continuing. For every operation, emit exactly `OPERATION PERFORMED: <inspect|create|modify|delete|move|command|validate|no_mutation>` in the planned order. Emit `VERIFICATION PASSED: <check>` only after actually observing that check.\n{}",
+        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below. Return the required structured completion envelope. For each `step_results[].operations_performed`, echo exactly that persisted step's `operations` list in the same order. Incidental inspection, command, or verification activity may be necessary, but do not include it in `operations_performed`; report it only in `observed` or `verification_passed`. Emit a verification only after actually observing that check.\n{}",
         build_worker_prompt(&contract, &project_name, &task),
         serde_json::to_string_pretty(&plan).context("failed to serialize execution plan")?
     );
@@ -943,20 +975,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                 .iter()
                 .position(|step| step.id == reported.step_id)
             {
-                let mut evidence = reported.observed.join("\n");
-                for operation in reported.operations_performed {
-                    evidence.push_str(&format!(
-                        "\nOPERATION PERFORMED: {}",
-                        crate::worker_protocol::operation_name(&operation)
-                    ));
-                }
-                for path in reported.affected_files {
-                    evidence.push_str(&format!("\nAFFECTED FILE: {path}"));
-                }
-                for check in reported.verification_passed {
-                    evidence.push_str(&format!("\nVERIFICATION PASSED: {check}"));
-                }
-                step_outputs[index] = Some(evidence);
+                step_outputs[index] = Some(completion_step_evidence(reported));
             }
         }
     }
@@ -1048,7 +1067,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 &plan.steps[index],
                                 &repair_prompt,
                                 &worktree_dir,
-                                &crate::automated::revision_handoff_schema(),
+                                &crate::worker_protocol::repair_completion_schema(),
                                 &|line| worker_output(line),
                                 cancellation,
                             );
@@ -1091,7 +1110,10 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 anyhow::bail!(message);
                             }
                             if let Some(repair_output) = repaired.output {
-                                step_outputs[index] = Some(repair_output);
+                                step_outputs[index] = Some(normalized_completion_step_output(
+                                    &repair_output,
+                                    &plan.steps[index].id,
+                                )?);
                             }
                             if repaired.token_usage.is_some() {
                                 token_usage = repaired.token_usage;
@@ -1835,14 +1857,7 @@ pub fn revise_with_worker_on_db_with_overrides(
                     .iter()
                     .position(|step| step.id == reported.step_id)
                 {
-                    let mut evidence = reported.observed.join("\n");
-                    for path in reported.affected_files {
-                        evidence.push_str(&format!("\nAFFECTED FILE: {path}"));
-                    }
-                    for check in reported.verification_passed {
-                        evidence.push_str(&format!("\nVERIFICATION PASSED: {check}"));
-                    }
-                    revision_step_outputs[index] = Some(evidence);
+                    revision_step_outputs[index] = Some(completion_step_evidence(reported));
                 }
             }
         } else {
@@ -1968,7 +1983,10 @@ pub fn revise_with_worker_on_db_with_overrides(
                 return fail(format!("Worker completion repair failed: {error}"));
             }
             if let Some(repair_output) = repaired.output {
-                revision_step_outputs[index] = Some(repair_output);
+                revision_step_outputs[index] = Some(normalized_completion_step_output(
+                    &repair_output,
+                    &revision_plan.steps[index].id,
+                )?);
                 output = Some(
                     revision_step_outputs
                         .iter()
@@ -3090,6 +3108,52 @@ new file mode 100644
         assert_eq!(
             db.get_task(&task_id).unwrap().unwrap().status,
             TaskStatus::Review
+        );
+    }
+
+    fn completion_step(operations: Vec<crate::worker_protocol::PlannedOperation>) -> crate::worker_protocol::PlannedStep {
+        crate::worker_protocol::PlannedStep {
+            id: "step-1".into(),
+            objective: "test checkpoint".into(),
+            intent: "test completion protocol".into(),
+            operations,
+            operation_targets: vec![],
+            acceptance_criteria: vec![],
+            required_tests: vec![],
+            active_review_blockers: vec![],
+            verification: vec![],
+        }
+    }
+
+    #[test]
+    fn strict_completion_accepts_exact_persisted_operations() {
+        let step = completion_step(vec![crate::worker_protocol::PlannedOperation::Modify]);
+        let output = "OPERATION PERFORMED: modify";
+        assert_eq!(
+            performed_operations_for_step(&step, Some(output), true).unwrap(),
+            step.operations
+        );
+    }
+
+    #[test]
+    fn strict_completion_rejects_incidental_operations() {
+        let step = completion_step(vec![crate::worker_protocol::PlannedOperation::Modify]);
+        let output = "OPERATION PERFORMED: inspect\nOPERATION PERFORMED: modify\nOPERATION PERFORMED: validate";
+        let error = performed_operations_for_step(&step, Some(output), true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persisted step operations in order"));
+    }
+
+    #[test]
+    fn structured_completion_repair_normalizes_before_next_self_check() {
+        let step = completion_step(vec![crate::worker_protocol::PlannedOperation::Modify]);
+        let repair = r#"{"completion":{"step_results":[{"step_id":"step-1","operations_performed":["modify"],"affected_files":[],"observed":["updated file"],"verification_passed":[]}],"summary":"repaired"}}"#;
+        let normalized = normalized_completion_step_output(repair, &step.id).unwrap();
+        assert!(normalized.contains("OPERATION PERFORMED: modify"));
+        assert_eq!(
+            performed_operations_for_step(&step, Some(&normalized), true).unwrap(),
+            step.operations
         );
     }
 }

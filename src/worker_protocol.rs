@@ -274,9 +274,7 @@ pub fn plan_completion_schema() -> String {
 }
 
 pub fn repair_completion_schema() -> String {
-    serde_json::json!({"type":"object","additionalProperties":false,
-        "properties":{"summary":{"type":"string"}},"required":["summary"]})
-    .to_string()
+    plan_completion_schema()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

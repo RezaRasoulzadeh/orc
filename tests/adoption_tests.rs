@@ -9,6 +9,7 @@ use orc::protocol::{
 use orc::storage::Database;
 use std::cell::RefCell;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -22,6 +23,63 @@ fn git_repo() -> (TempDir, std::path::PathBuf) {
         .output()
         .unwrap();
     (dir, repo)
+}
+
+fn adopt_isolated(start: impl AsRef<std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
+    let start = start.as_ref();
+    adoption::adopt_with_registry(start, start.join(".test-global-agents.db"))
+}
+
+fn adopt_and_invoke_lead_isolated(
+    start: impl AsRef<std::path::Path>,
+    objective: &str,
+    backend: &dyn LeadBackend,
+    context_limit: usize,
+) -> anyhow::Result<(std::path::PathBuf, orc::lead::LeadResponse)> {
+    let start = start.as_ref();
+    adoption::adopt_and_invoke_lead_with_registry(
+        start,
+        objective,
+        backend,
+        context_limit,
+        start.join(".test-global-agents.db"),
+    )
+}
+
+fn persisted_registry_path(project_db: &Path) -> PathBuf {
+    let conn = rusqlite::Connection::open(project_db).unwrap();
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'agent_registry_path'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    value.into()
+}
+
+fn configured_agent(id: &str) -> orc::registry::AgentDefinition {
+    orc::registry::AgentDefinition {
+        id: id.into(),
+        backend: "codex".into(),
+        execution_mode: orc::registry::AUTOMATED.into(),
+        display_name: id.into(),
+        enabled: true,
+        priority: 1,
+        capabilities: vec!["code".into()],
+        status: orc::registry::AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        quota_remaining_percent: None,
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+        actions: vec![orc::registry::AgentAction::Code],
+    }
 }
 
 fn response() -> ProjectDiscoveryResponse {
@@ -54,7 +112,7 @@ fn response() -> ProjectDiscoveryResponse {
 #[test]
 fn adopt_initializes_existing_git_repository() {
     let (_dir, repo) = git_repo();
-    let root = adoption::adopt(&repo).unwrap();
+    let root = adopt_isolated(&repo).unwrap();
     assert_eq!(root, std::fs::canonicalize(&repo).unwrap());
     assert!(repo.join(".orc/orc.db").exists());
     assert!(repo.join(".orc/engineering.md").exists());
@@ -67,10 +125,98 @@ fn adopt_initializes_existing_git_repository() {
 }
 
 #[test]
+fn fresh_adoption_persists_global_authority_not_project_companion() {
+    let (_dir, repo) = git_repo();
+    let global_registry = repo.join("configured-global-agents.db");
+
+    adoption::adopt_with_registry(&repo, &global_registry).unwrap();
+
+    assert_eq!(
+        persisted_registry_path(&repo.join(".orc/orc.db")),
+        global_registry
+    );
+    assert!(!repo.join(".orc/orc.agents.db").exists());
+}
+
+#[test]
+fn global_agent_survives_project_database_recreation_and_plain_open() {
+    let (dir, repo) = git_repo();
+    let global_registry = dir.path().join("global/agents.db");
+    let project_db = repo.join(".orc/orc.db");
+    adoption::adopt_with_registry(&repo, &global_registry).unwrap();
+    Database::open_with_registry(&project_db, &global_registry)
+        .unwrap()
+        .insert_agent(&configured_agent("surviving-global"))
+        .unwrap();
+
+    std::fs::remove_file(&project_db).unwrap();
+    adoption::adopt_with_registry(&repo, &global_registry).unwrap();
+
+    let reopened = Database::open(&project_db).unwrap();
+    assert!(reopened.get_agent("surviving-global").unwrap().is_some());
+    assert_eq!(persisted_registry_path(&project_db), global_registry);
+    assert!(!repo.join(".orc/orc.agents.db").exists());
+}
+
+#[test]
+fn readopting_existing_project_rebinds_legacy_companion_authority_to_global() {
+    let (dir, repo) = git_repo();
+    let project_db = repo.join(".orc/orc.db");
+    let legacy = Database::init(&project_db).unwrap();
+    legacy.create_project("sample-project").unwrap();
+    drop(legacy);
+    assert_eq!(
+        persisted_registry_path(&project_db),
+        repo.join(".orc/orc.agents.db")
+    );
+
+    let global_registry = dir.path().join("global/agents.db");
+    let global =
+        Database::init_with_registry(dir.path().join("authority.db"), &global_registry).unwrap();
+    global
+        .insert_agent(&configured_agent("authoritative-global"))
+        .unwrap();
+    drop(global);
+
+    adoption::adopt_with_registry(&repo, &global_registry).unwrap();
+
+    assert_eq!(persisted_registry_path(&project_db), global_registry);
+    assert!(
+        Database::open(&project_db)
+            .unwrap()
+            .get_agent("authoritative-global")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn orc_init_still_persists_configured_global_registry_authority() {
+    let dir = TempDir::new().unwrap();
+    let global_registry = dir.path().join("global/agents.db");
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(dir.path())
+        .env("ORC_GLOBAL_REGISTRY_PATH", &global_registry)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        persisted_registry_path(&dir.path().join(".orc/orc.db")),
+        global_registry
+    );
+    assert!(!dir.path().join(".orc/orc.agents.db").exists());
+}
+
+#[test]
 fn adopt_writes_the_maintained_engineering_contract_when_missing() {
     let (_dir, repo) = git_repo();
 
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
@@ -81,7 +227,7 @@ fn adopt_writes_the_maintained_engineering_contract_when_missing() {
 #[test]
 fn adopt_fails_outside_git_repository() {
     let dir = TempDir::new().unwrap();
-    let error = adoption::adopt(dir.path()).unwrap_err().to_string();
+    let error = adopt_isolated(dir.path()).unwrap_err().to_string();
     assert!(error.contains("not inside a Git repository"));
 }
 
@@ -90,7 +236,7 @@ fn adopt_does_not_overwrite_existing_project_docs() {
     let (_dir, repo) = git_repo();
     std::fs::create_dir_all(repo.join(".orc")).unwrap();
     std::fs::write(repo.join(".orc/project.md"), "custom project notes\n").unwrap();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     assert_eq!(
         std::fs::read_to_string(repo.join(".orc/project.md")).unwrap(),
         "custom project notes\n"
@@ -106,7 +252,7 @@ fn adopt_does_not_overwrite_existing_engineering_contract() {
         "# User-owned engineering contract\n",
     )
     .unwrap();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     assert_eq!(
         std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
         "# User-owned engineering contract\n"
@@ -120,7 +266,7 @@ fn adoption_preserves_empty_engineering_contract_but_populates_empty_project_doc
     std::fs::write(repo.join(".orc/engineering.md"), "").unwrap();
     std::fs::write(repo.join(".orc/project.md"), "").unwrap();
 
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
@@ -136,7 +282,7 @@ fn adoption_preserves_empty_engineering_contract_but_populates_empty_project_doc
 #[test]
 fn discovery_request_is_json_and_read_only() {
     let (_dir, repo) = git_repo();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     let request = discovery::build_request(&repo).unwrap();
     let json = serde_json::to_string(&request).unwrap();
     assert!(json.contains("Do not modify files"));
@@ -148,7 +294,7 @@ fn discovery_request_is_json_and_read_only() {
 #[test]
 fn discovery_response_deserializes_and_applies_summaries() {
     let (_dir, repo) = git_repo();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     let original = response();
     let json = serde_json::to_string(&original).unwrap();
     let parsed = discovery::parse_response(&json).unwrap();
@@ -177,7 +323,7 @@ fn discovery_snapshot_is_read_only_and_contains_project_context() {
     .unwrap();
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     let before = std::fs::read(repo.join(".orc/orc.db")).unwrap();
     let snapshot = discovery::build_snapshot(&repo).unwrap();
     assert_eq!(snapshot.project.name, "sample-project");
@@ -195,7 +341,7 @@ fn discovery_snapshot_is_read_only_and_contains_project_context() {
 #[test]
 fn reopening_database_preserves_adopted_project() {
     let (_dir, repo) = git_repo();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     let db_path = repo.join(".orc/orc.db");
     drop(Database::open(&db_path).unwrap());
     let reopened = Database::open(db_path).unwrap();
@@ -248,7 +394,7 @@ fn adopt_and_invoke_lead_discovers_persists_and_does_not_create_work() {
     let (_dir, repo) = git_repo();
     let backend = RecordingLead(RefCell::new(None));
     let (root, response) =
-        adoption::adopt_and_invoke_lead(repo.join("."), "understand this repository", &backend, 20)
+        adopt_and_invoke_lead_isolated(repo.join("."), "understand this repository", &backend, 20)
             .unwrap();
     assert!(backend.0.borrow().as_ref().unwrap().discovery.is_some());
     assert!(response.decision.is_some());
@@ -273,7 +419,7 @@ fn adopt_resolves_nested_repository_root_for_lead() {
     std::fs::create_dir(&nested).unwrap();
     let backend = RecordingLead(RefCell::new(None));
     let (root, _) =
-        adoption::adopt_and_invoke_lead(&nested, "understand this repository", &backend, 20)
+        adopt_and_invoke_lead_isolated(&nested, "understand this repository", &backend, 20)
             .unwrap();
     assert_eq!(root, std::fs::canonicalize(repo).unwrap());
     assert_eq!(
@@ -285,11 +431,11 @@ fn adopt_resolves_nested_repository_root_for_lead() {
 #[test]
 fn adopt_aborts_before_lead_when_structured_discovery_fails() {
     let (_dir, repo) = git_repo();
-    adoption::adopt(&repo).unwrap();
+    adopt_isolated(&repo).unwrap();
     std::fs::create_dir(repo.join(".orc/validation.toml")).unwrap();
     let backend = CountingLead(RefCell::new(0));
 
-    let error = adoption::adopt_and_invoke_lead(&repo, "understand this repository", &backend, 20)
+    let error = adopt_and_invoke_lead_isolated(&repo, "understand this repository", &backend, 20)
         .unwrap_err()
         .to_string();
 
@@ -321,9 +467,10 @@ printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
+    let global_registry = repo.join(".orc/test.agents.db");
     let output = Command::new(env!("CARGO_BIN_EXE_orc"))
         .current_dir(&nested)
-        .env("ORC_GLOBAL_REGISTRY_PATH", repo.join(".orc/test.agents.db"))
+        .env("ORC_GLOBAL_REGISTRY_PATH", &global_registry)
         .env("PATH", path)
         .args(["adopt", "assess this existing repository"])
         .output()
@@ -346,4 +493,9 @@ printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT
     assert!(decisions[0].snapshot.is_some());
     assert!(db.list_tasks().unwrap().is_empty());
     assert!(db.list_agent_runs(project, usize::MAX).unwrap().is_empty());
+    assert_eq!(
+        persisted_registry_path(&repo.join(".orc/orc.db")),
+        global_registry
+    );
+    assert!(!repo.join(".orc/orc.agents.db").exists());
 }

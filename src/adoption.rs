@@ -32,17 +32,28 @@ pub fn repository_root(start: impl AsRef<Path>) -> Result<PathBuf> {
 }
 
 pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
+    adopt_with_registry(start, Database::default_global_registry_path())
+}
+
+/// Adopt using an explicit registry authority. Normal operator-facing
+/// adoption uses [`adopt`] and the global registry; this seam is retained for
+/// isolated embedders and tests.
+pub fn adopt_with_registry(
+    start: impl AsRef<Path>,
+    registry_path: impl AsRef<Path>,
+) -> Result<PathBuf> {
     let root = repository_root(start)?;
     let orc_dir = root.join(".orc");
     let db_path = orc_dir.join("orc.db");
 
     if db_path.exists() {
-        let db = Database::open(&db_path).with_context(|| {
-            format!(
-                "{}.orc/orc.db already exists but is not a valid Orc database",
-                root.display()
-            )
-        })?;
+        let db =
+            Database::open_with_registry(&db_path, registry_path.as_ref()).with_context(|| {
+                format!(
+                    "{}.orc/orc.db already exists but is not a valid Orc database",
+                    root.display()
+                )
+            })?;
         if db.get_project_id()?.is_some() {
             ensure_adoption_files(&orc_dir)?;
             return Ok(root);
@@ -55,7 +66,8 @@ pub fn adopt(start: impl AsRef<Path>) -> Result<PathBuf> {
 
     std::fs::create_dir_all(&orc_dir)
         .with_context(|| format!("failed to create {}", orc_dir.display()))?;
-    let db = Database::init(&db_path).context("failed to initialize Orc database")?;
+    let db = Database::init_with_registry(&db_path, registry_path)
+        .context("failed to initialize Orc database")?;
     let project_name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -77,9 +89,25 @@ pub fn adopt_and_invoke_lead(
     backend: &dyn crate::lead::LeadBackend,
     context_limit: usize,
 ) -> Result<(PathBuf, crate::lead::LeadResponse)> {
-    let root = adopt(start)?;
-    let db =
-        Database::open(root.join(".orc/orc.db")).context("failed to open adopted Orc database")?;
+    adopt_and_invoke_lead_with_registry(
+        start,
+        objective,
+        backend,
+        context_limit,
+        Database::default_global_registry_path(),
+    )
+}
+
+pub fn adopt_and_invoke_lead_with_registry(
+    start: impl AsRef<Path>,
+    objective: &str,
+    backend: &dyn crate::lead::LeadBackend,
+    context_limit: usize,
+    registry_path: impl AsRef<Path>,
+) -> Result<(PathBuf, crate::lead::LeadResponse)> {
+    let root = adopt_with_registry(start, registry_path.as_ref())?;
+    let db = Database::open_with_registry(root.join(".orc/orc.db"), registry_path)
+        .context("failed to open adopted Orc database")?;
     let response = crate::lead::LeadService::new_with_required_discovery(&db, &root).invoke(
         objective,
         backend,

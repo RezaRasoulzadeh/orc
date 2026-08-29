@@ -17,10 +17,14 @@ use orc::validation::{
     ValidationCategory, ValidationFailureClassification, ValidationRunner, ValidationStepResult,
 };
 use orc::worker::{Worker, WorkerExecution, WorkerOutcome};
+use orc::workflow::{
+    AcceptancePolicy, LeadOutcome, PlanOutcome, PlanReviewOutcome, ProviderOutcome, ReviewOutcome,
+    WorkflowActions, WorkflowEngine, WorkflowPolicy, WorkflowStage, WorkflowStatus,
+};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 struct ProtocolOperationWorker {
@@ -360,6 +364,14 @@ struct QueuedReviewBackend {
     outputs: Mutex<VecDeque<String>>,
 }
 
+struct NonConvergingReviewBackend {
+    calls: Arc<Mutex<usize>>,
+}
+
+struct NonResolvingRevisionWorker {
+    calls: Arc<Mutex<usize>>,
+}
+
 struct FailingReviewBackend;
 
 impl ActionBackend for FailingReviewBackend {
@@ -394,6 +406,38 @@ impl ActionBackend for QueuedReviewBackend {
                 .expect("review output"),
             token_usage: None,
         })
+    }
+}
+
+impl ActionBackend for NonConvergingReviewBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Review);
+        let mut calls = self.calls.lock().unwrap();
+        let prior = (*calls > 0).then(|| blocker_id("persistent"));
+        *calls += 1;
+        Ok(ActionExecution {
+            output: multi_blocker_review_output("REVISE", &[("persistent", prior.as_deref())]),
+            token_usage: None,
+        })
+    }
+}
+
+impl Worker for NonResolvingRevisionWorker {
+    fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        let file = cwd.join("feature.txt");
+        let mut content = std::fs::read_to_string(&file).unwrap_or_default();
+        content.push_str(&format!("non-resolving revision {}\n", *calls));
+        std::fs::write(file, content).map_err(|error| error.to_string())?;
+        Ok((WorkerOutcome::Success, Some("revision output".into())))
     }
 }
 
@@ -1193,6 +1237,122 @@ fn multi_blocker_review_output(verdict: &str, statuses: &[(&str, Option<&str>)])
         "revision_feedback": "resolve the remaining blockers",
         "blockers": blockers,
     }).to_string()
+}
+
+struct ProductionReviewWorkflowActions<'a> {
+    db: &'a Database,
+    repo_path: &'a Path,
+    review_backend: &'a dyn ActionBackend,
+    revision_worker: &'a dyn Worker,
+}
+
+impl ProductionReviewWorkflowActions<'_> {
+    fn provider_run(&self, action: &str, purpose: &str) -> Result<i64> {
+        let project = self.db.get_project_id()?.expect("project");
+        let run = self.db.create_project_action_run(
+            project,
+            None,
+            action,
+            "fake",
+            AgentRunExecution {
+                class: action,
+                model: None,
+                effort: None,
+                source: "non-convergence-test",
+            },
+        )?;
+        let invocation = self.db.start_provider_invocation(run, purpose, 1, None)?;
+        self.db
+            .finish_provider_invocation(invocation, "completed", None)?;
+        self.db.update_agent_run_status(run, "completed", None)?;
+        Ok(run)
+    }
+}
+
+impl WorkflowActions for ProductionReviewWorkflowActions<'_> {
+    fn discover(&self) -> Result<String> {
+        Ok("persisted-test-snapshot".into())
+    }
+
+    fn lead(&self, _: &orc::workflow::WorkflowRun) -> Result<LeadOutcome> {
+        Ok(LeadOutcome {
+            decision_id: 1,
+            provider_run_id: self.provider_run("lead", "lead")?,
+            kind: orc::lead::LeadDecisionKind::DirectTasks,
+        })
+    }
+
+    fn apply_direct(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn plan(&self) -> Result<PlanOutcome> {
+        unreachable!("direct-task workflow does not plan")
+    }
+
+    fn revise_plan(&self) -> Result<PlanOutcome> {
+        unreachable!("direct-task workflow does not revise a plan")
+    }
+
+    fn review_plan(&self, _: &orc::workflow::WorkflowRun, _: i64) -> Result<PlanReviewOutcome> {
+        unreachable!("direct-task workflow does not review a plan")
+    }
+
+    fn apply_plan(&self) -> Result<()> {
+        unreachable!("direct-task workflow does not apply a plan")
+    }
+
+    fn dispatch(&self, task_id: &str) -> Result<ProviderOutcome> {
+        let summary = dispatch_with_worker_on_db_cancellable(
+            task_id,
+            &WritingWorker,
+            self.db,
+            self.repo_path,
+            "fake",
+            &FakeValidationRunner::success(),
+            None,
+        )?;
+        Ok(ProviderOutcome {
+            provider_run_id: summary.run_id,
+        })
+    }
+
+    fn review(&self, task_id: &str) -> Result<ReviewOutcome> {
+        let app = OrcApp::open(self.repo_path.join(".orc/orc.db"), self.repo_path)?;
+        let (run, outcome) = app.automated_review_with_backend(
+            task_id,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            self.review_backend,
+        )?;
+        Ok(ReviewOutcome {
+            provider_run_id: run,
+            verdict: outcome.verdict,
+            feedback: outcome.revision_feedback,
+        })
+    }
+
+    fn revise_task(&self, task_id: &str, feedback: &str) -> Result<ProviderOutcome> {
+        let summary = revise_with_worker_on_db(
+            task_id,
+            feedback,
+            self.revision_worker,
+            self.db,
+            self.repo_path,
+            "fake",
+            &FakeValidationRunner::success(),
+        )?;
+        Ok(ProviderOutcome {
+            provider_run_id: summary.run_id,
+        })
+    }
+
+    fn accept(&self, _: &str) -> Result<()> {
+        unreachable!("a perpetually REVISE review cannot reach acceptance")
+    }
 }
 
 fn explicit_blocker_review_output(
@@ -2200,6 +2360,257 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
             .status,
         "resolved"
     );
+}
+
+#[test]
+fn production_review_revision_loop_stops_at_task_revision_bound_after_restart() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![AgentAction::Code, AgentAction::Review, AgentAction::Lead],
+    ))
+    .unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let policy = WorkflowPolicy {
+        acceptance: AcceptancePolicy::Automatic,
+        max_task_revisions: 2,
+        ..WorkflowPolicy::default()
+    };
+    let workflow_id = db
+        .start_workflow(project, "prove revision convergence is bounded", &policy)
+        .unwrap()
+        .id;
+    let review_calls = Arc::new(Mutex::new(0));
+    let revision_calls = Arc::new(Mutex::new(0));
+    let review_backend = NonConvergingReviewBackend {
+        calls: Arc::clone(&review_calls),
+    };
+    let revision_worker = NonResolvingRevisionWorker {
+        calls: Arc::clone(&revision_calls),
+    };
+    let before_restart = {
+        let actions = ProductionReviewWorkflowActions {
+            db: &db,
+            repo_path: dir.path(),
+            review_backend: &review_backend,
+            revision_worker: &revision_worker,
+        };
+        let engine = WorkflowEngine::new(&db, &actions);
+        let mut current = db.get_workflow(workflow_id).unwrap().unwrap();
+        for _ in 0..7 {
+            current = engine.continue_one(workflow_id).unwrap();
+        }
+        current
+    };
+    assert_eq!(before_restart.status, WorkflowStatus::Running);
+    assert_eq!(before_restart.stage, WorkflowStage::Review);
+    assert_eq!(before_restart.task_revision_count, 1);
+    assert_eq!(*review_calls.lock().unwrap(), 1);
+    assert_eq!(*revision_calls.lock().unwrap(), 1);
+    drop(db);
+
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    let actions = ProductionReviewWorkflowActions {
+        db: &reopened,
+        repo_path: dir.path(),
+        review_backend: &review_backend,
+        revision_worker: &revision_worker,
+    };
+    let engine = WorkflowEngine::new(&reopened, &actions);
+    let stopped = engine.continue_run(workflow_id).unwrap();
+
+    assert_eq!(stopped.status, WorkflowStatus::NonConvergent);
+    assert_eq!(stopped.stage, WorkflowStage::Review);
+    assert_eq!(stopped.task_revision_count, policy.max_task_revisions);
+    assert_eq!(
+        stopped.stop_reason.as_deref(),
+        Some("task revision limit exhausted")
+    );
+    assert_eq!(
+        reopened.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    assert_eq!(*review_calls.lock().unwrap(), 3);
+    assert_eq!(*revision_calls.lock().unwrap(), 2);
+
+    let purposes = reopened
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+        .map(|invocation| invocation.purpose)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|purpose| *purpose == "review")
+            .count(),
+        3
+    );
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|purpose| *purpose == "revision")
+            .count(),
+        2
+    );
+    let blocker = reopened
+        .review_blocker_ledger(&task)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.blocker_id == blocker_id("persistent"))
+        .expect("persistent blocker remains in the ledger");
+    assert_eq!(blocker.status, "unresolved");
+    assert!(
+        reopened
+            .actionable_revision_contract(&task)
+            .unwrap()
+            .is_some()
+    );
+
+    let unchanged = engine.continue_run(workflow_id).unwrap();
+    assert_eq!(unchanged.status, WorkflowStatus::NonConvergent);
+    assert_eq!(*review_calls.lock().unwrap(), 3);
+    assert_eq!(*revision_calls.lock().unwrap(), 2);
+}
+
+#[test]
+fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![AgentAction::Code, AgentAction::Review, AgentAction::Lead],
+    ))
+    .unwrap();
+    let project = db.get_project_id().unwrap().unwrap();
+    let backend = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::from([multi_blocker_review_output(
+            "REJECT",
+            &[("unsafe-implementation", None)],
+        )])),
+    };
+    let revision_calls = Arc::new(Mutex::new(0));
+    let revision_worker = NonResolvingRevisionWorker {
+        calls: Arc::clone(&revision_calls),
+    };
+    let stopped = {
+        let actions = ProductionReviewWorkflowActions {
+            db: &db,
+            repo_path: dir.path(),
+            review_backend: &backend,
+            revision_worker: &revision_worker,
+        };
+        WorkflowEngine::new(&db, &actions)
+            .start(
+                project,
+                "reject unsafe implementation",
+                WorkflowPolicy::default(),
+            )
+            .unwrap()
+    };
+
+    assert_eq!(stopped.status, WorkflowStatus::Blocked);
+    assert_eq!(stopped.stage, WorkflowStage::Review);
+    assert_eq!(
+        stopped.stop_reason.as_deref(),
+        Some("review rejected the implementation")
+    );
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    assert_eq!(*revision_calls.lock().unwrap(), 0);
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert_eq!(db.revision_contract_history_count(&task).unwrap(), 0);
+
+    let runs = db.list_agent_runs_for_task(&task).unwrap();
+    let implementation = runs
+        .iter()
+        .find(|run| {
+            db.provider_invocations(run.id)
+                .unwrap()
+                .iter()
+                .any(|invocation| invocation.purpose == "implementation")
+        })
+        .unwrap();
+    assert!(db.get_change_evidence(implementation.id).unwrap().is_some());
+    assert!(
+        db.latest_validation_result_for_run(implementation.id)
+            .unwrap()
+            .is_some()
+    );
+    let review_run = runs
+        .iter()
+        .find(|run| run.execution_class == "review")
+        .unwrap();
+    assert_eq!(review_run.status, "completed");
+    assert!(review_run.output.as_deref().unwrap().contains("REJECT"));
+    let observations = db.review_blocker_observations(review_run.id).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].status, "new");
+    let ledger = db.review_blocker_ledger(&task).unwrap();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].status, "new");
+
+    let invocations_before = db
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| db.provider_invocations(run.id).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(invocations_before.len(), 3);
+    assert_eq!(
+        invocations_before
+            .iter()
+            .filter(|invocation| invocation.purpose == "review")
+            .count(),
+        1
+    );
+    assert!(
+        invocations_before
+            .iter()
+            .all(|invocation| invocation.purpose != "revision")
+    );
+    assert!(
+        db.workflow_transitions(stopped.id)
+            .unwrap()
+            .iter()
+            .all(|transition| transition.edge != "task_accepted"
+                && transition.edge != "task_revised_and_validated")
+    );
+    let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
+    assert!(dir.path().join(&worktree_path).exists());
+    assert!(!dir.path().join("feature.txt").exists());
+    drop(db);
+
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    let empty_backend = QueuedReviewBackend {
+        outputs: Mutex::new(VecDeque::new()),
+    };
+    let actions = ProductionReviewWorkflowActions {
+        db: &reopened,
+        repo_path: dir.path(),
+        review_backend: &empty_backend,
+        revision_worker: &revision_worker,
+    };
+    let unchanged = WorkflowEngine::new(&reopened, &actions)
+        .continue_run(stopped.id)
+        .unwrap();
+    assert_eq!(unchanged.status, WorkflowStatus::Blocked);
+    assert_eq!(unchanged.stage, WorkflowStage::Review);
+    let invocations_after = reopened
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+        .count();
+    assert_eq!(invocations_after, invocations_before.len());
+    assert_eq!(*revision_calls.lock().unwrap(), 0);
+    assert_eq!(
+        reopened.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    assert!(dir.path().join(worktree_path).exists());
 }
 
 #[test]
@@ -3252,6 +3663,137 @@ fn accept_integrates_and_reject_preserves_worktree() {
         db.get_task(&task2).unwrap().unwrap().status,
         TaskStatus::Review
     );
+}
+
+#[test]
+fn workflow_resolve_cli_accepts_persisted_gate_without_provider_invocation() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
+    dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &WritingWorker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    let project = db.get_project_id().unwrap().unwrap();
+    let current = db
+        .start_workflow(
+            project,
+            "accept through the CLI",
+            &WorkflowPolicy::default(),
+        )
+        .unwrap();
+    let mut acceptance_ready = current.clone();
+    acceptance_ready.status = WorkflowStatus::AcceptanceReady;
+    acceptance_ready.stage = WorkflowStage::Acceptance;
+    acceptance_ready.current_task_id = Some(task.clone());
+    acceptance_ready.resume_stage = Some(WorkflowStage::Acceptance);
+    let acceptance_ready = db
+        .commit_workflow_transition(
+            &current,
+            &acceptance_ready,
+            "test_task_ready_for_acceptance",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let invocations_before = db
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| db.provider_invocations(run.id).unwrap())
+        .count();
+    let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
+    drop(db);
+
+    let registry_path = dir.path().join(".orc/orc.agents.db");
+    let invalid = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(dir.path())
+        .env("ORC_GLOBAL_REGISTRY_PATH", &registry_path)
+        .args([
+            "workflow-resolve",
+            &acceptance_ready.id.to_string(),
+            "maybe",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("explicit accept"));
+    let after_invalid = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        after_invalid
+            .get_workflow(acceptance_ready.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::AcceptanceReady
+    );
+    assert_eq!(
+        after_invalid
+            .list_agent_runs(project, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|run| after_invalid.provider_invocations(run.id).unwrap())
+            .count(),
+        invocations_before
+    );
+    drop(after_invalid);
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(dir.path())
+        .env("ORC_GLOBAL_REGISTRY_PATH", registry_path)
+        .args([
+            "workflow-resolve",
+            &acceptance_ready.id.to_string(),
+            "accept",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["stage"], "done");
+
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        reopened
+            .get_workflow(acceptance_ready.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Completed
+    );
+    assert_eq!(
+        reopened
+            .list_agent_runs(project, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+            .count(),
+        invocations_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("feature.txt")).unwrap(),
+        "implemented\n"
+    );
+    assert!(!dir.path().join(worktree_path).exists());
 }
 
 #[test]

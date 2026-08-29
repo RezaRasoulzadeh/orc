@@ -370,6 +370,98 @@ fn plan_revision_and_task_revision_are_bounded_and_use_one_call_each() {
 }
 
 #[test]
+fn plan_revision_exhaustion_is_persisted_and_stops_provider_calls() {
+    let (directory, db, project) = setup();
+    let policy = WorkflowPolicy {
+        max_plan_revisions: 2,
+        ..automatic_policy()
+    };
+    let workflow_id = db
+        .start_workflow(project, "plan without converging", &policy)
+        .unwrap()
+        .id;
+
+    let before_restart = {
+        let actions = FakeActions::new(&db, project, Intake::Plan);
+        *actions.plan_reviews.lock().unwrap() = VecDeque::from([LeadDecisionKind::RevisePlan]);
+        let engine = WorkflowEngine::new(&db, &actions);
+        let mut current = db.get_workflow(workflow_id).unwrap().unwrap();
+        for _ in 0..5 {
+            current = engine.continue_one(workflow_id).unwrap();
+        }
+        current
+    };
+    assert_eq!(before_restart.status, WorkflowStatus::Running);
+    assert_eq!(before_restart.stage, WorkflowStage::PlanReview);
+    assert_eq!(before_restart.plan_revision_count, 1);
+    drop(db);
+
+    let reopened = Database::open(directory.path().join("orc.db")).unwrap();
+    let actions = FakeActions::new(&reopened, project, Intake::Plan);
+    *actions.plan_reviews.lock().unwrap() =
+        VecDeque::from([LeadDecisionKind::RevisePlan, LeadDecisionKind::RevisePlan]);
+    let engine = WorkflowEngine::new(&reopened, &actions);
+    let stopped = engine.continue_run(workflow_id).unwrap();
+
+    assert_eq!(stopped.status, WorkflowStatus::NonConvergent);
+    assert_eq!(stopped.stage, WorkflowStage::PlannerRevision);
+    assert_eq!(stopped.plan_revision_count, policy.max_plan_revisions);
+    assert_eq!(
+        stopped.stop_reason.as_deref(),
+        Some("plan revision limit exhausted")
+    );
+    assert!(reopened.list_tasks_for_project(project).unwrap().is_empty());
+
+    let invocations = reopened
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.purpose == "plan"
+                    && invocation.workflow_stage.as_deref() == Some("planner")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.purpose == "plan"
+                    && invocation.workflow_stage.as_deref() == Some("planner_revision")
+            })
+            .count(),
+        policy.max_plan_revisions
+    );
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.purpose == "lead"
+                    && invocation.workflow_stage.as_deref() == Some("plan_review")
+            })
+            .count(),
+        policy.max_plan_revisions + 1
+    );
+
+    let invocation_count = invocations.len();
+    let unchanged = engine.continue_run(workflow_id).unwrap();
+    assert_eq!(unchanged.status, WorkflowStatus::NonConvergent);
+    let after_terminal_count = reopened
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+        .count();
+    assert_eq!(after_terminal_count, invocation_count);
+}
+
+#[test]
 fn restart_between_every_committed_stage_resumes_without_repeating_provider_calls() {
     let (directory, db, project) = setup();
     let run = db
@@ -561,6 +653,51 @@ fn approval_gate_rejects_ambiguous_resolution_without_advancing() {
     let unchanged = db.get_workflow(waiting.id).unwrap().unwrap();
     assert_eq!(unchanged.status, WorkflowStatus::AcceptanceReady);
     assert_eq!(unchanged.version, version);
+}
+
+#[test]
+fn acceptance_gate_accepts_after_restart_without_provider_invocation() {
+    let (directory, db, project) = setup();
+    let waiting = {
+        let actions = FakeActions::new(&db, project, Intake::Direct);
+        WorkflowEngine::new(&db, &actions)
+            .start(
+                project,
+                "approval survives restart",
+                WorkflowPolicy::default(),
+            )
+            .unwrap()
+    };
+    assert_eq!(waiting.status, WorkflowStatus::AcceptanceReady);
+    assert_eq!(waiting.stage, WorkflowStage::Acceptance);
+    let task_id = waiting.current_task_id.clone().unwrap();
+    let invocations_before = db
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| db.provider_invocations(run.id).unwrap())
+        .count();
+    drop(db);
+
+    let reopened = Database::open(directory.path().join("orc.db")).unwrap();
+    let actions = FakeActions::new(&reopened, project, Intake::Direct);
+    let completed = WorkflowEngine::new(&reopened, &actions)
+        .resolve_user_gate(waiting.id, "accept")
+        .unwrap();
+
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert_eq!(completed.stage, WorkflowStage::Done);
+    assert_eq!(
+        reopened.get_task(&task_id).unwrap().unwrap().status,
+        TaskStatus::Done
+    );
+    let invocations_after = reopened
+        .list_agent_runs(project, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|run| reopened.provider_invocations(run.id).unwrap())
+        .count();
+    assert_eq!(invocations_after, invocations_before);
 }
 
 #[test]

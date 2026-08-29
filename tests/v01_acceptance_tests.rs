@@ -186,3 +186,175 @@ fn v01_happy_path_is_provider_independent() {
     assert!(doctor.contains("Active tasks\n  (none)"));
     assert!(doctor.contains("Overall: OK"), "doctor output: {doctor}");
 }
+
+#[cfg(unix)]
+#[test]
+fn automated_dispatch_cli_is_one_shot_and_stops_in_review() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().expect("temporary repository");
+    let root = directory.path();
+    init_git_repository(root);
+    assert_orc(root, &["init"]);
+    fs::write(root.join(".orc/validation.toml"), "commands = [\"true\"]\n")
+        .expect("write validation configuration");
+    assert!(
+        git(root, &["add", "-f", ".orc/validation.toml"])
+            .status
+            .success()
+    );
+    assert!(
+        git(root, &["commit", "-m", "configure validation"])
+            .status
+            .success()
+    );
+    let plan = serde_json::json!({
+        "protocol_version": 1,
+        "objective": "Exercise one automated dispatch",
+        "assumptions": [],
+        "risks": [],
+        "questions": [],
+        "tasks": [{
+            "local_id": "T-0001",
+            "title": "Create one-shot marker",
+            "objective": "Create one-shot.txt and stop after dispatch",
+            "role": "developer",
+            "priority": "normal",
+            "capabilities": ["code", "terminal"],
+            "scope_mode": "focused",
+            "context_files": ["README.md"],
+            "expected_changes": ["create: one-shot.txt"],
+            "unchanged": ["README.md"],
+            "acceptance_criteria": ["one-shot.txt exists in the task worktree"],
+            "required_tests": ["configured validation passes"],
+            "validation": ["true"],
+            "execution_hints": {"effort":"low","effort_reason":"single-file change"},
+            "risk_factors": [],
+            "depends_on": []
+        }]
+    });
+    fs::write(
+        root.join(".orc/plan.json"),
+        serde_json::to_vec(&plan).expect("serialize plan"),
+    )
+    .expect("write plan");
+    assert_orc(root, &["apply-plan", ".orc/plan.json"]);
+
+    let profile = root.join(".orc/automated-profile");
+    fs::create_dir_all(&profile).expect("create automated profile");
+    assert_orc(
+        root,
+        &[
+            "agent",
+            "add",
+            "automated-coder",
+            "--backend",
+            "codex",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--capability",
+            "code",
+            "--capability",
+            "terminal",
+        ],
+    );
+    let queue = assert_orc(root, &["queue", "--explain"]);
+    assert!(queue.contains("T-0001") && queue.contains("READY"));
+    let db_path = root.join(".orc/orc.db");
+    let before = Database::open(&db_path).expect("open database before dispatch");
+    before
+        .update_task_status("T-0001", TaskStatus::Ready)
+        .expect("persist ready task state");
+    assert_eq!(
+        before
+            .get_task("T-0001")
+            .expect("get task")
+            .expect("task")
+            .status,
+        TaskStatus::Ready
+    );
+    assert!(
+        before
+            .list_agent_runs_for_task("T-0001")
+            .unwrap()
+            .is_empty()
+    );
+    drop(before);
+
+    let bin = root.join("bin");
+    fs::create_dir(&bin).expect("create fake provider bin");
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        r#"#!/bin/sh
+if [ "$1" = "exec" ]; then
+  printf 'x' >> "$ORC_DISPATCH_PROVIDER_CALLS"
+  printf 'implemented by one-shot dispatch\n' > one-shot.txt
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"step_results\":[{\"step_id\":\"implementation\",\"operations_performed\":[\"create\"],\"affected_files\":[\"one-shot.txt\"],\"observed\":[\"created one-shot.txt\"],\"verification_passed\":[]}],\"summary\":\"implemented\"}"}}'
+  exit 0
+fi
+exit 1
+"#,
+    )
+    .expect("write fake provider");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make fake provider executable");
+    let calls = root.join("dispatch-provider-calls");
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), old_path.to_string_lossy());
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(root)
+        .env("ORC_GLOBAL_REGISTRY_PATH", root.join(".orc/test.agents.db"))
+        .env("ORC_DISPATCH_PROVIDER_CALLS", &calls)
+        .env("PATH", path)
+        .args(["dispatch", "T-0001", "--agent", "automated-coder"])
+        .output()
+        .expect("run automated dispatch");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "x");
+
+    let reopened = Database::open(&db_path).expect("reopen database after dispatch");
+    let task = reopened.get_task("T-0001").unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Review);
+    let runs = reopened.list_agent_runs_for_task("T-0001").unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].execution_mode, "automated");
+    assert_eq!(runs[0].execution_class, "coder");
+    assert_eq!(runs[0].status, "completed");
+    let invocations = reopened.provider_invocations(runs[0].id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].purpose, "implementation");
+    assert!(
+        invocations
+            .iter()
+            .all(|invocation| invocation.purpose != "review" && invocation.purpose != "revision")
+    );
+    assert!(
+        runs.iter()
+            .all(|run| run.execution_class != "review" && run.execution_class != "revision")
+    );
+    assert!(
+        reopened
+            .actionable_revision_contract("T-0001")
+            .unwrap()
+            .is_none()
+    );
+    assert!(reopened.review_blocker_ledger("T-0001").unwrap().is_empty());
+    let project = reopened.get_project_id().unwrap().unwrap();
+    assert!(reopened.active_workflow(project).unwrap().is_none());
+    assert!(
+        reopened
+            .list_lifecycle_events_for_task("T-0001", 100)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "review_accept")
+    );
+    let (_, worktree_path) = reopened.get_worktree_metadata("T-0001").unwrap().unwrap();
+    assert!(root.join(worktree_path).exists());
+    assert!(!root.join("one-shot.txt").exists());
+}

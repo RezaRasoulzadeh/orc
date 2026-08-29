@@ -1261,12 +1261,13 @@ fn select_and_run_review_validation(
     if !worktree_dir.exists() {
         return Ok(None);
     }
-    let config = crate::validation::ValidationConfig::load(&worktree_dir)
-        .unwrap_or_else(|_| crate::validation::ValidationConfig {
+    let config = crate::validation::ValidationConfig::load(&worktree_dir).unwrap_or_else(|_| {
+        crate::validation::ValidationConfig {
             commands: Vec::new(),
             groups: Vec::new(),
             boundaries: Vec::new(),
-        });
+        }
+    });
     let changed_files: Vec<String> = summary
         .changes
         .files
@@ -2051,7 +2052,11 @@ mod tests {
         }]})
         .to_string();
         let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
-        assert!(error.to_string().contains("missing implementation evidence"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing implementation evidence")
+        );
     }
 
     fn claim_evidence_fixture(changed_path: &str) -> (crate::git::WorktreeChanges, String) {
@@ -2083,9 +2088,8 @@ mod tests {
     #[test]
     fn claim_without_current_change_evidence_is_rejected() {
         let (_changes, handoff) = claim_evidence_fixture("tests/lifecycle.rs");
-        let error =
-            validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, None)
-                .unwrap_err();
+        let error = validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, None)
+            .unwrap_err();
         assert!(error.to_string().contains("current change evidence"));
     }
 
@@ -2093,12 +2097,9 @@ mod tests {
     fn claimed_file_not_in_current_diff_is_rejected() {
         let (changes, handoff) = claim_evidence_fixture("tests/other.rs");
         let handoff = handoff.replace("tests/other.rs", "tests/lifecycle.rs");
-        let error = validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-        )
-        .unwrap_err();
+        let error =
+            validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, Some(&changes))
+                .unwrap_err();
         assert!(error.to_string().contains("file not changed"));
     }
 
@@ -2109,13 +2110,14 @@ mod tests {
             "\"implementation_summary\":\"Added deterministic lifecycle coverage.\"",
             "\"implementation_summary\":\"\"",
         );
-        let error = validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("missing implementation evidence"));
+        let error =
+            validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, Some(&changes))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing implementation evidence")
+        );
     }
 
     #[test]

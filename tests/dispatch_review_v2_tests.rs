@@ -1547,8 +1547,13 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         reasoning_effort: None,
     };
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     revise_with_worker_on_db(
         &task,
         "resolve A",
@@ -1559,8 +1564,13 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
 
     let (_, contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     let contract: serde_json::Value = serde_json::from_str(&contract).unwrap();
@@ -1613,8 +1623,13 @@ fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_aft
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     let (_, contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(contract.contains(&a_id));
     assert!(contract.contains("regression"));
@@ -1889,13 +1904,23 @@ fn newer_revise_supersedes_prior_contract_and_pass_preserves_history() {
         model: None,
         reasoning_effort: None,
     };
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     let (_, json, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(json.contains("BLK-newer"));
     db.update_task_status(&task, TaskStatus::Review).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     assert!(db.actionable_revision_contract(&task).unwrap().is_none());
     assert_eq!(db.revision_contract_history_count(&task).unwrap(), 2);
 }
@@ -1917,7 +1942,12 @@ fn failed_review_attempts_do_not_make_an_unreviewed_task_revision_actionable() {
         )])),
     };
     let error = app
-        .automated_review_with_backend(&task, &overrides, &invalid, &FakeValidationRunner::success())
+        .automated_review_with_backend(
+            &task,
+            &overrides,
+            &invalid,
+            &FakeValidationRunner::success(),
+        )
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to task"));
     let failed = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
@@ -1933,22 +1963,35 @@ fn failed_review_attempts_do_not_make_an_unreviewed_task_revision_actionable() {
     );
 
     assert!(
-        app.automated_review_with_backend(&task, &overrides, &FailingReviewBackend, &FakeValidationRunner::success())
-            .is_err()
+        app.automated_review_with_backend(
+            &task,
+            &overrides,
+            &FailingReviewBackend,
+            &FakeValidationRunner::success()
+        )
+        .is_err()
     );
     let malformed = QueuedReviewBackend {
         outputs: Mutex::new(VecDeque::from(["not json".into()])),
     };
     assert!(
-        app.automated_review_with_backend(&task, &overrides, &malformed, &FakeValidationRunner::success())
-            .is_err()
+        app.automated_review_with_backend(
+            &task,
+            &overrides,
+            &malformed,
+            &FakeValidationRunner::success()
+        )
+        .is_err()
     );
     assert_eq!(
         db.actionable_revision_review(&task).unwrap().unwrap().0,
         source
     );
 
-    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
     let revision = revise_with_worker_on_db(
         &task,
         "",
@@ -2391,8 +2434,13 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
         reasoning_effort: None,
     };
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     let (_, first_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     assert!(first_contract.contains(&a_id) && first_contract.contains(&b_id));
 
@@ -2406,8 +2454,13 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     let (_, second_contract, _) = db.actionable_revision_contract(&task).unwrap().unwrap();
     let second: serde_json::Value = serde_json::from_str(&second_contract).unwrap();
     let unresolved = second["unresolved"].as_array().unwrap();
@@ -2459,8 +2512,13 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
     )
     .unwrap();
     let app = OrcApp::open(dir.path().join(".orc/orc.db"), dir.path()).unwrap();
-    app.automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
-        .unwrap();
+    app.automated_review_with_backend(
+        &task,
+        &overrides,
+        &backend,
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
     assert!(
         reopened
             .actionable_revision_contract(&task)
@@ -2760,7 +2818,10 @@ fn blocked_task_with_actionable_revise_review_can_revise() {
         &FakeValidationRunner::success(),
     )
     .unwrap();
-    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
 }
 
 #[test]
@@ -2778,7 +2839,7 @@ fn blocked_task_without_actionable_review_cannot_revise() {
         "fake",
         &FakeValidationRunner::success(),
     )
-        .unwrap_err();
+    .unwrap_err();
     assert!(format!("{error:#}").contains("no actionable REVISE review"));
 }
 
@@ -3246,7 +3307,11 @@ fn dispatch_does_not_invoke_validation_runner_or_repair_and_coder_prompt_forbids
 
     let calls = worker.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert!(!calls[0].0.contains("## Focused automatic validation repair"));
+    assert!(
+        !calls[0]
+            .0
+            .contains("## Focused automatic validation repair")
+    );
     assert!(
         calls[0]
             .0
@@ -3405,7 +3470,12 @@ fn non_coding_action_does_not_receive_coder_contract_layer() {
     };
     OrcApp::open(dir.path().join(".orc/orc.db"), dir.path())
         .unwrap()
-        .automated_review_with_backend(&task, &overrides, &backend, &FakeValidationRunner::success())
+        .automated_review_with_backend(
+            &task,
+            &overrides,
+            &backend,
+            &FakeValidationRunner::success(),
+        )
         .unwrap();
 
     let prompts = backend.prompts.lock().unwrap();

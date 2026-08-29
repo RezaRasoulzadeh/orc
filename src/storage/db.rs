@@ -372,7 +372,8 @@ mod reservation_lifecycle_tests {
                 TaskPriority::Normal,
             )
             .unwrap();
-        db.update_task_status(&pass_task, TaskStatus::Review).unwrap();
+        db.update_task_status(&pass_task, TaskStatus::Review)
+            .unwrap();
         db.conn
             .execute(
                 "DELETE FROM meta WHERE key='task_review_status_v2_migrated'",
@@ -2361,7 +2362,6 @@ impl Database {
             )
             .optional()?)
     }
-
 
     fn list_lifecycle_events_scoped(
         &self,

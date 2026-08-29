@@ -87,9 +87,7 @@ fn performed_operations_for_step(
 /// Convert the canonical structured completion envelope into the per-step
 /// protocol evidence consumed by the strict self-check. Both initial Worker
 /// results and completion repairs must use this representation.
-fn completion_step_evidence(
-    reported: crate::worker_protocol::ReportedStepCompletion,
-) -> String {
+fn completion_step_evidence(reported: crate::worker_protocol::ReportedStepCompletion) -> String {
     let mut evidence = reported.observed.join("\n");
     for operation in reported.operations_performed {
         evidence.push_str(&format!(
@@ -1597,7 +1595,10 @@ pub fn revise_with_worker_on_db_with_overrides(
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if !matches!(task.status, TaskStatus::RevisionRequired | TaskStatus::Blocked) {
+    if !matches!(
+        task.status,
+        TaskStatus::RevisionRequired | TaskStatus::Blocked
+    ) {
         anyhow::bail!(
             "task {} can only be revised from revision_required or blocked (currently {})",
             task_id,
@@ -2132,7 +2133,10 @@ pub fn revise_manual(
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if !matches!(task.status, TaskStatus::RevisionRequired | TaskStatus::Blocked) {
+    if !matches!(
+        task.status,
+        TaskStatus::RevisionRequired | TaskStatus::Blocked
+    ) {
         anyhow::bail!(
             "task {} can only be revised from revision_required or blocked (currently {})",
             task_id,
@@ -3111,7 +3115,9 @@ new file mode 100644
         );
     }
 
-    fn completion_step(operations: Vec<crate::worker_protocol::PlannedOperation>) -> crate::worker_protocol::PlannedStep {
+    fn completion_step(
+        operations: Vec<crate::worker_protocol::PlannedOperation>,
+    ) -> crate::worker_protocol::PlannedStep {
         crate::worker_protocol::PlannedStep {
             id: "step-1".into(),
             objective: "test checkpoint".into(),
@@ -3140,9 +3146,11 @@ new file mode 100644
         let step = completion_step(vec![crate::worker_protocol::PlannedOperation::Modify]);
         let output = "OPERATION PERFORMED: inspect\nOPERATION PERFORMED: modify\nOPERATION PERFORMED: validate";
         let error = performed_operations_for_step(&step, Some(output), true).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("persisted step operations in order"));
+        assert!(
+            error
+                .to_string()
+                .contains("persisted step operations in order")
+        );
     }
 
     #[test]

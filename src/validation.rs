@@ -87,11 +87,11 @@ impl ValidationConfig {
     pub fn known_commands(&self) -> Vec<String> {
         let mut seen = std::collections::BTreeSet::new();
         let mut ordered = Vec::new();
-        for command in self.commands.iter().chain(
-            self.groups
-                .iter()
-                .flat_map(|group| group.commands.iter()),
-        ) {
+        for command in self
+            .commands
+            .iter()
+            .chain(self.groups.iter().flat_map(|group| group.commands.iter()))
+        {
             if seen.insert(command.clone()) {
                 ordered.push(command.clone());
             }
@@ -129,16 +129,20 @@ impl ValidationConfig {
     /// unrelated groups plus unclassified files is present, selection
     /// conservatively escalates to the broader "integration" group (or, if
     /// none is configured, every known command) rather than guessing.
-    pub fn select_for_task(&self, changed_files: &[String], required: &[String]) -> ValidationSelection {
+    pub fn select_for_task(
+        &self,
+        changed_files: &[String],
+        required: &[String],
+    ) -> ValidationSelection {
         let mut selection = ValidationSelection::default();
         if self.groups.is_empty() {
             // No group taxonomy configured: fall back to the flat command
             // list, which is the only relevance signal available.
             selection.commands = self.commands.clone();
             if !selection.commands.is_empty() {
-                selection
-                    .rationale
-                    .push("no validation groups configured; using the configured command list".into());
+                selection.rationale.push(
+                    "no validation groups configured; using the configured command list".into(),
+                );
             }
         } else {
             let mut matched_groups = std::collections::BTreeSet::new();
@@ -166,7 +170,9 @@ impl ValidationConfig {
                         "task touches files outside the known validation groups; selected the broader integration group"
                             .into(),
                     );
-                    selection.commands.extend(integration.commands.iter().cloned());
+                    selection
+                        .commands
+                        .extend(integration.commands.iter().cloned());
                 } else {
                     selection.rationale.push(
                         "task touches files outside the known validation groups and no integration group is configured; using every known command"
@@ -200,7 +206,9 @@ impl ValidationConfig {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
-        selection.commands.retain(|command| seen.insert(command.clone()));
+        selection
+            .commands
+            .retain(|command| seen.insert(command.clone()));
         selection
     }
 }
@@ -1128,10 +1136,7 @@ groups = [
         let selection =
             config.select_for_task(&["src/agent.rs".into(), "src/storage/db.rs".into()], &[]);
         assert_eq!(selection.groups, vec!["rust-core"]);
-        assert_eq!(
-            selection.commands,
-            vec!["cargo fmt --check", "cargo test"]
-        );
+        assert_eq!(selection.commands, vec!["cargo fmt --check", "cargo test"]);
     }
 
     #[test]
@@ -1154,12 +1159,14 @@ groups = [
     #[test]
     fn cross_cutting_task_selects_multiple_relevant_groups() {
         let config = grouped_config();
-        let selection = config.select_for_task(
-            &["src-tauri/src/lib.rs".into(), "src/App.vue".into()],
-            &[],
-        );
+        let selection =
+            config.select_for_task(&["src-tauri/src/lib.rs".into(), "src/App.vue".into()], &[]);
         assert_eq!(selection.groups, vec!["frontend", "tauri"]);
-        assert!(selection.commands.contains(&"npm run typecheck".to_string()));
+        assert!(
+            selection
+                .commands
+                .contains(&"npm run typecheck".to_string())
+        );
         assert!(
             selection
                 .commands
@@ -1177,7 +1184,11 @@ groups = [
         let config = grouped_config();
         let selection = config.select_for_task(&["src-tauri/src/lib.rs".into()], &[]);
         assert_eq!(selection.groups, vec!["frontend", "tauri"]);
-        assert!(selection.commands.contains(&"npm run typecheck".to_string()));
+        assert!(
+            selection
+                .commands
+                .contains(&"npm run typecheck".to_string())
+        );
         assert!(
             selection
                 .commands
@@ -1210,12 +1221,9 @@ groups = [
             selection.commands,
             vec!["npm run validate:package".to_string()]
         );
-        assert!(
-            !selection
-                .commands
-                .iter()
-                .any(|command| command.starts_with("cargo") || command.starts_with("npm run typecheck"))
-        );
+        assert!(!selection.commands.iter().any(
+            |command| command.starts_with("cargo") || command.starts_with("npm run typecheck")
+        ));
     }
 
     #[test]
@@ -1234,16 +1242,16 @@ groups = [
         let config = grouped_config();
         let selection = config.select_for_task(&["README.md".into()], &[]);
         assert_eq!(selection.groups, vec!["integration"]);
-        assert_eq!(selection.commands, config.group("integration").unwrap().commands);
+        assert_eq!(
+            selection.commands,
+            config.group("integration").unwrap().commands
+        );
     }
 
     #[test]
     fn selected_commands_are_deduplicated() {
         let config = grouped_config();
-        let selection = config.select_for_task(
-            &["src/agent.rs".into()],
-            &["cargo test".into()],
-        );
+        let selection = config.select_for_task(&["src/agent.rs".into()], &["cargo test".into()]);
         let occurrences = selection
             .commands
             .iter()

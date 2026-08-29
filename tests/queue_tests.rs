@@ -962,13 +962,31 @@ fn queue_distinguishes_review_acceptance_and_revision_states() {
     let db = Database::init(&db_path).unwrap();
     let project = db.create_project("review states").unwrap();
     let review = db
-        .insert_task(project, "Review", "review", "developer", TaskPriority::Normal)
+        .insert_task(
+            project,
+            "Review",
+            "review",
+            "developer",
+            TaskPriority::Normal,
+        )
         .unwrap();
     let acceptance = db
-        .insert_task(project, "Accept", "accept", "developer", TaskPriority::Normal)
+        .insert_task(
+            project,
+            "Accept",
+            "accept",
+            "developer",
+            TaskPriority::Normal,
+        )
         .unwrap();
     let revision = db
-        .insert_task(project, "Revise", "revise", "developer", TaskPriority::Normal)
+        .insert_task(
+            project,
+            "Revise",
+            "revise",
+            "developer",
+            TaskPriority::Normal,
+        )
         .unwrap();
     db.update_task_status(&review, TaskStatus::Review).unwrap();
     db.update_task_status(&acceptance, TaskStatus::AcceptanceReady)

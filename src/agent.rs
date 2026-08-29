@@ -89,86 +89,6 @@ fn performed_operations_for_step(
     Ok(reported)
 }
 
-fn operation_target<'a>(
-    intent: &'a str,
-    operation: &crate::worker_protocol::PlannedOperation,
-) -> Option<&'a str> {
-    let value = intent.trim();
-    let Some((_, target)) = value.split_once(':') else {
-        return matches!(operation, crate::worker_protocol::PlannedOperation::Modify)
-            .then_some(value);
-    };
-    let target = target.trim();
-    if matches!(operation, crate::worker_protocol::PlannedOperation::Move) {
-        target
-            .split_once("->")
-            .map(|(_, destination)| destination.trim())
-    } else {
-        Some(target)
-    }
-}
-
-fn validate_operation_effect(
-    step: &crate::worker_protocol::PlannedStep,
-    before: &git::WorktreeChanges,
-    after: &git::WorktreeChanges,
-    enforce_protocol: bool,
-) -> Result<()> {
-    if !enforce_protocol {
-        return Ok(());
-    }
-    let Some(operation) = step.operations.first() else {
-        anyhow::bail!("step '{}' has no operation", step.id);
-    };
-    let changed = before.files != after.files || before.diff != after.diff;
-    match operation {
-        crate::worker_protocol::PlannedOperation::NoMutation
-        | crate::worker_protocol::PlannedOperation::Inspect
-        | crate::worker_protocol::PlannedOperation::Validate => {
-            if changed {
-                anyhow::bail!(
-                    "step '{}' changed project state for a non-mutating operation",
-                    step.id
-                );
-            }
-        }
-        crate::worker_protocol::PlannedOperation::Create
-        | crate::worker_protocol::PlannedOperation::Modify
-        | crate::worker_protocol::PlannedOperation::Delete
-        | crate::worker_protocol::PlannedOperation::Move => {
-            let Some(target) = step
-                .operation_targets
-                .first()
-                .map(String::as_str)
-                .or_else(|| operation_target(&step.intent, operation))
-            else {
-                anyhow::bail!("step '{}' does not identify an operation target", step.id);
-            };
-            let effect_target =
-                if matches!(operation, crate::worker_protocol::PlannedOperation::Move) {
-                    target
-                        .split_once("->")
-                        .map_or(target, |(_, destination)| destination.trim())
-                } else {
-                    target
-                };
-            let target_changed = after.files.iter().any(|file| file.path == effect_target)
-                || (matches!(operation, crate::worker_protocol::PlannedOperation::Delete)
-                    && before.files.iter().any(|file| file.path == effect_target));
-            if !changed || !target_changed {
-                anyhow::bail!(
-                    "step '{}' did not produce the declared {} effect for '{}',",
-                    step.id,
-                    crate::worker_protocol::operation_name(operation),
-                    target
-                );
-            }
-        }
-        crate::worker_protocol::PlannedOperation::Command => {}
-    }
-    Ok(())
-}
-
 fn failed_execution_evidence(
     plan: &crate::worker_protocol::WorkerPlan,
     outputs: &[Option<String>],
@@ -217,21 +137,31 @@ fn failed_execution_evidence(
             .last()
             .map(|(_, after)| after.files.iter().map(|file| file.path.clone()).collect())
             .unwrap_or_default(),
-        requirement_coverage: plan
-            .steps
-            .iter()
-            .flat_map(|step| {
-                step.acceptance_criteria
-                    .iter()
-                    .chain(step.required_tests.iter())
-                    .chain(step.active_review_blockers.iter())
-                    .map(move |requirement| (requirement.clone(), step.id.clone()))
-            })
-            .collect(),
+        requirement_coverage: requirement_coverage(plan),
         focused_verification,
         configured_validation: configured_validation.to_vec(),
         unresolved_issues: vec![issue.to_owned()],
     }
+}
+
+fn requirement_coverage(plan: &crate::worker_protocol::WorkerPlan) -> Vec<(String, String)> {
+    plan.steps
+        .iter()
+        .flat_map(|step| {
+            step.acceptance_criteria
+                .iter()
+                .chain(step.required_tests.iter())
+                .chain(step.active_review_blockers.iter())
+                .map(move |id| (id.clone(), step.id.clone()))
+        })
+        .chain(
+            plan.plan_acceptance_criteria
+                .iter()
+                .chain(plan.plan_required_tests.iter())
+                .chain(plan.plan_review_blockers.iter())
+                .map(|id| (id.clone(), "plan".to_owned())),
+        )
+        .collect()
 }
 
 /// Build the ordered execution units from the authoritative contract.  Each
@@ -239,10 +169,10 @@ fn failed_execution_evidence(
 /// calls, and evidence have the same operation boundaries.
 fn plan_steps(
     expected_changes: &[String],
-    acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
-    required_tests: &[crate::worker_protocol::WorkerRequirement],
-    active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
-    verification: &[String],
+    _acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
+    _required_tests: &[crate::worker_protocol::WorkerRequirement],
+    _active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
+    _verification: &[String],
     intent: &str,
 ) -> Vec<crate::worker_protocol::PlannedStep> {
     let entries = if expected_changes.is_empty() {
@@ -275,21 +205,10 @@ fn plan_steps(
                 },
                 operations: vec![operation],
                 operation_targets: vec![target],
-                // Every step is independently auditable and the ordered plan
-                // remains complete even if a later step fails.
-                acceptance_criteria: acceptance_criteria
-                    .iter()
-                    .map(|requirement| requirement.id.clone())
-                    .collect(),
-                required_tests: required_tests
-                    .iter()
-                    .map(|requirement| requirement.id.clone())
-                    .collect(),
-                active_review_blockers: active_review_blockers
-                    .iter()
-                    .map(|blocker| blocker.id.clone())
-                    .collect(),
-                verification: verification.to_vec(),
+                acceptance_criteria: Vec::new(),
+                required_tests: Vec::new(),
+                active_review_blockers: Vec::new(),
+                verification: Vec::new(),
             }
         })
         .collect()
@@ -344,6 +263,26 @@ const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
 const MAX_VALIDATION_REPAIRS: usize = 3;
 const MAX_COMPLETION_REPAIRS: usize = 2;
 const MAX_INFRASTRUCTURE_RETRIES: usize = 2;
+
+fn start_provider_invocation_bounded(
+    db: &Database,
+    run_id: i64,
+    task_id: &str,
+    purpose: &str,
+    attempt: usize,
+    effort: ReasoningEffort,
+) -> Result<i64> {
+    match db.start_provider_invocation(run_id, purpose, attempt, Some(effort)) {
+        Ok(id) => Ok(id),
+        Err(error) => {
+            let diagnostics =
+                format!("provider budget prevented {purpose} attempt {attempt}: {error}");
+            db.update_agent_run_status(run_id, "failed", Some(&diagnostics))?;
+            db.update_task_status(task_id, TaskStatus::Blocked)?;
+            anyhow::bail!(diagnostics)
+        }
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct RevisionExecutionOverrides {
     pub model: Option<String>,
@@ -518,12 +457,46 @@ fn validate_worker_step_completion(
     enforce_protocol: bool,
     unchanged: &[String],
 ) -> Result<()> {
-    let Some((before, after)) = snapshot else {
+    let Some((_before, after)) = snapshot else {
         anyhow::bail!("Worker did not execute persisted step '{}'", step.id);
     };
     performed_operations_for_step(step, output, enforce_protocol)?;
     if enforce_protocol {
-        validate_operation_effect(step, before, after, true)?;
+        let affected = crate::worker_protocol::reported_affected_files(output.unwrap_or_default());
+        for (operation, target) in step.operations.iter().zip(&step.operation_targets) {
+            if matches!(
+                operation,
+                crate::worker_protocol::PlannedOperation::Create
+                    | crate::worker_protocol::PlannedOperation::Modify
+                    | crate::worker_protocol::PlannedOperation::Delete
+                    | crate::worker_protocol::PlannedOperation::Move
+            ) && !affected
+                .iter()
+                .any(|path| path == target || target.ends_with(path))
+            {
+                anyhow::bail!(
+                    "Worker did not attribute affected file '{}' to step '{}'",
+                    target,
+                    step.id
+                );
+            }
+            let effect_target = target
+                .split_once("->")
+                .map_or(target.as_str(), |(_, value)| value.trim());
+            if matches!(
+                operation,
+                crate::worker_protocol::PlannedOperation::Create
+                    | crate::worker_protocol::PlannedOperation::Modify
+                    | crate::worker_protocol::PlannedOperation::Move
+            ) && !after.files.iter().any(|file| file.path == effect_target)
+            {
+                anyhow::bail!(
+                    "Worker checkpoint '{}' has no matching worktree effect for '{}'",
+                    step.id,
+                    effect_target
+                );
+            }
+        }
         validate_unchanged_constraints(after, unchanged)?;
         let reported = crate::worker_protocol::reported_verifications(output.unwrap_or_default());
         for check in &step.verification {
@@ -540,13 +513,13 @@ fn validate_worker_step_completion(
 }
 
 fn completion_repair_prompt(
-    context: &str,
+    diff: &str,
     step: &crate::worker_protocol::PlannedStep,
     failure: &str,
     attempt: usize,
 ) -> String {
     format!(
-        "{context}\n\nWORKER COMPLETION SELF-CHECK REPAIR (attempt {attempt}): The persisted step below was executed, but the completion gate found an omission:\n{failure}\n\nRepair only the implementation or evidence needed for this step. Reconcile the result with the persisted task/revision contract. After checking the actual worktree, emit the required operation and verification protocol lines for this step. Do not claim a check from the plan alone.\n\nPERSISTED STEP:\n{}",
+        "WORKER COMPLETION SELF-CHECK REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the exact failed checkpoint below. Preserve the existing worktree and unrelated changes.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP AND NECESSARY CONSTRAINTS:\n{}\n\nAfter inspecting the worktree, emit the required operation, `AFFECTED FILE: <path>`, and verification protocol lines. Do not claim a check from the plan alone.",
         serde_json::to_string_pretty(step).unwrap_or_else(|_| step.id.clone())
     )
 }
@@ -619,15 +592,9 @@ fn persist_validation_attempt(
     Ok(())
 }
 
-fn repair_prompt(
-    base: &str,
-    diff: &str,
-    previous: &str,
-    diagnostics: &str,
-    attempt: usize,
-) -> String {
+fn repair_prompt(diff: &str, previous: &str, diagnostics: &str, attempt: usize) -> String {
     format!(
-        "{base}\n\n## Automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Work in the existing task worktree. Preserve valid existing work and fix only what is necessary to address these validation failures. Do not reset, clean, recreate, or replace the worktree.\n\n## Current worktree diff\n\n{diff}\n\n## Previous worker result\n\n{previous}\n\n## Exact validation diagnostics\n\n{diagnostics}\n\nAfter repairing, leave the changes in this same worktree and report what you changed."
+        "## Focused automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree and fix only the exact failed command/requirement. Do not reset, clean, recreate, or replace the worktree.\n\n## Current worktree diff\n\n{diff}\n\n## Previous worker result\n\n{previous}\n\n## Exact failed command and diagnostics\n\n{diagnostics}\n\nAfter repairing, leave changes in this worktree and report only the focused repair."
     )
 }
 
@@ -870,6 +837,12 @@ pub fn dispatch_with_worker_on_db_cancellable(
         active_review_blockers: Vec::new(),
         resolved_review_blockers: Vec::new(),
         verification: verification.clone(),
+        plan_acceptance_criteria: acceptance_criteria
+            .iter()
+            .map(|item| item.id.clone())
+            .collect(),
+        plan_required_tests: required_tests.iter().map(|item| item.id.clone()).collect(),
+        plan_review_blockers: Vec::new(),
         steps: plan_steps(
             &proposal.expected_changes,
             &acceptance_criteria,
@@ -967,65 +940,72 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let worktree_dir = repo_path.join(&worktree_path);
     progress("worker spawned");
     progress("worker running");
-    // Each persisted step is a separate backend invocation. This makes the
-    // persisted order an execution invariant and gives every operation an
-    // actual execution boundary (including inspection/validation steps).
-    let mut execution = Ok(crate::worker::WorkerExecution {
-        outcome: WorkerOutcome::Success,
-        output: None,
-        token_usage: None,
-    });
-    let mut outputs = Vec::new();
-    let mut step_outputs: Vec<Option<String>> = Vec::new();
-    let mut step_snapshots = Vec::new();
-    for step in &plan.steps {
-        let before = git::inspect_worktree(&worktree_dir, repo_path)
-            .context("failed to inspect worktree before Worker plan step")?;
-        let result = match cancellation {
-            Some(cancellation) => worker.execute_planned_step_cancellable(
-                step,
-                &prompt,
-                &worktree_dir,
-                &crate::automated::revision_handoff_schema(),
-                &|line| worker_output(line),
-                cancellation,
-            ),
-            None => worker.execute_planned_step(
-                step,
-                &prompt,
-                &worktree_dir,
-                &crate::automated::revision_handoff_schema(),
-                &|line| worker_output(line),
-            ),
-        };
-        match result {
-            Ok(step_execution) => {
-                step_outputs.push(step_execution.output.clone());
-                let after = git::inspect_worktree(&worktree_dir, repo_path)
-                    .context("failed to inspect worktree after Worker plan step")?;
-                step_snapshots.push((before, after));
-                if let Some(output) = step_execution.output.as_deref() {
-                    outputs.push(output.to_owned());
+    let invocation_id = start_provider_invocation_bounded(
+        db,
+        run_id,
+        task_id,
+        "implementation",
+        1,
+        proposal_effort,
+    )?;
+    let execution = match cancellation {
+        Some(cancellation) => worker.execute_structured_with_progress_and_usage_cancellable(
+            &prompt,
+            &worktree_dir,
+            &crate::worker_protocol::plan_completion_schema(),
+            &|line| worker_output(line),
+            cancellation,
+        ),
+        None => worker.execute_structured_with_progress_and_usage(
+            &prompt,
+            &worktree_dir,
+            &crate::worker_protocol::plan_completion_schema(),
+            &|line| worker_output(line),
+        ),
+    };
+    db.finish_provider_invocation(
+        invocation_id,
+        if cancellation.is_some_and(crate::worker::CancellationControl::is_cancelled) {
+            "cancelled"
+        } else if execution.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        execution.as_ref().ok().and_then(|value| value.token_usage),
+    )?;
+    let after_plan = git::inspect_worktree(&worktree_dir, repo_path)
+        .context("failed to inspect worktree after Worker plan")?;
+    // The provider session owns the checkpoint boundaries. Orc verifies the
+    // resulting aggregate worktree, but does not invent per-step snapshots.
+    let mut step_snapshots = vec![(after_plan.clone(), after_plan); plan.steps.len()];
+    let mut step_outputs = vec![None; plan.steps.len()];
+    if let Ok(result) = &execution
+        && let Some(full_output) = result.output.as_deref()
+        && let Ok(completion) = crate::worker_protocol::parse_plan_completion(full_output)
+    {
+        for reported in completion.step_results {
+            if let Some(index) = plan
+                .steps
+                .iter()
+                .position(|step| step.id == reported.step_id)
+            {
+                let mut evidence = reported.observed.join("\n");
+                for operation in reported.operations_performed {
+                    evidence.push_str(&format!(
+                        "\nOPERATION PERFORMED: {}",
+                        crate::worker_protocol::operation_name(&operation)
+                    ));
                 }
-                if matches!(step_execution.outcome, WorkerOutcome::Failure(_)) {
-                    execution = Ok(step_execution);
-                    break;
+                for path in reported.affected_files {
+                    evidence.push_str(&format!("\nAFFECTED FILE: {path}"));
                 }
-                execution = Ok(step_execution);
-            }
-            Err(error) => {
-                step_outputs.push(None);
-                let after = git::inspect_worktree(&worktree_dir, repo_path).ok();
-                if let Some(after) = after {
-                    step_snapshots.push((before, after));
+                for check in reported.verification_passed {
+                    evidence.push_str(&format!("\nVERIFICATION PASSED: {check}"));
                 }
-                execution = Err(error);
-                break;
+                step_outputs[index] = Some(evidence);
             }
         }
-    }
-    if let Ok(result) = &mut execution {
-        result.output = (!outputs.is_empty()).then(|| outputs.join("\n\n"));
     }
     match execution {
         Ok(execution) => {
@@ -1077,8 +1057,9 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 anyhow::bail!(message);
                             }
                             completion_repair += 1;
+                            let repair_diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
                             let repair_prompt = completion_repair_prompt(
-                                &prompt,
+                                &repair_diff,
                                 &plan.steps[index],
                                 &gate_error.to_string(),
                                 completion_repair,
@@ -1101,23 +1082,32 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 .get(index)
                                 .map(|(before, _)| before.clone())
                                 .context("completion repair lost the step snapshot")?;
-                            let repaired = match cancellation {
-                                Some(cancellation) => worker.execute_planned_step_cancellable(
-                                    &plan.steps[index],
-                                    &repair_prompt,
-                                    &worktree_dir,
-                                    &crate::automated::revision_handoff_schema(),
-                                    &|line| worker_output(line),
-                                    cancellation,
-                                ),
-                                None => worker.execute_planned_step(
-                                    &plan.steps[index],
-                                    &repair_prompt,
-                                    &worktree_dir,
-                                    &crate::automated::revision_handoff_schema(),
-                                    &|line| worker_output(line),
-                                ),
-                            };
+                            progress(&format!("completion repair attempt {completion_repair}"));
+                            let repair_invocation = start_provider_invocation_bounded(
+                                db,
+                                run_id,
+                                task_id,
+                                "completion_repair",
+                                completion_repair,
+                                ReasoningEffort::Low,
+                            )?;
+                            let repaired = worker.execute_planned_step_repair(
+                                &plan.steps[index],
+                                &repair_prompt,
+                                &worktree_dir,
+                                &crate::automated::revision_handoff_schema(),
+                                &|line| worker_output(line),
+                                cancellation,
+                            );
+                            db.finish_provider_invocation(
+                                repair_invocation,
+                                if repaired.is_ok() {
+                                    "completed"
+                                } else {
+                                    "failed"
+                                },
+                                repaired.as_ref().ok().and_then(|value| value.token_usage),
+                            )?;
                             let repaired = match repaired {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1284,7 +1274,6 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         let diagnostics = validation_diagnostics(&report);
                         let diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
                         let repair = repair_prompt(
-                            &prompt,
                             &diff,
                             output.as_deref().unwrap_or_default(),
                             &diagnostics,
@@ -1301,11 +1290,35 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             Some(agent_id),
                             Some(&repair_started.to_string()),
                         )?;
-                        let execution = match worker.execute_with_progress_and_usage(
+                        progress(&format!("validation repair attempt {repair_attempt}"));
+                        let repair_invocation = start_provider_invocation_bounded(
+                            db,
+                            run_id,
+                            task_id,
+                            "validation_repair",
+                            repair_attempt,
+                            ReasoningEffort::Low,
+                        )?;
+                        let repair_execution = worker.execute_repair_with_progress_and_usage(
                             &repair,
                             &worktree_dir,
+                            &crate::worker_protocol::repair_completion_schema(),
                             &|line| worker_output(line),
-                        ) {
+                            cancellation,
+                        );
+                        db.finish_provider_invocation(
+                            repair_invocation,
+                            if repair_execution.is_ok() {
+                                "completed"
+                            } else {
+                                "failed"
+                            },
+                            repair_execution
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| value.token_usage),
+                        )?;
+                        let execution = match repair_execution {
                             Ok(execution) => execution,
                             Err(error) => {
                                 let message = format!("Validation repair worker failed: {error}");
@@ -1432,17 +1445,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                             .iter()
                             .map(|file| file.path.clone())
                             .collect(),
-                        requirement_coverage: plan
-                            .steps
-                            .iter()
-                            .flat_map(|step| {
-                                step.acceptance_criteria
-                                    .iter()
-                                    .chain(step.required_tests.iter())
-                                    .chain(step.active_review_blockers.iter())
-                                    .map(move |criterion| (criterion.clone(), step.id.clone()))
-                            })
-                            .collect(),
+                        requirement_coverage: requirement_coverage(&plan),
                         focused_verification: plan
                             .steps
                             .iter()
@@ -1570,7 +1573,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                     "cancelled",
                     Some("execution cancelled at a safe boundary"),
                 )?;
-                db.update_task_status(task_id, TaskStatus::Cancelled)?;
+                db.update_task_status(task_id, TaskStatus::Blocked)?;
                 anyhow::bail!("execution cancelled at a safe boundary");
             }
             // Spawn failed, mark run as failed and task as blocked
@@ -1861,6 +1864,15 @@ pub fn revise_with_worker_on_db_with_overrides(
             .map(|blocker| blocker.blocker_id.clone())
             .collect(),
         verification: verification.clone(),
+        plan_acceptance_criteria: acceptance_criteria
+            .iter()
+            .map(|item| item.id.clone())
+            .collect(),
+        plan_required_tests: required_tests.iter().map(|item| item.id.clone()).collect(),
+        plan_review_blockers: active_review_blockers
+            .iter()
+            .map(|item| item.id.clone())
+            .collect(),
         steps: plan_steps(
             &proposal.expected_changes,
             &acceptance_criteria,
@@ -1957,51 +1969,55 @@ pub fn revise_with_worker_on_db_with_overrides(
     progress("worker running");
     let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to capture pre-revision change evidence")?;
-    let mut execution = Ok(crate::worker::WorkerExecution {
-        outcome: WorkerOutcome::Success,
-        output: None,
-        token_usage: None,
-    });
-    let mut outputs = Vec::new();
-    let mut revision_step_outputs: Vec<Option<String>> = Vec::new();
-    let mut revision_step_snapshots = Vec::new();
-    for step in &revision_plan.steps {
-        let before = git::inspect_worktree(&worktree_dir, repo_path)
-            .context("failed to inspect worktree before Worker revision step")?;
-        let result = worker.execute_planned_step(
-            step,
-            &prompt,
-            &worktree_dir,
-            &crate::automated::revision_handoff_schema(),
-            &|line| worker_output(line),
-        );
-        match result {
-            Ok(step_execution) => {
-                revision_step_outputs.push(step_execution.output.clone());
-                let after = git::inspect_worktree(&worktree_dir, repo_path)
-                    .context("failed to inspect worktree after Worker revision step")?;
-                revision_step_snapshots.push((before, after));
-                if let Some(output) = step_execution.output.as_deref() {
-                    outputs.push(output.to_owned());
-                }
-                let failed = matches!(step_execution.outcome, WorkerOutcome::Failure(_));
-                execution = Ok(step_execution);
-                if failed {
-                    break;
+    let invocation_id =
+        start_provider_invocation_bounded(db, run_id, task_id, "revision", 1, revision_effort)?;
+    let execution = worker.execute_structured_with_progress_and_usage(
+        &prompt,
+        &worktree_dir,
+        &crate::automated::revision_handoff_schema(),
+        &|line| worker_output(line),
+    );
+    db.finish_provider_invocation(
+        invocation_id,
+        if execution.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        execution.as_ref().ok().and_then(|value| value.token_usage),
+    )?;
+    let after_revision = git::inspect_worktree(&worktree_dir, repo_path)
+        .context("failed to inspect worktree after Worker revision")?;
+    let mut revision_step_snapshots =
+        vec![(after_revision.clone(), after_revision); revision_plan.steps.len()];
+    let mut revision_step_outputs = vec![None; revision_plan.steps.len()];
+    let revision_output = execution
+        .as_ref()
+        .ok()
+        .and_then(|result| result.output.as_deref());
+    if let Some(full_output) = revision_output {
+        if let Ok(completion) = crate::worker_protocol::parse_plan_completion(full_output) {
+            for reported in completion.step_results {
+                if let Some(index) = revision_plan
+                    .steps
+                    .iter()
+                    .position(|step| step.id == reported.step_id)
+                {
+                    let mut evidence = reported.observed.join("\n");
+                    for path in reported.affected_files {
+                        evidence.push_str(&format!("\nAFFECTED FILE: {path}"));
+                    }
+                    for check in reported.verification_passed {
+                        evidence.push_str(&format!("\nVERIFICATION PASSED: {check}"));
+                    }
+                    revision_step_outputs[index] = Some(evidence);
                 }
             }
-            Err(error) => {
-                revision_step_outputs.push(None);
-                if let Ok(after) = git::inspect_worktree(&worktree_dir, repo_path) {
-                    revision_step_snapshots.push((before, after));
-                }
-                execution = Err(error);
-                break;
+        } else {
+            for step_output in &mut revision_step_outputs {
+                *step_output = Some(full_output.to_owned());
             }
         }
-    }
-    if let Ok(result) = &mut execution {
-        result.output = (!outputs.is_empty()).then(|| outputs.join("\n\n"));
     }
     let execution = match execution {
         Ok(result) => result,
@@ -2064,8 +2080,9 @@ pub fn revise_with_worker_on_db_with_overrides(
                 ));
             }
             completion_repair += 1;
+            let repair_diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
             let repair_prompt = completion_repair_prompt(
-                &prompt,
+                &repair_diff,
                 &revision_plan.steps[index],
                 &error.to_string(),
                 completion_repair,
@@ -2088,15 +2105,33 @@ pub fn revise_with_worker_on_db_with_overrides(
                 .get(index)
                 .map(|(before, _)| before.clone())
                 .context("completion repair lost the revision step snapshot")?;
-            let repaired = worker
-                .execute_planned_step(
-                    &revision_plan.steps[index],
-                    &repair_prompt,
-                    &worktree_dir,
-                    &crate::automated::revision_handoff_schema(),
-                    &|line| worker_output(line),
-                )
-                .map_err(anyhow::Error::msg)?;
+            progress(&format!("completion repair attempt {completion_repair}"));
+            let repair_invocation = start_provider_invocation_bounded(
+                db,
+                run_id,
+                task_id,
+                "completion_repair",
+                completion_repair,
+                ReasoningEffort::Low,
+            )?;
+            let repaired = worker.execute_planned_step_repair(
+                &revision_plan.steps[index],
+                &repair_prompt,
+                &worktree_dir,
+                &crate::worker_protocol::repair_completion_schema(),
+                &|line| worker_output(line),
+                None,
+            );
+            db.finish_provider_invocation(
+                repair_invocation,
+                if repaired.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                repaired.as_ref().ok().and_then(|value| value.token_usage),
+            )?;
+            let repaired = repaired.map_err(anyhow::Error::msg)?;
             if let WorkerOutcome::Failure(error) = repaired.outcome {
                 return fail(format!("Worker completion repair failed: {error}"));
             }
@@ -2200,17 +2235,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
         performed_operations,
         affected_files: changes.files.iter().map(|file| file.path.clone()).collect(),
-        requirement_coverage: revision_plan
-            .steps
-            .iter()
-            .flat_map(|step| {
-                step.acceptance_criteria
-                    .iter()
-                    .chain(step.required_tests.iter())
-                    .chain(step.active_review_blockers.iter())
-                    .map(move |criterion| (criterion.clone(), step.id.clone()))
-            })
-            .collect(),
+        requirement_coverage: requirement_coverage(&revision_plan),
         focused_verification: revision_plan
             .steps
             .iter()

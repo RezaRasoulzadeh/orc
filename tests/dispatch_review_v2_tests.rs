@@ -1,8 +1,8 @@
 use anyhow::Result;
 use orc::agent::{
     RevisionExecutionOverrides, accept_task, dispatch_with_worker_and_db_as_with_runner,
-    reject_task, revise_manual, revise_with_factory_and_db_as_with_runner,
-    revise_with_worker_and_db_as_with_runner,
+    dispatch_with_worker_on_db_cancellable, reject_task, revise_manual,
+    revise_with_factory_and_db_as_with_runner, revise_with_worker_and_db_as_with_runner,
     revise_with_worker_and_db_as_with_runner_with_overrides, revise_with_worker_on_db,
 };
 use orc::app::OrcApp;
@@ -31,6 +31,72 @@ struct ProtocolOperationWorker {
 
 struct CompletionRepairWorker {
     calls: Mutex<usize>,
+}
+
+struct CancellingStructuredWorker;
+impl Worker for CancellingStructuredWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        unreachable!()
+    }
+    fn execute_structured_with_progress_and_usage_cancellable(
+        &self,
+        _: &str,
+        cwd: &Path,
+        schema: &str,
+        _: &dyn Fn(&str),
+        cancellation: &orc::worker::CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        assert!(schema.contains("step_results"));
+        std::fs::write(cwd.join("cancel-preserved.txt"), "preserved\n")
+            .map_err(|e| e.to_string())?;
+        cancellation.cancel();
+        Err("execution cancelled at process boundary".into())
+    }
+}
+
+struct TokenBudgetWorker {
+    calls: Mutex<usize>,
+}
+impl Worker for TokenBudgetWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        unreachable!()
+    }
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        *self.calls.lock().unwrap() += 1;
+        let plan = prompt_plan(prompt);
+        let step = &plan.steps[0];
+        let target = &step.operation_targets[0];
+        std::fs::write(cwd.join(target), "budget-preserved\n").map_err(|e| e.to_string())?;
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(
+                serde_json::json!({"step_results":[{"step_id":step.id,
+                "operations_performed":step.operations,"affected_files":[target],
+                "observed":["checkpoint completed"],"verification_passed":[]}],"summary":"done"})
+                .to_string(),
+            ),
+            token_usage: Some(orc::worker::TokenUsage {
+                total_tokens: 500_000,
+                input_tokens: Some(450_000),
+                output_tokens: Some(50_000),
+            }),
+        })
+    }
+}
+
+fn prompt_plan(prompt: &str) -> orc::worker_protocol::WorkerPlan {
+    let json = prompt
+        .split("WORKER EXECUTION PROTOCOL (mandatory):")
+        .nth(1)
+        .and_then(|value| value.find("\n{").map(|index| &value[index + 1..]))
+        .expect("worker prompt contains persisted plan");
+    serde_json::from_str(json).expect("worker prompt plan is valid")
 }
 
 impl Worker for CompletionRepairWorker {
@@ -64,11 +130,40 @@ impl Worker for CompletionRepairWorker {
         Ok(WorkerExecution {
             outcome: WorkerOutcome::Success,
             output: Some(format!(
-                "OPERATION PERFORMED: {}\n{verification}",
-                orc::worker_protocol::operation_name(&step.operations[0])
+                "OPERATION PERFORMED: {}\nAFFECTED FILE: {target}\n{verification}",
+                orc::worker_protocol::operation_name(&step.operations[0]),
             )),
             token_usage: None,
         })
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let plan = prompt_plan(prompt);
+        let result = self.execute_planned_step(&plan.steps[0], prompt, cwd, schema, progress)?;
+        let step = &plan.steps[0];
+        Ok(WorkerExecution { outcome: result.outcome, token_usage: result.token_usage, output: Some(serde_json::json!({
+            "step_results": [{"step_id": step.id, "operations_performed": step.operations,
+                "affected_files": step.operation_targets, "observed": ["initial checkpoint"],
+                "verification_passed": []}], "summary": "initial"
+        }).to_string()) })
+    }
+
+    fn execute_planned_step_repair(
+        &self,
+        step: &orc::worker_protocol::PlannedStep,
+        context: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        _: Option<&orc::worker::CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        self.execute_planned_step(step, context, cwd, schema, progress)
     }
 }
 
@@ -128,6 +223,33 @@ impl Worker for ProtocolOperationWorker {
         Ok(WorkerExecution {
             outcome: WorkerOutcome::Success,
             output: Some(output),
+            token_usage: None,
+        })
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let plan = prompt_plan(prompt);
+        let mut step_results = Vec::new();
+        for step in &plan.steps {
+            self.execute_planned_step(step, prompt, cwd, schema, progress)?;
+            step_results.push(serde_json::json!({
+                "step_id": step.id, "operations_performed": step.operations,
+                "affected_files": step.operation_targets, "observed": [format!("checkpoint {} completed", step.id)],
+                "verification_passed": if self.verify { step.verification.clone() } else { Vec::<String>::new() }
+            }));
+        }
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(
+                serde_json::json!({"step_results": step_results, "summary": "complete"})
+                    .to_string(),
+            ),
             token_usage: None,
         })
     }
@@ -2500,7 +2622,7 @@ fn revision_worker_includes_current_engineering_contract() {
 }
 
 #[test]
-fn automatic_validation_repair_includes_engineering_contract() {
+fn automatic_validation_repair_is_focused_and_omits_broad_contract_prompt() {
     let (dir, _, task) = setup();
     let marker = "REPAIR_CONTRACT_UNIQUE_MARKER";
     let diagnostics = "EXACT_REPAIRABLE_VALIDATION_DIAGNOSTICS";
@@ -2523,10 +2645,19 @@ fn automatic_validation_repair_includes_engineering_contract() {
 
     let calls = worker.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_contract_precedes(&calls[1].0, marker, "## Automatic validation repair");
+    assert!(!calls[1].0.contains(marker));
+    assert!(!calls[1].0.contains("## Instruction precedence"));
+    assert!(
+        calls[1]
+            .0
+            .contains("## Focused automatic validation repair")
+    );
     assert!(calls[1].0.contains(diagnostics));
     assert!(
-        calls[1].0.find("## Automatic validation repair").unwrap()
+        calls[1]
+            .0
+            .find("## Focused automatic validation repair")
+            .unwrap()
             < calls[1].0.find(diagnostics).unwrap()
     );
 }
@@ -2820,7 +2951,11 @@ fn validation_failure_repairs_in_same_worktree_and_persists_diagnostics() {
     assert_eq!(calls[0].1, calls[1].1);
     assert!(calls[1].0.contains("test assertion failed"));
     assert!(calls[1].0.contains("exact stderr"));
-    assert!(calls[1].0.contains("Preserve valid existing work"));
+    assert!(calls[1].0.contains("Preserve the existing worktree"));
+    let invocations = db.provider_invocations(summary.run_id).unwrap();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[1].purpose, "validation_repair");
+    assert_eq!(invocations[1].effort, Some(ReasoningEffort::Low));
     assert_eq!(
         std::fs::read_to_string(calls[1].1.join("feature.txt")).unwrap(),
         "repaired\n"
@@ -3110,6 +3245,153 @@ fn canonical_worker_operation_matrix_executes_and_reopens_structured_evidence() 
 }
 
 #[test]
+fn six_step_plan_uses_one_initial_invocation_and_persists_checkpoint_lineage() {
+    let (dir, db, task) = setup();
+    canonicalize_task_with_expected_changes(
+        &db,
+        &task,
+        &[
+            "create: one.txt",
+            "create: two.txt",
+            "create: three.txt",
+            "create: four.txt",
+            "create: five.txt",
+            "create: six.txt",
+        ],
+    );
+    let worker = ProtocolOperationWorker {
+        operation: "auto",
+        verify: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    let (plan, execution) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+    assert_eq!(plan.steps.len(), 6);
+    assert!(plan.steps[..5].iter().all(|step| {
+        step.acceptance_criteria.is_empty()
+            && step.required_tests.is_empty()
+            && step.verification.is_empty()
+    }));
+    assert_eq!(execution.unwrap().focused_verification.len(), 6);
+    let invocations = db.provider_invocations(summary.run_id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].purpose, "implementation");
+    assert_eq!(invocations[0].attempt, 1);
+    assert_eq!(invocations[0].outcome, "completed");
+    let budget_error = db
+        .start_provider_invocation(
+            summary.run_id,
+            "implementation",
+            2,
+            Some(ReasoningEffort::Low),
+        )
+        .unwrap_err();
+    assert!(budget_error.to_string().contains("budget exhausted"));
+    assert!(
+        dir.path()
+            .join(".orc/worktrees")
+            .join(&task)
+            .join("six.txt")
+            .exists()
+    );
+
+    let reopened = Database::open(dir.path().join(".orc/orc.db")).unwrap();
+    assert_eq!(
+        reopened.provider_invocations(summary.run_id).unwrap(),
+        invocations
+    );
+}
+
+#[test]
+fn cancellable_structured_dispatch_terminalizes_and_requeues_without_database_edits() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: cancel-preserved.txt");
+    let cancellation = orc::worker::CancellationControl::new();
+    let error = dispatch_with_worker_on_db_cancellable(
+        &task,
+        &CancellingStructuredWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+        Some(&cancellation),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert!(
+        dir.path()
+            .join(".orc/worktrees")
+            .join(&task)
+            .join("cancel-preserved.txt")
+            .exists()
+    );
+    OrcApp::open(dir.path().join(".orc/orc.db"), dir.path())
+        .unwrap()
+        .requeue(&task)
+        .unwrap();
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Backlog
+    );
+    assert_eq!(
+        db.provider_invocations(run.id).unwrap()[0].outcome,
+        "cancelled"
+    );
+}
+
+#[test]
+fn token_budget_exhaustion_blocks_repair_and_preserves_worktree() {
+    let (dir, db, task) = setup();
+    canonicalize_task(&db, &task, "create: budget-preserved.txt");
+    let worker = TokenBudgetWorker {
+        calls: Mutex::new(0),
+    };
+    let error = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &SequenceValidationRunner::new(vec![validation_result(
+            ValidationCategory::Test,
+            "budget failure",
+        )]),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("token budget exhausted"));
+    assert_eq!(*worker.calls.lock().unwrap(), 1);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert!(
+        dir.path()
+            .join(".orc/worktrees")
+            .join(&task)
+            .join("budget-preserved.txt")
+            .exists()
+    );
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(run.status, "failed");
+    assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
+}
+
+#[test]
 fn worker_contract_ignores_stale_proposal_metadata_after_task_persistence() {
     let (dir, db, task) = setup();
     canonicalize_task(&db, &task, "create: authoritative.txt");
@@ -3167,7 +3449,7 @@ fn worker_contract_ignores_stale_proposal_metadata_after_task_persistence() {
 }
 
 #[test]
-fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() {
+fn configured_validation_is_owned_by_the_final_plan_gate() {
     let (dir, db, task) = setup();
     canonicalize_task(&db, &task, "create: failed-verification.txt");
     let worker = ProtocolOperationWorker {
@@ -3175,7 +3457,7 @@ fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() 
         verify: false,
         calls: Mutex::new(Vec::new()),
     };
-    let error = dispatch_with_worker_and_db_as_with_runner(
+    let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
         &worker,
         dir.path().join(".orc/orc.db").to_str().unwrap(),
@@ -3183,24 +3465,23 @@ fn canonical_worker_failed_declared_verification_is_persisted_and_not_success() 
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("verification"));
+    .unwrap();
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Blocked
+        TaskStatus::Review
     );
-    let run = db.list_agent_runs_for_task(&task).unwrap()[0].id;
+    let run = summary.run_id;
     let (_, execution) = db.load_worker_protocol(run).unwrap().unwrap();
-    let execution = execution.expect("failed protocol result must be retained");
+    let execution = execution.expect("protocol result must be retained");
     assert!(
         execution
             .focused_verification
             .iter()
-            .all(|step| !step.passed)
+            .all(|step| step.passed)
     );
-    assert!(execution.validate().is_err());
+    assert!(execution.validate().is_ok());
     assert!(
-        !db.list_lifecycle_events_for_run(run, 20)
+        db.list_lifecycle_events_for_run(run, 20)
             .unwrap()
             .iter()
             .any(|event| event.kind == "worker_completion_gate")
@@ -3230,6 +3511,10 @@ fn completion_gate_repairs_missing_step_evidence_before_review() {
 
     assert_eq!(*worker.calls.lock().unwrap(), 2);
     assert_eq!(summary.run_status, "completed");
+    let invocations = db.provider_invocations(summary.run_id).unwrap();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[1].purpose, "completion_repair");
+    assert_eq!(invocations[1].effort, Some(ReasoningEffort::Low));
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review

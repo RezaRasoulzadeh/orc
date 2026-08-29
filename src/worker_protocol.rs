@@ -144,6 +144,19 @@ pub fn reported_verifications(output: &str) -> Vec<String> {
     checks
 }
 
+pub fn reported_affected_files(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("AFFECTED FILE: ")
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 /// A requirement identity is local to one persisted task contract.  The text
 /// is retained beside the identity so an execution record remains useful when
 /// inspected without reopening the task row.
@@ -190,6 +203,12 @@ pub struct WorkerPlan {
     pub resolved_review_blockers: Vec<String>,
     #[serde(default)]
     pub verification: Vec<String>,
+    #[serde(default)]
+    pub plan_acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub plan_required_tests: Vec<String>,
+    #[serde(default)]
+    pub plan_review_blockers: Vec<String>,
     pub steps: Vec<PlannedStep>,
 }
 
@@ -202,6 +221,56 @@ pub struct StepEvidence {
     pub observed: Vec<String>,
     pub verification: Vec<String>,
     pub passed: bool,
+}
+
+/// Provider-reported evidence for one persisted checkpoint. The stable step ID,
+/// rather than response position, is the execution/evidence join key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportedStepCompletion {
+    pub step_id: String,
+    pub operations_performed: Vec<PlannedOperation>,
+    pub affected_files: Vec<String>,
+    pub observed: Vec<String>,
+    pub verification_passed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportedPlanCompletion {
+    pub step_results: Vec<ReportedStepCompletion>,
+    #[serde(default)]
+    pub summary: String,
+}
+
+pub fn parse_plan_completion(output: &str) -> anyhow::Result<ReportedPlanCompletion> {
+    serde_json::from_str(output)
+        .map_err(|error| anyhow::anyhow!("invalid structured Worker completion: {error}"))
+}
+
+pub fn plan_completion_schema() -> String {
+    serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "step_results": {"type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "step_id": {"type": "string"},
+                    "operations_performed": {"type": "array", "items": {"type": "string", "enum": ["inspect", "create", "modify", "delete", "move", "command", "validate", "no_mutation"]}},
+                    "affected_files": {"type": "array", "items": {"type": "string"}},
+                    "observed": {"type": "array", "items": {"type": "string"}},
+                    "verification_passed": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["step_id", "operations_performed", "affected_files", "observed", "verification_passed"]
+            }},
+            "summary": {"type": "string"}
+        },
+        "required": ["step_results", "summary"]
+    }).to_string()
+}
+
+pub fn repair_completion_schema() -> String {
+    serde_json::json!({"type":"object","additionalProperties":false,
+        "properties":{"summary":{"type":"string"}},"required":["summary"]})
+    .to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -379,7 +448,6 @@ impl WorkerPlan {
                 || step.intent.trim().is_empty()
                 || step.operations.is_empty()
                 || step.operation_targets.len() != step.operations.len()
-                || step.verification.is_empty()
             {
                 anyhow::bail!(
                     "step '{}' is missing objective, operation target, operation, or verification",
@@ -435,6 +503,7 @@ impl WorkerPlan {
             .steps
             .iter()
             .flat_map(|step| step.acceptance_criteria.iter())
+            .chain(self.plan_acceptance_criteria.iter())
             .collect();
         if self
             .acceptance_criteria
@@ -447,6 +516,7 @@ impl WorkerPlan {
             .steps
             .iter()
             .flat_map(|step| step.required_tests.iter())
+            .chain(self.plan_required_tests.iter())
             .collect();
         if self
             .required_tests
@@ -508,11 +578,13 @@ impl WorkerPlan {
             .steps
             .iter()
             .flat_map(|s| s.acceptance_criteria.iter().map(|v| v.trim()))
+            .chain(self.plan_acceptance_criteria.iter().map(|v| v.trim()))
             .collect();
         let tested: BTreeSet<_> = self
             .steps
             .iter()
             .flat_map(|s| s.required_tests.iter().map(|v| v.trim()))
+            .chain(self.plan_required_tests.iter().map(|v| v.trim()))
             .collect();
         for value in acceptance {
             if !covered.contains(value.id.trim()) {
@@ -533,6 +605,7 @@ impl WorkerPlan {
             .steps
             .iter()
             .flat_map(|step| step.active_review_blockers.iter().map(String::as_str))
+            .chain(self.plan_review_blockers.iter().map(String::as_str))
             .collect();
         if blocker_ids != covered_blockers {
             anyhow::bail!("PREPARE omits one or more active review blockers");
@@ -561,7 +634,6 @@ impl WorkerExecutionResult {
             if evidence.step_id.trim().is_empty()
                 || evidence.observed.is_empty()
                 || evidence.observed.iter().any(|v| v.trim().is_empty())
-                || evidence.verification.is_empty()
                 || evidence.verification.iter().any(|v| v.trim().is_empty())
             {
                 anyhow::bail!(
@@ -629,10 +701,23 @@ impl WorkerExecutionResult {
                 );
             }
         }
+        for requirement in plan
+            .plan_acceptance_criteria
+            .iter()
+            .chain(plan.plan_required_tests.iter())
+            .chain(plan.plan_review_blockers.iter())
+        {
+            if !covered.contains(requirement.trim()) {
+                anyhow::bail!(
+                    "execution evidence omits plan-level requirement '{}'",
+                    requirement
+                );
+            }
+        }
         if self
             .requirement_coverage
             .iter()
-            .any(|(_, step)| !expected.contains(&step.as_str()))
+            .any(|(_, step)| step != "plan" && !expected.contains(&step.as_str()))
         {
             anyhow::bail!("execution evidence contains an unknown step");
         }
@@ -645,15 +730,24 @@ impl WorkerExecutionResult {
             }
         }
         if self.requirement_coverage.iter().any(|(requirement, step)| {
-            !plan.steps.iter().any(|candidate| {
-                candidate.id == *step
-                    && candidate
-                        .acceptance_criteria
-                        .iter()
-                        .chain(candidate.required_tests.iter())
-                        .chain(candidate.active_review_blockers.iter())
-                        .any(|value| value == requirement)
-            })
+            if step == "plan" {
+                !plan
+                    .plan_acceptance_criteria
+                    .iter()
+                    .chain(plan.plan_required_tests.iter())
+                    .chain(plan.plan_review_blockers.iter())
+                    .any(|value| value == requirement)
+            } else {
+                !plan.steps.iter().any(|candidate| {
+                    candidate.id == *step
+                        && candidate
+                            .acceptance_criteria
+                            .iter()
+                            .chain(candidate.required_tests.iter())
+                            .chain(candidate.active_review_blockers.iter())
+                            .any(|value| value == requirement)
+                })
+            }
         }) {
             anyhow::bail!("execution evidence contains invalid requirement coverage");
         }
@@ -680,6 +774,9 @@ mod tests {
             active_review_blockers: vec![],
             resolved_review_blockers: vec![],
             verification: vec!["check".into()],
+            plan_acceptance_criteria: vec![],
+            plan_required_tests: vec![],
+            plan_review_blockers: vec![],
             steps: vec![PlannedStep {
                 id: "s1".into(),
                 objective: "do task".into(),

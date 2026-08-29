@@ -378,6 +378,33 @@ pub trait Worker: Send + Sync {
         self.execute_with_progress_and_usage(prompt, cwd, progress)
     }
 
+    fn execute_structured_with_progress_and_usage_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        _cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        self.execute_structured_with_progress_and_usage(prompt, cwd, schema, progress)
+    }
+
+    fn execute_repair_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        cancellation: Option<&CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        match cancellation {
+            Some(control) => self.execute_structured_with_progress_and_usage_cancellable(
+                prompt, cwd, schema, progress, control,
+            ),
+            None => self.execute_structured_with_progress_and_usage(prompt, cwd, schema, progress),
+        }
+    }
+
     /// Execute exactly one persisted PREPARE step.  This is the execution seam
     /// for the provider-independent protocol; callers must invoke it in plan
     /// order and may not collapse a plan into one provider request.
@@ -409,6 +436,22 @@ pub trait Worker: Send + Sync {
         _cancellation: &CancellationControl,
     ) -> Result<WorkerExecution, String> {
         self.execute_planned_step(step, context, cwd, schema, progress)
+    }
+
+    fn execute_planned_step_repair(
+        &self,
+        step: &crate::worker_protocol::PlannedStep,
+        context: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        cancellation: Option<&CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        let prompt = format!(
+            "{context}\n\nREPAIR CHECKPOINT:\n{}",
+            serde_json::to_string_pretty(step).map_err(|e| e.to_string())?
+        );
+        self.execute_repair_with_progress_and_usage(&prompt, cwd, schema, progress, cancellation)
     }
 }
 
@@ -764,6 +807,68 @@ impl Worker for CodexWorker {
             (Ok(execution), Ok(())) => Ok(execution),
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(format!("failed to remove Codex output schema: {error}")),
+        }
+    }
+
+    fn execute_structured_with_progress_and_usage_cancellable(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        cancellation: &CancellationControl,
+    ) -> Result<WorkerExecution, String> {
+        use std::io::Write;
+
+        let schema = codex_compatible_output_schema(schema)?;
+        let mut path = std::env::temp_dir();
+        static SCHEMA_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SCHEMA_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.push(format!(
+            "orc-output-schema-cancellable-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("failed to create Codex output schema: {error}"))?;
+        if let Err(error) = file.write_all(schema.as_bytes()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("failed to write Codex output schema: {error}"));
+        }
+        drop(file);
+        let result = self.run_cancellable(prompt, cwd, Some(&path), progress, Some(cancellation));
+        let cleanup = std::fs::remove_file(&path);
+        match (result, cleanup) {
+            (Ok(execution), Ok(())) => Ok(execution),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("failed to remove Codex output schema: {error}")),
+        }
+    }
+
+    fn execute_repair_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema: &str,
+        progress: &dyn Fn(&str),
+        cancellation: Option<&CancellationControl>,
+    ) -> Result<WorkerExecution, String> {
+        let repair = CodexWorker {
+            profile_path: self.profile_path.clone(),
+            model: self.model.clone(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            sandbox: self.sandbox,
+            executable: self.executable.clone(),
+        };
+        match cancellation {
+            Some(control) => repair.execute_structured_with_progress_and_usage_cancellable(
+                prompt, cwd, schema, progress, control,
+            ),
+            None => {
+                repair.execute_structured_with_progress_and_usage(prompt, cwd, schema, progress)
+            }
         }
     }
 }

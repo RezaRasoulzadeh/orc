@@ -61,7 +61,13 @@ impl Worker for CountingWorker {
         self.calls.fetch_add(1, Ordering::SeqCst);
         std::fs::write(cwd.join("eligibility-change.txt"), "dispatched\n")
             .map_err(|error| error.to_string())?;
-        Ok((WorkerOutcome::Success, Some("executed".into())))
+        Ok((
+            WorkerOutcome::Success,
+            Some(
+                "executed\nOPERATION PERFORMED: modify\nVERIFICATION PASSED: configured validation evidence"
+                    .into(),
+            ),
+        ))
     }
 
     fn execute_planned_step(
@@ -82,6 +88,36 @@ impl Worker for CountingWorker {
                 orc::worker_protocol::operation_name(&step.operations[0])
             )),
             token_usage: None,
+        })
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::fs::write(cwd.join("eligibility-change.txt"), "dispatched\n")
+            .map_err(|e| e.to_string())?;
+        let plan_json = prompt
+            .split("WORKER EXECUTION PROTOCOL (mandatory):")
+            .nth(1)
+            .and_then(|value| value.find("\n{").map(|i| &value[i + 1..]))
+            .ok_or("missing plan")?;
+        let plan: orc::worker_protocol::WorkerPlan =
+            serde_json::from_str(plan_json).map_err(|e| e.to_string())?;
+        let step = &plan.steps[0];
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            token_usage: None,
+            output: Some(
+                serde_json::json!({"step_results":[{"step_id":step.id,
+                "operations_performed":step.operations,"affected_files":["eligibility-change.txt"],
+                "observed":["checkpoint completed"],"verification_passed":[]}],"summary":"done"})
+                .to_string(),
+            ),
         })
     }
 }

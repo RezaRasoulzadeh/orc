@@ -44,6 +44,22 @@ pub struct TaskExecutionCondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderInvocation {
+    pub id: i64,
+    pub parent_run_id: i64,
+    pub purpose: String,
+    pub lineage: String,
+    pub attempt: usize,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub outcome: String,
+    pub effort: Option<ReasoningEffort>,
+    pub total_tokens: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanReview {
     pub id: i64,
     pub plan_id: i64,
@@ -1240,6 +1256,7 @@ impl Database {
         Self::ensure_execution_reservations_table(&conn)?;
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_worker_protocol_results_table(&conn)?;
+        Self::ensure_provider_invocations_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
@@ -1299,6 +1316,7 @@ impl Database {
         Self::ensure_execution_reservations_table(conn)?;
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_worker_protocol_results_table(conn)?;
+        Self::ensure_provider_invocations_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_change_evidence_table(conn)?;
@@ -1949,6 +1967,136 @@ impl Database {
     fn ensure_worker_protocol_results_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS worker_protocol_results (run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE, prepare TEXT NOT NULL, execution TEXT)")?;
         Ok(())
+    }
+
+    fn ensure_provider_invocations_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_invocations (
+                id INTEGER PRIMARY KEY,
+                parent_run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                purpose TEXT NOT NULL,
+                lineage TEXT NOT NULL DEFAULT 'root',
+                attempt INTEGER NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                finished_at TEXT,
+                outcome TEXT NOT NULL DEFAULT 'running',
+                effort TEXT,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                UNIQUE(parent_run_id, purpose, attempt)
+            )",
+        )?;
+        for (column, definition) in [
+            ("lineage", "TEXT NOT NULL DEFAULT 'root'"),
+            ("effort", "TEXT"),
+            ("total_tokens", "INTEGER"),
+            ("input_tokens", "INTEGER"),
+            ("output_tokens", "INTEGER"),
+        ] {
+            let exists: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('provider_invocations') WHERE name='{column}'"), [], |row| row.get(0))?;
+            if exists == 0 {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE provider_invocations ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_provider_invocation(
+        &self,
+        parent_run_id: i64,
+        purpose: &str,
+        attempt: usize,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<i64, DbError> {
+        let phase_limit = match purpose {
+            "implementation" | "revision" => 1,
+            "completion_repair" => 2,
+            "validation_repair" => 3,
+            _ => 0,
+        };
+        let used: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM provider_invocations WHERE parent_run_id=?1 AND purpose=?2",
+            params![parent_run_id, purpose],
+            |row| row.get(0),
+        )?;
+        let token_limit = std::env::var("ORC_PROVIDER_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(500_000);
+        let consumed: i64 = self.conn.query_row("SELECT COALESCE(SUM(total_tokens), 0) FROM provider_invocations WHERE parent_run_id=?1", [parent_run_id], |row| row.get(0))?;
+        if consumed >= token_limit {
+            return Err(DbError::Scheduler(format!(
+                "provider token budget exhausted ({consumed}/{token_limit}) before phase '{purpose}'"
+            )));
+        }
+        let invocation_limit = std::env::var("ORC_PROVIDER_INVOCATION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(6);
+        let total_used: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM provider_invocations WHERE parent_run_id=?1",
+            [parent_run_id],
+            |row| row.get(0),
+        )?;
+        if total_used >= invocation_limit {
+            return Err(DbError::Scheduler(format!(
+                "provider invocation budget exhausted ({total_used}/{invocation_limit})"
+            )));
+        }
+        if phase_limit == 0 || used >= phase_limit {
+            return Err(DbError::Scheduler(format!(
+                "provider invocation budget exhausted for phase '{purpose}'"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO provider_invocations(parent_run_id, purpose, lineage, attempt, effort) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![parent_run_id, purpose, format!("{purpose}:{attempt}"), attempt, effort.map(|value| value.as_str())],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn finish_provider_invocation(
+        &self,
+        id: i64,
+        outcome: &str,
+        usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE provider_invocations SET outcome=?1, finished_at=CURRENT_TIMESTAMP, total_tokens=?3, input_tokens=?4, output_tokens=?5 WHERE id=?2 AND outcome='running'",
+            params![outcome, id, usage.map(|v| v.total_tokens), usage.and_then(|v| v.input_tokens), usage.and_then(|v| v.output_tokens)],
+        )? != 0)
+    }
+
+    pub fn provider_invocations(
+        &self,
+        parent_run_id: i64,
+    ) -> Result<Vec<ProviderInvocation>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, parent_run_id, purpose, lineage, attempt, started_at, finished_at, outcome, effort, total_tokens, input_tokens, output_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
+        )?;
+        Ok(statement
+            .query_map([parent_run_id], |row| {
+                Ok(ProviderInvocation {
+                    id: row.get(0)?,
+                    parent_run_id: row.get(1)?,
+                    purpose: row.get(2)?,
+                    lineage: row.get(3)?,
+                    attempt: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                    outcome: row.get(7)?,
+                    effort: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|v| ReasoningEffort::parse(&v).ok()),
+                    total_tokens: row.get(9)?,
+                    input_tokens: row.get(10)?,
+                    output_tokens: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn store_worker_prepare(
@@ -4058,7 +4206,7 @@ impl Database {
                     return Err(DbError::TaskNotActive(id.into()));
                 }
                 let failed_run_exists: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status = 'failed')",
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('failed', 'cancelled'))",
                     params![id],
                     |row| row.get(0),
                 )?;

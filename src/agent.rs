@@ -165,17 +165,45 @@ fn requirement_coverage(plan: &crate::worker_protocol::WorkerPlan) -> Vec<(Strin
 /// contract. `expected_changes` describes scope; it is not an execution plan
 /// and must never multiply provider calls or fabricate checkpoint boundaries.
 fn plan_steps(
-    expected_changes: &[String],
+    proposal: &crate::protocol::TaskProposal,
     acceptance_criteria: &[crate::worker_protocol::WorkerRequirement],
     required_tests: &[crate::worker_protocol::WorkerRequirement],
     active_review_blockers: &[crate::worker_protocol::ReviewBlockerRequirement],
     verification: &[String],
     intent: &str,
 ) -> Vec<crate::worker_protocol::PlannedStep> {
-    let entries = if expected_changes.is_empty() {
-        vec!["no-mutation".to_owned()]
+    let entries = if proposal.expected_changes.is_empty() {
+        let capabilities = crate::registry::normalize_capability_names(&proposal.capabilities);
+        let implementation =
+            proposal.role == "developer" && capabilities.iter().any(|value| value == "code");
+        if implementation {
+            let bounded_targets = if proposal.context_files.is_empty() {
+                vec!["task-scoped repository files".to_owned()]
+            } else {
+                proposal.context_files.clone()
+            };
+            let mut entries = bounded_targets
+                .iter()
+                .map(|target| format!("inspect: {target}"))
+                .chain(
+                    bounded_targets
+                        .iter()
+                        .map(|target| format!("modify: {target}")),
+                )
+                .collect::<Vec<_>>();
+            if capabilities
+                .iter()
+                .any(|value| value == "command_execution")
+            {
+                entries.push("command: task-required implementation commands".to_owned());
+                entries.push("validate: persisted task requirements".to_owned());
+            }
+            entries
+        } else {
+            vec!["no-mutation".to_owned()]
+        }
     } else {
-        expected_changes.to_vec()
+        proposal.expected_changes.clone()
     };
     let (operations, operation_targets) = entries
         .into_iter()
@@ -971,7 +999,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
         plan_required_tests: Vec::new(),
         plan_review_blockers: Vec::new(),
         steps: plan_steps(
-            &proposal.expected_changes,
+            &proposal,
             &acceptance_criteria,
             &required_tests,
             &[],
@@ -1954,7 +1982,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         plan_required_tests: Vec::new(),
         plan_review_blockers: Vec::new(),
         steps: plan_steps(
-            &proposal.expected_changes,
+            &proposal,
             &acceptance_criteria,
             &required_tests,
             &active_review_blockers,

@@ -11,12 +11,13 @@ use orc::git;
 use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
 use orc::review;
 use orc::storage::{AgentRunExecution, Database};
-use orc::task::{TaskPriority, TaskStatus};
+use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
 use orc::validation::{
     ValidationCategory, ValidationFailureClassification, ValidationRunner, ValidationStepResult,
 };
 use orc::worker::{Worker, WorkerExecution, WorkerOutcome};
+use orc::worker_protocol::PlannedOperation;
 use orc::workflow::{
     AcceptancePolicy, LeadOutcome, PlanOutcome, PlanReviewOutcome, ProviderOutcome, ReviewOutcome,
     WorkflowActions, WorkflowEngine, WorkflowPolicy, WorkflowStage, WorkflowStatus,
@@ -293,6 +294,106 @@ fn canonicalize_task_with_expected_changes(db: &Database, task: &str, expected_c
         },
     )
     .unwrap();
+}
+
+#[test]
+fn direct_developer_task_prepare_authorizes_contract_implied_implementation() {
+    let (dir, db, _) = setup();
+    let project = db.get_project_id().unwrap().unwrap();
+    let task = db
+        .create_task(
+            project,
+            &CreateTaskInput {
+                title: "Implement quota support".into(),
+                objective: "Modify the Rust source and run tests for short-term quota limits"
+                    .into(),
+                role: "developer".into(),
+                priority: TaskPriority::Normal,
+                required_capabilities: vec!["code".into(), "command_execution".into()],
+                scope_mode: Some(orc::task::TaskScopeMode::Focused),
+                context_files: vec!["README.md".into()],
+                expected_changes: vec![],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+    let worker = ProtocolOperationWorker {
+        operation: "auto",
+        verify: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    let (plan, _) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+    assert_eq!(
+        plan.steps[0].operations,
+        vec![
+            PlannedOperation::Inspect,
+            PlannedOperation::Modify,
+            PlannedOperation::Command,
+            PlannedOperation::Validate,
+        ]
+    );
+    assert_eq!(
+        &plan.steps[0].operation_targets[..2],
+        ["README.md", "README.md"]
+    );
+    assert_eq!(plan.unchanged, Vec::<String>::new());
+    assert_eq!(
+        plan.acceptance_criteria[0].text,
+        "Modify the Rust source and run tests for short-term quota limits"
+    );
+}
+
+#[test]
+fn direct_read_only_task_prepare_retains_no_mutation() {
+    let (dir, db, _) = setup();
+    let project = db.get_project_id().unwrap().unwrap();
+    let task = db
+        .create_task(
+            project,
+            &CreateTaskInput {
+                title: "Report repository state".into(),
+                objective: "Inspect and report without changing repository files".into(),
+                role: "observer".into(),
+                priority: TaskPriority::Normal,
+                required_capabilities: vec![],
+                scope_mode: Some(orc::task::TaskScopeMode::Focused),
+                context_files: vec!["README.md".into()],
+                expected_changes: vec!["no-mutation: report repository state".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+    let worker = ProtocolOperationWorker {
+        operation: "auto",
+        verify: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+
+    let (plan, _) = db.load_worker_protocol(summary.run_id).unwrap().unwrap();
+    assert_eq!(plan.steps[0].operations, vec![PlannedOperation::NoMutation]);
+    assert_eq!(
+        plan.steps[0].operation_targets,
+        vec!["report repository state"]
+    );
 }
 
 struct WritingWorker;

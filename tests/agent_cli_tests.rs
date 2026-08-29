@@ -431,6 +431,7 @@ impl ActionBackend for ReviewBackend {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
                 total_tokens: 2,
+                cached_input_tokens: None,
             }),
         })
     }

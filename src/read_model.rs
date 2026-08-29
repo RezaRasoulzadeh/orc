@@ -388,6 +388,7 @@ mod tests {
                 total_tokens: 34,
                 input_tokens: Some(21),
                 output_tokens: Some(13),
+                cached_input_tokens: Some(8),
             }),
         )
         .unwrap();
@@ -397,6 +398,7 @@ mod tests {
         assert_eq!(result.total_tokens, Some(34));
         assert_eq!(result.input_tokens, Some(21));
         assert_eq!(result.output_tokens, Some(13));
+        assert_eq!(result.cached_input_tokens, Some(8));
         let workspace = runs_workspace(&db, 10, 10).unwrap();
         assert!(workspace.runs[0].output.is_none());
         assert!(workspace.details[0].run.output.is_none());

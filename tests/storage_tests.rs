@@ -706,6 +706,7 @@ fn worker_result_persists_once_per_run_across_reopen() {
             total_tokens: Some(130),
             input_tokens: Some(100),
             output_tokens: Some(30),
+            cached_input_tokens: Some(45),
         })
         .unwrap();
         assert!(
@@ -718,6 +719,7 @@ fn worker_result_persists_once_per_run_across_reopen() {
                 total_tokens: None,
                 input_tokens: None,
                 output_tokens: None,
+                cached_input_tokens: None,
             })
             .is_err()
         );
@@ -734,6 +736,7 @@ fn worker_result_persists_once_per_run_across_reopen() {
             total_tokens: Some(130),
             input_tokens: Some(100),
             output_tokens: Some(30),
+            cached_input_tokens: Some(45),
         })
     );
 }
@@ -766,6 +769,7 @@ fn lineage_fixture(force: bool) -> (tempfile::TempDir, Database, String, i64, St
         total_tokens: Some(10),
         input_tokens: Some(8),
         output_tokens: Some(2),
+        cached_input_tokens: None,
     })
     .unwrap();
     db.update_agent_run_status(run_id, "completed", Some("done"))

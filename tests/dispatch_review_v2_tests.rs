@@ -13,9 +13,7 @@ use orc::review;
 use orc::storage::{AgentRunExecution, Database};
 use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
-use orc::validation::{
-    ValidationCategory, ValidationFailureClassification, ValidationRunner, ValidationStepResult,
-};
+use orc::validation::{ValidationCategory, ValidationRunner, ValidationStepResult};
 use orc::worker::{Worker, WorkerExecution, WorkerOutcome};
 use orc::worker_protocol::PlannedOperation;
 use orc::workflow::{
@@ -90,6 +88,7 @@ impl Worker for TokenBudgetWorker {
                 total_tokens: 500_000,
                 input_tokens: Some(450_000),
                 output_tokens: Some(50_000),
+                cached_input_tokens: None,
             }),
         })
     }
@@ -693,30 +692,6 @@ impl ValidationRunner for SequenceValidationRunner {
     }
 }
 
-fn validation_result(category: ValidationCategory, diagnostics: &str) -> ValidationStepResult {
-    let passed = category == ValidationCategory::Success;
-    ValidationStepResult {
-        command: "check".to_owned(),
-        category,
-        passed,
-        stdout: if passed { "ok" } else { "partial output" }.to_owned(),
-        stderr: if passed { "" } else { "exact stderr" }.to_owned(),
-        exit_status: Some(if passed { 0 } else { 1 }),
-        diagnostics: (!diagnostics.is_empty()).then(|| diagnostics.to_owned()),
-        failure_classification: (!passed).then_some(
-            if matches!(
-                category,
-                ValidationCategory::Timeout | ValidationCategory::Infrastructure
-            ) {
-                ValidationFailureClassification::Infrastructure
-            } else {
-                ValidationFailureClassification::Implementation
-            },
-        ),
-        fallback_command: None,
-    }
-}
-
 fn cmd(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(dir)
@@ -835,12 +810,6 @@ fn valid_revision_handoff() -> String {
             "status": "addressed",
             "implementation_summary": "revision.txt records the implementation",
             "changed_files": ["revision.txt"],
-            "evidence": [{
-                "changed_file": "revision.txt",
-                "validation_command": "check",
-                "test_names": []
-            }],
-            "validation_evidence": "check command passed for revision.txt",
             "unresolved_risk": null
         }]
     })
@@ -880,12 +849,6 @@ impl Worker for TestOnlyRevisionWorker {
             "status": "addressed",
             "implementation_summary": "Added deterministic persisted lifecycle coverage.",
             "changed_files": ["tests/revision_contract_lifecycle.rs"],
-            "evidence": [{
-                "changed_file": "tests/revision_contract_lifecycle.rs",
-                "validation_command": "check",
-                "test_names": [LIFECYCLE_TEST]
-            }],
-            "validation_evidence": "Named test executed by the configured check.",
             "unresolved_risk": null
         }]})
         .to_string();
@@ -1002,8 +965,6 @@ fn revision_worker_receives_native_handoff_schema() {
         "status",
         "implementation_summary",
         "changed_files",
-        "evidence",
-        "validation_evidence",
         "unresolved_risk",
     ] {
         assert!(
@@ -1012,6 +973,17 @@ fn revision_worker_receives_native_handoff_schema() {
                 .unwrap()
                 .iter()
                 .any(|value| value == field)
+        );
+    }
+    // The claim schema no longer asks the provider to prove it ran
+    // validation; that ownership belongs to automated review.
+    for removed_field in ["evidence", "validation_evidence"] {
+        assert!(
+            !required
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == removed_field)
         );
     }
 }
@@ -2635,10 +2607,11 @@ fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
         })
         .unwrap();
     assert!(db.get_change_evidence(implementation.id).unwrap().is_some());
+    // Dispatch no longer runs configured validation; automated review owns it.
     assert!(
         db.latest_validation_result_for_run(implementation.id)
             .unwrap()
-            .is_some()
+            .is_none()
     );
     let review_run = runs
         .iter()
@@ -3137,18 +3110,14 @@ fn revision_worker_includes_current_engineering_contract() {
 }
 
 #[test]
-fn automatic_validation_repair_is_focused_and_omits_broad_contract_prompt() {
-    let (dir, _, task) = setup();
-    let marker = "REPAIR_CONTRACT_UNIQUE_MARKER";
-    let diagnostics = "EXACT_REPAIRABLE_VALIDATION_DIAGNOSTICS";
-    std::fs::write(dir.path().join(".orc/engineering.md"), marker).unwrap();
+fn dispatch_does_not_invoke_validation_runner_or_repair_and_coder_prompt_forbids_validation() {
+    let (dir, db, task) = setup();
     let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(vec![
-        validation_result(ValidationCategory::Test, diagnostics),
-        validation_result(ValidationCategory::Success, ""),
-    ]);
+    // An empty sequence: if dispatch calls the validation runner even once,
+    // this panics on the missing queued result instead of silently passing.
+    let runner = SequenceValidationRunner::new(vec![]);
 
-    dispatch_with_worker_and_db_as_with_runner(
+    let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
         &worker,
         dir.path().join(".orc/orc.db").to_str().unwrap(),
@@ -3159,21 +3128,19 @@ fn automatic_validation_repair_is_focused_and_omits_broad_contract_prompt() {
     .unwrap();
 
     let calls = worker.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert!(!calls[1].0.contains(marker));
-    assert!(!calls[1].0.contains("## Instruction precedence"));
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].0.contains("## Focused automatic validation repair"));
     assert!(
-        calls[1]
+        calls[0]
             .0
-            .contains("## Focused automatic validation repair")
+            .contains("Do not run the project's validation/test suite")
     );
-    assert!(calls[1].0.contains(diagnostics));
-    assert!(
-        calls[1]
-            .0
-            .find("## Focused automatic validation repair")
-            .unwrap()
-            < calls[1].0.find(diagnostics).unwrap()
+    let invocations = db.provider_invocations(summary.run_id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].purpose, "implementation");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
     );
 }
 
@@ -3390,7 +3357,7 @@ fn untracked_and_runtime_db_artifacts_are_handled_correctly() {
 }
 
 #[test]
-fn no_change_blocks_but_validation_failure_enters_review() {
+fn no_change_blocks_the_task_without_running_validation() {
     let (dir, db, task) = setup();
     let db_path = dir.path().join(".orc/orc.db");
     assert!(
@@ -3400,7 +3367,7 @@ fn no_change_blocks_but_validation_failure_enters_review() {
             db_path.to_str().unwrap(),
             dir.path(),
             "fake",
-            &FakeValidationRunner::success()
+            &SequenceValidationRunner::new(vec![]),
         )
         .is_err()
     );
@@ -3408,184 +3375,56 @@ fn no_change_blocks_but_validation_failure_enters_review() {
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Blocked
     );
-
-    let task2 = db
-        .insert_task(
-            db.get_project_id().unwrap().unwrap(),
-            "Fail validation",
-            "change",
-            "developer",
-            TaskPriority::Normal,
-        )
-        .unwrap();
+    let run_id = db.list_agent_runs_for_task(&task).unwrap()[0].id;
     assert!(
-        dispatch_with_worker_and_db_as_with_runner(
-            &task2,
-            &WritingWorker,
-            db_path.to_str().unwrap(),
-            dir.path(),
-            "fake",
-            &FakeValidationRunner::failing_on("check")
-        )
-        .is_err()
+        db.list_lifecycle_events_for_run(run_id, 20)
+            .unwrap()
+            .into_iter()
+            .all(|event| event.kind != "validation_result")
     );
-    assert_eq!(
-        db.get_task(&task2).unwrap().unwrap().status,
-        TaskStatus::Review
-    );
-    let run_id = db.list_agent_runs_for_task(&task2).unwrap()[0].id;
-    let validation = db
-        .list_lifecycle_events_for_run(run_id, 20)
-        .unwrap()
-        .into_iter()
-        .find(|event| event.kind == "validation_result")
-        .unwrap();
-    assert!(validation.payload.unwrap().contains("\"passed\":false"));
 }
 
 #[test]
-fn validation_failure_repairs_in_same_worktree_and_persists_diagnostics() {
+fn dispatch_persists_no_validation_lifecycle_events() {
     let (dir, db, task) = setup();
     let db_path = dir.path().join(".orc/orc.db");
     let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(vec![
-        validation_result(ValidationCategory::Test, "test assertion failed"),
-        validation_result(ValidationCategory::Success, ""),
-    ]);
     let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
         &worker,
         db_path.to_str().unwrap(),
         dir.path(),
         "fake",
-        &runner,
+        &SequenceValidationRunner::new(vec![]),
     )
     .unwrap();
-    let calls = worker.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].1, calls[1].1);
-    assert!(calls[1].0.contains("test assertion failed"));
-    assert!(calls[1].0.contains("exact stderr"));
-    assert!(calls[1].0.contains("Preserve the existing worktree"));
-    let invocations = db.provider_invocations(summary.run_id).unwrap();
-    assert_eq!(invocations.len(), 2);
-    assert_eq!(invocations[1].purpose, "validation_repair");
-    assert_eq!(invocations[1].effort, Some(ReasoningEffort::Low));
-    assert_eq!(
-        std::fs::read_to_string(calls[1].1.join("feature.txt")).unwrap(),
-        "repaired\n"
-    );
+    assert_eq!(worker.calls.lock().unwrap().len(), 1);
     assert_eq!(summary.run_status, "completed");
     let events = db
         .list_lifecycle_events_for_run(summary.run_id, 30)
         .unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "validation_attempt")
-            .count(),
-        2
-    );
-    assert!(events.iter().any(|event| {
-        event.kind == "validation_result"
-            && event.payload.as_deref().is_some_and(|payload| {
-                payload.contains("test assertion failed") && payload.contains("exact stderr")
-            })
-    }));
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "validation_repair_started")
-            .count(),
-        1
-    );
+    for kind in [
+        "validation_attempt",
+        "validation_result",
+        "validation_repair_started",
+        "validation_repair_completed",
+    ] {
+        assert!(
+            !events.iter().any(|event| event.kind == kind),
+            "unexpected dispatch-owned lifecycle event '{kind}'"
+        );
+    }
 }
 
 #[test]
-fn validation_repair_is_bounded_and_infrastructure_only_retries_validation() {
-    let (dir, db, task) = setup();
-    let db_path = dir.path().join(".orc/orc.db");
-    let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(
-        (0..4)
-            .map(|_| validation_result(ValidationCategory::Lint, "lint failed"))
-            .collect(),
-    );
-    assert!(
-        dispatch_with_worker_and_db_as_with_runner(
-            &task,
-            &worker,
-            db_path.to_str().unwrap(),
-            dir.path(),
-            "fake",
-            &runner,
-        )
-        .is_err()
-    );
-    assert_eq!(worker.calls.lock().unwrap().len(), 4);
-    let run_id = db.list_agent_runs_for_task(&task).unwrap()[0].id;
-    let events = db.list_lifecycle_events_for_run(run_id, 40).unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "validation_repair_completed")
-            .count(),
-        3
-    );
-
-    let task = db
-        .insert_task(
-            db.get_project_id().unwrap().unwrap(),
-            "Infrastructure validation",
-            "change",
-            "developer",
-            TaskPriority::Normal,
-        )
-        .unwrap();
-    let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(vec![
-        validation_result(ValidationCategory::Infrastructure, "registry unavailable"),
-        validation_result(ValidationCategory::Infrastructure, "registry unavailable"),
-        validation_result(ValidationCategory::Success, ""),
-    ]);
-    let summary = dispatch_with_worker_and_db_as_with_runner(
-        &task,
-        &worker,
-        db_path.to_str().unwrap(),
-        dir.path(),
-        "fake",
-        &runner,
-    )
-    .unwrap();
-    assert_eq!(worker.calls.lock().unwrap().len(), 1);
-    let events = db
-        .list_lifecycle_events_for_run(summary.run_id, 30)
-        .unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "validation_attempt")
-            .count(),
-        3
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.kind == "validation_repair_started")
-    );
-}
-
-#[test]
-fn revision_validation_failure_repairs_once_and_publishes_to_review() {
+fn revision_does_not_invoke_validation_runner_and_publishes_single_invocation_to_review() {
     let (dir, db, task, review_id) = revision_fixture();
     let marker = "BROAD_REVISION_CONTRACT_MARKER";
-    let diagnostics = "REVISION_VALIDATION_DIAGNOSTICS";
     std::fs::write(dir.path().join(".orc/engineering.md"), marker).unwrap();
     let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(vec![
-        validation_result(ValidationCategory::Test, diagnostics),
-        validation_result(ValidationCategory::Success, ""),
-    ]);
+    // An empty sequence: if revision calls the validation runner even once,
+    // this panics on the missing queued result instead of silently passing.
+    let runner = SequenceValidationRunner::new(vec![]);
 
     let summary = revise_with_worker_on_db(
         &task,
@@ -3599,22 +3438,10 @@ fn revision_validation_failure_repairs_once_and_publishes_to_review() {
     .unwrap();
 
     let calls = worker.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert!(!calls[1].0.contains(marker));
-    assert!(!calls[1].0.contains("## Instruction precedence"));
-    assert!(!calls[1].0.contains("## Review feedback"));
-    assert!(
-        calls[1]
-            .0
-            .contains("## Focused automatic validation repair")
-    );
-    assert!(calls[1].0.contains(diagnostics));
+    assert_eq!(calls.len(), 1);
     let invocations = db.provider_invocations(summary.run_id).unwrap();
-    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].purpose, "revision");
-    assert_eq!(invocations[1].purpose, "validation_repair");
-    assert_eq!(invocations[1].attempt, 1);
-    assert_eq!(invocations[1].effort, Some(ReasoningEffort::Low));
     assert_eq!(
         db.get_agent_run(summary.run_id).unwrap().unwrap().status,
         "completed"
@@ -3632,75 +3459,36 @@ fn revision_validation_failure_repairs_once_and_publishes_to_review() {
 }
 
 #[test]
-fn revision_validation_repair_stops_at_existing_bound() {
-    let (dir, db, task, _) = revision_fixture();
-    let worker = RepairWorker::new();
-    let runner = SequenceValidationRunner::new(
-        (0..4)
-            .map(|_| validation_result(ValidationCategory::Lint, "revision lint failed"))
-            .collect(),
-    );
-
-    assert!(
-        revise_with_worker_on_db(
-            &task,
-            "repair validation only",
-            &worker,
-            &db,
-            dir.path(),
-            "fake",
-            &runner,
-        )
-        .is_err()
-    );
-
-    assert_eq!(worker.calls.lock().unwrap().len(), 4);
-    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
-    let invocations = db.provider_invocations(run.id).unwrap();
-    assert_eq!(
-        invocations
-            .iter()
-            .filter(|invocation| invocation.purpose == "validation_repair")
-            .count(),
-        3
-    );
-    assert_eq!(run.status, "failed");
-    assert_eq!(
-        db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Blocked
-    );
-}
-
-#[test]
-fn revision_validation_repair_budget_exhaustion_prevents_provider_call() {
+fn revision_succeeds_without_validation_repair_or_token_budget_rejection() {
     let (dir, db, task, _) = revision_fixture();
     let worker = TokenBudgetWorker {
         calls: Mutex::new(0),
     };
 
-    let error = revise_with_worker_on_db(
+    let summary = revise_with_worker_on_db(
         &task,
-        "repair within budget",
+        "revise without validating",
         &worker,
         &db,
         dir.path(),
         "fake",
-        &SequenceValidationRunner::new(vec![validation_result(
-            ValidationCategory::Test,
-            "revision budget failure",
-        )]),
+        &SequenceValidationRunner::new(vec![]),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("token budget exhausted"));
+    // Only the single "revision" invocation ran: no validation_repair
+    // provider call, and the old 500_000-token budget did not block it.
     assert_eq!(*worker.calls.lock().unwrap(), 1);
     let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
-    assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
-    assert_eq!(run.status, "failed");
+    let invocations = db.provider_invocations(run.id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].purpose, "revision");
+    assert_eq!(run.status, "completed");
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Blocked
+        TaskStatus::Review
     );
+    assert_eq!(summary.run_status, "completed");
 }
 
 #[test]
@@ -4125,29 +3913,28 @@ fn cancellable_structured_dispatch_terminalizes_and_requeues_without_database_ed
 }
 
 #[test]
-fn token_budget_exhaustion_blocks_repair_and_preserves_worktree() {
+fn dispatch_succeeds_despite_provider_usage_exceeding_the_old_token_budget() {
+    // ORC_PROVIDER_TOKEN_BUDGET enforcement (default 500_000) has been
+    // removed entirely; a single invocation reporting exactly the old limit
+    // must not block dispatch from completing into review.
     let (dir, db, task) = setup();
     canonicalize_task(&db, &task, "create: budget-preserved.txt");
     let worker = TokenBudgetWorker {
         calls: Mutex::new(0),
     };
-    let error = dispatch_with_worker_and_db_as_with_runner(
+    let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
         &worker,
         dir.path().join(".orc/orc.db").to_str().unwrap(),
         dir.path(),
         "fake",
-        &SequenceValidationRunner::new(vec![validation_result(
-            ValidationCategory::Test,
-            "budget failure",
-        )]),
+        &SequenceValidationRunner::new(vec![]),
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("token budget exhausted"));
+    .unwrap();
     assert_eq!(*worker.calls.lock().unwrap(), 1);
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::Blocked
+        TaskStatus::Review
     );
     assert!(
         dir.path()
@@ -4157,8 +3944,11 @@ fn token_budget_exhaustion_blocks_repair_and_preserves_worktree() {
             .exists()
     );
     let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
-    assert_eq!(run.status, "failed");
-    assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
+    assert_eq!(run.status, "completed");
+    let invocations = db.provider_invocations(run.id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].total_tokens, Some(500_000));
+    assert_eq!(summary.run_status, "completed");
 }
 
 #[test]

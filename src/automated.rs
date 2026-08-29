@@ -9,6 +9,7 @@ use crate::protocol::{PlanResponse, PlanningRequest};
 use crate::registry::{self, AgentAction, AgentActionProfile, AgentDefinition, ReasoningEffort};
 use crate::review::ReviewSummary;
 use crate::storage::{AgentRunExecution, Database};
+use crate::validation::ValidationRunner;
 use crate::worker::{TokenUsage, WorkerOutcome};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -347,16 +348,6 @@ pub fn revision_handoff_schema() -> String {
                         "status": {"type": "string", "enum": ["addressed", "unresolved"]},
                         "implementation_summary": {"type": "string"},
                         "changed_files": {"type": "array", "items": {"type": "string"}},
-                        "evidence": {"type": "array", "items": {
-                            "type": "object", "additionalProperties": false,
-                            "properties": {
-                                "changed_file": {"type": "string"},
-                                "validation_command": {"type": "string"},
-                                "test_names": {"type": "array", "items": {"type": "string"}}
-                            },
-                            "required": ["changed_file", "validation_command", "test_names"]
-                        }},
-                        "validation_evidence": {"type": "string"},
                         "unresolved_risk": {"type": ["string", "null"]}
                     },
                     "required": [
@@ -364,8 +355,6 @@ pub fn revision_handoff_schema() -> String {
                         "status",
                         "implementation_summary",
                         "changed_files",
-                        "evidence",
-                        "validation_evidence",
                         "unresolved_risk"
                     ]
                 }
@@ -465,22 +454,14 @@ pub struct RevisionClaim {
     pub status: String,
     pub implementation_summary: String,
     pub changed_files: Vec<String>,
-    pub evidence: Vec<RevisionClaimEvidence>,
-    pub validation_evidence: String,
     pub unresolved_risk: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RevisionClaimEvidence {
-    pub changed_file: String,
-    pub validation_command: String,
-    #[serde(default)]
-    pub test_names: Vec<String>,
-}
-
-/// Validation captured after the current diff was inspected. The fingerprint
-/// prevents an otherwise valid report from being replayed after the worktree changes.
+/// Task-specific validation captured by automated review after the current
+/// diff was inspected. The fingerprint ties the report to the exact worktree
+/// state it applies to, so a stale report cannot validate a changed
+/// implementation. Validation ownership belongs to review, not to the
+/// dispatch/revision provider sessions this evidence used to be attached to.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionValidationEvidence {
@@ -512,17 +493,17 @@ pub fn validate_revision_handoff(
     contract: &RevisionContract,
     output: &str,
 ) -> Result<RevisionHandoff> {
-    validate_revision_handoff_with_evidence(contract, output, None, None)
+    validate_revision_handoff_with_evidence(contract, output, None)
 }
 
-/// Validate a revision handoff against evidence captured for this revision.
-/// The optional arguments retain compatibility for callers which only need the
-/// legacy empty-contract behavior; active blocker claims require both records.
+/// Validate a revision handoff against the change evidence captured for this
+/// revision. Validation ownership belongs to automated review: this check
+/// only confirms the handoff is structurally sound and each claim is tied to
+/// real changed files, not that the revision provider ran validation.
 pub fn validate_revision_handoff_with_evidence(
     contract: &RevisionContract,
     output: &str,
     changes: Option<&crate::git::WorktreeChanges>,
-    validation_payload: Option<&str>,
 ) -> Result<RevisionHandoff> {
     let active = contract.active_blocker_records();
     let active_count = active.len();
@@ -555,15 +536,11 @@ pub fn validate_revision_handoff_with_evidence(
             .iter()
             .find(|b| b.blocker_id == claim.blocker_id)
             .ok_or_else(|| anyhow::anyhow!("unknown blocker ID '{}'", claim.blocker_id))?;
-        if claim.implementation_summary.trim().is_empty() {
+        if claim.implementation_summary.trim().is_empty()
+            || is_vacuous_text(&claim.implementation_summary)
+        {
             bail!(
-                "revision handoff claim '{}' is missing implementation or validation evidence",
-                claim.blocker_id
-            );
-        }
-        if claim.validation_evidence.trim().is_empty() {
-            bail!(
-                "revision handoff claim '{}' is missing implementation or validation evidence",
+                "revision handoff claim '{}' is missing implementation evidence",
                 claim.blocker_id
             );
         }
@@ -580,12 +557,6 @@ pub fn validate_revision_handoff_with_evidence(
         {
             bail!(
                 "revision handoff claim '{}' contains placeholder changed files",
-                claim.blocker_id
-            );
-        }
-        if is_vacuous_text(&claim.validation_evidence) {
-            bail!(
-                "revision handoff claim '{}' contains placeholder validation evidence",
                 claim.blocker_id
             );
         }
@@ -625,62 +596,6 @@ pub fn validate_revision_handoff_with_evidence(
                 actual_paths.iter().copied().collect::<Vec<_>>().join(", ")
             );
         }
-        let validation = validation_payload
-            .context("active revision claims require current validation evidence")?;
-        let validation: RevisionValidationEvidence = serde_json::from_str(validation)
-            .context("current revision validation evidence is not structured")?;
-        if validation.worktree_fingerprint != revision_worktree_fingerprint(changes) {
-            bail!(
-                "revision handoff claim '{}' is supported by stale validation evidence",
-                claim.blocker_id
-            );
-        }
-        let report = &validation.report;
-        if !report.is_success() {
-            bail!(
-                "revision handoff claim '{}' is supported by failed validation",
-                claim.blocker_id
-            );
-        }
-        let evidence_paths: std::collections::BTreeSet<_> = claim
-            .evidence
-            .iter()
-            .map(|evidence| evidence.changed_file.as_str())
-            .collect();
-        let claimed_paths: std::collections::BTreeSet<_> =
-            claim.changed_files.iter().map(String::as_str).collect();
-        if evidence_paths != claimed_paths {
-            bail!(
-                "revision handoff claim '{}' is not tied to its changed files or acceptance condition",
-                claim.blocker_id
-            );
-        }
-        for evidence in &claim.evidence {
-            let step = report
-                .steps
-                .iter()
-                .find(|step| step.command == evidence.validation_command && step.passed)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "revision handoff claim '{}' lacks fresh passing evidence for command '{}'",
-                        claim.blocker_id,
-                        evidence.validation_command
-                    )
-                })?;
-            let patch = changed_file_patch(changes, &evidence.changed_file);
-            for test_name in &evidence.test_names {
-                if test_name.trim().is_empty()
-                    || !patch.contains(test_name)
-                    || !step.output().contains(test_name)
-                {
-                    bail!(
-                        "revision handoff claim '{}' contains fabricated or unexecuted test name '{}'",
-                        claim.blocker_id,
-                        test_name
-                    );
-                }
-            }
-        }
         if !required.contains(claim.blocker_id.as_str()) {
             bail!(
                 "revision handoff contains unknown blocker ID '{}'",
@@ -698,22 +613,6 @@ pub fn validate_revision_handoff_with_evidence(
         bail!("revision handoff is missing one or more active blocker claims");
     }
     Ok(handoff)
-}
-
-fn changed_file_patch<'a>(changes: &'a crate::git::WorktreeChanges, path: &str) -> &'a str {
-    let marker_a = format!("a/{path}");
-    let marker_b = format!("b/{path}");
-    changes
-        .diff
-        .split("diff --git ")
-        .skip(1)
-        .find(|section| {
-            section
-                .lines()
-                .next()
-                .is_some_and(|header| header.contains(&marker_a) || header.contains(&marker_b))
-        })
-        .unwrap_or_default()
 }
 
 fn is_vacuous_text(value: &str) -> bool {
@@ -991,7 +890,7 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
     for failure in &contract.validation_failures {
         out.push_str(&format!("- {failure}\n"));
     }
-    out.push_str("\n### Required handoff\nReturn JSON {\"completion\":{\"step_results\":[{\"step_id\":\"...\",\"operations_performed\":[\"modify\"],\"affected_files\":[],\"observed\":[],\"verification_passed\":[]}],\"summary\":\"...\"},\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"evidence\":[],\"validation_evidence\":\"...\",\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. `completion` is the same checkpoint evidence contract used by initial implementation; claims add only revision blocker disposition. Keep changes focused.");
+    out.push_str("\n### Required handoff\nReturn JSON {\"completion\":{\"step_results\":[{\"step_id\":\"...\",\"operations_performed\":[\"modify\"],\"affected_files\":[],\"observed\":[],\"verification_passed\":[]}],\"summary\":\"...\"},\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. Resolved constraints require no claim. `completion` is the same checkpoint evidence contract used by initial implementation; claims add only revision blocker disposition. Do not include validation evidence in a claim \u{2014} automated review owns validation. Keep changes focused.");
     out
 }
 
@@ -1330,13 +1229,164 @@ fn lead_packet(context: &LeadContext, message: &str) -> serde_json::Value {
     })
 }
 
+/// Task-specific validation selected and executed by automated review for a
+/// single review invocation, kept in memory only long enough to build the
+/// review prompt and, on failure, a focused blocker.
+struct ReviewValidationRun {
+    selection: crate::validation::ValidationSelection,
+    report: crate::validation::ValidationReport,
+}
+
+/// Determine, execute, and persist the task-specific validation for a
+/// review. Selects the smallest authoritative set of configured validation
+/// commands relevant to the task's changed files and any explicit
+/// task-required validation, runs each selected command at most once against
+/// the worktree being reviewed, and persists the selection, its rationale,
+/// the results, and the worktree fingerprint they apply to.
+///
+/// Returns `Ok(None)` when there is nothing to validate (no worktree, or
+/// selection produced no commands) rather than treating that as a failure.
+fn select_and_run_review_validation(
+    db: &Database,
+    summary: &ReviewSummary,
+    run_id: i64,
+    agent_id: &str,
+    repo_path: &Path,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<Option<ReviewValidationRun>> {
+    let Some(worktree_path) = summary.worktree_path.as_deref() else {
+        return Ok(None);
+    };
+    let worktree_dir = repo_path.join(worktree_path);
+    if !worktree_dir.exists() {
+        return Ok(None);
+    }
+    let config = crate::validation::ValidationConfig::load(&worktree_dir)
+        .unwrap_or_else(|_| crate::validation::ValidationConfig {
+            commands: Vec::new(),
+            groups: Vec::new(),
+        });
+    let changed_files: Vec<String> = summary
+        .changes
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
+    let required = db
+        .get_task_contract(&summary.task.id)?
+        .map(|contract| contract.validation)
+        .unwrap_or_default();
+    let selection = config.select_for_task(&changed_files, &required);
+    if selection.commands.is_empty() {
+        return Ok(None);
+    }
+    let report = crate::validation::run_validation_pipeline(
+        validation_runner,
+        &selection.commands,
+        &worktree_dir,
+    )
+    .unwrap_or_else(|error| {
+        crate::validation::ValidationReport::infrastructure_failure(
+            selection
+                .commands
+                .first()
+                .map_or("validation", String::as_str),
+            format!("{error:#}"),
+        )
+    });
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(&summary.task.id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&serde_json::to_string(&report)?),
+    )?;
+    let record = serde_json::json!({
+        "selected_groups": selection.groups,
+        "selected_commands": selection.commands,
+        "rationale": selection.rationale,
+        "worktree_fingerprint": revision_worktree_fingerprint(&summary.changes),
+    });
+    db.record_lifecycle_event(
+        "review_validation_selection",
+        Some(&summary.task.id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&record.to_string()),
+    )?;
+    Ok(Some(ReviewValidationRun { selection, report }))
+}
+
+/// If the executed task-specific validation failed, ensure a corresponding
+/// blocker is present regardless of whether the LLM reviewer independently
+/// surfaced one. Reuses the blocker's stable key to reopen a previously
+/// resolved blocker as a regression, or continue an existing unresolved one,
+/// rather than spawning duplicates across review cycles.
+fn append_validation_failure_blocker(
+    result: &mut ReviewResult,
+    prior: &[crate::storage::db::ReviewBlockerRecord],
+    validation_run: &ReviewValidationRun,
+) {
+    if validation_run.report.is_success() {
+        return;
+    }
+    let Some(step) = validation_run.report.steps.iter().find(|step| !step.passed) else {
+        return;
+    };
+    let subsystem = if validation_run.selection.groups.is_empty() {
+        "task-specific validation".to_owned()
+    } else {
+        validation_run.selection.groups.join(", ")
+    };
+    let blocker_key = format!("task-validation:{}", step.command);
+    if result
+        .blockers
+        .iter()
+        .any(|blocker| blocker.blocker_key == blocker_key)
+    {
+        // The reviewer already surfaced this exact failing command.
+        return;
+    }
+    let output: String = step.output().chars().take(2000).collect();
+    let evidence = if output.trim().is_empty() {
+        format!("`{}` failed for the {subsystem} subsystem.", step.command)
+    } else {
+        format!(
+            "`{}` failed for the {subsystem} subsystem.\n\n{output}",
+            step.command
+        )
+    };
+    let prior_match = prior.iter().find(|old| old.blocker_key == blocker_key);
+    let status = if prior_match.map(|old| old.status.as_str()) == Some("resolved") {
+        "regression"
+    } else {
+        "unresolved"
+    };
+    let finding = format!(
+        "Task-specific validation command `{}` failed.",
+        step.command
+    );
+    result.blockers.push(ReviewBlocker {
+        id: String::new(),
+        prior_blocker_id: prior_match.map(|old| old.blocker_id.clone()),
+        blocker_key,
+        requirement_ref: format!("task-specific validation ({subsystem})"),
+        evidence,
+        severity: "high".into(),
+        acceptance_condition: format!("`{}` must pass", step.command),
+        status: status.into(),
+        finding: finding.clone(),
+    });
+    result.blocking_findings.push(finding);
+}
+
 pub fn run_review(
     db: &Database,
     summary: &ReviewSummary,
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
 ) -> Result<(i64, ReviewResult)> {
-    run_review_mode(db, summary, overrides, backend, false)
+    run_review_mode(db, summary, overrides, backend, false, None)
 }
 
 pub fn run_project_review(
@@ -1345,7 +1395,29 @@ pub fn run_project_review(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
 ) -> Result<(i64, ReviewResult)> {
-    run_review_mode(db, summary, overrides, backend, true)
+    run_review_mode(db, summary, overrides, backend, true, None)
+}
+
+/// Task review that additionally owns and executes task-specific project
+/// validation (see [`select_and_run_review_validation`]) before producing a
+/// verdict. This is the authoritative production review path: dispatch and
+/// revision no longer run configured validation themselves.
+pub fn run_review_with_validation(
+    db: &Database,
+    summary: &ReviewSummary,
+    overrides: &ActionOverrides,
+    backend: &dyn ActionBackend,
+    repo_path: &Path,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<(i64, ReviewResult)> {
+    run_review_mode(
+        db,
+        summary,
+        overrides,
+        backend,
+        false,
+        Some((repo_path, validation_runner)),
+    )
 }
 
 fn run_review_mode(
@@ -1354,6 +1426,7 @@ fn run_review_mode(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
     project_review: bool,
+    validation: Option<(&Path, &dyn ValidationRunner)>,
 ) -> Result<(i64, ReviewResult)> {
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
     let run = db.create_project_action_run(
@@ -1369,13 +1442,45 @@ fn run_review_mode(
         },
     )?;
     let _run_finalizer = db.run_finalizer(run);
+    let validation_run = match validation {
+        Some((repo_path, runner)) => {
+            select_and_run_review_validation(db, summary, run, &resolved.agent, repo_path, runner)?
+        }
+        None => None,
+    };
     let instructions = if project_review {
         "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
     } else {
         TASK_REVIEW_INSTRUCTIONS
     };
+    let validation_section = match &validation_run {
+        Some(validation_run) => {
+            // Bound the embedded command output: a large failing test dump
+            // must not blow up review prompt size.
+            const MAX_VALIDATION_SUMMARY_CHARS: usize = 4_000;
+            let summary = validation_run.report.summary();
+            let summary: String = if summary.chars().count() > MAX_VALIDATION_SUMMARY_CHARS {
+                let mut truncated: String =
+                    summary.chars().take(MAX_VALIDATION_SUMMARY_CHARS).collect();
+                truncated.push_str("\n... (truncated)");
+                truncated
+            } else {
+                summary
+            };
+            format!(
+                "\n\nTask-specific validation (selected and executed by Orc, not the provider):\nSelected groups: {}\nWhy selected: {}\nResults:\n{summary}",
+                if validation_run.selection.groups.is_empty() {
+                    "none (flat command list)".to_owned()
+                } else {
+                    validation_run.selection.groups.join(", ")
+                },
+                validation_run.selection.rationale.join("; "),
+            )
+        }
+        None => String::new(),
+    };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. Do not accept or merge the task.\nReview packet:\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. A failed task-specific validation command below must be reflected as a blocker. Do not accept or merge the task.{validation_section}\nReview packet:\n{}",
         serde_json::to_string(&review_packet(db, summary)?)?
     );
     let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
@@ -1416,6 +1521,14 @@ fn run_review_mode(
                     normalize_blockers(&mut result);
                     result.validate_structured_blockers()?;
                     let prior = db.review_blocker_ledger(&summary.task.id)?;
+                    if let Some(validation_run) = &validation_run {
+                        append_validation_failure_blocker(&mut result, &prior, validation_run);
+                        if !result.blocking_findings.is_empty()
+                            && result.verdict.eq_ignore_ascii_case("pass")
+                        {
+                            result.verdict = "REVISE".into();
+                        }
+                    }
                     let mut referenced = std::collections::HashSet::new();
                     for blocker in &mut result.blockers {
                         if let Some(returned_id) = blocker.prior_blocker_id.as_deref() {
@@ -1551,17 +1664,11 @@ fn run_review_mode(
                             {
                                 contract.current_persisted_execution_evidence = evidence;
                             }
-                            contract.validation_failures = summary
-                                .validation_evidence
+                            contract.validation_failures = validation_run
                                 .as_ref()
-                                .and_then(|value| {
-                                    serde_json::from_str::<crate::validation::ValidationReport>(
-                                        value,
-                                    )
-                                    .ok()
-                                })
-                                .map(|report| {
-                                    report
+                                .map(|validation_run| {
+                                    validation_run
+                                        .report
                                         .steps
                                         .iter()
                                         .filter(|step| !step.passed)
@@ -1761,7 +1868,7 @@ mod tests {
     use std::collections::BTreeSet;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     fn assert_codex_schema_compatible(value: &serde_json::Value) {
         match value {
@@ -1912,8 +2019,7 @@ mod tests {
         let output = serde_json::json!({"claims": [{
             "blocker_id": "BLK-1", "status": "addressed",
             "implementation_summary": "fixed it", "changed_files": [],
-            "evidence": [],
-            "validation_evidence": "cargo test passed", "unresolved_risk": null
+            "unresolved_risk": null
         }]})
         .to_string();
         let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
@@ -1921,23 +2027,18 @@ mod tests {
     }
 
     #[test]
-    fn handoff_rejects_placeholder_validation_evidence() {
+    fn handoff_rejects_placeholder_implementation_summary() {
         let output = serde_json::json!({"claims": [{
             "blocker_id": "BLK-1", "status": "addressed",
-            "implementation_summary": "fixed it", "changed_files": ["src/lib.rs"],
-            "evidence": [{"changed_file":"src/lib.rs","validation_command":"cargo test","test_names":[]}],
-            "validation_evidence": "not tested", "unresolved_risk": null
+            "implementation_summary": "not tested", "changed_files": ["src/lib.rs"],
+            "unresolved_risk": null
         }]})
         .to_string();
         let error = validate_revision_handoff(&handoff_contract(), &output).unwrap_err();
-        assert!(error.to_string().contains("placeholder validation"));
+        assert!(error.to_string().contains("missing implementation evidence"));
     }
 
-    fn test_evidence_fixture(
-        changed_path: &str,
-        test_in_patch: &str,
-        executed_test: &str,
-    ) -> (crate::git::WorktreeChanges, String, String) {
+    fn claim_evidence_fixture(changed_path: &str) -> (crate::git::WorktreeChanges, String) {
         let changes = crate::git::WorktreeChanges {
             files: vec![crate::git::ChangedFile {
                 status: "M".into(),
@@ -1945,148 +2046,67 @@ mod tests {
             }],
             stat: format!("{changed_path} | 1 +"),
             diff: format!(
-                "diff --git a/{changed_path} b/{changed_path}\n--- a/{changed_path}\n+++ b/{changed_path}\n+fn {test_in_patch}() {{}}\n"
+                "diff --git a/{changed_path} b/{changed_path}\n--- a/{changed_path}\n+++ b/{changed_path}\n+fn covered() {{}}\n"
             ),
-        };
-        let validation = RevisionValidationEvidence {
-            evidence_id: "validation-current".into(),
-            worktree_fingerprint: revision_worktree_fingerprint(&changes),
-            report: crate::validation::ValidationReport {
-                steps: vec![crate::validation::ValidationStepResult {
-                    command: "cargo test persisted_revision_contract_lifecycle".into(),
-                    category: crate::validation::ValidationCategory::Test,
-                    passed: true,
-                    stdout: format!("test {executed_test} ... ok"),
-                    stderr: String::new(),
-                    exit_status: Some(0),
-                    diagnostics: None,
-                    failure_classification: None,
-                    fallback_command: None,
-                }],
-            },
         };
         let handoff = serde_json::json!({"claims": [{
             "blocker_id": "BLK-1", "status": "addressed",
             "implementation_summary": "Added deterministic lifecycle coverage.",
             "changed_files": [changed_path],
-            "evidence": [{
-                "changed_file": changed_path,
-                "validation_command": "cargo test persisted_revision_contract_lifecycle",
-                "test_names": ["persisted_revision_contract_lifecycle"]
-            }],
-            "validation_evidence": "Named test evidence is attached.",
             "unresolved_risk": null
         }]})
         .to_string();
-        (
-            changes,
-            serde_json::to_string(&validation).unwrap(),
-            handoff,
-        )
+        (changes, handoff)
+    }
+
+    // Validation ownership moved to automated review (see run_review_mode);
+    // revision handoff validation no longer requires provider-proven
+    // validation evidence. These tests cover what remains: the claim must be
+    // structurally sound and tied to real changed files.
+
+    #[test]
+    fn claim_without_current_change_evidence_is_rejected() {
+        let (_changes, handoff) = claim_evidence_fixture("tests/lifecycle.rs");
+        let error =
+            validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, None)
+                .unwrap_err();
+        assert!(error.to_string().contains("current change evidence"));
     }
 
     #[test]
-    fn changed_test_without_fresh_test_evidence_is_rejected() {
-        let (changes, _, handoff) = test_evidence_fixture(
-            "tests/lifecycle.rs",
-            "persisted_revision_contract_lifecycle",
-            "persisted_revision_contract_lifecycle",
-        );
-        let error = validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-            None,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("current validation evidence"));
-    }
-
-    #[test]
-    fn fresh_validation_with_unchanged_claimed_file_is_rejected() {
-        let (changes, validation, handoff) = test_evidence_fixture(
-            "tests/other.rs",
-            "persisted_revision_contract_lifecycle",
-            "persisted_revision_contract_lifecycle",
-        );
+    fn claimed_file_not_in_current_diff_is_rejected() {
+        let (changes, handoff) = claim_evidence_fixture("tests/other.rs");
         let handoff = handoff.replace("tests/other.rs", "tests/lifecycle.rs");
         let error = validate_revision_handoff_with_evidence(
             &handoff_contract(),
             &handoff,
             Some(&changes),
-            Some(&validation),
         )
         .unwrap_err();
         assert!(error.to_string().contains("file not changed"));
     }
 
     #[test]
-    fn fabricated_test_name_is_rejected() {
-        let (changes, validation, handoff) = test_evidence_fixture(
-            "tests/lifecycle.rs",
-            "persisted_revision_contract_lifecycle",
-            "some_other_test",
+    fn empty_implementation_summary_is_rejected() {
+        let (changes, handoff) = claim_evidence_fixture("tests/lifecycle.rs");
+        let handoff = handoff.replace(
+            "\"implementation_summary\":\"Added deterministic lifecycle coverage.\"",
+            "\"implementation_summary\":\"\"",
         );
         let error = validate_revision_handoff_with_evidence(
             &handoff_contract(),
             &handoff,
             Some(&changes),
-            Some(&validation),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("fabricated or unexecuted"));
+        assert!(error.to_string().contains("missing implementation evidence"));
     }
 
     #[test]
-    fn validation_from_previous_fingerprint_is_rejected() {
-        let (changes, validation, handoff) = test_evidence_fixture(
-            "tests/lifecycle.rs",
-            "persisted_revision_contract_lifecycle",
-            "persisted_revision_contract_lifecycle",
-        );
-        let mut validation: RevisionValidationEvidence = serde_json::from_str(&validation).unwrap();
-        validation.worktree_fingerprint = "rev-previous".into();
-        let error = validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-            Some(&serde_json::to_string(&validation).unwrap()),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("stale validation"));
-    }
-
-    #[test]
-    fn unrelated_changed_file_is_rejected_even_when_named_test_ran() {
-        let (changes, validation, handoff) = test_evidence_fixture(
-            "tests/unrelated.rs",
-            "unrelated_test",
-            "persisted_revision_contract_lifecycle",
-        );
-        let error = validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-            Some(&validation),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("fabricated or unexecuted"));
-    }
-
-    #[test]
-    fn current_diff_matching_test_and_fresh_passing_evidence_is_accepted() {
-        let (changes, validation, handoff) = test_evidence_fixture(
-            "tests/lifecycle.rs",
-            "persisted_revision_contract_lifecycle",
-            "persisted_revision_contract_lifecycle",
-        );
-        validate_revision_handoff_with_evidence(
-            &handoff_contract(),
-            &handoff,
-            Some(&changes),
-            Some(&validation),
-        )
-        .unwrap();
+    fn well_formed_claim_tied_to_real_changed_files_is_accepted() {
+        let (changes, handoff) = claim_evidence_fixture("tests/lifecycle.rs");
+        validate_revision_handoff_with_evidence(&handoff_contract(), &handoff, Some(&changes))
+            .unwrap();
     }
 
     type Invocation = (AgentAction, Option<String>, Option<ReasoningEffort>);
@@ -2143,6 +2163,7 @@ mod tests {
                     total_tokens: 30,
                     input_tokens: Some(20),
                     output_tokens: Some(10),
+                    cached_input_tokens: None,
                 }),
             })
         }
@@ -2450,6 +2471,323 @@ mod tests {
                 output: output.to_string(),
             },
         )
+    }
+
+    /// Records every command it was asked to run, exactly once each call, so
+    /// tests can assert both which commands were selected and that none ran
+    /// more than once per review.
+    struct RecordingValidationRunner {
+        fail_on: Vec<String>,
+        executed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingValidationRunner {
+        fn new(fail_on: &[&str]) -> Self {
+            Self {
+                fail_on: fail_on.iter().map(|value| (*value).to_owned()).collect(),
+                executed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn executed(&self) -> Vec<String> {
+            self.executed.lock().unwrap().clone()
+        }
+    }
+
+    impl ValidationRunner for RecordingValidationRunner {
+        fn run(
+            &self,
+            command: &str,
+            _working_dir: &Path,
+        ) -> Result<crate::validation::ValidationStepResult> {
+            self.executed.lock().unwrap().push(command.to_owned());
+            let passed = !self.fail_on.iter().any(|value| value == command);
+            Ok(crate::validation::ValidationStepResult {
+                command: command.to_owned(),
+                category: if passed {
+                    crate::validation::ValidationCategory::Success
+                } else {
+                    crate::validation::ValidationCategory::Test
+                },
+                passed,
+                stdout: String::new(),
+                stderr: if passed {
+                    String::new()
+                } else {
+                    format!("{command} failed")
+                },
+                exit_status: Some(if passed { 0 } else { 1 }),
+                diagnostics: None,
+                failure_classification: (!passed)
+                    .then_some(crate::validation::ValidationFailureClassification::Implementation),
+                fallback_command: None,
+            })
+        }
+    }
+
+    /// A review fixture with a real worktree directory configured with the
+    /// given `.orc/validation.toml` and changed files, for exercising
+    /// [`run_review_with_validation`].
+    fn validation_review_fixture(
+        output: serde_json::Value,
+        validation_toml: &str,
+        changed_files: &[&str],
+    ) -> (Database, ReviewSummary, FakeBackend, TempDir) {
+        let (db, mut summary, backend) = review_fixture(output);
+        let directory = tempdir().unwrap();
+        let worktree_rel = "worktree";
+        let worktree_dir = directory.path().join(worktree_rel);
+        std::fs::create_dir_all(worktree_dir.join(".orc")).unwrap();
+        std::fs::write(worktree_dir.join(".orc/validation.toml"), validation_toml).unwrap();
+        summary.worktree_path = Some(worktree_rel.to_owned());
+        summary.changes = crate::git::WorktreeChanges {
+            files: changed_files
+                .iter()
+                .map(|path| crate::git::ChangedFile {
+                    status: "M".into(),
+                    path: (*path).into(),
+                })
+                .collect(),
+            stat: String::new(),
+            diff: String::new(),
+        };
+        (db, summary, backend, directory)
+    }
+
+    const GROUPED_VALIDATION_TOML: &str = r#"
+commands = ["cargo test"]
+
+[[groups]]
+name = "rust-core"
+commands = ["cargo fmt --check", "cargo test"]
+
+[[groups]]
+name = "frontend"
+commands = ["npm run typecheck", "npm run build"]
+"#;
+
+    #[test]
+    fn review_owns_validation_and_persists_evidence_tied_to_the_reviewed_worktree() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let runner = RecordingValidationRunner::new(&[]);
+        let (run_id, result) = run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(result.verdict, "PASS");
+        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        let selection_event = db
+            .list_lifecycle_events_for_run(run_id, 20)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "review_validation_selection")
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&selection_event.payload.unwrap()).unwrap();
+        assert_eq!(payload["selected_groups"], serde_json::json!(["rust-core"]));
+        assert_eq!(
+            payload["worktree_fingerprint"],
+            serde_json::json!(revision_worktree_fingerprint(&summary.changes))
+        );
+        let validation_result = db
+            .latest_validation_result_for_run(run_id)
+            .unwrap()
+            .unwrap();
+        assert!(validation_result.contains("cargo fmt --check"));
+    }
+
+    #[test]
+    fn rust_core_task_review_does_not_run_frontend_validation() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/storage/db.rs"],
+        );
+        let runner = RecordingValidationRunner::new(&[]);
+        run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert!(
+            !runner
+                .executed()
+                .iter()
+                .any(|command| command.starts_with("npm"))
+        );
+    }
+
+    #[test]
+    fn frontend_task_review_does_not_run_rust_validation() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/App.vue", "package.json"],
+        );
+        let runner = RecordingValidationRunner::new(&[]);
+        run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(
+            runner.executed(),
+            vec!["npm run typecheck", "npm run build"]
+        );
+    }
+
+    #[test]
+    fn failed_task_specific_validation_becomes_a_focused_blocker_even_when_reviewer_says_pass() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [], "blockers": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let runner = RecordingValidationRunner::new(&["cargo fmt --check"]);
+        let (run_id, result) = run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(result.blockers.len(), 1);
+        assert!(result.blockers[0].finding.contains("cargo fmt --check"));
+        // Only the failing command ran; the pipeline stops at the first
+        // failure instead of running every selected command regardless.
+        assert_eq!(runner.executed(), vec!["cargo fmt --check"]);
+        let contract: RevisionContract = serde_json::from_str(
+            &db.actionable_revision_contract(&summary.task.id)
+                .unwrap()
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(contract.active_blockers.len(), 1);
+        assert!(
+            contract.validation_failures[0].contains("cargo fmt --check"),
+            "revision context should carry the exact failure evidence: {:?}",
+            contract.validation_failures
+        );
+        let _ = run_id;
+    }
+
+    #[test]
+    fn recurring_validation_failure_reopens_a_previously_resolved_blocker_as_a_regression() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [], "blockers": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let project_id = db.get_project_id().unwrap().unwrap();
+        let seed_run = db
+            .create_project_action_run(
+                project_id,
+                Some(summary.task.id.as_str()),
+                "review",
+                &agent().id,
+                AgentRunExecution {
+                    class: "review",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        db.commit_task_review_result(
+            &summary.task.id,
+            seed_run,
+            &[ReviewBlocker {
+                id: blocker_id("task-validation:cargo fmt --check"),
+                prior_blocker_id: None,
+                blocker_key: "task-validation:cargo fmt --check".into(),
+                requirement_ref: "task-specific validation (rust-core)".into(),
+                evidence: "previously failed".into(),
+                severity: "high".into(),
+                acceptance_condition: "`cargo fmt --check` must pass".into(),
+                status: "resolved".into(),
+                finding: "Task-specific validation command `cargo fmt --check` failed.".into(),
+            }],
+            None,
+            true,
+            "{}",
+            None,
+        )
+        .unwrap();
+
+        let runner = RecordingValidationRunner::new(&["cargo fmt --check"]);
+        let (_, result) = run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(result.blockers.len(), 1);
+        assert_eq!(result.blockers[0].status, "regression");
+    }
+
+    #[test]
+    fn review_without_a_worktree_skips_validation() {
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "PASS", "findings": [], "blocking_findings": [],
+            "non_blocking_findings": [], "severity": null, "revision_feedback": null
+        }));
+        let runner = RecordingValidationRunner::new(&[]);
+        let directory = tempdir().unwrap();
+        let (run_id, result) = run_review_with_validation(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(result.verdict, "PASS");
+        assert!(runner.executed().is_empty());
+        assert!(
+            db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

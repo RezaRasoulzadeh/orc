@@ -14,7 +14,7 @@ use crate::task::{Task, TaskScopeMode, TaskStatus};
 use crate::validation::{
     self, SystemValidationRunner, ValidationConfig, ValidationReport, ValidationRunner,
 };
-use crate::worker::{TokenUsage, Worker, WorkerOutcome};
+use crate::worker::{Worker, WorkerOutcome};
 
 /// Evidence observations come from the worker output and post-execution
 /// checks; declarations in PREPARE are never observations.
@@ -287,9 +287,7 @@ fn performed_operations_for_plan(
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
-const MAX_VALIDATION_REPAIRS: usize = 3;
 const MAX_COMPLETION_REPAIRS: usize = 2;
-const MAX_INFRASTRUCTURE_RETRIES: usize = 2;
 
 fn start_provider_invocation_bounded(
     db: &Database,
@@ -316,29 +314,6 @@ pub struct RevisionExecutionOverrides {
     pub effort: Option<ReasoningEffort>,
 }
 const CODER_PROMPT_PRECEDENCE: &str = "## Instruction precedence\n\n1. Orc execution and safety rules have the highest precedence.\n2. The `.orc/engineering.md` content below is the authoritative, mandatory project engineering contract and applies automatically; it does not need to be repeated in the task or user prompt.\n3. Role- and action-specific instructions follow the engineering contract.\n4. Task objectives and context, revision feedback, validation diagnostics, and all other run-specific instructions follow the engineering contract.\n\nLater task, revision, or repair text must not override or contradict mandatory requirements in `.orc/engineering.md`. If task-specific instructions conflict with the engineering contract, follow the engineering contract and report the conflict rather than silently overriding it.\n";
-
-fn run_validation_with_retries(
-    runner: &dyn ValidationRunner,
-    commands: &[String],
-    worktree: &Path,
-) -> Vec<ValidationReport> {
-    let mut reports = Vec::new();
-    for _ in 0..=MAX_INFRASTRUCTURE_RETRIES {
-        let report = validation::run_validation_pipeline(runner, commands, worktree)
-            .unwrap_or_else(|error| {
-                ValidationReport::infrastructure_failure(
-                    commands.first().map_or("validation", String::as_str),
-                    format!("{error:#}"),
-                )
-            });
-        let retry = report.is_infrastructure_failure();
-        reports.push(report);
-        if !retry {
-            break;
-        }
-    }
-    reports
-}
 
 fn task_contract_effort(db: &Database, task: &crate::task::Task) -> Result<ReasoningEffort> {
     let persisted = db
@@ -463,22 +438,6 @@ fn effective_revision_effort(
     })
 }
 
-fn validation_diagnostics(report: &ValidationReport) -> String {
-    report
-        .steps
-        .iter()
-        .filter(|step| !step.passed)
-        .map(|step| {
-            format!(
-                "command: {}\nstatus: failed\ndiagnostics:\n{}",
-                step.command,
-                step.output()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 fn validate_worker_step_completion(
     step: &crate::worker_protocol::PlannedStep,
     snapshot: Option<&(git::WorktreeChanges, git::WorktreeChanges)>,
@@ -577,182 +536,6 @@ fn validate_unchanged_constraints(
     Ok(())
 }
 
-fn persist_validation_result(
-    db: &Database,
-    task_id: &str,
-    run_id: i64,
-    agent_id: &str,
-    report: &ValidationReport,
-) -> Result<()> {
-    let evidence =
-        serde_json::to_string(report).context("failed to serialize validation result")?;
-    db.record_lifecycle_event(
-        "validation_result",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&evidence),
-    )?;
-    Ok(())
-}
-
-fn persist_validation_attempt(
-    db: &Database,
-    task_id: &str,
-    run_id: i64,
-    agent_id: &str,
-    report: &ValidationReport,
-    repair_attempt: usize,
-    validation_attempt: usize,
-) -> Result<()> {
-    let payload = serde_json::json!({
-        "repair_attempt": repair_attempt,
-        "validation_attempt": validation_attempt,
-        "report": report,
-    });
-    db.record_lifecycle_event(
-        "validation_attempt",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&payload.to_string()),
-    )?;
-    persist_validation_result(db, task_id, run_id, agent_id, report)?;
-    Ok(())
-}
-
-fn repair_prompt(diff: &str, diagnostics: &str, attempt: usize) -> String {
-    format!(
-        "## Focused automatic validation repair\n\nRepair attempt {attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree and fix only the exact failed command/requirement. Do not reset, clean, recreate, or replace the worktree.\n\n## Relevant current worktree diff\n\n{diff}\n\n## Exact failed command and diagnostics\n\n{diagnostics}\n\nAfter repairing, leave changes in this worktree and report only the focused repair."
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the shared repair boundary needs execution, persistence, and progress context"
-)]
-fn run_validation_repair_loop(
-    validation_runner: &dyn ValidationRunner,
-    commands: &[String],
-    worker: &dyn Worker,
-    db: &Database,
-    worktree: &Path,
-    repo_path: &Path,
-    task_id: &str,
-    run_id: i64,
-    agent_id: &str,
-    output: &mut Option<String>,
-    token_usage: &mut Option<TokenUsage>,
-    progress: &dyn Fn(&str),
-    worker_output: &dyn Fn(&str),
-    cancellation: Option<&crate::worker::CancellationControl>,
-) -> Result<ValidationReport> {
-    let reports = run_validation_with_retries(validation_runner, commands, worktree);
-    for (index, report) in reports.iter().enumerate() {
-        persist_validation_attempt(db, task_id, run_id, agent_id, report, 0, index + 1)?;
-    }
-    let mut report = reports
-        .into_iter()
-        .last()
-        .expect("validation always produces a report");
-    let mut repair_attempt = 0;
-    while !report.is_success()
-        && !report.is_infrastructure_failure()
-        && repair_attempt < MAX_VALIDATION_REPAIRS
-    {
-        repair_attempt += 1;
-        let diagnostics = validation_diagnostics(&report);
-        let diff = git::inspect_worktree(worktree, repo_path)?.diff;
-        let repair = repair_prompt(&diff, &diagnostics, repair_attempt);
-        db.record_lifecycle_event(
-            "validation_repair_started",
-            Some(task_id),
-            Some(run_id),
-            Some(agent_id),
-            Some(
-                &serde_json::json!({
-                    "repair_attempt": repair_attempt,
-                    "prompt": repair,
-                })
-                .to_string(),
-            ),
-        )?;
-        progress(&format!("validation repair attempt {repair_attempt}"));
-        let repair_invocation = start_provider_invocation_bounded(
-            db,
-            run_id,
-            task_id,
-            "validation_repair",
-            repair_attempt,
-            ReasoningEffort::Low,
-        )?;
-        let repair_execution = worker.execute_repair_with_progress_and_usage(
-            &repair,
-            worktree,
-            &crate::worker_protocol::repair_completion_schema(),
-            worker_output,
-            cancellation,
-        );
-        db.finish_provider_invocation(
-            repair_invocation,
-            if repair_execution.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-            repair_execution
-                .as_ref()
-                .ok()
-                .and_then(|value| value.token_usage),
-        )?;
-        let execution = repair_execution
-            .map_err(|error| anyhow::anyhow!("Validation repair worker failed: {error}"))?;
-        db.record_lifecycle_event(
-            "validation_repair_completed",
-            Some(task_id),
-            Some(run_id),
-            Some(agent_id),
-            Some(
-                &serde_json::json!({
-                    "repair_attempt": repair_attempt,
-                    "outcome": match &execution.outcome {
-                        WorkerOutcome::Success => "success",
-                        WorkerOutcome::Failure(_) => "failure",
-                    },
-                    "output": execution.output,
-                })
-                .to_string(),
-            ),
-        )?;
-        if let WorkerOutcome::Failure(error) = execution.outcome {
-            anyhow::bail!("Validation repair worker failed: {error}");
-        }
-        if execution.output.is_some() {
-            *output = execution.output;
-        }
-        if execution.token_usage.is_some() {
-            *token_usage = execution.token_usage;
-        }
-        let reports = run_validation_with_retries(validation_runner, commands, worktree);
-        for (index, report) in reports.iter().enumerate() {
-            persist_validation_attempt(
-                db,
-                task_id,
-                run_id,
-                agent_id,
-                report,
-                repair_attempt,
-                index + 1,
-            )?;
-        }
-        report = reports
-            .into_iter()
-            .last()
-            .expect("validation always produces a report");
-    }
-    Ok(report)
-}
-
 fn architecture_decisions(output: &str) -> Vec<&str> {
     let mut decisions = Vec::new();
     let mut reported = HashSet::new();
@@ -800,7 +583,7 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         })
         .unwrap_or_default();
     format!(
-        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Run focused checks and production-path tests relevant to the changed area and fix failures you encounter. Orc owns and will run the complete configured project validation gate after your single implementation session, so do not repeatedly run that full pipeline. Do not modify unrelated files or change task status. Stop after completing the task and summarize what you changed and any follow-up steps.\n",
+        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Stay within the specified scope; do not modify unrelated files or change task status. Do not run the project's validation/test suite, focused checks, or any other command to prove completion \u{2014} automated review owns validation and will run the task-specific checks it needs after this session ends. Stop as soon as the implementation is complete and summarize what you changed and any follow-up steps.\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         contract = contract,
         project = project,
@@ -810,6 +593,19 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         role = task.role,
         execution_contract = execution_contract,
     )
+}
+
+/// Whether the formatted revision contract already carries this feedback
+/// text, so the revision prompt does not repeat the same review feedback
+/// under two separate headings.
+fn contract_already_contains_feedback(
+    contract: &crate::automated::RevisionContract,
+    feedback: &str,
+) -> bool {
+    contract
+        .reviewer_revision_feedback
+        .iter()
+        .any(|recorded| recorded.trim() == feedback.trim())
 }
 
 pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id: &str) -> String {
@@ -935,7 +731,10 @@ pub fn dispatch_with_worker_on_db_cancellable(
     db: &Database,
     repo_path: impl AsRef<Path>,
     agent_id: &str,
-    validation_runner: &dyn ValidationRunner,
+    // Configured project validation is no longer run by dispatch; it is
+    // owned by automated review. The parameter is retained for API
+    // compatibility with existing callers.
+    _validation_runner: &dyn ValidationRunner,
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
@@ -981,9 +780,8 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let acceptance_criteria =
         worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
     let required_tests = worker_requirements(&proposal.required_tests, "required-test");
-    // The Worker may run focused checks while implementing, but configured
-    // validation is Orc's authoritative final gate and is not provider-
-    // reported evidence.
+    // Configured project validation is owned by automated review, not the
+    // implementation session; no validation checkpoints are demanded here.
     let verification = Vec::new();
     let plan = crate::worker_protocol::WorkerPlan {
         protocol_version: crate::worker_protocol::WORKER_PROTOCOL_VERSION,
@@ -1172,7 +970,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
             match outcome {
                 WorkerOutcome::Success => {
                     progress("worker completed");
-                    let mut changes;
+                    let changes;
                     if enforce_worker_protocol {
                         let mut completion_repair = 0;
                         loop {
@@ -1384,98 +1182,15 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         }
                     }
                     db.store_change_evidence(run_id, &changes)?;
-                    let validation_config = match ValidationConfig::load(&worktree_dir) {
-                        Ok(config) => config,
-                        Err(error) => {
-                            let output = format!(
-                                "{}\n\nValidation setup failed: {error:#}",
-                                output.as_deref().unwrap_or_default()
-                            );
-                            db.update_agent_run_status_with_usage(
-                                run_id,
-                                "failed",
-                                Some(&output),
-                                token_usage,
-                            )?;
-                            db.update_task_status(task_id, TaskStatus::Blocked)?;
-                            anyhow::bail!("validation setup failed for task {task_id}")
-                        }
-                    };
-                    progress("validation started");
-                    let report = match run_validation_repair_loop(
-                        validation_runner,
-                        &validation_config.commands,
-                        worker,
-                        db,
-                        &worktree_dir,
-                        repo_path,
-                        task_id,
-                        run_id,
-                        agent_id,
-                        &mut output,
-                        &mut token_usage,
-                        &progress,
-                        &worker_output,
-                        cancellation,
-                    ) {
-                        Ok(report) => report,
-                        Err(error) => {
-                            let message = format!("{error:#}");
-                            db.update_agent_run_status_with_usage(
-                                run_id,
-                                "failed",
-                                Some(&message),
-                                token_usage,
-                            )?;
-                            db.update_task_status(task_id, TaskStatus::Blocked)?;
-                            anyhow::bail!(message);
-                        }
-                    };
-                    changes = git::inspect_worktree(&worktree_dir, repo_path)
-                        .context("failed to inspect worktree after validation")?;
-                    progress("validation completed");
-                    let validation_summary = report.summary();
-                    let validation_observation = if validation_summary.trim().is_empty() {
-                        "PASS (configured validation completed successfully)"
-                    } else {
-                        validation_summary.as_str()
-                    };
-                    let combined_output = if validation_summary.is_empty() {
-                        output.clone().unwrap_or_default()
-                    } else {
-                        format!(
-                            "{}\n\nValidation:\n{}",
-                            output.clone().unwrap_or_default(),
-                            validation_summary
-                        )
-                    };
+                    // Configured project validation is owned by automated review, not
+                    // dispatch. Dispatch publishes implementation/change evidence and
+                    // transitions straight into review.
+                    let combined_output = output.clone().unwrap_or_default();
                     for decision in architecture_decisions(&combined_output) {
                         db.insert_approval_request(project_id, decision)
                             .with_context(
                                 || "failed to record architecture decision approval request",
                             )?;
-                    }
-                    if !report.is_success() {
-                        let evidence = failed_execution_evidence(
-                            &plan,
-                            &step_outputs,
-                            &step_snapshots,
-                            &validation_config.commands,
-                            &combined_output,
-                            enforce_worker_protocol,
-                        );
-                        db.store_worker_execution(run_id, &evidence)?;
-                        db.update_agent_run_status_with_usage(
-                            run_id,
-                            "failed",
-                            Some(&combined_output),
-                            token_usage,
-                        )?;
-                        // The worker completed and left inspectable changes.  A failed
-                        // validation is therefore reviewable work, unlike an execution
-                        // failure which cannot safely enter the review/revise flow.
-                        db.update_task_status(task_id, TaskStatus::Review)?;
-                        anyhow::bail!("validation failed for task {task_id}; task requires review");
                     }
                     let performed_operations = performed_operations_for_plan(
                         &plan.steps,
@@ -1503,11 +1218,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                     step_id: step.id.clone(),
                                     observed: worker_observations(
                                         step_output,
-                                        if index + 1 == plan.steps.len() {
-                                            validation_observation
-                                        } else {
-                                            ""
-                                        },
+                                        "",
                                         step_snapshots
                                             .get(index)
                                             .map(|(_, after)| after)
@@ -1516,22 +1227,17 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                         !enforce_worker_protocol,
                                     ),
                                     verification: step.verification.clone(),
-                                    passed: report.is_success()
-                                        && step.verification.iter().all(|check| {
-                                            crate::worker_protocol::reported_verifications(
-                                                step_output.unwrap_or_default(),
-                                            )
-                                            .iter()
-                                            .any(|reported| reported == check)
-                                                || (!enforce_worker_protocol
-                                                    && check.trim()
-                                                        == "configured validation evidence"
-                                                    && validation_observation.contains("PASS"))
-                                        }),
+                                    passed: step.verification.iter().all(|check| {
+                                        crate::worker_protocol::reported_verifications(
+                                            step_output.unwrap_or_default(),
+                                        )
+                                        .iter()
+                                        .any(|reported| reported == check)
+                                    }),
                                 }
                             })
                             .collect(),
-                        configured_validation: validation_config.commands.clone(),
+                        configured_validation: Vec::new(),
                         unresolved_issues: Vec::new(),
                     };
                     if let Err(error) = evidence.validate_against_plan(&plan) {
@@ -1590,7 +1296,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         worktree_path: worktree_path.display().to_string(),
                         run_id,
                         run_status: "completed".to_owned(),
-                        validation: "PASS".to_owned(),
+                        validation: "deferred to review".to_owned(),
                         changes,
                     })
                 }
@@ -1860,7 +1566,10 @@ pub fn revise_with_worker_on_db_with_overrides(
     db: &Database,
     repo_path: impl AsRef<Path>,
     agent_id: &str,
-    validation_runner: &dyn ValidationRunner,
+    // Configured project validation is no longer run by revision; it is
+    // owned by automated review. The parameter is retained for API
+    // compatibility with existing callers.
+    _validation_runner: &dyn ValidationRunner,
     overrides: &RevisionExecutionOverrides,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
@@ -2063,12 +1772,20 @@ pub fn revise_with_worker_on_db_with_overrides(
         println!("[orc] worker output: {line}");
     };
     progress("revision/worker starting");
+    // The revision contract already carries the source review's feedback
+    // once (see format_revision_contract). Only append `feedback` again when
+    // it adds information the contract does not already contain, e.g. an
+    // operator-supplied override distinct from the persisted review.
+    let extra_feedback = (!feedback.trim().is_empty()
+        && !contract_already_contains_feedback(&revision_contract, feedback))
+    .then(|| format!("\n\n## Additional operator feedback\n\n{feedback}"))
+    .unwrap_or_default();
     let prompt = format!(
-        "{}\n\n## Selected revision effort\n\nReasoning effort: {}\n\n{}\n\n## Review feedback (compatibility context)\n\n{}\n\nRevise the existing implementation in the existing task worktree, then rerun validation.",
+        "{}\n\n## Selected revision effort\n\nReasoning effort: {}\n\n{}{}\n\nFix ONLY the active blockers listed above, using the supplied blocker and relevant-file context. Do not broadly rediscover the repository and do not run the project's validation/test suite \u{2014} automated review will validate the result. Stop as soon as the fixes are implemented.",
         build_worker_prompt(&contract, &project_name, &task),
         revision_effort.as_str(),
         crate::automated::format_revision_contract(&revision_contract),
-        feedback
+        extra_feedback,
     );
     let prompt = format!(
         "{}\n\nWORKER EXECUTION PROTOCOL (mandatory): execute the persisted revision PREPARE plan in exact order and verify each step before continuing.\n{}",
@@ -2145,20 +1862,14 @@ pub fn revise_with_worker_on_db_with_overrides(
     };
     let outcome = execution.outcome;
     let mut output = execution.output;
-    let initial_token_usage = execution.token_usage;
-    let mut token_usage = initial_token_usage;
+    let token_usage = execution.token_usage;
     let fail = |message: String| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
             "worker timeout"
         } else {
             "revision failed"
         });
-        db.update_agent_run_status_with_usage(
-            run_id,
-            "failed",
-            Some(&message),
-            initial_token_usage,
-        )?;
+        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
         db.update_task_status(task_id, TaskStatus::Blocked)?;
         anyhow::bail!("{message}")
     };
@@ -2286,7 +1997,7 @@ pub fn revise_with_worker_on_db_with_overrides(
             )?;
         }
     }
-    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(current) => git::changes_since(&baseline_changes, &current),
         Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
     };
@@ -2294,87 +2005,10 @@ pub fn revise_with_worker_on_db_with_overrides(
         return fail("Revision completed without meaningful project changes.".into());
     }
     db.store_change_evidence(run_id, &changes)?;
-    let config = match ValidationConfig::load(&worktree_dir) {
-        Ok(config) => config,
-        Err(error) => return fail(format!("Validation setup failed: {error:#}")),
-    };
-    progress("validation started");
-    let report = match run_validation_repair_loop(
-        validation_runner,
-        &config.commands,
-        worker,
-        db,
-        &worktree_dir,
-        repo_path,
-        task_id,
-        run_id,
-        agent_id,
-        &mut output,
-        &mut token_usage,
-        &progress,
-        &worker_output,
-        None,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            let message = format!("{error:#}");
-            progress(if message.to_ascii_lowercase().contains("timeout") {
-                "worker timeout"
-            } else {
-                "revision failed"
-            });
-            db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
-            db.update_task_status(task_id, TaskStatus::Blocked)?;
-            anyhow::bail!(message)
-        }
-    };
-    let fail = |message: String| -> Result<DispatchSummary> {
-        progress(if message.to_ascii_lowercase().contains("timeout") {
-            "worker timeout"
-        } else {
-            "revision failed"
-        });
-        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
-        db.update_task_status(task_id, TaskStatus::Blocked)?;
-        anyhow::bail!(message)
-    };
-    changes = match git::inspect_worktree(&worktree_dir, repo_path) {
-        Ok(current) => git::changes_since(&baseline_changes, &current),
-        Err(error) => return fail(format!("Post-validation inspection failed: {error:#}")),
-    };
-    db.store_change_evidence(run_id, &changes)?;
-    progress("validation completed");
-    let summary = report.summary();
-    let revision_validation_evidence =
-        serde_json::to_string(&crate::automated::RevisionValidationEvidence {
-            evidence_id: format!("revision-validation-{run_id}"),
-            worktree_fingerprint: crate::automated::revision_worktree_fingerprint(&changes),
-            report: report.clone(),
-        })?;
-    db.record_lifecycle_event(
-        "revision_validation_evidence",
-        Some(task_id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&revision_validation_evidence),
-    )?;
-    let combined = format!(
-        "{}\n\nValidation:\n{}",
-        output.clone().unwrap_or_default(),
-        summary
-    );
-    if !report.is_success() {
-        let evidence = failed_execution_evidence(
-            &revision_plan,
-            &revision_step_outputs,
-            &revision_step_snapshots,
-            &config.commands,
-            &combined,
-            enforce_worker_protocol,
-        );
-        db.store_worker_execution(run_id, &evidence)?;
-        return fail(combined);
-    }
+    // Configured project validation is owned by automated review, not
+    // revision. Revision publishes implementation/change evidence and
+    // transitions straight back into review.
+    let combined = output.clone().unwrap_or_default();
     let performed_operations = performed_operations_for_plan(
         &revision_plan.steps,
         &revision_step_outputs,
@@ -2396,11 +2030,7 @@ pub fn revise_with_worker_on_db_with_overrides(
                     step_id: step.id.clone(),
                     observed: worker_observations(
                         step_output,
-                        if index + 1 == revision_plan.steps.len() {
-                            &summary
-                        } else {
-                            ""
-                        },
+                        "",
                         revision_step_snapshots
                             .get(index)
                             .map(|(_, after)| after)
@@ -2409,21 +2039,17 @@ pub fn revise_with_worker_on_db_with_overrides(
                         !enforce_worker_protocol,
                     ),
                     verification: step.verification.clone(),
-                    passed: report.is_success()
-                        && step.verification.iter().all(|check| {
-                            crate::worker_protocol::reported_verifications(
-                                step_output.unwrap_or_default(),
-                            )
-                            .iter()
-                            .any(|reported| reported == check)
-                                || (!enforce_worker_protocol
-                                    && check.trim() == "configured validation evidence"
-                                    && summary.contains("PASS"))
-                        }),
+                    passed: step.verification.iter().all(|check| {
+                        crate::worker_protocol::reported_verifications(
+                            step_output.unwrap_or_default(),
+                        )
+                        .iter()
+                        .any(|reported| reported == check)
+                    }),
                 }
             })
             .collect(),
-        configured_validation: config.commands.clone(),
+        configured_validation: Vec::new(),
         unresolved_issues: Vec::new(),
     };
     if let Err(error) = revision_evidence.validate_against_plan(&revision_plan) {
@@ -2449,8 +2075,8 @@ pub fn revise_with_worker_on_db_with_overrides(
     db.store_worker_execution(run_id, &revision_evidence)
         .context("failed to persist Worker revision execution evidence")?;
     // The subsequent automated review is authoritative for blocker
-    // resolution.  Consume and link the source review only after the
-    // revision has produced changes and passed the configured validation.
+    // resolution and validation. Consume and link the source review only
+    // after the revision has produced inspectable, evidenced changes.
     if !db.complete_revision_run_for_review(
         task_id,
         run_id,
@@ -2459,7 +2085,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         &combined,
         token_usage,
     )? {
-        return fail("Revision review was consumed before successful validation.".into());
+        return fail("Revision review was consumed before this revision completed.".into());
     }
     progress("review transition");
     Ok(DispatchSummary {
@@ -2474,7 +2100,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         worktree_path,
         run_id,
         run_status: "completed".into(),
-        validation: "PASS".into(),
+        validation: "deferred to review".into(),
         changes,
     })
 }
@@ -2920,12 +2546,10 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
             source_review_id,
         )?;
         let changes = db.get_change_evidence(run_id)?;
-        let validation = db.latest_revision_validation_evidence_for_run(run_id)?;
         let handoff = crate::automated::validate_revision_handoff_with_evidence(
             &contract,
             output,
             changes.as_ref(),
-            validation.as_deref(),
         )
         .context("invalid revision handoff")?;
         db.record_lifecycle_event(

@@ -40,6 +40,12 @@ pub struct TokenUsage {
     pub total_tokens: i64,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// The subset of `input_tokens` served from cache, when the provider
+    /// reports it (e.g. Codex's `cached_input_tokens`). Observability only:
+    /// never subtracted from any enforcement budget. `None` for providers
+    /// that do not report cached input.
+    #[serde(default)]
+    pub cached_input_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1205,6 +1211,9 @@ fn parse_codex_jsonl(
             let input_tokens = value
                 .get("input_tokens")
                 .and_then(serde_json::Value::as_i64);
+            let cached_input_tokens = value
+                .get("cached_input_tokens")
+                .and_then(serde_json::Value::as_i64);
             let output_tokens = value
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_i64);
@@ -1221,6 +1230,7 @@ fn parse_codex_jsonl(
                     total_tokens,
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
                 });
             }
         }
@@ -1438,6 +1448,23 @@ mod tests {
                 total_tokens: 150,
                 input_tokens: Some(120),
                 output_tokens: Some(30),
+                cached_input_tokens: Some(20),
+            })
+        );
+    }
+
+    #[test]
+    fn codex_json_events_treat_cached_input_tokens_as_optional() {
+        let events = r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"output_tokens":30}}"#;
+        let (_, usage) = parse_codex_jsonl(events, false).unwrap();
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                total_tokens: 150,
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                cached_input_tokens: None,
             })
         );
     }

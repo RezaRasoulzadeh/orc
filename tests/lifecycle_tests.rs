@@ -25,6 +25,29 @@ impl Worker for EvolvingWorker {
     }
 }
 
+struct PassIgnoringValidationReviewBackend;
+
+impl ActionBackend for PassIgnoringValidationReviewBackend {
+    fn invoke(
+        &self,
+        _: &AgentDefinition,
+        action: AgentAction,
+        _: &str,
+        _: Option<&str>,
+        _: Option<registry::ReasoningEffort>,
+    ) -> Result<ActionExecution> {
+        assert_eq!(action, AgentAction::Review);
+        // The reviewer claims a clean PASS despite the task-specific
+        // validation Orc executed having failed; automated review must
+        // still surface a blocker and not accept this as PASS.
+        Ok(ActionExecution {
+            output: r#"{"verdict":"PASS","findings":[],"blocking_findings":[],"blockers":[]}"#
+                .into(),
+            token_usage: None,
+        })
+    }
+}
+
 impl ActionBackend for ValidationLifecycleReviewBackend {
     fn invoke(
         &self,
@@ -355,6 +378,28 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
     let db = Database::init(&db_path).unwrap();
     let project = db.create_project("validation-lifecycle").unwrap();
     register_eligible_agent(&db);
+    db.insert_agent(&AgentDefinition {
+        id: "eligible-reviewer".into(),
+        backend: "codex".into(),
+        execution_mode: registry::AUTOMATED.into(),
+        display_name: "Reviewer".into(),
+        enabled: true,
+        priority: 100,
+        capabilities: vec!["review".into()],
+        status: registry::AVAILABLE.into(),
+        unavailable_reason: None,
+        profile_path: None,
+        model: None,
+        reasoning_effort: None,
+        config_metadata: None,
+        quota_remaining_percent: Some(100),
+        quota_reset_at: None,
+        quota_checked_at: None,
+        quota_source: None,
+        quota_limits: None,
+        actions: vec![AgentAction::Review],
+    })
+    .unwrap();
     let task = get_unique_task_id();
     db.insert_task_with_id(
         project,
@@ -366,7 +411,8 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
     )
     .unwrap();
 
-    let runner = FakeValidationRunner::failing_on("cargo test validation-lifecycle");
+    // Dispatch no longer runs configured validation itself; it succeeds and
+    // publishes the task for review regardless of what validation would say.
     let worker = FakeWorker::new_success(None);
     let result = agent::dispatch_with_worker_on_db(
         &task,
@@ -374,9 +420,9 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
         &db,
         &repo_dir,
         "eligible-codex",
-        &runner,
+        &FakeValidationRunner::success(),
     );
-    assert!(result.is_err());
+    assert!(result.is_ok());
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review
@@ -384,16 +430,45 @@ fn validation_failure_enters_review_with_evidence_and_cannot_be_requeued() {
 
     let runs = db.list_agent_runs_for_task(&task).unwrap();
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, "failed");
+    assert_eq!(runs[0].status, "completed");
+    assert!(
+        db.latest_validation_result_for_run(runs[0].id)
+            .unwrap()
+            .is_none(),
+        "dispatch must not persist validation evidence; that is review's job"
+    );
+
+    // Automated review owns validation: it selects and runs the configured
+    // command against the reviewed worktree, and a failure becomes a
+    // blocker even though the reviewer backend claims PASS.
+    let app = OrcApp::open(&db_path, &repo_dir).unwrap();
+    let overrides = ActionOverrides {
+        agent_id: Some("eligible-reviewer".into()),
+        ..ActionOverrides::default()
+    };
+    let (review_run, review) = app
+        .automated_review_with_backend_and_validation(
+            &task,
+            &overrides,
+            &PassIgnoringValidationReviewBackend,
+            &FakeValidationRunner::failing_on("cargo test validation-lifecycle"),
+        )
+        .unwrap();
+    assert_eq!(review.verdict, "REVISE");
+    assert_eq!(review.blockers.len(), 1);
+    assert!(
+        review.blockers[0]
+            .finding
+            .contains("cargo test validation-lifecycle")
+    );
     let validation = db
-        .latest_validation_result_for_run(runs[0].id)
+        .latest_validation_result_for_run(review_run)
         .unwrap()
         .unwrap();
     assert!(validation.contains("validation-lifecycle"));
     assert!(validation.contains("command failed"));
     assert!(repo_dir.join(".orc/worktrees").join(&task).exists());
 
-    let app = OrcApp::open(&db_path, &repo_dir).unwrap();
     let requeue = app.requeue(&task).unwrap_err().to_string();
     assert!(requeue.contains("cannot be requeued") || requeue.contains("not active"));
     assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Review);
@@ -457,7 +532,8 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
     )
     .unwrap();
 
-    let failing = FakeValidationRunner::failing_on("validation");
+    // Dispatch no longer runs configured validation itself, so it succeeds
+    // regardless of what validation would later say during review.
     assert!(
         agent::dispatch_with_worker_on_db(
             &task,
@@ -465,9 +541,9 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
             &db,
             &repo_dir,
             "eligible-codex",
-            &failing
+            &FakeValidationRunner::success(),
         )
-        .is_err()
+        .is_ok()
     );
     let worker = EvolvingWorker;
     let worktree = repo_dir.join(db.get_worktree_metadata(&task).unwrap().unwrap().1);
@@ -480,7 +556,12 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
         ..ActionOverrides::default()
     };
     let (review_run, review) = app
-        .automated_review_with_backend(&task, &overrides, &ValidationLifecycleReviewBackend)
+        .automated_review_with_backend_and_validation(
+            &task,
+            &overrides,
+            &ValidationLifecycleReviewBackend,
+            &FakeValidationRunner::success(),
+        )
         .unwrap();
     assert_eq!(review.verdict, "REVISE");
     assert!(db.actionable_revision_contract(&task).unwrap().is_some());

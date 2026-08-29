@@ -1,3 +1,53 @@
+# Known/available validation commands and groups for this project.
+# `commands` is the flat list of every known command (used when no group
+# taxonomy applies, e.g. a legacy consumer that expects a single list).
+#
+# Automated review selects the smallest relevant group(s) below for a given
+# task rather than running every command for every task. See
+# ValidationConfig::select_for_task in src/validation.rs.
+commands = [
+  "npm run typecheck",
+  "npm run build",
+  "npm test",
+  "npm run tauri:build",
+  "npm run validate:package",
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+  "cargo test --manifest-path src-tauri/Cargo.toml",
+]
+
+[[groups]]
+name = "rust-core"
+commands = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+]
+
+[[groups]]
+name = "frontend"
+commands = [
+  "npm run typecheck",
+  "npm run build",
+  "npm test",
+]
+
+[[groups]]
+name = "tauri"
+commands = [
+  "cargo test --manifest-path src-tauri/Cargo.toml",
+]
+
+[[groups]]
+name = "packaging"
+commands = [
+  "npm run tauri:build",
+  "npm run validate:package",
+]
+
+[[groups]]
+name = "integration"
 commands = [
   "npm run typecheck",
   "npm run build",

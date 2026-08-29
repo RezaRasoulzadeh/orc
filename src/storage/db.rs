@@ -63,6 +63,7 @@ pub struct ProviderInvocation {
     pub total_tokens: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -191,6 +192,7 @@ mod reservation_lifecycle_tests {
                 total_tokens: 30,
                 input_tokens: Some(20),
                 output_tokens: Some(10),
+                cached_input_tokens: Some(6),
             };
 
             db.complete_agent_run_for_review(&task, run, "validated", Some(usage))
@@ -211,6 +213,7 @@ mod reservation_lifecycle_tests {
             assert_eq!(result.total_tokens, Some(30));
             assert_eq!(result.input_tokens, Some(20));
             assert_eq!(result.output_tokens, Some(10));
+            assert_eq!(result.cached_input_tokens, Some(6));
             let events = db.list_lifecycle_events_for_run(run, 10).unwrap();
             let worker_events = events
                 .iter()
@@ -225,6 +228,51 @@ mod reservation_lifecycle_tests {
             );
             assert!(db.list_busy_agents().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn provider_invocation_is_not_rejected_after_cumulative_tokens_exceed_old_budget() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("ORC_PROVIDER_TOKEN_BUDGET");
+        // Historically, ORC_PROVIDER_TOKEN_BUDGET (default 500_000) capped
+        // cumulative provider token usage per run. Setting it here proves the
+        // variable no longer has any effect now that enforcement is removed.
+        unsafe {
+            std::env::set_var("ORC_PROVIDER_TOKEN_BUDGET", "1");
+        }
+        let (_directory, _path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        let first = db
+            .start_provider_invocation(run, "implementation", 1, None)
+            .unwrap();
+        db.finish_provider_invocation(
+            first,
+            "completed",
+            Some(crate::worker::TokenUsage {
+                total_tokens: 900_000,
+                input_tokens: Some(800_000),
+                output_tokens: Some(100_000),
+                cached_input_tokens: Some(50_000),
+            }),
+        )
+        .unwrap();
+
+        // A second invocation on the same parent run, after cumulative usage
+        // already far exceeds the old 500_000-token budget, must still be
+        // permitted: token accounting is observability only.
+        let second = db.start_provider_invocation(run, "completion_repair", 1, None);
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORC_PROVIDER_TOKEN_BUDGET", value) },
+            None => unsafe { std::env::remove_var("ORC_PROVIDER_TOKEN_BUDGET") },
+        }
+
+        assert!(second.is_ok());
+        let invocations = db.provider_invocations(run).unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].total_tokens, Some(900_000));
+        assert_eq!(invocations[0].cached_input_tokens, Some(50_000));
     }
 
     #[test]
@@ -644,6 +692,7 @@ pub struct WorkerResult {
     pub total_tokens: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1504,7 +1553,8 @@ impl Database {
                 metadata TEXT,
                 total_tokens INTEGER,
                 input_tokens INTEGER,
-                output_tokens INTEGER
+                output_tokens INTEGER,
+                cached_input_tokens INTEGER
             );
             CREATE TABLE IF NOT EXISTS worker_protocol_results (
                 run_id INTEGER PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -2162,19 +2212,6 @@ impl Database {
             .optional()?)
     }
 
-    pub fn latest_revision_validation_evidence_for_run(
-        &self,
-        run_id: i64,
-    ) -> Result<Option<String>, DbError> {
-        self.conn
-            .query_row(
-                "SELECT payload FROM lifecycle_events WHERE run_id = ?1 AND kind = 'revision_validation_evidence' ORDER BY id DESC LIMIT 1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(DbError::from)
-    }
 
     fn list_lifecycle_events_scoped(
         &self,
@@ -2430,7 +2467,12 @@ impl Database {
             .prepare("PRAGMA table_info(worker_results)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        for column in ["total_tokens", "input_tokens", "output_tokens"] {
+        for column in [
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+        ] {
             if !columns.iter().any(|value| value == column) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE worker_results ADD COLUMN {column} INTEGER"
@@ -2484,6 +2526,7 @@ impl Database {
             ("total_tokens", "INTEGER"),
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
+            ("cached_input_tokens", "INTEGER"),
         ] {
             let exists: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('provider_invocations') WHERE name='{column}'"), [], |row| row.get(0))?;
             if exists == 0 {
@@ -2546,16 +2589,6 @@ impl Database {
             params![parent_run_id, purpose],
             |row| row.get(0),
         )?;
-        let token_limit = std::env::var("ORC_PROVIDER_TOKEN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(500_000);
-        let consumed: i64 = self.conn.query_row("SELECT COALESCE(SUM(total_tokens), 0) FROM provider_invocations WHERE parent_run_id=?1", [parent_run_id], |row| row.get(0))?;
-        if consumed >= token_limit {
-            return Err(DbError::Scheduler(format!(
-                "provider token budget exhausted ({consumed}/{token_limit}) before phase '{purpose}'"
-            )));
-        }
         let invocation_limit = std::env::var("ORC_PROVIDER_INVOCATION_BUDGET")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -2616,8 +2649,15 @@ impl Database {
         usage: Option<crate::worker::TokenUsage>,
     ) -> Result<bool, DbError> {
         Ok(self.conn.execute(
-            "UPDATE provider_invocations SET outcome=?1, finished_at=CURRENT_TIMESTAMP, total_tokens=?3, input_tokens=?4, output_tokens=?5 WHERE id=?2 AND outcome='running'",
-            params![outcome, id, usage.map(|v| v.total_tokens), usage.and_then(|v| v.input_tokens), usage.and_then(|v| v.output_tokens)],
+            "UPDATE provider_invocations SET outcome=?1, finished_at=CURRENT_TIMESTAMP, total_tokens=?3, input_tokens=?4, output_tokens=?5, cached_input_tokens=?6 WHERE id=?2 AND outcome='running'",
+            params![
+                outcome,
+                id,
+                usage.map(|v| v.total_tokens),
+                usage.and_then(|v| v.input_tokens),
+                usage.and_then(|v| v.output_tokens),
+                usage.and_then(|v| v.cached_input_tokens),
+            ],
         )? != 0)
     }
 
@@ -2626,7 +2666,7 @@ impl Database {
         parent_run_id: i64,
     ) -> Result<Vec<ProviderInvocation>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
+            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
         )?;
         Ok(statement
             .query_map([parent_run_id], |row| {
@@ -2651,6 +2691,7 @@ impl Database {
                     total_tokens: row.get(15)?,
                     input_tokens: row.get(16)?,
                     output_tokens: row.get(17)?,
+                    cached_input_tokens: row.get(18)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -5628,8 +5669,17 @@ impl Database {
             value => Some(value),
         };
         conn.execute(
-            "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4, ?5, ?6, ?7 FROM agent_runs WHERE id = ?1",
-            params![run_id, outcome, failure_category, format!("{{\"run_status\":\"{status}\"}}"), token_usage.map(|usage| usage.total_tokens), token_usage.and_then(|usage| usage.input_tokens), token_usage.and_then(|usage| usage.output_tokens)],
+            "INSERT OR REPLACE INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens, cached_input_tokens) SELECT ?1, ?2, ?3, (unixepoch(finished_at) - unixepoch(started_at)) * 1000, ?4, ?5, ?6, ?7, ?8 FROM agent_runs WHERE id = ?1",
+            params![
+                run_id,
+                outcome,
+                failure_category,
+                format!("{{\"run_status\":\"{status}\"}}"),
+                token_usage.map(|usage| usage.total_tokens),
+                token_usage.and_then(|usage| usage.input_tokens),
+                token_usage.and_then(|usage| usage.output_tokens),
+                token_usage.and_then(|usage| usage.cached_input_tokens),
+            ],
         )?;
         let (task_id, agent_id): (Option<String>, String) = conn.query_row(
             "SELECT task_id, agent FROM agent_runs WHERE id = ?1",
@@ -5676,17 +5726,17 @@ impl Database {
 
     pub fn insert_worker_result(&self, result: &WorkerResult) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![result.run_id, result.outcome, result.failure_category, result.duration_ms, result.metadata, result.total_tokens, result.input_tokens, result.output_tokens],
+            "INSERT INTO worker_results (run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens, cached_input_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![result.run_id, result.outcome, result.failure_category, result.duration_ms, result.metadata, result.total_tokens, result.input_tokens, result.output_tokens, result.cached_input_tokens],
         )?;
         Ok(())
     }
 
     pub fn get_worker_result(&self, run_id: i64) -> Result<Option<WorkerResult>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens FROM worker_results WHERE run_id = ?1",
+            "SELECT run_id, outcome, failure_category, duration_ms, metadata, total_tokens, input_tokens, output_tokens, cached_input_tokens FROM worker_results WHERE run_id = ?1",
             params![run_id],
-            |row| Ok(WorkerResult { run_id: row.get(0)?, outcome: row.get(1)?, failure_category: row.get(2)?, duration_ms: row.get(3)?, metadata: row.get(4)?, total_tokens: row.get(5)?, input_tokens: row.get(6)?, output_tokens: row.get(7)? }),
+            |row| Ok(WorkerResult { run_id: row.get(0)?, outcome: row.get(1)?, failure_category: row.get(2)?, duration_ms: row.get(3)?, metadata: row.get(4)?, total_tokens: row.get(5)?, input_tokens: row.get(6)?, output_tokens: row.get(7)?, cached_input_tokens: row.get(8)? }),
         ).optional()?)
     }
 

@@ -7,6 +7,161 @@ use std::process::Command;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationConfig {
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<ValidationGroup>,
+}
+
+/// A named, deterministically selectable subset of the configured validation
+/// commands. Groups let review pick the smallest authoritative set of
+/// commands for a task's affected subsystem instead of running every
+/// configured command for every task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationGroup {
+    pub name: String,
+    pub commands: Vec<String>,
+}
+
+/// The outcome of selecting task-specific validation commands: which
+/// commands to run, and why, so review can persist and later explain its
+/// selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationSelection {
+    pub commands: Vec<String>,
+    pub groups: Vec<String>,
+    pub rationale: Vec<String>,
+}
+
+/// Classify a single changed file path into the validation group whose
+/// commands protect it. This is a small, principled rule set based on file
+/// extension and top-level directory - not a per-file mapping table.
+fn group_for_path(path: &str) -> Option<&'static str> {
+    let path = path.split_once(" -> ").map_or(path, |(_, dst)| dst);
+    if path.starts_with("src-tauri/") {
+        return Some("tauri");
+    }
+    if path.starts_with("packaging/")
+        || path == "scripts/validate-package.mjs"
+        || path == "scripts/tauri-build.mjs"
+    {
+        return Some("packaging");
+    }
+    if path.ends_with(".rs") || path == "Cargo.toml" || path == "Cargo.lock" {
+        return Some("rust-core");
+    }
+    if path.ends_with(".vue")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".css")
+        || path == "package.json"
+        || path == "package-lock.json"
+        || path == "tsconfig.json"
+        || path == "vite.config.ts"
+        || path == "index.html"
+    {
+        return Some("frontend");
+    }
+    None
+}
+
+impl ValidationConfig {
+    /// All commands known to this configuration, across every group and the
+    /// flat command list, in a stable de-duplicated order.
+    pub fn known_commands(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ordered = Vec::new();
+        for command in self.commands.iter().chain(
+            self.groups
+                .iter()
+                .flat_map(|group| group.commands.iter()),
+        ) {
+            if seen.insert(command.clone()) {
+                ordered.push(command.clone());
+            }
+        }
+        ordered
+    }
+
+    fn group(&self, name: &str) -> Option<&ValidationGroup> {
+        self.groups.iter().find(|group| group.name == name)
+    }
+
+    /// Select the smallest authoritative set of configured validation
+    /// commands relevant to a task, given its changed files and any
+    /// explicit task-required validation commands.
+    ///
+    /// Files that cannot be classified into a known group are treated as
+    /// unclassified. If every changed file is unclassified, or a mix of
+    /// unrelated groups plus unclassified files is present, selection
+    /// conservatively escalates to the broader "integration" group (or, if
+    /// none is configured, every known command) rather than guessing.
+    pub fn select_for_task(&self, changed_files: &[String], required: &[String]) -> ValidationSelection {
+        let mut selection = ValidationSelection::default();
+        if self.groups.is_empty() {
+            // No group taxonomy configured: fall back to the flat command
+            // list, which is the only relevance signal available.
+            selection.commands = self.commands.clone();
+            if !selection.commands.is_empty() {
+                selection
+                    .rationale
+                    .push("no validation groups configured; using the configured command list".into());
+            }
+        } else {
+            let mut matched_groups = std::collections::BTreeSet::new();
+            let mut unclassified = false;
+            for file in changed_files {
+                match group_for_path(file) {
+                    Some(name) if self.group(name).is_some() => {
+                        matched_groups.insert(name);
+                    }
+                    _ => unclassified = true,
+                }
+            }
+            if unclassified || matched_groups.is_empty() {
+                if let Some(integration) = self.group("integration") {
+                    selection.groups.push(integration.name.clone());
+                    selection.rationale.push(
+                        "task touches files outside the known validation groups; selected the broader integration group"
+                            .into(),
+                    );
+                    selection.commands.extend(integration.commands.iter().cloned());
+                } else {
+                    selection.rationale.push(
+                        "task touches files outside the known validation groups and no integration group is configured; using every known command"
+                            .into(),
+                    );
+                    selection.commands = self.known_commands();
+                }
+            } else {
+                for name in &matched_groups {
+                    if let Some(group) = self.group(name) {
+                        selection.groups.push(group.name.clone());
+                        selection.rationale.push(format!(
+                            "changed files matched the '{name}' validation group"
+                        ));
+                        selection.commands.extend(group.commands.iter().cloned());
+                    }
+                }
+            }
+        }
+        let known = self.known_commands();
+        for command in required {
+            let command = command.trim();
+            if command.is_empty() {
+                continue;
+            }
+            if known.iter().any(|known| known == command) {
+                selection.rationale.push(format!(
+                    "'{command}' is an explicit task-required validation command"
+                ));
+                selection.commands.push(command.to_owned());
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        selection.commands.retain(|command| seen.insert(command.clone()));
+        selection
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,7 +499,10 @@ impl ValidationConfig {
             let content = std::fs::read_to_string(&toml_path)
                 .with_context(|| format!("failed to read {}", toml_path.display()))?;
             if let Some(commands) = parse_commands_from_toml(&content) {
-                return Ok(Self { commands });
+                return Ok(Self {
+                    commands,
+                    groups: parse_groups_from_toml(&content),
+                });
             }
         }
 
@@ -364,12 +522,16 @@ impl ValidationConfig {
             .ok()
             .and_then(|content| extract_commands_from_engineering_contract(&content))
         {
-            return Ok(Self { commands });
+            return Ok(Self {
+                commands,
+                groups: Vec::new(),
+            });
         }
 
         // 4. Default fallback
         Ok(Self {
             commands: Self::default_commands(),
+            groups: Vec::new(),
         })
     }
 }
@@ -434,6 +596,109 @@ fn parse_commands_from_toml(content: &str) -> Option<Vec<String>> {
     } else {
         None
     }
+}
+
+/// Parse `[[groups]]` array-of-tables from `.orc/validation.toml`. Each group
+/// has a `name` and a `commands` array, using the same lightweight bracket
+/// parsing as the top-level `commands` key.
+fn parse_groups_from_toml(content: &str) -> Vec<ValidationGroup> {
+    let mut groups = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_commands: Vec<String> = Vec::new();
+    let mut in_group = false;
+    let mut in_commands = false;
+
+    fn flush(
+        groups: &mut Vec<ValidationGroup>,
+        name: &mut Option<String>,
+        commands: &mut Vec<String>,
+    ) {
+        if let Some(name) = name.take() {
+            groups.push(ValidationGroup {
+                name,
+                commands: std::mem::take(commands),
+            });
+        } else {
+            commands.clear();
+        }
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[[groups]]" {
+            flush(&mut groups, &mut current_name, &mut current_commands);
+            in_group = true;
+            in_commands = false;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            flush(&mut groups, &mut current_name, &mut current_commands);
+            in_group = false;
+            in_commands = false;
+            continue;
+        }
+        if !in_group {
+            continue;
+        }
+        if in_commands {
+            if trimmed.ends_with(']') || trimmed == "]" {
+                let inner = trimmed.trim_end_matches(']');
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_commands.push(s.to_string());
+                    }
+                }
+                in_commands = false;
+            } else {
+                for item in trimmed.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_commands.push(s.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("name") && trimmed.contains('=') {
+            let Some((_, after_eq)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let value = after_eq.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                current_name = Some(value.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with("commands") && trimmed.contains('=') {
+            let Some((_, after_eq)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let after_eq = after_eq.trim();
+            if after_eq.starts_with('[') && after_eq.ends_with(']') {
+                let inner = &after_eq[1..after_eq.len() - 1];
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() {
+                        current_commands.push(s.to_string());
+                    }
+                }
+            } else if let Some(inner) = after_eq.strip_prefix('[') {
+                in_commands = true;
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !s.is_empty() && s != "]" {
+                        current_commands.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut groups, &mut current_name, &mut current_commands);
+    groups
 }
 
 fn extract_commands_from_engineering_contract(content: &str) -> Option<Vec<String>> {
@@ -593,6 +858,142 @@ commands = [
         .unwrap();
         let cfg = ValidationConfig::load(dir.path()).unwrap();
         assert_eq!(cfg.commands, vec!["cargo test --lib"]);
+    }
+
+    #[test]
+    fn parse_groups_from_toml_reads_named_command_sets() {
+        let toml = r#"
+commands = ["cargo fmt --check"]
+
+[[groups]]
+name = "rust-core"
+commands = ["cargo fmt --check", "cargo test"]
+
+[[groups]]
+name = "frontend"
+commands = [
+  "npm run typecheck",
+  "npm run build",
+]
+"#;
+        let groups = parse_groups_from_toml(toml);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "rust-core");
+        assert_eq!(groups[0].commands, vec!["cargo fmt --check", "cargo test"]);
+        assert_eq!(groups[1].name, "frontend");
+        assert_eq!(
+            groups[1].commands,
+            vec!["npm run typecheck", "npm run build"]
+        );
+    }
+
+    fn grouped_config() -> ValidationConfig {
+        ValidationConfig {
+            commands: vec!["cargo fmt --check".into()],
+            groups: vec![
+                ValidationGroup {
+                    name: "rust-core".into(),
+                    commands: vec!["cargo fmt --check".into(), "cargo test".into()],
+                },
+                ValidationGroup {
+                    name: "frontend".into(),
+                    commands: vec!["npm run typecheck".into(), "npm run build".into()],
+                },
+                ValidationGroup {
+                    name: "tauri".into(),
+                    commands: vec!["cargo test --manifest-path src-tauri/Cargo.toml".into()],
+                },
+                ValidationGroup {
+                    name: "integration".into(),
+                    commands: vec![
+                        "cargo fmt --check".into(),
+                        "cargo test".into(),
+                        "npm run typecheck".into(),
+                        "npm run build".into(),
+                        "cargo test --manifest-path src-tauri/Cargo.toml".into(),
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn rust_only_task_selects_only_rust_core_group() {
+        let config = grouped_config();
+        let selection =
+            config.select_for_task(&["src/agent.rs".into(), "src/storage/db.rs".into()], &[]);
+        assert_eq!(selection.groups, vec!["rust-core"]);
+        assert_eq!(
+            selection.commands,
+            vec!["cargo fmt --check", "cargo test"]
+        );
+    }
+
+    #[test]
+    fn frontend_only_task_selects_only_frontend_group() {
+        let config = grouped_config();
+        let selection = config.select_for_task(&["src/App.vue".into(), "package.json".into()], &[]);
+        assert_eq!(selection.groups, vec!["frontend"]);
+        assert_eq!(
+            selection.commands,
+            vec!["npm run typecheck", "npm run build"]
+        );
+        assert!(
+            !selection
+                .commands
+                .iter()
+                .any(|command| command.starts_with("cargo"))
+        );
+    }
+
+    #[test]
+    fn cross_cutting_task_selects_multiple_relevant_groups() {
+        let config = grouped_config();
+        let selection = config.select_for_task(
+            &["src-tauri/src/lib.rs".into(), "src/App.vue".into()],
+            &[],
+        );
+        assert_eq!(selection.groups, vec!["frontend", "tauri"]);
+        assert!(selection.commands.contains(&"npm run typecheck".to_string()));
+        assert!(
+            selection
+                .commands
+                .contains(&"cargo test --manifest-path src-tauri/Cargo.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_task_required_command_is_included_when_known() {
+        let config = grouped_config();
+        let selection = config.select_for_task(
+            &["src/agent.rs".into()],
+            &["npm run build".into(), "made up command".into()],
+        );
+        assert!(selection.commands.contains(&"npm run build".to_string()));
+        assert!(!selection.commands.contains(&"made up command".to_string()));
+    }
+
+    #[test]
+    fn unclassified_changed_files_escalate_to_integration_group_not_every_command_by_default() {
+        let config = grouped_config();
+        let selection = config.select_for_task(&["README.md".into()], &[]);
+        assert_eq!(selection.groups, vec!["integration"]);
+        assert_eq!(selection.commands, config.group("integration").unwrap().commands);
+    }
+
+    #[test]
+    fn selected_commands_are_deduplicated() {
+        let config = grouped_config();
+        let selection = config.select_for_task(
+            &["src/agent.rs".into()],
+            &["cargo test".into()],
+        );
+        let occurrences = selection
+            .commands
+            .iter()
+            .filter(|command| *command == "cargo test")
+            .count();
+        assert_eq!(occurrences, 1);
     }
 
     #[test]

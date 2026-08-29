@@ -2,8 +2,8 @@
 
 This document is the mandatory engineering constitution for coding work performed on Orc.
 
-It applies automatically to ordinary implementation, revision work, validation repair,
-recovered or requeued execution, and any other coding-agent execution path.
+It applies automatically to ordinary implementation, revision work, recovered or requeued
+execution, and any other coding-agent execution path.
 
 Task and revision instructions may specialize this contract but must not silently weaken,
 override, or contradict it.
@@ -136,9 +136,10 @@ For every blocking finding:
 2. Inspect the implementation path responsible for it.
 3. Determine why the previous implementation failed the requirement.
 4. Correct the production behavior.
-5. Add or improve behavioral validation when appropriate.
+5. Add or improve behavioral test coverage when appropriate.
 6. Check whether the same defect exists in related paths.
-7. Run the required validation against the final revision.
+7. Fix only the active blockers; do not run the project's validation/test suite to prove the fix
+   — automated review owns validation and will check the result.
 
 Do not repeatedly append narrow patches when the finding exposes a flawed design.
 
@@ -148,22 +149,24 @@ the implementation instead of continuing the patch loop.
 
 ## 8. Validation and evidence
 
-Every implementation must pass the repository-configured validation pipeline.
-
-At minimum, where applicable:
+Every change must ultimately pass the repository-configured validation relevant to it, at minimum,
+where applicable:
 
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
     cargo test
 
-The repository's configured validation pipeline is authoritative when it contains additional checks.
+Ownership of proving this belongs to automated review, not to the implementation or revision
+provider session. A coding or revision session must not run the project's validation/test suite,
+focused checks, or any other command to prove completion; it implements the requested change within
+its specified scope and stops. Automated review selects and runs the task-specific validation
+relevant to the changed subsystem, and a failure becomes a blocker for the next revision.
 
-Validation evidence must correspond to the exact final worktree revision.
+Review's validation evidence must identify the exact revision tested; stale evidence from a
+worktree state that has since changed must not be treated as proof for the current revision.
 
-Do not claim a check passed if relevant changes were made after that check.
-
-Do not claim unsupported platform validation. Clearly distinguish structural reasoning from
-validation actually executed.
+Do not claim a check passed, or narrate validation you did not execute. Clearly distinguish
+structural reasoning from validation actually executed.
 
 
 ## 9. Error handling
@@ -266,10 +269,11 @@ Work is complete only when:
 - required behavioral tests exercise the real behavior;
 - persistence and failure paths remain safe;
 - the implementation fits the existing architecture or an approved architectural decision;
-- the complete configured validation pipeline passes against the final revision;
 - no known blocking requirement remains unresolved.
 
 A worker must not describe work as complete while knowingly identifying an unmet task requirement.
+Configured project validation is not part of this completion gate: automated review runs it after
+the session ends and raises a blocker if it fails.
 
 
 ## 17. Worker completion report
@@ -279,10 +283,12 @@ Every coding worker must report:
 - files changed;
 - behavior changed;
 - tests added or changed;
-- validation commands actually run and their results;
 - unresolved risks or limitations;
 - architectural decisions requiring approval.
-- Validation evidence must identify the exact revision tested.
+
+Do not report validation commands as run, or their results, unless they were genuinely executed in
+this session for a reason other than proving completion (project validation is not run in this
+session at all).
 
 If an architectural decision is required, include:
 

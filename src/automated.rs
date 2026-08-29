@@ -1431,9 +1431,14 @@ fn run_review_mode(
     project_review: bool,
     validation: Option<(&Path, &dyn ValidationRunner)>,
 ) -> Result<(i64, ReviewResult)> {
-    if !project_review && summary.task.status != crate::task::TaskStatus::Review {
+    if !project_review
+        && !matches!(
+            summary.task.status,
+            crate::task::TaskStatus::Review | crate::task::TaskStatus::Blocked
+        )
+    {
         bail!(
-            "task {} can only be reviewed from review (currently {})",
+            "task {} can only be reviewed from review or blocked (currently {})",
             summary.task.id,
             summary.task.status
         );

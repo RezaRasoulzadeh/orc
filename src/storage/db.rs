@@ -3356,12 +3356,12 @@ impl Database {
             [run_id],
         )?;
         if tx.execute(
-            "UPDATE tasks SET status=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND status='review'",
+            "UPDATE tasks SET status=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND status IN ('review', 'blocked')",
             params![destination, task_id],
         )? != 1
         {
             return Err(DbError::Scheduler(format!(
-                "task '{task_id}' is not awaiting review"
+                "task '{task_id}' is not awaiting review or blocked recovery"
             )));
         }
         let event = Self::persist_worker_result_and_event(

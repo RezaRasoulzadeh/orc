@@ -1597,9 +1597,9 @@ pub fn revise_with_worker_on_db_with_overrides(
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if task.status != TaskStatus::RevisionRequired {
+    if !matches!(task.status, TaskStatus::RevisionRequired | TaskStatus::Blocked) {
         anyhow::bail!(
-            "task {} can only be revised from revision_required (currently {})",
+            "task {} can only be revised from revision_required or blocked (currently {})",
             task_id,
             task.status
         );
@@ -2132,9 +2132,9 @@ pub fn revise_manual(
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
-    if task.status != TaskStatus::RevisionRequired {
+    if !matches!(task.status, TaskStatus::RevisionRequired | TaskStatus::Blocked) {
         anyhow::bail!(
-            "task {} can only be revised from revision_required (currently {})",
+            "task {} can only be revised from revision_required or blocked (currently {})",
             task_id,
             task.status
         );

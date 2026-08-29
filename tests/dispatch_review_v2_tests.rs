@@ -2747,8 +2747,27 @@ fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
 }
 
 #[test]
-fn blocked_task_with_actionable_revise_review_cannot_revise() {
+fn blocked_task_with_actionable_revise_review_can_revise() {
     let (dir, db, task, _) = revision_fixture();
+    db.update_task_status(&task, TaskStatus::Blocked).unwrap();
+    revise_with_worker_on_db(
+        &task,
+        "retry",
+        &WritingWorker,
+        &db,
+        dir.path(),
+        "fake",
+        &FakeValidationRunner::success(),
+    )
+    .unwrap();
+    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+}
+
+#[test]
+fn blocked_task_without_actionable_review_cannot_revise() {
+    let (dir, db, task) = setup();
+    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+        .unwrap();
     db.update_task_status(&task, TaskStatus::Blocked).unwrap();
     let error = revise_with_worker_on_db(
         &task,
@@ -2759,27 +2778,64 @@ fn blocked_task_with_actionable_revise_review_cannot_revise() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("revision_required"));
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("no actionable REVISE review"));
 }
 
 #[test]
-fn blocked_task_without_actionable_review_cannot_revise() {
-    let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
+fn blocked_task_can_be_explicitly_reviewed_to_pass_or_revision_required() {
+    let (pass_dir, pass_db, pass_task, _) = production_contract_fixture();
+    pass_db
+        .update_task_status(&pass_task, TaskStatus::Blocked)
         .unwrap();
-    db.update_task_status(&task, TaskStatus::Blocked).unwrap();
-    assert!(
-        revise_with_worker_on_db(
-            &task,
-            "retry",
-            &WritingWorker,
-            &db,
-            dir.path(),
-            "fake",
-            &FakeValidationRunner::success()
+    let pass_app = OrcApp::open(pass_dir.path().join(".orc/orc.db"), pass_dir.path()).unwrap();
+    let (_, pass) = pass_app
+        .automated_review_with_backend(
+            &pass_task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([production_review_output("PASS", None)])),
+            },
+            &FakeValidationRunner::success(),
         )
-        .is_err()
+        .unwrap();
+    assert_eq!(pass.verdict, "PASS");
+    assert_eq!(
+        pass_db.get_task(&pass_task).unwrap().unwrap().status,
+        TaskStatus::AcceptanceReady
+    );
+
+    let (revise_dir, revise_db, revise_task, _) = production_contract_fixture();
+    revise_db
+        .update_task_status(&revise_task, TaskStatus::Blocked)
+        .unwrap();
+    let revise_app =
+        OrcApp::open(revise_dir.path().join(".orc/orc.db"), revise_dir.path()).unwrap();
+    let (_, revise) = revise_app
+        .automated_review_with_backend(
+            &revise_task,
+            &ActionOverrides {
+                agent_id: Some("fake".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            &QueuedReviewBackend {
+                outputs: Mutex::new(VecDeque::from([production_review_output(
+                    "REVISE",
+                    Some("BLK-blocked-recovery"),
+                )])),
+            },
+            &FakeValidationRunner::success(),
+        )
+        .unwrap();
+    assert_eq!(revise.verdict, "REVISE");
+    assert_eq!(
+        revise_db.get_task(&revise_task).unwrap().unwrap().status,
+        TaskStatus::RevisionRequired
     );
 }
 

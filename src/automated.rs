@@ -310,11 +310,11 @@ fn schema(action: AgentAction) -> String {
             "role":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high","critical"]},
             "depends_on":string_array,"capabilities":string_array,
             "scope_mode":{"type":["string","null"],"enum":["focused","module","project",null]},"context_files":string_array,
-            "expected_changes":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_EXPECTED_CHANGES,"uniqueItems":true,"items":{"type":"string","minLength":1}},
-            "unchanged":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
-            "acceptance_criteria":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_ACCEPTANCE_CRITERIA,"uniqueItems":true,"items":{"type":"string","minLength":1}},
-            "required_tests":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
-            "validation":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "expected_changes":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_EXPECTED_CHANGES,"items":{"type":"string","minLength":1}},
+            "unchanged":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
+            "acceptance_criteria":{"type":"array","minItems":1,"maxItems":crate::protocol::TaskProposal::MAX_ACCEPTANCE_CRITERIA,"items":{"type":"string","minLength":1}},
+            "required_tests":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
+            "validation":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
             "execution_hints":{"type":"object","additionalProperties":false,"properties":{"class":{"type":["string","null"],"enum":["coder","reviewer","architect","researcher","general",null]},"model":{"type":["string","null"],"minLength":1},"effort":{"type":"string","enum":["low","medium","high"]},"effort_reason":{"type":"string","minLength":1,"maxLength":240}},"required":["class","model","effort","effort_reason"]},
             "risk_factors":{"type":"array","items":{"type":"string","enum":["state_machine_lifecycle","persistence","restart_recovery","concurrency","cross_role_protocol","schema_data_flow","verification"]}}
         },
@@ -1982,6 +1982,10 @@ mod tests {
         match value {
             serde_json::Value::Object(object) => {
                 assert!(!object.contains_key("oneOf"), "unsupported oneOf: {value}");
+                assert!(
+                    !object.contains_key("uniqueItems"),
+                    "unsupported uniqueItems: {value}"
+                );
                 if let Some(properties) = object
                     .get("properties")
                     .and_then(serde_json::Value::as_object)
@@ -2046,6 +2050,32 @@ mod tests {
             value
                 .pointer("/properties/completion/properties/step_results")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn codex_planner_schema_omits_unique_items_but_keeps_array_bounds() {
+        let value: serde_json::Value = serde_json::from_str(&schema(AgentAction::Plan)).unwrap();
+        assert_codex_schema_compatible(&value);
+        let task_properties = &value["properties"]["tasks"]["items"]["properties"];
+        for field in [
+            "expected_changes",
+            "unchanged",
+            "acceptance_criteria",
+            "required_tests",
+            "validation",
+        ] {
+            assert!(task_properties[field].get("uniqueItems").is_none());
+        }
+        assert_eq!(task_properties["expected_changes"]["minItems"], 1);
+        assert_eq!(
+            task_properties["expected_changes"]["maxItems"],
+            crate::protocol::TaskProposal::MAX_EXPECTED_CHANGES
+        );
+        assert_eq!(task_properties["acceptance_criteria"]["minItems"], 1);
+        assert_eq!(
+            task_properties["acceptance_criteria"]["maxItems"],
+            crate::protocol::TaskProposal::MAX_ACCEPTANCE_CRITERIA
         );
     }
 

@@ -188,7 +188,7 @@ The [CLI reference](docs/cli-reference.md) documents every flag, default value, 
 
 ## Agents, profiles, models, and effort
 
-Agents can be automated or manual. Automated workers execute through supported backends in isolated worktrees; manual agents receive a task packet and wait for submitted output or a validated patch. A registered agent may have a provider profile directory, model, reasoning effort (`none`, `low`, `medium`, or `high`), capabilities, availability, and quota settings.
+Agents can be automated or manual. Automated workers execute through supported backends in isolated worktrees; manual agents receive a task packet and wait for submitted output or a patch. Automated Dispatch and Revise are followed by Orc deterministic validation before semantic Review; manual submission remains on its current path until Task 9. A registered agent may have a provider profile directory, model, reasoning effort (`none`, `low`, `medium`, or `high`), capabilities, availability, and quota settings.
 
 v0.2.2 persists action-specific profiles for code, review, planning, and Lead actions. A single automated agent can therefore resolve different model and effort settings per action. Explicit per-command overrides take precedence and execution records the resolved action, agent, settings, status, token usage, and result. The desktop exposes these settings; the CLI provides the agent, Lead, and per-run configuration commands documented in the CLI reference.
 
@@ -204,7 +204,7 @@ Dispatch a selected task with `orc dispatch TASK_ID`, or dispatch ready automate
 
 Automated runs work in task-specific Git worktrees. Manual runs print a task packet and wait for `orc run submit RUN_ID`, `orc run submit-patch RUN_ID PATCH_FILE`, or `orc run fail RUN_ID`. Inspect runs with `orc runs`; inspect changes with `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`.
 
-Review does not accept or merge work and may validate any nonterminal task with usable evidence. Send feedback with `orc revise TASK_ID "feedback"`; integrate satisfactory work with `orc task accept TASK_ID`; reject it with `orc task reject TASK_ID "reason"` while preserving the worktree; or cancel unfinished work with `orc task cancel TASK_ID "reason"`. An interrupted active task or failed blocked task can return to the queue with `orc task requeue TASK_ID`. After inspecting a `REPLAN_REQUIRED` non-convergence gate, acknowledge it explicitly with `orc task unblock TASK_ID`; this records the intervention but does not dispatch, revise, or review the task.
+Review is semantic-only, consumes fresh Orc validation evidence, and does not accept or merge work. Send feedback with `orc revise TASK_ID "feedback"`; integrate satisfactory work with `orc task accept TASK_ID`; reject it with `orc task reject TASK_ID "reason"` while preserving the worktree; or cancel unfinished work with `orc task cancel TASK_ID "reason"`. An interrupted active task or failed blocked task can return to the queue with `orc task requeue TASK_ID`. After inspecting a `REPLAN_REQUIRED` non-convergence gate, acknowledge it explicitly with `orc task unblock TASK_ID`; this records the intervention but does not dispatch, revise, or review the task.
 
 ## Planning, Lead, review, and approvals
 

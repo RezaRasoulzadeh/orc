@@ -2883,8 +2883,9 @@ pub fn submit_patch_with_runner(
         Some(&change_evidence),
     )?;
 
-    // Validation belongs to the explicit review command. Patch submission is
-    // one execution attempt and publishes its evidence for later review.
+    // Manual patch submission records change evidence and leaves validation to
+    // the current manual workflow; Task 9 will move it onto Orc's validation
+    // boundary before Review.
     let success_output = format!(
         "Worktree: {}\nApplied: yes\n\nValidation: deferred to review\nPatch:\n{}",
         worktree_path.display(),

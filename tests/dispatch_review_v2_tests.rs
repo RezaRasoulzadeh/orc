@@ -1237,7 +1237,7 @@ fn revision_worker_receives_native_handoff_schema() {
         );
     }
     // The claim schema no longer asks the provider to prove it ran
-    // validation; that ownership belongs to automated review.
+    // validation; Orc owns that validation before semantic Review.
     for removed_field in ["evidence", "validation_evidence"] {
         assert!(
             !required

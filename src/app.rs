@@ -986,14 +986,9 @@ impl OrcApp {
     pub fn review_for_run(&self, task_id: &str, run_id: i64) -> Result<ReviewSummary> {
         crate::review::build_review_for_task_run(&self.db, task_id, run_id, &self.repo_path)
     }
-    /// Task review: always determines, executes, and persists task-specific
-    /// validation against the reviewed worktree before producing a verdict
-    /// (see `automated::run_review`). There is no lower-level "review
-    /// without validation" primitive exposed here — a caller that has no
-    /// real worktree to validate (e.g. a test exercising only the
-    /// verdict/blocker machinery) still supplies a `validation_runner`;
-    /// validation is then a no-op because there is nothing to select
-    /// against, not because it was skipped by choice.
+    /// Task review consumes fresh, task-specific validation evidence produced
+    /// by Orc before producing a verdict (see `automated::run_review`).
+    /// Review itself is semantic-only and does not execute validation.
     pub fn automated_review_with_backend(
         &self,
         task_id: &str,

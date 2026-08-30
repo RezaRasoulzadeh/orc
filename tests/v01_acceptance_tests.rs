@@ -1,4 +1,4 @@
-use orc::storage::Database;
+use orc::storage::{AgentRunExecution, Database};
 use orc::task::TaskStatus;
 use std::fs;
 use std::path::Path;
@@ -162,6 +162,41 @@ fn v01_happy_path_is_provider_independent() {
             .status,
         TaskStatus::Review
     );
+    let review_run = db
+        .create_project_action_run(
+            db.get_project_id()
+                .expect("project")
+                .expect("project exists"),
+            Some("T-0001"),
+            "review",
+            "manual-review-fixture",
+            AgentRunExecution {
+                class: "review",
+                model: None,
+                effort: None,
+                source: "test",
+            },
+        )
+        .expect("create review run");
+    let (_, worktree_path) = db
+        .get_worktree_metadata("T-0001")
+        .expect("worktree metadata")
+        .expect("task worktree");
+    let changes =
+        orc::git::inspect_worktree(&directory.path().join(worktree_path), directory.path())
+            .expect("review current changes");
+    db.store_change_evidence(review_run, &changes)
+        .expect("store review evidence");
+    db.commit_task_review_result(
+        "T-0001",
+        review_run,
+        &[],
+        None,
+        true,
+        r#"{"verdict":"PASS"}"#,
+        None,
+    )
+    .expect("publish PASS review");
     drop(db);
 
     assert_orc(directory.path(), &["task", "accept", "T-0001"]);

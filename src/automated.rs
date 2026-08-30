@@ -229,11 +229,9 @@ impl ActionBackend for WorkerActionBackend {
                     self.planner_executable.clone(),
                 )
             }
-            AgentAction::Review => crate::backend::WorkerFactory::build_review(
-                agent,
-                model.map(str::to_owned),
-                effort,
-            ),
+            AgentAction::Review => {
+                crate::backend::WorkerFactory::build_review(agent, model.map(str::to_owned), effort)
+            }
             _ => crate::backend::WorkerFactory::build_with_overrides(
                 agent,
                 model.map(str::to_owned),
@@ -286,8 +284,12 @@ fn review_execution_directory() -> Result<PathBuf> {
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir(&directory)
-        .with_context(|| format!("failed to create isolated review directory {}", directory.display()))?;
+    std::fs::create_dir(&directory).with_context(|| {
+        format!(
+            "failed to create isolated review directory {}",
+            directory.display()
+        )
+    })?;
     Ok(directory)
 }
 
@@ -1537,17 +1539,15 @@ fn run_review_mode(
         backend.observe("Preparing review packet       OK");
     }
     let validation_run = match validation {
-        Some((repo_path, runner)) => {
-            select_and_run_review_validation(
-                db,
-                summary,
-                run,
-                &resolved.agent,
-                repo_path,
-                runner,
-                &|message| backend.observe(message),
-            )?
-        }
+        Some((repo_path, runner)) => select_and_run_review_validation(
+            db,
+            summary,
+            run,
+            &resolved.agent,
+            repo_path,
+            runner,
+            &|message| backend.observe(message),
+        )?,
         None => None,
     };
     let instructions = if project_review {
@@ -2471,6 +2471,8 @@ mod tests {
                 TaskPriority::Normal,
             )
             .unwrap();
+        db.update_task_status(&task, crate::task::TaskStatus::Review)
+            .unwrap();
         db.insert_agent(&agent()).unwrap();
         db.set_agent_action_profile(
             "multi",
@@ -2523,7 +2525,7 @@ mod tests {
         assert_eq!(review.verdict, "revise");
         assert_eq!(
             app.task(&task).unwrap().unwrap().status.to_string(),
-            "backlog"
+            "revision_required"
         );
         let calls = backend.calls.borrow();
         assert_eq!(calls[0].1.as_deref(), Some("plan-model"));
@@ -2866,6 +2868,10 @@ commands = ["npm run typecheck", "npm run build"]
             None,
         )
         .unwrap();
+        // The seeded PASS models an earlier review. A subsequent validation
+        // recurrence belongs to a new, explicitly prepared review cycle.
+        db.update_task_status(&summary.task.id, crate::task::TaskStatus::Review)
+            .unwrap();
 
         let runner = RecordingValidationRunner::new(&["cargo fmt --check"]);
         let (_, result) = run_review(
@@ -3000,32 +3006,48 @@ commands = ["npm run typecheck", "npm run build"]
         .unwrap();
 
         assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
-        assert!(!backend
-            .capabilities
-            .borrow()
-            .iter()
-            .any(|capability| capability == "command_execution"));
+        assert!(
+            !backend
+                .capabilities
+                .borrow()
+                .iter()
+                .any(|capability| capability == "command_execution")
+        );
         let prompt = backend.prompt.borrow();
         assert!(prompt.contains("Selected groups: rust-core"));
         assert!(prompt.contains("cargo fmt --check"));
         assert!(prompt.contains("Do not execute shell commands"));
         let observed = backend.observed.borrow();
-        assert!(observed.iter().any(|message| message == "Preparing review packet       OK"));
-        assert!(observed
-            .iter()
-            .any(|message| message.contains("Selecting validation          rust-core")));
-        assert!(observed
-            .iter()
-            .any(|message| message.contains("cargo fmt --check") && message.contains("PASS")));
-        assert!(observed
-            .iter()
-            .any(|message| message.starts_with("Starting reviewer")));
-        assert!(observed
-            .iter()
-            .any(|message| message == "Reviewing implementation      ..."));
-        assert!(observed
-            .iter()
-            .any(|message| message == "Reviewer finished             PASS"));
+        assert!(
+            observed
+                .iter()
+                .any(|message| message == "Preparing review packet       OK")
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message.contains("Selecting validation          rust-core"))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message.contains("cargo fmt --check") && message.contains("PASS"))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message.starts_with("Starting reviewer"))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message == "Reviewing implementation      ...")
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message == "Reviewer finished             PASS")
+        );
     }
 
     #[test]
@@ -3091,9 +3113,11 @@ commands = ["npm run typecheck", "npm run build"]
 
     #[test]
     fn resolution_prompt_keeps_equivalent_blockers_resolved_unless_evidence_shows_regression() {
-        let instructions = "Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression";
-
-        assert!(TASK_REVIEW_INSTRUCTIONS.contains(instructions));
+        assert!(TASK_REVIEW_INSTRUCTIONS.contains(
+            "equivalent or reworded findings refer to the same concern and remain resolved"
+        ));
+        assert!(TASK_REVIEW_INSTRUCTIONS
+            .contains("Reopen a resolved concern only when supplied current evidence demonstrates a genuine regression"));
     }
 
     #[test]

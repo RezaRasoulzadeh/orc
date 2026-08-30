@@ -5,7 +5,7 @@ use anyhow::Result;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewResult};
 use orc::registry::{AgentAction, AgentDefinition, ReasoningEffort};
 use orc::storage::Database;
-use orc::task::TaskPriority;
+use orc::task::{TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
 use orc::worker::TokenUsage;
 use tempfile::tempdir;
@@ -470,6 +470,7 @@ fn cli_configured_review_action_is_selected_for_automated_review() {
             TaskPriority::Normal,
         )
         .unwrap();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
     drop(db);
 
     let app = orc::app::OrcApp::open(&db_path, directory.path()).unwrap();

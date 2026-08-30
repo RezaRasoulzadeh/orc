@@ -99,25 +99,28 @@ pub fn parse_rate_limits_response(value: Value) -> Result<QuotaSnapshot, String>
                 None,
                 "individualLimit",
             )
-        } else if let Some(limit) = secondary.as_ref() {
-            (
-                limit.remaining_percent,
-                limit.reset_at,
-                limit.window_duration_mins,
-                "secondary",
-            )
-        } else if let Some(limit) = primary.as_ref() {
-            (
-                limit.remaining_percent,
-                limit.reset_at,
-                limit.window_duration_mins,
-                "primary",
-            )
         } else {
-            return Err(
-                "Codex rate-limit response has no individualLimit, secondary, or primary limit"
-                    .to_owned(),
-            );
+            let (limit, name) = match (primary.as_ref(), secondary.as_ref()) {
+                (Some(primary), Some(secondary))
+                    if secondary.remaining_percent < primary.remaining_percent =>
+                {
+                    (secondary, "secondary")
+                }
+                (Some(primary), _) => (primary, "primary"),
+                (None, Some(secondary)) => (secondary, "secondary"),
+                (None, None) => {
+                    return Err(
+                    "Codex rate-limit response has no individualLimit, secondary, or primary limit"
+                        .to_owned(),
+                );
+                }
+            };
+            (
+                limit.remaining_percent,
+                limit.reset_at,
+                limit.window_duration_mins,
+                name,
+            )
         };
     Ok(QuotaSnapshot {
         remaining_percent,
@@ -554,6 +557,62 @@ mod tests {
         assert_eq!(result.reset_at, Some(1787600000));
         assert_eq!(result.window_duration_mins, Some(10080));
         assert_eq!(result.limits.effective, "secondary");
+    }
+
+    #[test]
+    fn dual_windows_use_the_more_restrictive_five_hour_primary_limit() {
+        let result = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 75, "windowDurationMins": 300, "resetsAt": 1787000000},
+                "secondary": {"usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 1787600000}
+            }}
+        }))
+        .unwrap();
+
+        assert_eq!(result.remaining_percent, 25);
+        assert_eq!(result.reset_at, Some(1787000000));
+        assert_eq!(result.window_duration_mins, Some(300));
+        assert_eq!(result.limits.effective, "primary");
+        assert_eq!(
+            result.limits.secondary.as_ref().unwrap().remaining_percent,
+            90
+        );
+    }
+
+    #[test]
+    fn dual_windows_survive_reopen_with_the_effective_limit() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("orc.db");
+        let db = Database::init(&database_path).unwrap();
+        let registered = agent("codex-main", "codex", "/profiles/main");
+        db.insert_agent(&registered).unwrap();
+        let parsed = parse_rate_limits_response(json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 75, "windowDurationMins": 300, "resetsAt": 1787000000},
+                "secondary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1787600000}
+            }}
+        }))
+        .unwrap();
+        let provider = FakeProvider {
+            results: HashMap::from([("/profiles/main".into(), Ok(parsed))]),
+            profiles: Mutex::new(vec![]),
+        };
+        sync_agent(&db, &registered, &provider).unwrap();
+        drop(db);
+
+        let stored = Database::open(&database_path)
+            .unwrap()
+            .get_agent("codex-main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.quota_remaining_percent, Some(25));
+        assert_eq!(stored.quota_reset_at.as_deref(), Some("1787000000"));
+        let limits = stored.quota_limits.unwrap();
+        assert_eq!(limits.effective, "primary");
+        assert_eq!(limits.primary.unwrap().window_duration_mins, Some(300));
+        assert_eq!(limits.secondary.unwrap().window_duration_mins, Some(10080));
     }
 
     #[test]

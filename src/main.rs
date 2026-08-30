@@ -1327,9 +1327,10 @@ fn print_synced_quota(id: &str, snapshot: &orc::backend::ProviderQuotaSnapshot) 
             .unwrap_or_else(|| "unknown".to_owned())
     );
     println!("  effective limit: {}", snapshot.limits.effective);
+    print_quota_limit("  5-hour / primary", snapshot.limits.primary.as_ref());
+    print_quota_limit("  weekly / secondary", snapshot.limits.secondary.as_ref());
 }
 
-#[allow(dead_code)]
 fn print_quota_limit(label: &str, limit: Option<&orc::registry::QuotaLimit>) {
     match limit {
         Some(limit) => println!(

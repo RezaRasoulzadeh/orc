@@ -2081,7 +2081,7 @@ fn failed_review_attempts_do_not_make_an_unreviewed_task_revision_actionable() {
 }
 
 #[test]
-fn failed_revision_requires_execution_recovery_before_another_revision() {
+fn failed_revision_can_be_recovered_from_blocked_with_an_actionable_contract() {
     let (dir, db, task, _) = production_contract_fixture();
     assert!(
         revise_with_worker_on_db(
@@ -2095,7 +2095,7 @@ fn failed_revision_requires_execution_recovery_before_another_revision() {
         )
         .is_err()
     );
-    let (_, _, contract_id) = db.actionable_revision_contract(&task).unwrap().unwrap();
+    assert!(db.actionable_revision_contract(&task).unwrap().is_some());
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Blocked
@@ -2109,12 +2109,10 @@ fn failed_revision_requires_execution_recovery_before_another_revision() {
         "fake",
         &FakeValidationRunner::success(),
     )
-    .unwrap_err();
-    assert!(format!("{retry:#}").contains("revision_required"));
-    assert_eq!(
-        db.actionable_revision_contract(&task).unwrap().unwrap().2,
-        contract_id
-    );
+    .unwrap();
+    assert_eq!(retry.task.status, TaskStatus::Review);
+    assert!(db.actionable_revision_contract(&task).unwrap().is_none());
+    assert_eq!(db.revision_contract_history_count(&task).unwrap(), 1);
 }
 
 #[test]
@@ -4449,7 +4447,10 @@ fn dispatch_uses_worktree_changes_when_completion_omits_affected_files() {
     )
     .unwrap();
     assert_eq!(summary.run_status, "completed");
-    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
     let evidence = db.get_change_evidence(summary.run_id).unwrap().unwrap();
     assert!(
         evidence
@@ -4462,11 +4463,7 @@ fn dispatch_uses_worktree_changes_when_completion_omits_affected_files() {
 #[test]
 fn dispatch_accepts_subset_completion_metadata_when_worktree_has_all_changes() {
     let (dir, db, task) = setup();
-    canonicalize_task_with_expected_changes(
-        &db,
-        &task,
-        &["create: first.rs", "create: second.rs"],
-    );
+    canonicalize_task_with_expected_changes(&db, &task, &["create: first.rs", "create: second.rs"]);
     let summary = dispatch_with_worker_and_db_as_with_runner(
         &task,
         &PartialCompletionMetadataWorker {
@@ -4480,7 +4477,10 @@ fn dispatch_accepts_subset_completion_metadata_when_worktree_has_all_changes() {
     .unwrap();
     let evidence = db.get_change_evidence(summary.run_id).unwrap().unwrap();
     assert_eq!(evidence.files.len(), 2);
-    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Review);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
 }
 
 #[test]
@@ -4497,7 +4497,10 @@ fn dispatch_still_blocks_when_worker_has_no_implementation_effect() {
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("worktree implementation effect"));
-    assert_eq!(db.get_task(&task).unwrap().unwrap().status, TaskStatus::Blocked);
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
 }
 
 #[test]

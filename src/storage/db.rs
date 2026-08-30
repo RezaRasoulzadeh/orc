@@ -2427,6 +2427,7 @@ impl Database {
             ("required_tests", "TEXT"),
             ("validation", "TEXT"),
             ("unchanged", "TEXT"),
+            ("updated_at", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {definition}"))?;

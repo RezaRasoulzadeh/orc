@@ -1841,10 +1841,7 @@ pub fn run_plan(
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
     let packet = planner_packet(db, request)?;
-    let prompt = format!(
-        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response.\n{}",
-        serde_json::to_string(&packet)?
-    );
+    let prompt = planner_prompt(&packet)?;
     let planner_backend = PlannerActionBackend::new(backend);
     let execution = invoke_action(db, run, &planner_backend, &agent, &resolved, &prompt);
     match execution {
@@ -1880,6 +1877,31 @@ pub fn run_plan(
             Err(error)
         }
     }
+}
+
+fn planner_prompt(packet: &serde_json::Value) -> Result<String> {
+    Ok(format!(
+        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. {} Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response.\n{}",
+        planner_effort_guidance(),
+        serde_json::to_string(packet)?
+    ))
+}
+
+fn planner_effort_guidance() -> String {
+    let risks_for = |effort| {
+        crate::protocol::TaskRiskFactor::ALL
+            .iter()
+            .copied()
+            .filter(|risk| risk.minimum_effort() == effort)
+            .map(crate::protocol::TaskRiskFactor::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Deterministic risk-factor minimums are mandatory: high minimum: {}; medium minimum: {}; low minimum: no declared risk factors. execution_hints.effort must be at least the maximum minimum effort required by all declared risk_factors. It may be higher when semantic complexity warrants it, but must never be lower than this deterministic mapping. If no risk factor applies, do not invent one merely to justify effort.",
+        risks_for(ReasoningEffort::High),
+        risks_for(ReasoningEffort::Medium),
+    )
 }
 
 struct LeadActionAdapter<'a> {
@@ -2077,6 +2099,46 @@ mod tests {
             task_properties["acceptance_criteria"]["maxItems"],
             crate::protocol::TaskProposal::MAX_ACCEPTANCE_CRITERIA
         );
+    }
+
+    #[test]
+    fn planner_prompt_communicates_the_deterministic_risk_effort_contract() {
+        let packet = serde_json::json!({"objective": "test planner guidance"});
+        let prompt = planner_prompt(&packet).unwrap();
+
+        assert!(prompt.contains(
+            "high minimum: state_machine_lifecycle, persistence, restart_recovery, concurrency, cross_role_protocol"
+        ));
+        assert!(prompt.contains(
+            "medium minimum: schema_data_flow, verification; low minimum: no declared risk factors"
+        ));
+        assert!(prompt.contains(
+            "execution_hints.effort must be at least the maximum minimum effort required by all declared risk_factors"
+        ));
+        assert!(prompt.contains("It may be higher when semantic complexity warrants it"));
+        assert!(prompt.contains("must never be lower than this deterministic mapping"));
+        assert!(
+            prompt
+                .contains("If no risk factor applies, do not invent one merely to justify effort")
+        );
+    }
+
+    #[test]
+    fn planner_effort_guidance_derives_each_risk_from_its_deterministic_minimum() {
+        let guidance = planner_effort_guidance();
+
+        for risk in crate::protocol::TaskRiskFactor::ALL {
+            let expected_section = match risk.minimum_effort() {
+                ReasoningEffort::High => "high minimum:",
+                ReasoningEffort::Medium => "medium minimum:",
+                ReasoningEffort::None | ReasoningEffort::Low => {
+                    unreachable!("risk factor minimums are medium or high")
+                }
+            };
+            let risk_position = guidance.find(risk.as_str()).unwrap();
+            let section_position = guidance.find(expected_section).unwrap();
+            assert!(risk_position > section_position, "{}", risk.as_str());
+        }
     }
 
     #[test]

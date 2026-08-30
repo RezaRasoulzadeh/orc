@@ -221,6 +221,28 @@ pub enum TaskRiskFactor {
 }
 
 impl TaskRiskFactor {
+    pub const ALL: [Self; 7] = [
+        Self::StateMachineLifecycle,
+        Self::Persistence,
+        Self::RestartRecovery,
+        Self::Concurrency,
+        Self::CrossRoleProtocol,
+        Self::SchemaDataFlow,
+        Self::Verification,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StateMachineLifecycle => "state_machine_lifecycle",
+            Self::Persistence => "persistence",
+            Self::RestartRecovery => "restart_recovery",
+            Self::Concurrency => "concurrency",
+            Self::CrossRoleProtocol => "cross_role_protocol",
+            Self::SchemaDataFlow => "schema_data_flow",
+            Self::Verification => "verification",
+        }
+    }
+
     pub const fn minimum_effort(self) -> crate::registry::ReasoningEffort {
         match self {
             Self::StateMachineLifecycle

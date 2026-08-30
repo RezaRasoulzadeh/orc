@@ -2363,6 +2363,20 @@ impl Database {
             .optional()?)
     }
 
+    pub fn latest_validation_selection_for_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT payload FROM lifecycle_events WHERE run_id = ?1 AND kind = 'validation_selection' ORDER BY id DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn list_lifecycle_events_scoped(
         &self,
         predicate: &str,

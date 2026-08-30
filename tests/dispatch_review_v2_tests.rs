@@ -758,6 +758,138 @@ struct SequenceValidationRunner {
     directories: Mutex<Vec<std::path::PathBuf>>,
 }
 
+struct BoundaryRepairWorker {
+    calls: Mutex<usize>,
+}
+
+impl Worker for BoundaryRepairWorker {
+    fn execute(&self, _: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            std::fs::create_dir_all(cwd.join("src")).map_err(|error| error.to_string())?;
+            std::fs::write(cwd.join("src/lib.rs"), "pub fn changed() {}\n")
+                .map_err(|error| error.to_string())?;
+        } else {
+            std::fs::create_dir_all(cwd.join("ui")).map_err(|error| error.to_string())?;
+            std::fs::write(cwd.join("ui/App.vue"), "<template>repaired</template>\n")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok((
+            WorkerOutcome::Success,
+            Some(format!("worker call {}", *calls)),
+        ))
+    }
+}
+
+struct RecordingBoundaryValidationRunner {
+    commands: Mutex<Vec<String>>,
+    fail_first_rust_check: Mutex<bool>,
+}
+
+struct RevisionValidationUsageWorker {
+    calls: Mutex<usize>,
+}
+
+impl Worker for RevisionValidationUsageWorker {
+    fn execute(&self, _: &str, _: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
+        unreachable!("structured revision execution is required")
+    }
+
+    fn execute_structured_with_progress_and_usage(
+        &self,
+        _: &str,
+        cwd: &Path,
+        _: &str,
+        _: &dyn Fn(&str),
+    ) -> Result<WorkerExecution, String> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        std::fs::write(
+            cwd.join("feature.txt"),
+            format!("revision call {}\n", *calls),
+        )
+        .map_err(|error| error.to_string())?;
+        let total_tokens = if *calls == 1 { 10 } else { 7 };
+        Ok(WorkerExecution {
+            outcome: WorkerOutcome::Success,
+            output: Some(format!("revision call {}", *calls)),
+            token_usage: Some(orc::worker::TokenUsage {
+                total_tokens,
+                input_tokens: Some(total_tokens - 1),
+                output_tokens: Some(1),
+                cached_input_tokens: None,
+            }),
+        })
+    }
+}
+
+struct AlwaysFailValidationRunner;
+
+struct InfrastructureValidationRunner {
+    calls: Mutex<usize>,
+}
+
+impl ValidationRunner for InfrastructureValidationRunner {
+    fn run(&self, _: &str, _: &Path) -> anyhow::Result<ValidationStepResult> {
+        *self.calls.lock().unwrap() += 1;
+        Err(anyhow::anyhow!("validation runner unavailable"))
+    }
+}
+
+impl ValidationRunner for AlwaysFailValidationRunner {
+    fn run(&self, command: &str, _: &Path) -> anyhow::Result<ValidationStepResult> {
+        Ok(ValidationStepResult {
+            command: command.to_owned(),
+            category: ValidationCategory::Test,
+            passed: false,
+            stdout: String::new(),
+            stderr: "still failing".into(),
+            exit_status: Some(1),
+            diagnostics: None,
+            failure_classification: None,
+            fallback_command: None,
+        })
+    }
+}
+
+impl RecordingBoundaryValidationRunner {
+    fn new() -> Self {
+        Self {
+            commands: Mutex::new(Vec::new()),
+            fail_first_rust_check: Mutex::new(true),
+        }
+    }
+}
+
+impl ValidationRunner for RecordingBoundaryValidationRunner {
+    fn run(&self, command: &str, _: &Path) -> anyhow::Result<ValidationStepResult> {
+        self.commands.lock().unwrap().push(command.to_owned());
+        let mut fail_first_rust_check = self.fail_first_rust_check.lock().unwrap();
+        let passed = if command == "rust-check" && *fail_first_rust_check {
+            *fail_first_rust_check = false;
+            false
+        } else {
+            true
+        };
+        Ok(ValidationStepResult {
+            command: command.to_owned(),
+            category: ValidationCategory::Test,
+            passed,
+            stdout: String::new(),
+            stderr: if passed {
+                String::new()
+            } else {
+                "repair required".into()
+            },
+            exit_status: passed.then_some(0).or(Some(1)),
+            diagnostics: None,
+            failure_classification: None,
+            fallback_command: None,
+        })
+    }
+}
+
 impl SequenceValidationRunner {
     fn new(results: Vec<ValidationStepResult>) -> Self {
         Self {
@@ -789,6 +921,22 @@ fn cmd(dir: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn clear_validation_selection(dir: &Path) {
+    std::fs::write(dir.join(".orc/validation.toml"), "commands = []\n").unwrap();
+    cmd(dir, &["add", ".orc/validation.toml"]);
+    cmd(dir, &["commit", "-m", "empty validation selection"]);
+    let worktrees = dir.join(".orc/worktrees");
+    if worktrees.exists() {
+        for entry in std::fs::read_dir(worktrees).unwrap() {
+            let worktree = entry.unwrap().path();
+            let config = worktree.join(".orc/validation.toml");
+            if config.exists() {
+                std::fs::write(config, "commands = []\n").unwrap();
+            }
+        }
+    }
 }
 
 fn setup() -> (TempDir, Database, String) {
@@ -2793,11 +2941,10 @@ fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
         })
         .unwrap();
     assert!(db.get_change_evidence(implementation.id).unwrap().is_some());
-    // Dispatch no longer runs configured validation; automated review owns it.
     assert!(
         db.latest_validation_result_for_run(implementation.id)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     let review_run = runs
         .iter()
@@ -3357,8 +3504,9 @@ fn revision_worker_includes_current_engineering_contract() {
 }
 
 #[test]
-fn dispatch_does_not_invoke_validation_runner_or_repair_and_coder_prompt_forbids_validation() {
+fn dispatch_with_no_selected_validation_commands_skips_runner_and_repair() {
     let (dir, db, task) = setup();
+    clear_validation_selection(dir.path());
     let worker = RepairWorker::new();
     // An empty sequence: if dispatch calls the validation runner even once,
     // this panics on the missing queued result instead of silently passing.
@@ -3392,6 +3540,57 @@ fn dispatch_does_not_invoke_validation_runner_or_repair_and_coder_prompt_forbids
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review
+    );
+}
+
+#[test]
+fn dispatch_infrastructure_validation_failure_is_not_repair_non_convergence() {
+    let (dir, db, task) = setup();
+    std::fs::write(
+        dir.path().join(".orc/validation.toml"),
+        "commands = [\"validation-command\"]\n",
+    )
+    .unwrap();
+    cmd(dir.path(), &["add", ".orc/validation.toml"]);
+    cmd(dir.path(), &["commit", "-m", "validation config"]);
+    let runner = InfrastructureValidationRunner {
+        calls: Mutex::new(0),
+    };
+    let worker = TokenBudgetWorker {
+        calls: Mutex::new(0),
+    };
+
+    let error = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
+    assert!(error.contains("validation infrastructure failure"));
+    assert!(!error.contains("did not converge after 3 repairs"));
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(run.status, "failed");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
+    assert_eq!(
+        db.provider_invocations(run.id).unwrap()[0].purpose,
+        "implementation"
+    );
+    let result = db.get_worker_result(run.id).unwrap().unwrap();
+    assert_eq!(result.total_tokens, Some(500_000));
+    assert!(
+        run.output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("validation infrastructure failure")
     );
 }
 
@@ -3641,8 +3840,9 @@ fn no_change_blocks_the_task_without_running_validation() {
 }
 
 #[test]
-fn dispatch_persists_no_validation_lifecycle_events() {
+fn dispatch_persists_current_validation_evidence() {
     let (dir, db, task) = setup();
+    clear_validation_selection(dir.path());
     let db_path = dir.path().join(".orc/orc.db");
     let worker = RepairWorker::new();
     let summary = dispatch_with_worker_and_db_as_with_runner(
@@ -3659,22 +3859,75 @@ fn dispatch_persists_no_validation_lifecycle_events() {
     let events = db
         .list_lifecycle_events_for_run(summary.run_id, 30)
         .unwrap();
-    for kind in [
-        "validation_attempt",
-        "validation_result",
-        "validation_repair_started",
-        "validation_repair_completed",
-    ] {
-        assert!(
-            !events.iter().any(|event| event.kind == kind),
-            "unexpected dispatch-owned lifecycle event '{kind}'"
-        );
-    }
+    assert!(events.iter().any(|event| event.kind == "validation_result"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "validation_selection")
+    );
 }
 
 #[test]
-fn revision_does_not_invoke_validation_runner_and_publishes_single_invocation_to_review() {
+fn dispatch_reselects_validation_after_repair_and_persists_final_worktree_selection() {
+    let (dir, db, task) = setup();
+    std::fs::write(
+        dir.path().join(".orc/validation.toml"),
+        r#"commands = []
+
+[[groups]]
+name = "rust-core"
+commands = ["rust-check"]
+
+[[groups]]
+name = "frontend"
+commands = ["frontend-check"]
+"#,
+    )
+    .unwrap();
+    cmd(dir.path(), &["add", ".orc/validation.toml"]);
+    cmd(dir.path(), &["commit", "-m", "validation groups"]);
+
+    let worker = BoundaryRepairWorker {
+        calls: Mutex::new(0),
+    };
+    let runner = RecordingBoundaryValidationRunner::new();
+    let summary = dispatch_with_worker_and_db_as_with_runner(
+        &task,
+        &worker,
+        dir.path().join(".orc/orc.db").to_str().unwrap(),
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap();
+
+    assert_eq!(*worker.calls.lock().unwrap(), 2);
+    assert_eq!(
+        *runner.commands.lock().unwrap(),
+        vec!["rust-check", "frontend-check", "rust-check"]
+    );
+    let selection: serde_json::Value = serde_json::from_str(
+        &db.latest_validation_selection_for_run(summary.run_id)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        selection["selected_commands"],
+        serde_json::json!(["frontend-check", "rust-check"])
+    );
+    let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
+    let current = git::inspect_worktree(dir.path().join(worktree_path), dir.path()).unwrap();
+    assert_eq!(
+        selection["worktree_fingerprint"],
+        serde_json::json!(orc::automated::revision_worktree_fingerprint(&current))
+    );
+}
+
+#[test]
+fn revision_with_no_selected_validation_commands_skips_runner_and_repair() {
     let (dir, db, task, review_id) = revision_fixture();
+    clear_validation_selection(dir.path());
     let marker = "BROAD_REVISION_CONTRACT_MARKER";
     std::fs::write(dir.path().join(".orc/engineering.md"), marker).unwrap();
     let worker = RepairWorker::new();
@@ -3715,8 +3968,9 @@ fn revision_does_not_invoke_validation_runner_and_publishes_single_invocation_to
 }
 
 #[test]
-fn revision_succeeds_without_validation_repair_or_token_budget_rejection() {
+fn revision_with_no_selected_validation_commands_has_no_validation_repair_call() {
     let (dir, db, task, _) = revision_fixture();
+    clear_validation_selection(dir.path());
     let worker = TokenBudgetWorker {
         calls: Mutex::new(0),
     };
@@ -3732,8 +3986,8 @@ fn revision_succeeds_without_validation_repair_or_token_budget_rejection() {
     )
     .unwrap();
 
-    // Only the single "revision" invocation ran: no validation_repair
-    // provider call, and the old 500_000-token budget did not block it.
+    // With no selected validation commands, only the single revision
+    // provider invocation runs; the token budget remains available.
     assert_eq!(*worker.calls.lock().unwrap(), 1);
     let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
     let invocations = db.provider_invocations(run.id).unwrap();
@@ -3745,6 +3999,95 @@ fn revision_succeeds_without_validation_repair_or_token_budget_rejection() {
         TaskStatus::Review
     );
     assert_eq!(summary.run_status, "completed");
+}
+
+#[test]
+fn revision_infrastructure_validation_failure_preserves_initial_usage() {
+    let (dir, db, task, _) = revision_fixture();
+    std::fs::write(
+        dir.path().join(".orc/validation.toml"),
+        "commands = [\"validation-command\"]\n",
+    )
+    .unwrap();
+    cmd(dir.path(), &["add", ".orc/validation.toml"]);
+    cmd(dir.path(), &["commit", "-m", "validation config"]);
+    let runner = InfrastructureValidationRunner {
+        calls: Mutex::new(0),
+    };
+    let worker = RevisionValidationUsageWorker {
+        calls: Mutex::new(0),
+    };
+
+    let error = revise_with_worker_on_db(
+        &task,
+        "repair the semantic blocker",
+        &worker,
+        &db,
+        dir.path(),
+        "fake",
+        &runner,
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
+    assert!(error.contains("validation infrastructure failure"));
+    assert!(!error.contains("did not converge after 3 repairs"));
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].clone();
+    assert_eq!(run.status, "failed");
+    assert_eq!(
+        db.get_task(&task).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    let invocations = db.provider_invocations(run.id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].purpose, "revision");
+    let result = db.get_worker_result(run.id).unwrap().unwrap();
+    assert_eq!(result.total_tokens, Some(10));
+    assert!(
+        run.output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("validation infrastructure failure")
+    );
+}
+
+#[test]
+fn failed_revision_keeps_initial_and_validation_repair_token_usage() {
+    let (dir, db, task, _) = revision_fixture();
+    let worker = RevisionValidationUsageWorker {
+        calls: Mutex::new(0),
+    };
+
+    assert!(
+        revise_with_worker_on_db(
+            &task,
+            "repair the semantic blocker",
+            &worker,
+            &db,
+            dir.path(),
+            "fake",
+            &AlwaysFailValidationRunner,
+        )
+        .is_err()
+    );
+
+    assert_eq!(*worker.calls.lock().unwrap(), 4);
+    let revision = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| {
+            db.provider_invocations(run.id)
+                .unwrap()
+                .iter()
+                .any(|invocation| invocation.purpose == "revision")
+        })
+        .unwrap();
+    assert_eq!(revision.status, "failed");
+    let result = db.get_worker_result(revision.id).unwrap().unwrap();
+    assert_eq!(result.total_tokens, Some(31));
+    assert_eq!(result.input_tokens, Some(27));
+    assert_eq!(result.output_tokens, Some(4));
 }
 
 #[test]
@@ -4254,6 +4597,7 @@ fn dispatch_succeeds_despite_provider_usage_exceeding_the_old_token_budget() {
     // removed entirely; a single invocation reporting exactly the old limit
     // must not block dispatch from completing into review.
     let (dir, db, task) = setup();
+    clear_validation_selection(dir.path());
     canonicalize_task(&db, &task, "create: budget-preserved.txt");
     let worker = TokenBudgetWorker {
         calls: Mutex::new(0),
@@ -4390,6 +4734,7 @@ fn configured_validation_is_owned_by_the_final_plan_gate() {
 #[test]
 fn completion_gate_repairs_missing_implementation_effect_without_validation() {
     let (dir, db, task) = setup();
+    clear_validation_selection(dir.path());
     canonicalize_task(&db, &task, "create: completion-gated.txt");
     let worker = CompletionRepairWorker {
         calls: Mutex::new(0),

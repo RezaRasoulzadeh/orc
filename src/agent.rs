@@ -11,8 +11,8 @@ use crate::registry::{self, AgentDefinition, ReasoningEffort};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
 use crate::task::{Task, TaskScopeMode, TaskStatus};
-use crate::validation::{SystemValidationRunner, ValidationRunner};
-use crate::worker::{Worker, WorkerOutcome};
+use crate::validation::{self, SystemValidationRunner, ValidationReport, ValidationRunner};
+use crate::worker::{TokenUsage, Worker, WorkerOutcome};
 
 /// Evidence observations come from the worker output and post-execution
 /// checks; declarations in PREPARE are never observations.
@@ -278,6 +278,7 @@ fn planned_operations_for_plan(
 
 const ENGINEERING_CONTRACT_PATH: &str = ".orc/engineering.md";
 const ARCHITECTURE_DECISION_MARKER: &str = "ORC-ARCHITECTURE-DECISION:";
+const MAX_VALIDATION_REPAIRS: usize = 3;
 const MAX_COMPLETION_REPAIRS: usize = 2;
 
 fn start_provider_invocation_bounded(
@@ -483,9 +484,185 @@ fn completion_repair_prompt(
     attempt: usize,
 ) -> String {
     format!(
-        "WORKER COMPLETION REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the missing implementation effect for the checkpoint below. Preserve the existing worktree and unrelated changes. Do not run tests, validation, acceptance checks, or reviewer-style verification; automated review owns those responsibilities.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP:\n{}\n\nReturn a structured Worker completion object using the canonical `step_results` envelope. Completion metadata is descriptive only; Orc will derive changed files from the worktree.",
+        "WORKER COMPLETION REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the missing implementation effect for the checkpoint below. Preserve the existing worktree and unrelated changes. Do not run tests, validation, acceptance checks, or reviewer-style verification; Orc owns deterministic validation.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP:\n{}\n\nReturn a structured Worker completion object using the canonical `step_results` envelope. Completion metadata is descriptive only; Orc will derive changed files from the worktree.",
         serde_json::to_string_pretty(step).unwrap_or_else(|_| step.id.clone())
     )
+}
+
+fn validation_diagnostics(report: &ValidationReport) -> String {
+    report
+        .steps
+        .iter()
+        .filter(|step| !step.passed)
+        .map(|step| {
+            let diagnostics: String = step.output().chars().take(4_000).collect();
+            format!(
+                "command: {}\nstatus: failed\ndiagnostics:\n{diagnostics}",
+                step.command
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn merge_token_usage(accumulated: &mut Option<TokenUsage>, additional: Option<TokenUsage>) {
+    let Some(additional) = additional else {
+        return;
+    };
+    let Some(existing) = accumulated.as_mut() else {
+        *accumulated = Some(additional);
+        return;
+    };
+    existing.total_tokens += additional.total_tokens;
+    existing.input_tokens = match (existing.input_tokens, additional.input_tokens) {
+        (Some(left), Some(right)) => Some(left + right),
+        (left, None) => left,
+        (None, right) => right,
+    };
+    existing.output_tokens = match (existing.output_tokens, additional.output_tokens) {
+        (Some(left), Some(right)) => Some(left + right),
+        (left, None) => left,
+        (None, right) => right,
+    };
+    existing.cached_input_tokens =
+        match (existing.cached_input_tokens, additional.cached_input_tokens) {
+            (Some(left), Some(right)) => Some(left + right),
+            (left, None) => left,
+            (None, right) => right,
+        };
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation repair owns one implementation run"
+)]
+fn run_task_validation_repair_loop(
+    validation_runner: &dyn ValidationRunner,
+    validation_config: &crate::validation::ValidationConfig,
+    required_validation: &[String],
+    worker: &dyn Worker,
+    db: &Database,
+    worktree: &Path,
+    repo_path: &Path,
+    task_id: &str,
+    run_id: i64,
+    agent_id: &str,
+    output: &mut Option<String>,
+    token_usage: &mut Option<TokenUsage>,
+    progress: &dyn Fn(&str),
+    worker_output: &dyn Fn(&str),
+    cancellation: Option<&crate::worker::CancellationControl>,
+) -> Result<(ValidationReport, crate::validation::ValidationSelection)> {
+    let mut repair_attempt = 0;
+    loop {
+        let current = git::inspect_worktree(worktree, repo_path)?;
+        let changed_files = current
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let selection = validation_config.select_for_task(&changed_files, required_validation);
+        let report =
+            validation::run_validation_pipeline(validation_runner, &selection.commands, worktree)
+                .unwrap_or_else(|error| {
+                    ValidationReport::infrastructure_failure(
+                        selection
+                            .commands
+                            .first()
+                            .map_or("validation", String::as_str),
+                        format!("{error:#}"),
+                    )
+                });
+        db.record_lifecycle_event(
+            "validation_result",
+            Some(task_id),
+            Some(run_id),
+            Some(agent_id),
+            Some(&serde_json::to_string(&report)?),
+        )?;
+        db.record_lifecycle_event("validation_selection", Some(task_id), Some(run_id), Some(agent_id), Some(&serde_json::json!({
+            "selected_groups": selection.groups, "selected_commands": selection.commands,
+            "rationale": selection.rationale,
+            "worktree_fingerprint": crate::automated::revision_worktree_fingerprint(&current),
+        }).to_string()))?;
+        if report.is_success()
+            || report.is_infrastructure_failure()
+            || repair_attempt >= MAX_VALIDATION_REPAIRS
+        {
+            return Ok((report, selection));
+        }
+        repair_attempt += 1;
+        let repair = format!(
+            "## Focused automatic validation repair\n\nRepair attempt {repair_attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree. Repair only these current failed commands and bounded diagnostics; do not run validation commands yourself.\n\n## Current diff\n\n{}\n\n## Current failures\n\n{}",
+            git::inspect_worktree(worktree, repo_path)?.diff,
+            validation_diagnostics(&report),
+        );
+        db.record_lifecycle_event(
+            "validation_repair_started",
+            Some(task_id),
+            Some(run_id),
+            Some(agent_id),
+            Some(&serde_json::json!({"repair_attempt": repair_attempt}).to_string()),
+        )?;
+        let invocation = start_provider_invocation_bounded(
+            db,
+            run_id,
+            task_id,
+            "validation_repair",
+            repair_attempt,
+            ReasoningEffort::Low,
+        )?;
+        let repair_execution = worker.execute_repair_with_progress_and_usage(
+            &repair,
+            worktree,
+            &crate::worker_protocol::repair_completion_schema(),
+            worker_output,
+            cancellation,
+        );
+        db.finish_provider_invocation(
+            invocation,
+            if repair_execution.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            repair_execution
+                .as_ref()
+                .ok()
+                .and_then(|value| value.token_usage),
+        )?;
+        let repair_execution = repair_execution
+            .map_err(|error| anyhow::anyhow!("validation repair worker failed: {error}"))?;
+        if let WorkerOutcome::Failure(error) = repair_execution.outcome {
+            anyhow::bail!("validation repair worker failed: {error}");
+        }
+        if repair_execution.output.is_some() {
+            *output = repair_execution.output;
+        }
+        merge_token_usage(token_usage, repair_execution.token_usage);
+        db.record_lifecycle_event(
+            "validation_repair_completed",
+            Some(task_id),
+            Some(run_id),
+            Some(agent_id),
+            Some(&serde_json::json!({"repair_attempt": repair_attempt}).to_string()),
+        )?;
+        progress(&format!("validation repair attempt {repair_attempt}"));
+    }
+}
+
+fn validation_failure_message(report: &ValidationReport) -> String {
+    if report.is_infrastructure_failure() {
+        format!(
+            "validation infrastructure failure; deterministic validation could not run:\n{}",
+            report.summary()
+        )
+    } else {
+        format!(
+            "deterministic validation did not converge after {MAX_VALIDATION_REPAIRS} repairs:\n{}",
+            report.summary()
+        )
+    }
 }
 
 fn architecture_decisions(output: &str) -> Vec<&str> {
@@ -535,7 +712,7 @@ fn build_worker_prompt(contract: &str, project: &str, task: &Task) -> String {
         })
         .unwrap_or_default();
     format!(
-        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Stay within the specified scope; do not modify unrelated files or change task status. Do not run the project's validation/test suite, focused checks, or any other command to prove completion \u{2014} automated review owns validation and will run the task-specific checks it needs after this session ends. Stop as soon as the implementation is complete and summarize what you changed and any follow-up steps.\n",
+        "# Orc Coder Instructions\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n---\n\n# Task\n\nProject: {project}\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\nInspect the repository rooted at the current working directory and implement ONLY the changes required to complete this single task. Stay within the specified scope; do not modify unrelated files or change task status. Do not run the project's validation/test suite, focused checks, or any other command to prove completion \u{2014} Orc runs the selected deterministic checks after this session ends. Stop as soon as the implementation is complete and summarize what you changed and any follow-up steps.\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         contract = contract,
         project = project,
@@ -684,9 +861,9 @@ pub fn dispatch_with_worker_on_db_cancellable(
     repo_path: impl AsRef<Path>,
     agent_id: &str,
     // Configured project validation is no longer run by dispatch; it is
-    // owned by automated review. The parameter is retained for API
+    // executed by Orc after implementation. The parameter is retained for API
     // compatibility with existing callers.
-    _validation_runner: &dyn ValidationRunner,
+    validation_runner: &dyn ValidationRunner,
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
@@ -732,7 +909,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
     let acceptance_criteria =
         worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
     let required_tests = worker_requirements(&proposal.required_tests, "required-test");
-    // Configured project validation is owned by automated review, not the
+    // Configured project validation is owned by Orc, not the
     // implementation session; no validation checkpoints are demanded here.
     let verification = Vec::new();
     let plan = crate::worker_protocol::WorkerPlan {
@@ -836,7 +1013,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
     }
 
     let prompt = format!(
-        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — automated review owns those responsibilities.\n{}",
+        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — Orc owns deterministic validation.\n{}",
         build_worker_prompt(&contract, &project_name, &task),
         serde_json::to_string_pretty(&plan).context("failed to serialize execution plan")?
     );
@@ -1037,7 +1214,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 ));
                             }
                             if repaired.token_usage.is_some() {
-                                token_usage = repaired.token_usage;
+                                merge_token_usage(&mut token_usage, repaired.token_usage);
                             }
                             let after = git::inspect_worktree(&worktree_dir, repo_path)
                                 .context("failed to inspect worktree after completion repair")?;
@@ -1064,7 +1241,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 .join("\n\n")
                         });
                     }
-                    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+                    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
                         Ok(changes) => changes,
                         Err(error) => {
                             let output = format!(
@@ -1123,9 +1300,42 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         }
                     }
                     db.store_change_evidence(run_id, &changes)?;
-                    // Configured project validation is owned by automated review, not
-                    // dispatch. Dispatch publishes implementation/change evidence and
-                    // transitions straight into review.
+                    let validation_config =
+                        crate::validation::ValidationConfig::load(&worktree_dir)?;
+                    let required_validation = db
+                        .get_task_contract(task_id)?
+                        .map(|contract| contract.validation)
+                        .unwrap_or_default();
+                    let (report, selection) = run_task_validation_repair_loop(
+                        validation_runner,
+                        &validation_config,
+                        &required_validation,
+                        worker,
+                        db,
+                        &worktree_dir,
+                        repo_path,
+                        task_id,
+                        run_id,
+                        agent_id,
+                        &mut output,
+                        &mut token_usage,
+                        &progress,
+                        &worker_output,
+                        cancellation,
+                    )?;
+                    changes = git::inspect_worktree(&worktree_dir, repo_path)?;
+                    db.store_change_evidence(run_id, &changes)?;
+                    if !report.is_success() {
+                        let message = validation_failure_message(&report);
+                        db.update_agent_run_status_with_usage(
+                            run_id,
+                            "failed",
+                            Some(&message),
+                            token_usage,
+                        )?;
+                        db.update_task_status(task_id, TaskStatus::Blocked)?;
+                        anyhow::bail!(message);
+                    }
                     let combined_output = output.clone().unwrap_or_default();
                     for decision in architecture_decisions(&combined_output) {
                         db.insert_approval_request(project_id, decision)
@@ -1167,7 +1377,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 }
                             })
                             .collect(),
-                        configured_validation: Vec::new(),
+                        configured_validation: selection.commands.clone(),
                         unresolved_issues: Vec::new(),
                     };
                     db.record_lifecycle_event(
@@ -1214,7 +1424,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                         worktree_path: worktree_path.display().to_string(),
                         run_id,
                         run_status: "completed".to_owned(),
-                        validation: "deferred to review".to_owned(),
+                        validation: "passed".to_owned(),
                         changes,
                     })
                 }
@@ -1485,9 +1695,9 @@ pub fn revise_with_worker_on_db_with_overrides(
     repo_path: impl AsRef<Path>,
     agent_id: &str,
     // Configured project validation is no longer run by revision; it is
-    // owned by automated review. The parameter is retained for API
+    // executed by Orc after revision. The parameter is retained for API
     // compatibility with existing callers.
-    _validation_runner: &dyn ValidationRunner,
+    validation_runner: &dyn ValidationRunner,
     overrides: &RevisionExecutionOverrides,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
@@ -1712,7 +1922,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         extra_feedback,
     );
     let prompt = format!(
-        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory): execute the persisted revision PREPARE plan in exact order and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — automated review owns those responsibilities.\n{}",
+        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory): execute the persisted revision PREPARE plan in exact order and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — Orc owns deterministic validation.\n{}",
         prompt,
         serde_json::to_string_pretty(&revision_plan)?
     );
@@ -1779,20 +1989,20 @@ pub fn revise_with_worker_on_db_with_overrides(
     };
     let outcome = execution.outcome;
     let mut output = execution.output;
-    let token_usage = execution.token_usage;
-    let fail = |message: String| -> Result<DispatchSummary> {
+    let mut token_usage = execution.token_usage;
+    let fail = |message: String, usage: Option<TokenUsage>| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
             "worker timeout"
         } else {
             "revision failed"
         });
-        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), token_usage)?;
+        db.update_agent_run_status_with_usage(run_id, "failed", Some(&message), usage)?;
         db.update_task_status(task_id, TaskStatus::Blocked)?;
         anyhow::bail!("{message}")
     };
     if let WorkerOutcome::Failure(error) = outcome {
         progress("worker failed");
-        return fail(format!("Worker failed: {error}"));
+        return fail(format!("Worker failed: {error}"), token_usage);
     }
     progress("worker completed");
     if enforce_worker_protocol {
@@ -1820,9 +2030,10 @@ pub fn revise_with_worker_on_db_with_overrides(
                     true,
                 );
                 db.store_worker_execution(run_id, &evidence)?;
-                return fail(format!(
-                    "Worker revision completion self-check failed: {error:#}"
-                ));
+                return fail(
+                    format!("Worker revision completion self-check failed: {error:#}"),
+                    token_usage,
+                );
             }
             completion_repair += 1;
             let repair_diff = git::inspect_worktree(&worktree_dir, repo_path)?.diff;
@@ -1877,8 +2088,12 @@ pub fn revise_with_worker_on_db_with_overrides(
                 repaired.as_ref().ok().and_then(|value| value.token_usage),
             )?;
             let repaired = repaired.map_err(anyhow::Error::msg)?;
+            merge_token_usage(&mut token_usage, repaired.token_usage);
             if let WorkerOutcome::Failure(error) = repaired.outcome {
-                return fail(format!("Worker completion repair failed: {error}"));
+                return fail(
+                    format!("Worker completion repair failed: {error}"),
+                    token_usage,
+                );
             }
             if let Some(repair_output) = repaired.output {
                 let repair_evidence = normalized_completion_step_output(
@@ -1916,17 +2131,50 @@ pub fn revise_with_worker_on_db_with_overrides(
             )?;
         }
     }
-    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+    let mut changes = match git::inspect_worktree(&worktree_dir, repo_path) {
         Ok(current) => git::changes_since(&baseline_changes, &current),
-        Err(error) => return fail(format!("Post-worker inspection failed: {error:#}")),
+        Err(error) => {
+            return fail(
+                format!("Post-worker inspection failed: {error:#}"),
+                token_usage,
+            );
+        }
     };
     if changes.files.is_empty() {
-        return fail("Revision completed without meaningful project changes.".into());
+        return fail(
+            "Revision completed without meaningful project changes.".into(),
+            token_usage,
+        );
     }
     db.store_change_evidence(run_id, &changes)?;
-    // Configured project validation is owned by automated review, not
-    // revision. Revision publishes implementation/change evidence and
-    // transitions straight back into review.
+    let validation_config = crate::validation::ValidationConfig::load(&worktree_dir)?;
+    let required_validation = db
+        .get_task_contract(task_id)?
+        .map(|contract| contract.validation)
+        .unwrap_or_default();
+    let (report, selection) = run_task_validation_repair_loop(
+        validation_runner,
+        &validation_config,
+        &required_validation,
+        worker,
+        db,
+        &worktree_dir,
+        repo_path,
+        task_id,
+        run_id,
+        agent_id,
+        &mut output,
+        &mut token_usage,
+        &progress,
+        &worker_output,
+        None,
+    )?;
+    let current = git::inspect_worktree(&worktree_dir, repo_path)?;
+    changes = git::changes_since(&baseline_changes, &current);
+    db.store_change_evidence(run_id, &changes)?;
+    if !report.is_success() {
+        return fail(validation_failure_message(&report), token_usage);
+    }
     let combined = output.clone().unwrap_or_default();
     let performed_operations = planned_operations_for_plan(&revision_plan.steps);
     let revision_evidence = crate::worker_protocol::WorkerExecutionResult {
@@ -1957,7 +2205,7 @@ pub fn revise_with_worker_on_db_with_overrides(
                 }
             })
             .collect(),
-        configured_validation: Vec::new(),
+        configured_validation: selection.commands.clone(),
         unresolved_issues: Vec::new(),
     };
     db.record_lifecycle_event(
@@ -1976,9 +2224,8 @@ pub fn revise_with_worker_on_db_with_overrides(
     )?;
     db.store_worker_execution(run_id, &revision_evidence)
         .context("failed to persist Worker revision execution evidence")?;
-    // The subsequent automated review is authoritative for blocker
-    // resolution and validation. Consume and link the source review only
-    // after the revision has produced inspectable, evidenced changes.
+    // Consume and link the source review only after the revision has produced
+    // inspectable changes and current deterministic validation evidence.
     if !db.complete_revision_run_for_review(
         task_id,
         run_id,
@@ -1987,7 +2234,10 @@ pub fn revise_with_worker_on_db_with_overrides(
         &combined,
         token_usage,
     )? {
-        return fail("Revision review was consumed before this revision completed.".into());
+        return fail(
+            "Revision review was consumed before this revision completed.".into(),
+            token_usage,
+        );
     }
     progress("review transition");
     Ok(DispatchSummary {
@@ -2002,7 +2252,7 @@ pub fn revise_with_worker_on_db_with_overrides(
         worktree_path,
         run_id,
         run_status: "completed".into(),
-        validation: "deferred to review".into(),
+        validation: "passed".into(),
         changes,
     })
 }

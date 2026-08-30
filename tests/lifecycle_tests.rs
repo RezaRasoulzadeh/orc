@@ -353,7 +353,7 @@ fn successful_worker_transitions_active_to_review() {
 }
 
 #[test]
-fn validation_failure_requires_revision_with_evidence_and_cannot_be_requeued() {
+fn dispatch_validation_evidence_is_reused_by_semantic_review() {
     let dir = TempDir::new().unwrap();
     let repo_dir = dir.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -411,8 +411,8 @@ fn validation_failure_requires_revision_with_evidence_and_cannot_be_requeued() {
     )
     .unwrap();
 
-    // Dispatch no longer runs configured validation itself; it succeeds and
-    // publishes the task for review regardless of what validation would say.
+    // Dispatch owns deterministic validation and publishes fresh evidence
+    // before making the task Review-ready.
     let worker = FakeWorker::new_success(None);
     let result = agent::dispatch_with_worker_on_db(
         &task,
@@ -434,13 +434,11 @@ fn validation_failure_requires_revision_with_evidence_and_cannot_be_requeued() {
     assert!(
         db.latest_validation_result_for_run(runs[0].id)
             .unwrap()
-            .is_none(),
-        "dispatch must not persist validation evidence; that is review's job"
+            .is_some(),
+        "dispatch must persist current validation evidence"
     );
 
-    // Automated review owns validation: it selects and runs the configured
-    // command against the reviewed worktree, and a failure becomes a
-    // blocker even though the reviewer backend claims PASS.
+    // Review consumes the existing pass and stays semantic-only.
     let app = OrcApp::open(&db_path, &repo_dir).unwrap();
     let overrides = ActionOverrides {
         agent_id: Some("eligible-reviewer".into()),
@@ -454,35 +452,29 @@ fn validation_failure_requires_revision_with_evidence_and_cannot_be_requeued() {
             &FakeValidationRunner::failing_on("cargo test validation-lifecycle"),
         )
         .unwrap();
-    assert_eq!(review.verdict, "REVISE");
+    assert_eq!(review.verdict, "PASS");
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
-        TaskStatus::RevisionRequired
+        TaskStatus::AcceptanceReady
     );
-    assert_eq!(review.blockers.len(), 1);
+    assert!(review.blockers.is_empty());
     assert!(
-        review.blockers[0]
-            .finding
-            .contains("cargo test validation-lifecycle")
+        db.latest_validation_result_for_run(review_run)
+            .unwrap()
+            .is_none()
     );
-    let validation = db
-        .latest_validation_result_for_run(review_run)
-        .unwrap()
-        .unwrap();
-    assert!(validation.contains("validation-lifecycle"));
-    assert!(validation.contains("command failed"));
     assert!(repo_dir.join(".orc/worktrees").join(&task).exists());
 
     let requeue = app.requeue(&task).unwrap_err().to_string();
     assert!(requeue.contains("cannot be requeued") || requeue.contains("not active"));
     assert_eq!(
         app.task(&task).unwrap().unwrap().status,
-        TaskStatus::RevisionRequired
+        TaskStatus::AcceptanceReady
     );
 }
 
 #[test]
-fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecycle() {
+fn semantic_review_revise_validate_review_accept_is_one_production_lifecycle() {
     let dir = TempDir::new().unwrap();
     let repo_dir = dir.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -542,8 +534,8 @@ fn validation_failure_review_revise_validate_and_accept_is_one_production_lifecy
     )
     .unwrap();
 
-    // Dispatch no longer runs configured validation itself, so it succeeds
-    // regardless of what validation would later say during review.
+    // This fixture has no selected validation commands, so Dispatch succeeds
+    // without invoking the ValidationRunner.
     assert!(
         agent::dispatch_with_worker_on_db(
             &task,

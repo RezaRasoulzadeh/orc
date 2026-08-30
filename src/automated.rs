@@ -928,7 +928,7 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
     for failure in &contract.validation_failures {
         out.push_str(&format!("- {failure}\n"));
     }
-    out.push_str("\n### Required handoff\nReturn JSON {\"completion\":{\"step_results\":[{\"step_id\":\"...\",\"operations_performed\":[\"modify\"],\"affected_files\":[],\"observed\":[],\"verification_passed\":[]}],\"summary\":\"...\"},\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. `completion` describes the work performed; Orc derives changed files from the worktree and automated review owns validation, acceptance, and reviewer-style verification. Resolved constraints require no claim. `completion` is the same checkpoint evidence contract used by initial implementation; claims add only revision blocker disposition. Do not include validation evidence in a claim \u{2014} automated review owns validation. Keep changes focused.");
+    out.push_str("\n### Required handoff\nReturn JSON {\"completion\":{\"step_results\":[{\"step_id\":\"...\",\"operations_performed\":[\"modify\"],\"affected_files\":[],\"observed\":[],\"verification_passed\":[]}],\"summary\":\"...\"},\"claims\":[{\"blocker_id\":\"...\",\"status\":\"addressed|unresolved\",\"implementation_summary\":\"...\",\"changed_files\":[],\"unresolved_risk\":null}]} with exactly one claim for every active blocker ID. `completion` describes the work performed; Orc derives changed files from the worktree and owns deterministic validation, acceptance, and reviewer-style verification. Resolved constraints require no claim. `completion` is the same checkpoint evidence contract used by initial implementation; claims add only revision blocker disposition. Do not include validation evidence in a claim \u{2014} Orc owns validation. Keep changes focused.");
     out
 }
 
@@ -1290,205 +1290,54 @@ fn lead_packet(context: &LeadContext, message: &str) -> serde_json::Value {
     })
 }
 
-/// Task-specific validation selected and executed by automated review for a
-/// single review invocation, kept in memory only long enough to build the
-/// review prompt and, on failure, a focused blocker.
-struct ReviewValidationRun {
-    selection: crate::validation::ValidationSelection,
-    report: crate::validation::ValidationReport,
-}
-
-/// Determine, execute, and persist the task-specific validation for a
-/// review. Selects the smallest authoritative set of configured validation
-/// commands relevant to the task's changed files and any explicit
-/// task-required validation, runs each selected command at most once against
-/// the worktree being reviewed, and persists the selection, its rationale,
-/// the results, and the worktree fingerprint they apply to.
-///
-/// Returns `Ok(None)` when there is nothing to validate (no worktree, or
-/// selection produced no commands) rather than treating that as a failure.
-fn select_and_run_review_validation(
-    db: &Database,
-    summary: &ReviewSummary,
-    run_id: i64,
-    agent_id: &str,
-    repo_path: &Path,
-    validation_runner: &dyn ValidationRunner,
-    progress: &dyn Fn(&str),
-) -> Result<Option<ReviewValidationRun>> {
-    let Some(worktree_path) = summary.worktree_path.as_deref() else {
-        return Ok(None);
-    };
-    let worktree_dir = repo_path.join(worktree_path);
-    if !worktree_dir.exists() {
-        return Ok(None);
-    }
-    let config = crate::validation::ValidationConfig::load(&worktree_dir).unwrap_or_else(|_| {
-        crate::validation::ValidationConfig {
-            commands: Vec::new(),
-            groups: Vec::new(),
-            boundaries: Vec::new(),
-        }
-    });
-    let changed_files: Vec<String> = summary
-        .changes
-        .files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect();
-    let required = db
-        .get_task_contract(&summary.task.id)?
-        .map(|contract| contract.validation)
-        .unwrap_or_default();
-    let selection = config.select_for_task(&changed_files, &required);
-    if selection.commands.is_empty() {
-        progress("Selecting validation          none");
-        return Ok(None);
-    }
-    let selection_label = if selection.groups.is_empty() {
-        selection.commands.join(", ")
-    } else {
-        selection.groups.join(", ")
-    };
-    progress(&format!("Selecting validation          {selection_label}"));
-    let report = crate::validation::run_validation_pipeline(
-        validation_runner,
-        &selection.commands,
-        &worktree_dir,
-    )
-    .unwrap_or_else(|error| {
-        crate::validation::ValidationReport::infrastructure_failure(
-            selection
-                .commands
-                .first()
-                .map_or("validation", String::as_str),
-            format!("{error:#}"),
-        )
-    });
-    for step in &report.steps {
-        progress(&format!(
-            "{:<30} {}",
-            step.command,
-            if step.passed { "PASS" } else { "FAIL" }
-        ));
-    }
-    db.record_lifecycle_event(
-        "validation_result",
-        Some(&summary.task.id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&serde_json::to_string(&report)?),
-    )?;
-    let record = serde_json::json!({
-        "selected_groups": selection.groups,
-        "selected_commands": selection.commands,
-        "rationale": selection.rationale,
-        "worktree_fingerprint": revision_worktree_fingerprint(&summary.changes),
-    });
-    db.record_lifecycle_event(
-        "review_validation_selection",
-        Some(&summary.task.id),
-        Some(run_id),
-        Some(agent_id),
-        Some(&record.to_string()),
-    )?;
-    Ok(Some(ReviewValidationRun { selection, report }))
-}
-
-/// If the executed task-specific validation failed, ensure a corresponding
-/// blocker is present regardless of whether the LLM reviewer independently
-/// surfaced one. Reuses the blocker's stable key to reopen a previously
-/// resolved blocker as a regression, or continue an existing unresolved one,
-/// rather than spawning duplicates across review cycles.
-fn append_validation_failure_blocker(
-    result: &mut ReviewResult,
-    prior: &[crate::storage::db::ReviewBlockerRecord],
-    validation_run: &ReviewValidationRun,
-) {
-    if validation_run.report.is_success() {
-        return;
-    }
-    let subsystem = if validation_run.selection.groups.is_empty() {
-        "task-specific validation".to_owned()
-    } else {
-        validation_run.selection.groups.join(", ")
-    };
-    for step in validation_run
-        .report
-        .steps
-        .iter()
-        .filter(|step| !step.passed)
-    {
-        let blocker_key = format!("task-validation:{}", step.command);
-        if result
-            .blockers
-            .iter()
-            .any(|blocker| blocker.blocker_key == blocker_key)
-        {
-            // The reviewer already surfaced this exact failing command.
-            continue;
-        }
-        let output: String = step.output().chars().take(2000).collect();
-        let evidence = if output.trim().is_empty() {
-            format!("`{}` failed for the {subsystem} subsystem.", step.command)
-        } else {
-            format!(
-                "`{}` failed for the {subsystem} subsystem.\n\n{output}",
-                step.command
-            )
-        };
-        let prior_match = prior.iter().find(|old| old.blocker_key == blocker_key);
-        let status = if prior_match.map(|old| old.status.as_str()) == Some("resolved") {
-            "regression"
-        } else {
-            "unresolved"
-        };
-        let finding = format!(
-            "Task-specific validation command `{}` failed.",
-            step.command
-        );
-        result.blockers.push(ReviewBlocker {
-            id: String::new(),
-            prior_blocker_id: prior_match.map(|old| old.blocker_id.clone()),
-            blocker_key,
-            requirement_ref: format!("task-specific validation ({subsystem})"),
-            evidence,
-            severity: "high".into(),
-            acceptance_condition: format!("`{}` must pass", step.command),
-            status: status.into(),
-            finding: finding.clone(),
-        });
-        result.blocking_findings.push(finding);
-    }
-}
-
-/// Task review: produces the PASS/REVISE/REJECT verdict that gates task
-/// acceptance. This is the only public entry point for a task review, and it
-/// always determines, executes, and persists task-specific validation (see
-/// [`select_and_run_review_validation`]) before producing a verdict —
-/// dispatch and revision no longer run configured validation themselves, so
-/// there must be no task-review path that can skip it. Callers that
-/// genuinely have no worktree to validate (e.g. tests exercising only the
-/// verdict/blocker machinery) still pass a `repo_path`/`validation_runner`;
-/// validation is then a no-op because there is nothing to select against
-/// (see `select_and_run_review_validation`'s worktree check), not because
-/// the caller opted out.
+/// Task review consumes fresh deterministic validation evidence created by
+/// Dispatch or Revise, then evaluates only semantic task-contract concerns.
 pub fn run_review(
     db: &Database,
     summary: &ReviewSummary,
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
-    repo_path: &Path,
-    validation_runner: &dyn ValidationRunner,
+    _repo_path: &Path,
+    _validation_runner: &dyn ValidationRunner,
 ) -> Result<(i64, ReviewResult)> {
-    run_review_mode(
-        db,
-        summary,
-        overrides,
-        backend,
-        false,
-        Some((repo_path, validation_runner)),
-    )
+    require_fresh_passing_validation(db, summary)?;
+    run_review_mode(db, summary, overrides, backend, false, None)
+}
+
+fn require_fresh_passing_validation(db: &Database, summary: &ReviewSummary) -> Result<()> {
+    let Some(run) = summary.run.as_ref() else {
+        return Ok(());
+    };
+    let Some(worktree) = summary.worktree_path.as_ref() else {
+        return Ok(());
+    };
+    if worktree.is_empty() {
+        return Ok(());
+    }
+    let report: crate::validation::ValidationReport = db
+        .latest_validation_result_for_run(run.id)?
+        .context("review requires current passing deterministic validation evidence")
+        .and_then(|value| {
+            serde_json::from_str(&value).context("persisted validation evidence is invalid")
+        })?;
+    if !report.is_success() {
+        bail!(
+            "review requires current passing deterministic validation evidence; return to implementation-stage repair"
+        );
+    }
+    let selection: serde_json::Value = db
+        .latest_validation_selection_for_run(run.id)?
+        .context("review requires validation freshness evidence")
+        .and_then(|value| {
+            serde_json::from_str(&value).context("persisted validation selection is invalid")
+        })?;
+    let current = revision_worktree_fingerprint(&summary.changes);
+    if selection["worktree_fingerprint"].as_str() != Some(current.as_str()) {
+        bail!(
+            "review validation evidence is stale for the current worktree; return to implementation-stage validation"
+        );
+    }
+    Ok(())
 }
 
 /// Project-wide audit. Unlike [`run_review`], this never gates task
@@ -1510,7 +1359,7 @@ fn run_review_mode(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
     project_review: bool,
-    validation: Option<(&Path, &dyn ValidationRunner)>,
+    _validation: Option<(&Path, &dyn ValidationRunner)>,
 ) -> Result<(i64, ReviewResult)> {
     if !project_review && summary.task.status.is_terminal() {
         bail!(
@@ -1537,51 +1386,13 @@ fn run_review_mode(
     if !project_review {
         backend.observe("Preparing review packet       OK");
     }
-    let validation_run = match validation {
-        Some((repo_path, runner)) => select_and_run_review_validation(
-            db,
-            summary,
-            run,
-            &resolved.agent,
-            repo_path,
-            runner,
-            &|message| backend.observe(message),
-        )?,
-        None => None,
-    };
     let instructions = if project_review {
         "Perform a project-wide audit. Inspect broader architecture, latent defects, consistency, technical debt, missing tests, and adjacent concerns without task-scope restrictions. Classify findings in blocking_findings or non_blocking_findings for this project audit."
     } else {
         TASK_REVIEW_INSTRUCTIONS
     };
-    let validation_section = match &validation_run {
-        Some(validation_run) => {
-            // Bound the embedded command output: a large failing test dump
-            // must not blow up review prompt size.
-            const MAX_VALIDATION_SUMMARY_CHARS: usize = 4_000;
-            let summary = validation_run.report.summary();
-            let summary: String = if summary.chars().count() > MAX_VALIDATION_SUMMARY_CHARS {
-                let mut truncated: String =
-                    summary.chars().take(MAX_VALIDATION_SUMMARY_CHARS).collect();
-                truncated.push_str("\n... (truncated)");
-                truncated
-            } else {
-                summary
-            };
-            format!(
-                "\n\nTask-specific validation (selected and executed by Orc, not the provider):\nSelected groups: {}\nWhy selected: {}\nResults:\n{summary}",
-                if validation_run.selection.groups.is_empty() {
-                    "none (flat command list)".to_owned()
-                } else {
-                    validation_run.selection.groups.join(", ")
-                },
-                validation_run.selection.rationale.join("; "),
-            )
-        }
-        None => String::new(),
-    };
     let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. A failed task-specific validation command below must be reflected as a blocker. Do not accept or merge the task.{validation_section}\nReview packet:\n{}",
+        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. Deterministic validation was already executed by Orc; review only semantic task-contract concerns. Do not accept or merge the task.\nReview packet:\n{}",
         serde_json::to_string(&review_packet(db, summary)?)?
     );
     let execution = invoke_action(db, run, backend, &review_agent, &resolved, &prompt);
@@ -1622,14 +1433,6 @@ fn run_review_mode(
                     normalize_blockers(&mut result);
                     result.validate_structured_blockers()?;
                     let prior = db.review_blocker_ledger(&summary.task.id)?;
-                    if let Some(validation_run) = &validation_run {
-                        append_validation_failure_blocker(&mut result, &prior, validation_run);
-                        if !result.blocking_findings.is_empty()
-                            && result.verdict.eq_ignore_ascii_case("pass")
-                        {
-                            result.verdict = "REVISE".into();
-                        }
-                    }
                     let mut referenced = std::collections::HashSet::new();
                     for blocker in &mut result.blockers {
                         if let Some(returned_id) = blocker.prior_blocker_id.as_deref() {
@@ -1661,7 +1464,8 @@ fn run_review_mode(
                                 ("resolved", "regression") => "regression",
                                 ("resolved", "resolved" | "unresolved") => "resolved",
                                 ("new" | "unresolved" | "regression", "resolved") => "resolved",
-                                ("new" | "unresolved" | "regression", "unresolved") => "unresolved",
+                                ("new" | "unresolved" | "regression", "new" | "unresolved") => "unresolved",
+                                ("new" | "unresolved" | "regression", "regression") => "regression",
                                 ("new" | "unresolved" | "regression", _) => {
                                     bail!(
                                         "invalid status transition for prior blocker '{}'",
@@ -1772,18 +1576,7 @@ fn run_review_mode(
                             {
                                 contract.current_persisted_execution_evidence = evidence;
                             }
-                            contract.validation_failures = validation_run
-                                .as_ref()
-                                .map(|validation_run| {
-                                    validation_run
-                                        .report
-                                        .steps
-                                        .iter()
-                                        .filter(|step| !step.passed)
-                                        .map(|step| format!("{}: {}", step.command, step.output()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            contract.validation_failures = Vec::new();
                             if let Some(feedback) = &result.revision_feedback
                                 && !feedback.trim().is_empty()
                             {
@@ -2768,7 +2561,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        assert!(runner.executed().is_empty());
         assert_eq!(backend.calls.borrow().len(), 1);
         assert_eq!(
             db.get_task(&summary.task.id).unwrap().unwrap().status,
@@ -2882,7 +2675,7 @@ commands = ["npm run typecheck", "npm run build"]
 "#;
 
     #[test]
-    fn review_owns_validation_and_persists_evidence_tied_to_the_reviewed_worktree() {
+    fn review_consumes_validation_evidence_without_executing_commands() {
         let (db, summary, backend, directory) = validation_review_fixture(
             serde_json::json!({
                 "verdict": "PASS", "findings": [], "blocking_findings": [],
@@ -2902,25 +2695,12 @@ commands = ["npm run typecheck", "npm run build"]
         )
         .unwrap();
         assert_eq!(result.verdict, "PASS");
-        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
-        let selection_event = db
-            .list_lifecycle_events_for_run(run_id, 20)
-            .unwrap()
-            .into_iter()
-            .find(|event| event.kind == "review_validation_selection")
-            .unwrap();
-        let payload: serde_json::Value =
-            serde_json::from_str(&selection_event.payload.unwrap()).unwrap();
-        assert_eq!(payload["selected_groups"], serde_json::json!(["rust-core"]));
-        assert_eq!(
-            payload["worktree_fingerprint"],
-            serde_json::json!(revision_worktree_fingerprint(&summary.changes))
+        assert!(runner.executed().is_empty());
+        assert!(
+            db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .is_none()
         );
-        let validation_result = db
-            .latest_validation_result_for_run(run_id)
-            .unwrap()
-            .unwrap();
-        assert!(validation_result.contains("cargo fmt --check"));
     }
 
     #[test]
@@ -2971,10 +2751,7 @@ commands = ["npm run typecheck", "npm run build"]
             &runner,
         )
         .unwrap();
-        assert_eq!(
-            runner.executed(),
-            vec!["npm run typecheck", "npm run build"]
-        );
+        assert!(runner.executed().is_empty());
     }
 
     #[test]
@@ -2997,33 +2774,14 @@ commands = ["npm run typecheck", "npm run build"]
             &runner,
         )
         .unwrap();
-        assert_eq!(result.verdict, "REVISE");
-        assert_eq!(result.blockers.len(), 1);
-        assert!(result.blockers[0].finding.contains("cargo fmt --check"));
-        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
-        let validation: crate::validation::ValidationReport = serde_json::from_str(
-            &db.latest_validation_result_for_run(run_id)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(validation.steps.len(), 2);
-        assert!(!validation.steps[0].passed);
-        assert!(validation.steps[1].passed);
-        let contract: RevisionContract = serde_json::from_str(
-            &db.actionable_revision_contract(&summary.task.id)
-                .unwrap()
-                .unwrap()
-                .1,
-        )
-        .unwrap();
-        assert_eq!(contract.active_blockers.len(), 1);
+        assert_eq!(result.verdict, "PASS");
+        assert!(result.blockers.is_empty());
+        assert!(runner.executed().is_empty());
         assert!(
-            contract.validation_failures[0].contains("cargo fmt --check"),
-            "revision context should carry the exact failure evidence: {:?}",
-            contract.validation_failures
+            db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .is_none()
         );
-        let _ = run_id;
     }
 
     #[test]
@@ -3047,37 +2805,14 @@ commands = ["npm run typecheck", "npm run build"]
         )
         .unwrap();
 
-        assert_eq!(result.verdict, "REVISE");
-        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
-        assert_eq!(result.blockers.len(), 2);
+        assert_eq!(result.verdict, "PASS");
+        assert!(result.blockers.is_empty());
+        assert!(runner.executed().is_empty());
         assert!(
-            result
-                .blockers
-                .iter()
-                .any(|blocker| blocker.blocker_key == "task-validation:cargo fmt --check")
+            db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .is_none()
         );
-        assert!(
-            result
-                .blockers
-                .iter()
-                .any(|blocker| blocker.blocker_key == "task-validation:cargo test")
-        );
-        let validation: crate::validation::ValidationReport = serde_json::from_str(
-            &db.latest_validation_result_for_run(run_id)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(validation.steps.len(), 2);
-        assert!(validation.steps.iter().all(|step| !step.passed));
-        let contract: RevisionContract = serde_json::from_str(
-            &db.actionable_revision_contract(&summary.task.id)
-                .unwrap()
-                .unwrap()
-                .1,
-        )
-        .unwrap();
-        assert_eq!(contract.validation_failures.len(), 2);
     }
 
     #[test]
@@ -3127,7 +2862,7 @@ commands = ["npm run typecheck", "npm run build"]
         .unwrap();
 
         let prompt = backend.0.borrow();
-        assert!(prompt.contains("... (truncated)"));
+        assert!(!prompt.contains("diagnostic diagnostic"));
         assert!(
             prompt.len() < 10_000,
             "review prompt was not bounded: {}",
@@ -3195,8 +2930,7 @@ commands = ["npm run typecheck", "npm run build"]
             &runner,
         )
         .unwrap();
-        assert_eq!(result.blockers.len(), 1);
-        assert_eq!(result.blockers[0].status, "regression");
+        assert!(result.blockers.is_empty());
     }
 
     #[test]
@@ -3317,7 +3051,7 @@ commands = ["npm run typecheck", "npm run build"]
         )
         .unwrap();
 
-        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        assert!(runner.executed().is_empty());
         assert!(
             !backend
                 .capabilities
@@ -3326,24 +3060,14 @@ commands = ["npm run typecheck", "npm run build"]
                 .any(|capability| capability == "command_execution")
         );
         let prompt = backend.prompt.borrow();
-        assert!(prompt.contains("Selected groups: rust-core"));
-        assert!(prompt.contains("cargo fmt --check"));
+        assert!(!prompt.contains("Selected groups: rust-core"));
+        assert!(!prompt.contains("cargo fmt --check"));
         assert!(prompt.contains("Do not execute shell commands"));
         let observed = backend.observed.borrow();
         assert!(
             observed
                 .iter()
                 .any(|message| message == "Preparing review packet       OK")
-        );
-        assert!(
-            observed
-                .iter()
-                .any(|message| message.contains("Selecting validation          rust-core"))
-        );
-        assert!(
-            observed
-                .iter()
-                .any(|message| message.contains("cargo fmt --check") && message.contains("PASS"))
         );
         assert!(
             observed

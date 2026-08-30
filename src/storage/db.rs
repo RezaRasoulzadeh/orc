@@ -3357,12 +3357,12 @@ impl Database {
             [run_id],
         )?;
         if tx.execute(
-            "UPDATE tasks SET status=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND status IN ('review', 'blocked')",
+            "UPDATE tasks SET status=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND status NOT IN ('done', 'cancelled')",
             params![destination, task_id],
         )? != 1
         {
             return Err(DbError::Scheduler(format!(
-                "task '{task_id}' is not awaiting review or blocked recovery"
+                "task '{task_id}' is terminal and cannot receive a review result"
             )));
         }
         let event = Self::persist_worker_result_and_event(
@@ -5033,6 +5033,51 @@ impl Database {
             "INSERT INTO task_execution_conditions (task_id, kind, details) VALUES (?1, ?2, ?3) ON CONFLICT(task_id) DO UPDATE SET kind = excluded.kind, details = excluded.details",
             params![task_id, kind, details],
         )?;
+        Ok(())
+    }
+
+    /// Acknowledges the only execution condition that deliberately requires
+    /// operator re-planning. The original condition is retained in the
+    /// lifecycle event payload so clearing the active gate never destroys its
+    /// audit trail.
+    pub fn acknowledge_non_convergence_replan_required(
+        &self,
+        task_id: &str,
+    ) -> Result<(), DbError> {
+        let task = self
+            .get_task(task_id)?
+            .ok_or_else(|| DbError::TaskNotFound(task_id.to_owned()))?;
+        if task.status.is_terminal() {
+            return Err(DbError::Scheduler(format!(
+                "task '{task_id}' is terminal and cannot recover an execution condition"
+            )));
+        }
+        let condition = self.get_task_execution_condition(task_id)?.ok_or_else(|| {
+            DbError::Scheduler(format!(
+                "task '{task_id}' has no execution condition to unblock"
+            ))
+        })?;
+        if condition.kind != "non_convergence_replan_required" {
+            return Err(DbError::Scheduler(format!(
+                "task '{task_id}' is not blocked by non_convergence_replan_required"
+            )));
+        }
+        let details = serde_json::json!({
+            "acknowledged_condition": condition.kind,
+            "original_details": serde_json::from_str::<serde_json::Value>(&condition.details)
+                .unwrap_or(serde_json::Value::String(condition.details.clone())),
+        })
+        .to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE task_execution_conditions SET kind = 'non_convergence_replan_acknowledged', details = ?1 WHERE task_id = ?2 AND kind = 'non_convergence_replan_required'",
+            params![details, task_id],
+        )?;
+        tx.execute(
+            "INSERT INTO lifecycle_events (kind, task_id, payload) VALUES ('task_execution_condition_acknowledged', ?1, ?2)",
+            params![task_id, condition.details],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

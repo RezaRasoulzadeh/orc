@@ -399,6 +399,28 @@ fn effective_revision_effort(
             &blocker.blocker_id,
         )? {
             if previous == ReasoningEffort::High {
+                let acknowledged =
+                    db.get_task_execution_condition(&task.id)?
+                        .is_some_and(|condition| {
+                            condition.kind == "non_convergence_replan_acknowledged"
+                                && serde_json::from_str::<serde_json::Value>(&condition.details)
+                                    .ok()
+                                    .and_then(|details| details.get("original_details").cloned())
+                                    .is_some_and(|details| {
+                                        details.get("blocker_id")
+                                            == Some(&serde_json::Value::String(
+                                                blocker.blocker_id.clone(),
+                                            ))
+                                            && details.get("source_review_id")
+                                                == Some(&serde_json::Value::from(source_review_id))
+                                    })
+                        });
+                if acknowledged {
+                    if ReasoningEffort::High.rank() > effective.rank() {
+                        effective = ReasoningEffort::High;
+                    }
+                    continue;
+                }
                 let details = serde_json::json!({
                     "blocker_id": blocker.blocker_id,
                     "source_review_id": source_review_id,
@@ -2811,6 +2833,98 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("REPLAN_REQUIRED"));
+
+        let blocker_history = db.review_blocker_ledger(&task).unwrap();
+        let task_before_recovery = db.get_task(&task).unwrap().unwrap();
+        let revision_history = db
+            .list_agent_runs(project, 100)
+            .unwrap()
+            .into_iter()
+            .map(|run| (run.id, run.status, run.output, run.error))
+            .collect::<Vec<_>>();
+        db.acknowledge_non_convergence_replan_required(&task)
+            .unwrap();
+        let condition = db.get_task_execution_condition(&task).unwrap().unwrap();
+        assert_eq!(condition.kind, "non_convergence_replan_acknowledged");
+        assert_eq!(db.get_task(&task).unwrap().unwrap(), task_before_recovery);
+        assert_eq!(db.review_blocker_ledger(&task).unwrap(), blocker_history);
+        assert_eq!(
+            db.list_agent_runs(project, 100)
+                .unwrap()
+                .into_iter()
+                .map(|run| (run.id, run.status, run.output, run.error))
+                .collect::<Vec<_>>(),
+            revision_history
+        );
+        assert!(
+            db.list_lifecycle_events_for_task(&task, 20)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "task_execution_condition_acknowledged")
+        );
+        assert_eq!(effort(fourth_review), ReasoningEffort::High);
+
+        // The acknowledgement is scoped to this review observation. A later
+        // review that establishes the same non-convergence condition must
+        // raise the gate again.
+        revision(&db, fourth_review, ReasoningEffort::High);
+        let fifth_review = review(&db);
+        let error = effective_revision_effort(
+            &db,
+            &db.get_task(&task).unwrap().unwrap(),
+            fifth_review,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("REPLAN_REQUIRED"));
+        assert_eq!(
+            db.get_task_execution_condition(&task)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "non_convergence_replan_required"
+        );
+    }
+
+    #[test]
+    fn non_convergence_recovery_rejects_invalid_attempts_without_mutation() {
+        let (_dir, db, task) = setup();
+        let before = db.get_task(&task).unwrap().unwrap();
+        assert!(
+            db.acknowledge_non_convergence_replan_required(&task)
+                .is_err()
+        );
+        assert_eq!(db.get_task(&task).unwrap().unwrap(), before);
+        assert!(db.get_task_execution_condition(&task).unwrap().is_none());
+
+        db.set_task_execution_condition(&task, "other_condition", "{}")
+            .unwrap();
+        assert!(
+            db.acknowledge_non_convergence_replan_required(&task)
+                .is_err()
+        );
+        assert_eq!(
+            db.get_task_execution_condition(&task)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "other_condition"
+        );
+
+        db.update_task_status(&task, TaskStatus::Done).unwrap();
+        db.set_task_execution_condition(&task, "non_convergence_replan_required", "{}")
+            .unwrap();
+        assert!(
+            db.acknowledge_non_convergence_replan_required(&task)
+                .is_err()
+        );
+        assert_eq!(
+            db.get_task_execution_condition(&task)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "non_convergence_replan_required"
+        );
     }
 
     fn effort_with_override(

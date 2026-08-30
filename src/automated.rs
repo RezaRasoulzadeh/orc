@@ -1512,14 +1512,9 @@ fn run_review_mode(
     project_review: bool,
     validation: Option<(&Path, &dyn ValidationRunner)>,
 ) -> Result<(i64, ReviewResult)> {
-    if !project_review
-        && !matches!(
-            summary.task.status,
-            crate::task::TaskStatus::Review | crate::task::TaskStatus::Blocked
-        )
-    {
+    if !project_review && summary.task.status.is_terminal() {
         bail!(
-            "task {} can only be reviewed from review or blocked (currently {})",
+            "task {} cannot be reviewed from terminal status {}",
             summary.task.id,
             summary.task.status
         );
@@ -2594,6 +2589,99 @@ mod tests {
                 output: output.to_string(),
             },
         )
+    }
+
+    #[test]
+    fn task_review_accepts_every_open_status_and_rejects_terminal_statuses() {
+        let output = serde_json::json!({
+            "verdict": "PASS", "findings": [], "blocking_findings": [],
+            "non_blocking_findings": [], "severity": null, "revision_feedback": null,
+            "blockers": []
+        });
+        for status in [
+            crate::task::TaskStatus::Ready,
+            crate::task::TaskStatus::Active,
+            crate::task::TaskStatus::Review,
+            crate::task::TaskStatus::Blocked,
+            crate::task::TaskStatus::RevisionRequired,
+            crate::task::TaskStatus::AcceptanceReady,
+        ] {
+            let (db, mut summary, backend) = review_fixture(output.clone());
+            db.update_task_status(&summary.task.id, status).unwrap();
+            summary.task.status = status;
+            run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap();
+            assert_eq!(
+                db.get_task(&summary.task.id).unwrap().unwrap().status,
+                crate::task::TaskStatus::AcceptanceReady,
+                "{status} should be directly reviewable"
+            );
+        }
+
+        for status in [
+            crate::task::TaskStatus::Done,
+            crate::task::TaskStatus::Cancelled,
+        ] {
+            let (db, mut summary, backend) = review_fixture(output.clone());
+            db.update_task_status(&summary.task.id, status).unwrap();
+            summary.task.status = status;
+            let error = run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("terminal status"));
+            assert!(
+                db.list_agent_runs(db.get_project_id().unwrap().unwrap(), 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn manually_repaired_revision_required_task_can_be_reviewed_without_revise() {
+        let (db, mut summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null,
+                "blockers": []
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        db.update_task_status(&summary.task.id, crate::task::TaskStatus::RevisionRequired)
+            .unwrap();
+        summary.task.status = crate::task::TaskStatus::RevisionRequired;
+        let runner = RecordingValidationRunner::new(&[]);
+
+        run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        assert_eq!(backend.calls.borrow().len(), 1);
+        assert_eq!(
+            db.get_task(&summary.task.id).unwrap().unwrap().status,
+            crate::task::TaskStatus::AcceptanceReady
+        );
     }
 
     /// Records every command it was asked to run, exactly once each call, so

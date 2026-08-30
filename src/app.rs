@@ -1040,6 +1040,13 @@ impl OrcApp {
         )?;
         Ok(())
     }
+    /// Deliberately acknowledges a persisted non-convergence gate. It does
+    /// not change task status or execute a lifecycle stage.
+    pub fn unblock_non_convergence(&self, task_id: &str) -> Result<()> {
+        self.db
+            .acknowledge_non_convergence_replan_required(task_id)?;
+        Ok(())
+    }
     pub fn cancel(
         &self,
         task_id: &str,

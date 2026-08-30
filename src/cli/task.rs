@@ -36,6 +36,10 @@ pub enum TaskCommand {
     Requeue {
         task_id: String,
     },
+    /// Acknowledge a non-convergence replan requirement after inspection.
+    Unblock {
+        task_id: String,
+    },
     /// Display task details
     Show {
         /// Task ID to display
@@ -164,6 +168,10 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
         TaskCommand::Requeue { task_id } => {
             OrcApp::open_global(db_path, ".")?.requeue(&task_id)?;
             println!("Requeued task {task_id}");
+        }
+        TaskCommand::Unblock { task_id } => {
+            OrcApp::open_global(db_path, ".")?.unblock_non_convergence(&task_id)?;
+            println!("Acknowledged non-convergence condition for task {task_id}");
         }
         TaskCommand::Show { task_id } => match Database::open_global(db_path) {
             Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {

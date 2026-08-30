@@ -238,6 +238,9 @@ Cancels a task while preserving its worktree. Fails if the task is already done 
 ### `orc task requeue TASK_ID`
 Recovers an interrupted active task or a failed blocked task and returns it to the queue.
 
+### `orc task unblock TASK_ID`
+Acknowledges a persisted `non_convergence_replan_required` condition after inspection. It preserves task, blocker, review, and revision history and does not execute a lifecycle stage.
+
 ### `orc task purge TASK_ID [--force]`
 Irreversibly deletes a task and its persisted state. Without `--force`, the task must be done or cancelled, have no dependents, and have a clean canonical worktree. `--force` bypasses terminal and dependent-task restrictions and removes dependency edges and the worktree, but never bypasses active/waiting-run protection or unsafe worktree-path checks.
 - `TASK_ID` — task to purge.
@@ -510,6 +513,7 @@ orc task accept <TASK_ID>
 orc task reject <TASK_ID> [REASON]
 orc task cancel <TASK_ID> [REASON]
 orc task requeue <TASK_ID>
+orc task unblock <TASK_ID>
 orc task purge <TASK_ID> [--force]
 orc task depend <TASK_ID> <DEPENDENCY_ID>
 orc task undepend <TASK_ID> <DEPENDENCY_ID>

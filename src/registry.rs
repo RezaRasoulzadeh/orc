@@ -44,6 +44,90 @@ pub const AGENT_MODEL_VERSION: u16 = 1;
 pub const GLOBAL_AGENT_SCOPE: &str = "global";
 pub const AGENT_CONFIGURATION_VERSION: u16 = 1;
 
+/// Provider-independent cost bands used to make economy decisions reproducible.
+/// Model identifiers remain strings because they are provider configuration.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Ord,
+    PartialOrd,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EconomyTier {
+    Default,
+    Escalation,
+    Exceptional,
+    #[default]
+    Unknown,
+}
+
+impl EconomyTier {
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Escalation => 1,
+            Self::Exceptional => 2,
+            Self::Unknown => 3,
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Escalation => "escalation",
+            Self::Exceptional => "exceptional",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EconomyCostConfiguration {
+    /// Relative cost per model. Missing models deterministically use `unknown_tier`.
+    #[serde(default)]
+    pub model_costs: BTreeMap<String, f64>,
+    #[serde(default = "default_unknown_tier")]
+    pub unknown_tier: EconomyTier,
+}
+
+fn default_unknown_tier() -> EconomyTier {
+    EconomyTier::Unknown
+}
+
+impl EconomyCostConfiguration {
+    pub fn tier_for(&self, model: Option<&str>) -> EconomyTier {
+        match model.and_then(|name| self.model_costs.get(name)) {
+            Some(cost) if cost.is_finite() && *cost >= 0.0 => {
+                if *cost <= 1.0 {
+                    EconomyTier::Default
+                } else if *cost <= 3.0 {
+                    EconomyTier::Escalation
+                } else {
+                    EconomyTier::Exceptional
+                }
+            }
+            _ => self.unknown_tier,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolutionRecord {
+    pub selected_agent: String,
+    pub selected_model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+    pub tier: EconomyTier,
+    pub source: String,
+    pub escalation_reason: Option<String>,
+    pub input_lineage: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AgentAction {
     Code,

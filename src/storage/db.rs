@@ -1,6 +1,7 @@
 use crate::execution::{ExecutionClass, ExecutionTemplate};
 use crate::registry::{
-    AgentAction, AgentActionProfile, AgentDefinition, QuotaLimits, ReasoningEffort,
+    AgentAction, AgentActionProfile, AgentDefinition, EconomyTier, QuotaLimits, ReasoningEffort,
+    ResolutionRecord,
 };
 use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
@@ -64,6 +65,7 @@ pub struct ProviderInvocation {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub tier: EconomyTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1741,6 +1743,7 @@ impl Database {
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_worker_protocol_results_table(&conn)?;
         Self::ensure_provider_invocations_table(&conn)?;
+        Self::ensure_resolution_records_table(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
@@ -1968,6 +1971,7 @@ impl Database {
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_worker_protocol_results_table(conn)?;
         Self::ensure_provider_invocations_table(conn)?;
+        Self::ensure_resolution_records_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
         Self::ensure_change_evidence_table(conn)?;
@@ -2670,6 +2674,7 @@ impl Database {
                 selected_agent TEXT,
                 selected_model TEXT,
                 escalation_reason TEXT,
+                tier TEXT NOT NULL DEFAULT 'unknown',
                 total_tokens INTEGER,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
@@ -2688,6 +2693,7 @@ impl Database {
             ("selected_agent", "TEXT"),
             ("selected_model", "TEXT"),
             ("escalation_reason", "TEXT"),
+            ("tier", "TEXT NOT NULL DEFAULT 'unknown'"),
             ("total_tokens", "INTEGER"),
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
@@ -2700,6 +2706,21 @@ impl Database {
                 ))?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_resolution_records_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS resolution_records (
+            id INTEGER PRIMARY KEY,
+            provider_invocation_id INTEGER NOT NULL UNIQUE REFERENCES provider_invocations(id) ON DELETE CASCADE,
+            selected_agent TEXT NOT NULL,
+            selected_model TEXT,
+            effort TEXT,
+            tier TEXT NOT NULL,
+            source TEXT NOT NULL,
+            escalation_reason TEXT,
+            input_lineage TEXT NOT NULL
+        )")?;
         Ok(())
     }
 
@@ -2793,9 +2814,9 @@ impl Database {
             .map(|(id, stage, version)| (Some(id), Some(stage), Some(version)))
             .unwrap_or((None, None, None));
         self.conn.execute(
-            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason)
+            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason, tier)
              SELECT ?1, ?6, ?7, ?8, ?2, ?3, ?4, ?5, agent, resolved_model,
-                    CASE WHEN ?4 = 1 THEN 'initial semantic invocation' ELSE 'bounded evidence-backed repair' END
+                    CASE WHEN ?4 = 1 THEN 'initial semantic invocation' ELSE 'bounded evidence-backed repair' END, 'unknown'
              FROM agent_runs WHERE id = ?1",
             params![parent_run_id, purpose, format!("{purpose}:{attempt}"), attempt, effort.map(|value| value.as_str()), workflow_id, workflow_stage, workflow_version],
         )?;
@@ -2804,7 +2825,43 @@ impl Database {
                 "provider invocation parent run {parent_run_id} does not exist"
             )));
         }
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO resolution_records(provider_invocation_id, selected_agent, selected_model, effort, tier, source, escalation_reason, input_lineage)
+             SELECT id, selected_agent, selected_model, effort, tier,
+                    CASE WHEN attempt = 1 THEN 'provider' ELSE 'escalation' END,
+                    escalation_reason, lineage FROM provider_invocations WHERE id=?1",
+            [id],
+        )?;
+        Ok(id)
+    }
+
+    pub fn resolution_records(&self, parent_run_id: i64) -> Result<Vec<ResolutionRecord>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT selected_agent, selected_model, effort, tier, source, escalation_reason, input_lineage
+             FROM resolution_records r JOIN provider_invocations p ON p.id=r.provider_invocation_id
+             WHERE p.parent_run_id=?1 ORDER BY r.id",
+        )?;
+        Ok(statement
+            .query_map([parent_run_id], |row| {
+                Ok(ResolutionRecord {
+                    selected_agent: row.get(0)?,
+                    selected_model: row.get(1)?,
+                    effort: row
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|v| ReasoningEffort::parse(&v).ok()),
+                    tier: match row.get::<_, String>(3)?.as_str() {
+                        "default" => EconomyTier::Default,
+                        "escalation" => EconomyTier::Escalation,
+                        "exceptional" => EconomyTier::Exceptional,
+                        _ => EconomyTier::Unknown,
+                    },
+                    source: row.get(4)?,
+                    escalation_reason: row.get(5)?,
+                    input_lineage: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn finish_provider_invocation(
@@ -2831,7 +2888,7 @@ impl Database {
         parent_run_id: i64,
     ) -> Result<Vec<ProviderInvocation>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
+            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens, tier FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
         )?;
         Ok(statement
             .query_map([parent_run_id], |row| {
@@ -2857,6 +2914,12 @@ impl Database {
                     input_tokens: row.get(16)?,
                     output_tokens: row.get(17)?,
                     cached_input_tokens: row.get(18)?,
+                    tier: match row.get::<_, String>(19)?.as_str() {
+                        "default" => EconomyTier::Default,
+                        "escalation" => EconomyTier::Escalation,
+                        "exceptional" => EconomyTier::Exceptional,
+                        _ => EconomyTier::Unknown,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)

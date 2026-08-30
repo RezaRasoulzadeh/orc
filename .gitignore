@@ -16,6 +16,7 @@ Cargo.lock
 .orc/orc.db
 .orc/orc.db.*
 .orc/history
+.orc/plan.json
 .orc/orc.db-wal
 .orc/orc.db-shm
 .orc/worktrees/

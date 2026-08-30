@@ -1,0 +1,208 @@
+{
+  "protocol_version": 1,
+  "objective": "Add a small read-only `orc tui` terminal interface using Ratatui and Crossterm, reusing Orc application/domain APIs without introducing lifecycle or persistence semantics.",
+  "assumptions": [
+    "The root Rust crate owns the `orc` CLI; existing task/query APIs are discoverable from the application/domain/storage modules.",
+    "The implementation may add a minimal read-only application API only if no suitable existing task-queue query exists.",
+    "Automated review will execute the required validation commands after implementation."
+  ],
+  "risks": [
+    "Terminal restoration must remain reliable across normal exits and managed error paths.",
+    "The TUI must preserve existing task ordering and lifecycle terminology while avoiding TUI-specific SQL or state transitions.",
+    "The event loop must remain thin and keep navigation state testable independently of a real terminal."
+  ],
+  "questions": [],
+  "tasks": [
+    {
+      "local_id": "tui-queue-api",
+      "title": "Expose the read-only task queue",
+      "objective": "Provide the TUI with an authoritative read-only task queue through existing Orc APIs.",
+      "role": "Implement the read-only application/query boundary",
+      "priority": "high",
+      "depends_on": [],
+      "capabilities": [
+        "Rust application API",
+        "Read-only task query integration",
+        "SQLite/storage boundary inspection",
+        "Behavioral testing"
+      ],
+      "scope_mode": "module",
+      "context_files": [
+        "Cargo.toml",
+        "src/lib.rs",
+        "src/main.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/main.rs",
+        "tests/queue_tests.rs",
+        "tests/storage_tests.rs",
+        "tests/app_api_tests.rs",
+        "ENGINEERING.md"
+      ],
+      "expected_changes": [
+        "Reuse the existing task-list/query API or add the smallest provider-independent read-only application method.",
+        "Add a stable TUI-facing task row/read-model conversion while preserving existing ordering and terminology.",
+        "Add focused behavioral tests for populated and empty queues and assigned-agent availability."
+      ],
+      "unchanged": [
+        "Lifecycle transitions and task mutation behavior.",
+        "Raw SQL outside the storage layer.",
+        "TUI, terminal, and CLI behavior."
+      ],
+      "acceptance_criteria": [
+        "A read-only task-queue query is available through the existing Orc application/domain boundary.",
+        "Returned data preserves existing task ordering and exposes task ID, title, status, priority, and assigned agent when available.",
+        "No TUI-specific SQL or lifecycle mutation path is introduced.",
+        "The API handles empty queues without error or fabricated records."
+      ],
+      "required_tests": [
+        "Query a populated queue through the production application boundary and verify all required display fields.",
+        "Query an empty queue and verify a successful empty result.",
+        "Verify task ordering matches the existing queue semantics."
+      ],
+      "validation": [
+        "cargo fmt --check",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo test",
+        "git diff --check"
+      ],
+      "execution_hints": {
+        "class": "coder",
+        "effort": "medium",
+        "effort_reason": "Requires tracing the existing application and storage boundaries and proving read-model data flow without persistence changes."
+      },
+      "risk_factors": [
+        "schema_data_flow",
+        "verification"
+      ]
+    },
+    {
+      "local_id": "tui-core",
+      "title": "Build the TUI state and rendering core",
+      "objective": "Implement the terminal-independent TUI state, navigation, and read-only task queue rendering.",
+      "role": "Implement the TUI core",
+      "priority": "high",
+      "depends_on": [
+        "tui-queue-api"
+      ],
+      "capabilities": [
+        "Ratatui rendering",
+        "Terminal-independent state modeling",
+        "Keyboard navigation",
+        "Unit and behavioral testing"
+      ],
+      "scope_mode": "module",
+      "context_files": [
+        "Cargo.toml",
+        "src/lib.rs",
+        "src/main.rs",
+        "tests/queue_tests.rs",
+        "tests/app_api_tests.rs",
+        "ENGINEERING.md"
+      ],
+      "expected_changes": [
+        "Add Ratatui and Crossterm dependencies at versions compatible with the existing Rust project.",
+        "Add modular TUI state, task-row/view-model, input-action, and rendering components.",
+        "Implement bounded Up/Down selection and quit action handling without domain mutations.",
+        "Add terminal-independent tests for rendering data mapping, navigation bounds, quit inputs, and empty queues."
+      ],
+      "unchanged": [
+        "Task ordering and lifecycle terminology.",
+        "Task mutations, lifecycle actions, refresh, logs, and detail panes.",
+        "Desktop/Tauri behavior and orchestration semantics."
+      ],
+      "acceptance_criteria": [
+        "TUI application state is independent of terminal I/O and event backend code.",
+        "Rows render ID, title, status, priority, and assigned agent when available.",
+        "Up and Down update selection within bounds without mutating task data or Orc state.",
+        "Empty queues render cleanly and have no invalid selection.",
+        "`q` and `Esc` are represented as quit actions in the terminal-independent input/state layer."
+      ],
+      "required_tests": [
+        "Verify Up and Down navigation at the first, middle, and last selectable rows.",
+        "Verify navigation over an empty queue does not panic or create a selection.",
+        "Verify q and Esc produce quit actions.",
+        "Verify every required task field is mapped to the rendered row representation."
+      ],
+      "validation": [
+        "cargo fmt --check",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo test",
+        "git diff --check"
+      ],
+      "execution_hints": {
+        "class": "coder",
+        "effort": "medium",
+        "effort_reason": "The state and rendering split is localized but requires careful input semantics, bounds handling, empty-state behavior, and testable presentation mapping."
+      },
+      "risk_factors": [
+        "verification"
+      ]
+    },
+    {
+      "local_id": "tui-cli-runtime",
+      "title": "Wire `orc tui` and safe terminal lifecycle",
+      "objective": "Integrate the TUI core into the `orc tui` command with safe Crossterm terminal lifecycle management.",
+      "role": "Integrate the CLI command and terminal runtime",
+      "priority": "critical",
+      "depends_on": [
+        "tui-core"
+      ],
+      "capabilities": [
+        "CLI command integration",
+        "Crossterm terminal lifecycle",
+        "Error-path cleanup",
+        "Interactive event loop integration"
+      ],
+      "scope_mode": "module",
+      "context_files": [
+        "Cargo.toml",
+        "src/lib.rs",
+        "src/main.rs",
+        "tests/agent_cli_tests.rs",
+        "tests/lead_cli_inspection_tests.rs",
+        "tests/app_api_tests.rs",
+        "ENGINEERING.md",
+        "README.md"
+      ],
+      "expected_changes": [
+        "Add the `tui` CLI command to the existing command routing layer.",
+        "Implement a managed terminal session/guard that restores raw mode and alternate-screen state on normal and recoverable error paths.",
+        "Connect task loading, event polling, input handling, rendering, and quit behavior using the TUI core.",
+        "Add focused integration or seam tests proving terminal cleanup sequencing and CLI command dispatch without mutating Orc state."
+      ],
+      "unchanged": [
+        "Lifecycle state machine, scheduler, provider, quota, validation, review, blocker, and persistence semantics.",
+        "Dispatch, review, revise, accept, requeue, unblock, reject, cancel, refresh, and orchestration controls.",
+        "Desktop/Tauri application behavior."
+      ],
+      "acceptance_criteria": [
+        "`orc tui` starts the Ratatui/Crossterm interface and loads the current task queue through the read-only application API.",
+        "Terminal initialization enables raw mode and alternate-screen handling through a managed execution path.",
+        "Normal exit via q or Esc restores terminal state.",
+        "Recoverable errors from the managed TUI path restore terminal state before returning the error.",
+        "The event loop delegates navigation and rendering to the terminal-independent TUI core and performs no lifecycle or task mutations."
+      ],
+      "required_tests": [
+        "Invoke the CLI routing path for `orc tui` and verify it reaches the TUI runtime.",
+        "Exercise normal quit and verify terminal restoration is requested.",
+        "Inject a recoverable runtime error and verify restoration occurs before the error is returned.",
+        "Verify the runtime uses the read-only task API and performs no task or lifecycle mutations."
+      ],
+      "validation": [
+        "cargo fmt --check",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo test",
+        "git diff --check"
+      ],
+      "execution_hints": {
+        "class": "coder",
+        "effort": "high",
+        "effort_reason": "Terminal setup, restoration, and managed error cleanup form a lifecycle-sensitive integration boundary with interactive event handling and CLI wiring."
+      },
+      "risk_factors": [
+        "state_machine_lifecycle",
+        "verification"
+      ]
+    }
+  ]
+}

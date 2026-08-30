@@ -24,6 +24,7 @@ pub struct ProviderExecutionOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub read_only: bool,
+    pub isolated_review: bool,
     pub executable: Option<PathBuf>,
 }
 
@@ -33,6 +34,7 @@ impl ProviderExecutionOptions {
             model: agent.execution.provider.model.clone(),
             reasoning_effort: agent.execution.provider.reasoning_effort,
             read_only: false,
+            isolated_review: false,
             executable: None,
         }
     }
@@ -155,7 +157,13 @@ impl ProviderAdapter for CodexProviderAdapter {
                     agent.id, agent.id
                 )
             })?;
-        let worker = if options.read_only {
+        let worker = if options.isolated_review {
+            CodexWorker::with_review_execution(
+                PathBuf::from(profile_path),
+                options.model.clone(),
+                options.reasoning_effort,
+            )
+        } else if options.read_only {
             CodexWorker::with_read_only_execution(
                 PathBuf::from(profile_path),
                 options.model.clone(),
@@ -763,7 +771,29 @@ impl WorkerFactory {
                 reasoning_effort: reasoning_effort
                     .or(canonical.execution.provider.reasoning_effort),
                 read_only: true,
+                isolated_review: false,
                 executable,
+            },
+        )
+    }
+
+    pub fn build_review(
+        agent: &AgentDefinition,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String> {
+        let canonical = Agent::from_definition(agent).map_err(|error| error.to_string())?;
+        let adapter = provider_adapter(canonical.provider())
+            .ok_or_else(|| format!("unsupported agent backend '{}'", canonical.provider()))?;
+        adapter.build_worker_with_options(
+            &canonical,
+            &ProviderExecutionOptions {
+                model: model.or(canonical.execution.provider.model.clone()),
+                reasoning_effort: reasoning_effort
+                    .or(canonical.execution.provider.reasoning_effort),
+                read_only: true,
+                isolated_review: true,
+                executable: None,
             },
         )
     }
@@ -795,6 +825,7 @@ impl WorkerFactory {
                 reasoning_effort: reasoning_effort
                     .or(canonical.execution.provider.reasoning_effort),
                 read_only: false,
+                isolated_review: false,
                 executable: None,
             },
         )

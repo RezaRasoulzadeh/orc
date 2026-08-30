@@ -206,6 +206,7 @@ impl OrcApp {
                     model: config.model.clone().or(agent.model.clone()),
                     reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
                     read_only: true,
+                    isolated_review: false,
                     executable: None,
                 },
             )
@@ -242,6 +243,7 @@ impl OrcApp {
                     model: config.model.or(agent.model.clone()),
                     reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
                     read_only: true,
+                    isolated_review: false,
                     executable: None,
                 },
             )

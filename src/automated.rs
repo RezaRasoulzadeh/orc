@@ -229,6 +229,11 @@ impl ActionBackend for WorkerActionBackend {
                     self.planner_executable.clone(),
                 )
             }
+            AgentAction::Review => crate::backend::WorkerFactory::build_review(
+                agent,
+                model.map(str::to_owned),
+                effort,
+            ),
             _ => crate::backend::WorkerFactory::build_with_overrides(
                 agent,
                 model.map(str::to_owned),
@@ -236,16 +241,24 @@ impl ActionBackend for WorkerActionBackend {
             ),
         }
         .map_err(anyhow::Error::msg)?;
+        let review_dir = (action == AgentAction::Review)
+            .then(review_execution_directory)
+            .transpose()?;
+        let working_dir = review_dir.as_deref().unwrap_or(&self.repo);
         let execution = worker
             .execute_structured_with_progress_and_usage(
                 input,
-                &self.repo,
+                working_dir,
                 progress.schema,
                 &|event| {
                     (progress.callback)(&worker.activity(event));
                 },
             )
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::msg);
+        if let Some(directory) = review_dir {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        let execution = execution?;
         match execution.outcome {
             WorkerOutcome::Success => Ok(ActionExecution {
                 output: execution
@@ -258,8 +271,31 @@ impl ActionBackend for WorkerActionBackend {
     }
 
     fn observe(&self, message: &str) {
-        eprintln!("{message}");
+        if normal_provider_progress(message).is_some() {
+            eprintln!("{message}");
+        }
     }
+}
+
+fn review_execution_directory() -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "orc-review-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&directory)
+        .with_context(|| format!("failed to create isolated review directory {}", directory.display()))?;
+    Ok(directory)
+}
+
+fn normal_provider_progress(message: &str) -> Option<&str> {
+    (!message.starts_with("provider item.")
+        && !message.starts_with("provider turn.")
+        && message != "provider activity")
+        .then_some(message)
 }
 
 fn schema(action: AgentAction) -> String {
@@ -1070,7 +1106,7 @@ fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
     ledger
 }
 
-const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review. Use the task contract, submitted diff, persisted structured validation evidence, and review history; worker narrative is not validation evidence. On a revision, verify every unresolved blocker against the current implementation and fresh evidence before considering a broad review. Check each resolved blocker for regression; Equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when current implementation evidence demonstrates a genuine regression, and explain that evidence. Clearly distinguish RESOLVED from UNRESOLVED prior blockers in your findings. Do not restate equivalent findings. Reject vacuous or placeholder tests, assertions, changed-file lists, and validation claims: a test must exercise the production behavior and an assertion must observe its outcome, not merely name a requirement or duplicate a constant. A blocker must identify an explicit requirement, concrete current evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. If required commands are outside the persisted project validation pipeline, report that accurately rather than requesting fabricated evidence. Keep blocking findings to at most 5. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation. Escalate to a full review only after blocker verification passes, or when the architecture changed materially.";
+const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review using only the supplied task contract, submitted diff/change evidence, blocker ledger/revision history, and Orc-produced structured validation evidence. Do not execute shell commands, tests, cargo/npm/formatting commands, validation, or repository discovery; Orc already selected and ran task-specific validation. Treat its validation results as authoritative for command outcomes. On a revision, assess every unresolved blocker against the supplied current evidence before considering a broad review. Check each resolved blocker for regression; equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when supplied current evidence demonstrates a genuine regression. Clearly distinguish RESOLVED from UNRESOLVED prior blockers. Do not restate equivalent findings. Reject vacuous or placeholder tests, assertions, changed-file lists, and validation claims. A blocker must identify an explicit requirement, concrete supplied evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. Keep blocking findings to at most 5. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation.";
 
 fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> Result<i64> {
     let project_id = db.get_project_id()?.context("no project found in DB")?;
@@ -1089,6 +1125,14 @@ fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> R
 }
 
 fn announce_run(backend: &dyn ActionBackend, run: i64, resolved: &ResolvedAction) {
+    if resolved.action == AgentAction::Review {
+        backend.observe(&format!(
+            "Starting reviewer             {} / {}",
+            resolved.agent,
+            resolved.model.as_deref().unwrap_or("default"),
+        ));
+        return;
+    }
     backend.observe(&format!(
         "Automated {} run {}: agent={} model={} reasoning_effort={}",
         resolved.action.as_str(),
@@ -1113,8 +1157,13 @@ fn invoke_action(
     announce_run(backend, run, resolved);
     let invocation =
         db.start_provider_invocation(run, resolved.action.as_str(), 1, resolved.reasoning_effort)?;
-    db.update_agent_run_phase(run, "provider starting")?;
-    backend.observe("provider starting");
+    let phase = if resolved.action == AgentAction::Review {
+        "Reviewing implementation      ..."
+    } else {
+        "provider starting"
+    };
+    db.update_agent_run_phase(run, phase)?;
+    backend.observe(phase);
     let progress = |activity: &str| {
         if let Err(error) = db.update_agent_run_phase(run, activity) {
             backend.observe(&format!(
@@ -1196,12 +1245,22 @@ pub fn review_packet(db: &Database, summary: &ReviewSummary) -> Result<serde_jso
         "task": summary.task,
         "task_contract": db.get_task_contract(&summary.task.id)?,
         "implementation_run_id": summary.run.as_ref().map(|run| run.id),
-        "worktree_path": summary.worktree_path,
         "changes": summary.changes,
         "change_evidence": summary.change_evidence,
         "validation_evidence": summary.validation_evidence,
         "blocker_ledger": db.review_blocker_ledger(&summary.task.id)?,
     }))
+}
+
+fn review_agent_without_command_execution(agent: &AgentDefinition) -> AgentDefinition {
+    let mut review_agent = agent.clone();
+    review_agent.capabilities.retain(|capability| {
+        !matches!(
+            crate::registry::AgentCapability::parse(capability),
+            crate::registry::AgentCapability::CommandExecution
+        )
+    });
+    review_agent
 }
 
 fn lead_packet(context: &LeadContext, message: &str) -> serde_json::Value {
@@ -1253,6 +1312,7 @@ fn select_and_run_review_validation(
     agent_id: &str,
     repo_path: &Path,
     validation_runner: &dyn ValidationRunner,
+    progress: &dyn Fn(&str),
 ) -> Result<Option<ReviewValidationRun>> {
     let Some(worktree_path) = summary.worktree_path.as_deref() else {
         return Ok(None);
@@ -1280,8 +1340,15 @@ fn select_and_run_review_validation(
         .unwrap_or_default();
     let selection = config.select_for_task(&changed_files, &required);
     if selection.commands.is_empty() {
+        progress("Selecting validation          none");
         return Ok(None);
     }
+    let selection_label = if selection.groups.is_empty() {
+        selection.commands.join(", ")
+    } else {
+        selection.groups.join(", ")
+    };
+    progress(&format!("Selecting validation          {selection_label}"));
     let report = crate::validation::run_validation_pipeline(
         validation_runner,
         &selection.commands,
@@ -1296,6 +1363,13 @@ fn select_and_run_review_validation(
             format!("{error:#}"),
         )
     });
+    for step in &report.steps {
+        progress(&format!(
+            "{:<30} {}",
+            step.command,
+            if step.passed { "PASS" } else { "FAIL" }
+        ));
+    }
     db.record_lifecycle_event(
         "validation_result",
         Some(&summary.task.id),
@@ -1445,6 +1519,7 @@ fn run_review_mode(
         );
     }
     let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
+    let review_agent = review_agent_without_command_execution(&agent);
     let run = db.create_project_action_run(
         db.get_project_id()?.context("no project found in DB")?,
         (!project_review).then_some(summary.task.id.as_str()),
@@ -1458,9 +1533,20 @@ fn run_review_mode(
         },
     )?;
     let _run_finalizer = db.run_finalizer(run);
+    if !project_review {
+        backend.observe("Preparing review packet       OK");
+    }
     let validation_run = match validation {
         Some((repo_path, runner)) => {
-            select_and_run_review_validation(db, summary, run, &resolved.agent, repo_path, runner)?
+            select_and_run_review_validation(
+                db,
+                summary,
+                run,
+                &resolved.agent,
+                repo_path,
+                runner,
+                &|message| backend.observe(message),
+            )?
         }
         None => None,
     };
@@ -1499,7 +1585,7 @@ fn run_review_mode(
         "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. A failed task-specific validation command below must be reflected as a blocker. Do not accept or merge the task.{validation_section}\nReview packet:\n{}",
         serde_json::to_string(&review_packet(db, summary)?)?
     );
-    let execution = invoke_action(db, run, backend, &agent, &resolved, &prompt);
+    let execution = invoke_action(db, run, backend, &review_agent, &resolved, &prompt);
     match execution {
         Ok(execution) => {
             let parsed = parse_structured::<ReviewResult>(&execution.output, "reviewer").and_then(
@@ -1625,6 +1711,12 @@ fn run_review_mode(
             );
             match parsed {
                 Ok(result) => {
+                    if !project_review {
+                        backend.observe(&format!(
+                            "Reviewer finished             {}",
+                            result.verdict.to_ascii_uppercase()
+                        ));
+                    }
                     let persisted_output = serde_json::to_string(&result)?;
                     if !project_review {
                         db.store_change_evidence(run, &summary.changes)?;
@@ -2195,7 +2287,7 @@ mod tests {
             display_name: "Multi".into(),
             enabled: true,
             priority: 10,
-            capabilities: Vec::new(),
+            capabilities: vec!["command_execution".into()],
             status: AVAILABLE.into(),
             unavailable_reason: None,
             profile_path: Some("/profile".into()),
@@ -2474,6 +2566,8 @@ mod tests {
             )
             .unwrap();
         db.insert_agent(&agent()).unwrap();
+        db.update_task_status(&task, crate::task::TaskStatus::Review)
+            .unwrap();
         let task = db.get_task(&task).unwrap().unwrap();
         let summary = ReviewSummary {
             task,
@@ -2842,6 +2936,111 @@ commands = ["npm run typecheck", "npm run build"]
         assert!(packet.get("prior_reviews").is_none());
         assert!(packet.get("automated_reviews").is_none());
         assert!(packet.get("blocker_ledger").is_some());
+        assert!(packet.get("worktree_path").is_none());
+    }
+
+    #[test]
+    fn review_invocation_has_no_command_execution_and_receives_orc_validation() {
+        struct ReviewBoundaryBackend {
+            capabilities: RefCell<Vec<String>>,
+            prompt: RefCell<String>,
+            observed: RefCell<Vec<String>>,
+        }
+
+        impl ActionBackend for ReviewBoundaryBackend {
+            fn invoke(
+                &self,
+                agent: &AgentDefinition,
+                action: AgentAction,
+                input: &str,
+                _model: Option<&str>,
+                _effort: Option<ReasoningEffort>,
+            ) -> Result<ActionExecution> {
+                assert_eq!(action, AgentAction::Review);
+                *self.capabilities.borrow_mut() = agent.capabilities.clone();
+                *self.prompt.borrow_mut() = input.to_owned();
+                Ok(ActionExecution {
+                    output: serde_json::json!({
+                        "verdict": "PASS", "findings": [], "blocking_findings": [],
+                        "non_blocking_findings": [], "severity": null,
+                        "revision_feedback": null, "blockers": []
+                    })
+                    .to_string(),
+                    token_usage: None,
+                })
+            }
+
+            fn observe(&self, message: &str) {
+                self.observed.borrow_mut().push(message.to_owned());
+            }
+        }
+
+        let (db, mut summary, _backend, directory) = validation_review_fixture(
+            serde_json::json!({}),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        db.update_task_status(&summary.task.id, crate::task::TaskStatus::Review)
+            .unwrap();
+        summary.task.status = crate::task::TaskStatus::Review;
+        let backend = ReviewBoundaryBackend {
+            capabilities: RefCell::new(Vec::new()),
+            prompt: RefCell::new(String::new()),
+            observed: RefCell::new(Vec::new()),
+        };
+        let runner = RecordingValidationRunner::new(&[]);
+        run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        assert!(!backend
+            .capabilities
+            .borrow()
+            .iter()
+            .any(|capability| capability == "command_execution"));
+        let prompt = backend.prompt.borrow();
+        assert!(prompt.contains("Selected groups: rust-core"));
+        assert!(prompt.contains("cargo fmt --check"));
+        assert!(prompt.contains("Do not execute shell commands"));
+        let observed = backend.observed.borrow();
+        assert!(observed.iter().any(|message| message == "Preparing review packet       OK"));
+        assert!(observed
+            .iter()
+            .any(|message| message.contains("Selecting validation          rust-core")));
+        assert!(observed
+            .iter()
+            .any(|message| message.contains("cargo fmt --check") && message.contains("PASS")));
+        assert!(observed
+            .iter()
+            .any(|message| message.starts_with("Starting reviewer")));
+        assert!(observed
+            .iter()
+            .any(|message| message == "Reviewing implementation      ..."));
+        assert!(observed
+            .iter()
+            .any(|message| message == "Reviewer finished             PASS"));
+    }
+
+    #[test]
+    fn normal_review_progress_filters_raw_provider_protocol_events() {
+        assert!(normal_provider_progress("provider item.started: command_execution").is_none());
+        assert!(normal_provider_progress("provider item.completed: command_execution").is_none());
+        assert!(normal_provider_progress("provider turn.started").is_none());
+        assert_eq!(
+            normal_provider_progress("Reviewing implementation      ..."),
+            Some("Reviewing implementation      ...")
+        );
+        assert_eq!(
+            normal_provider_progress("cargo test                     PASS"),
+            Some("cargo test                     PASS")
+        );
     }
 
     #[test]

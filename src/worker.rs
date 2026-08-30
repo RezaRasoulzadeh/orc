@@ -617,6 +617,7 @@ pub struct CodexWorker {
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     sandbox: &'static str,
+    skip_git_repo_check: bool,
     executable: PathBuf,
 }
 
@@ -635,6 +636,7 @@ impl CodexWorker {
             model,
             reasoning_effort,
             sandbox: "workspace-write",
+            skip_git_repo_check: false,
             executable: PathBuf::from("codex"),
         }
     }
@@ -649,8 +651,22 @@ impl CodexWorker {
             model,
             reasoning_effort,
             sandbox: "read-only",
+            skip_git_repo_check: false,
             executable: PathBuf::from("codex"),
         }
+    }
+
+    /// Review receives an isolated, read-only provider environment. Orc
+    /// supplies the review packet and validation evidence, so the provider
+    /// must not discover or execute commands in the project worktree.
+    pub fn with_review_execution(
+        profile_path: PathBuf,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        let mut worker = Self::with_read_only_execution(profile_path, model, reasoning_effort);
+        worker.skip_git_repo_check = true;
+        worker
     }
 
     pub fn with_executable(mut self, executable: PathBuf) -> Self {
@@ -717,6 +733,11 @@ impl CodexWorker {
             args.push(path.to_string_lossy().into_owned());
             args.push(stdin_marker);
         }
+        if self.skip_git_repo_check {
+            let stdin_marker = args.pop().expect("Codex command includes stdin marker");
+            args.push("--skip-git-repo-check".into());
+            args.push(stdin_marker);
+        }
         command.args(args);
         backend::apply_profile_environment(&mut command, &self.profile_path);
         backend::configure_noninteractive(&mut command, cwd);
@@ -725,12 +746,18 @@ impl CodexWorker {
 
     #[cfg(test)]
     fn command_args_for_test(&self) -> Vec<String> {
-        Self::command_args_with_sandbox(
+        let mut args = Self::command_args_with_sandbox(
             "",
             self.model.as_deref(),
             self.reasoning_effort,
             self.sandbox,
-        )
+        );
+        if self.skip_git_repo_check {
+            let stdin_marker = args.pop().expect("Codex command includes stdin marker");
+            args.push("--skip-git-repo-check".into());
+            args.push(stdin_marker);
+        }
+        args
     }
 }
 
@@ -866,6 +893,7 @@ impl Worker for CodexWorker {
             model: self.model.clone(),
             reasoning_effort: Some(ReasoningEffort::Low),
             sandbox: self.sandbox,
+            skip_git_repo_check: self.skip_git_repo_check,
             executable: self.executable.clone(),
         };
         match cancellation {
@@ -1434,6 +1462,24 @@ mod tests {
             CodexWorker::with_read_only_execution(PathBuf::from("/profiles/lead"), None, None)
                 .command_args_for_test();
         assert_eq!(args, vec!["exec", "--json", "--sandbox", "read-only", "-"]);
+    }
+
+    #[test]
+    fn review_execution_uses_isolated_read_only_mode() {
+        let args =
+            CodexWorker::with_review_execution(PathBuf::from("/profiles/reviewer"), None, None)
+                .command_args_for_test();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "-",
+            ]
+        );
     }
 
     #[test]

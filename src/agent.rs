@@ -887,18 +887,15 @@ pub fn dispatch_with_worker_on_db_cancellable(
             match outcome {
                 WorkerOutcome::Success => {
                     progress("worker completed");
-                    let changes;
+
                     if enforce_worker_protocol {
                         let mut completion_repair = 0;
                         loop {
                             let failed_step =
                                 plan.steps.iter().enumerate().find_map(|(index, step)| {
-                                    validate_worker_step_completion(
-                                        step,
-                                        step_snapshots.get(index),
-                                    )
-                                    .err()
-                                    .map(|error| (index, error))
+                                    validate_worker_step_completion(step, step_snapshots.get(index))
+                                        .err()
+                                        .map(|error| (index, error))
                                 });
                             let Some((index, gate_error)) = failed_step else {
                                 break;
@@ -1045,7 +1042,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 .join("\n\n")
                         });
                     }
-                    changes = match git::inspect_worktree(&worktree_dir, repo_path) {
+                    let changes = match git::inspect_worktree(&worktree_dir, repo_path) {
                         Ok(changes) => changes,
                         Err(error) => {
                             let output = format!(
@@ -1678,10 +1675,13 @@ pub fn revise_with_worker_on_db_with_overrides(
     // once (see format_revision_contract). Only append `feedback` again when
     // it adds information the contract does not already contain, e.g. an
     // operator-supplied override distinct from the persisted review.
-    let extra_feedback = (!feedback.trim().is_empty()
-        && !contract_already_contains_feedback(&revision_contract, feedback))
-    .then(|| format!("\n\n## Additional operator feedback\n\n{feedback}"))
-    .unwrap_or_default();
+    let extra_feedback = if !feedback.trim().is_empty()
+        && !contract_already_contains_feedback(&revision_contract, feedback)
+    {
+        format!("\n\n## Additional operator feedback\n\n{feedback}")
+    } else {
+        String::new()
+    };
     let prompt = format!(
         "{}\n\n## Selected revision effort\n\nReasoning effort: {}\n\n{}{}\n\nFix ONLY the active blockers listed above, using the supplied blocker and relevant-file context. Do not broadly rediscover the repository and do not run the project's validation/test suite \u{2014} automated review will validate the result. Stop as soon as the fixes are implemented.",
         build_worker_prompt(&contract, &project_name, &task),
@@ -1781,12 +1781,9 @@ pub fn revise_with_worker_on_db_with_overrides(
                 .iter()
                 .enumerate()
                 .find_map(|(index, step)| {
-                    validate_worker_step_completion(
-                        step,
-                        revision_step_snapshots.get(index),
-                    )
-                    .err()
-                    .map(|error| (index, error))
+                    validate_worker_step_completion(step, revision_step_snapshots.get(index))
+                        .err()
+                        .map(|error| (index, error))
                 });
             let Some((index, error)) = failed_step else {
                 break;

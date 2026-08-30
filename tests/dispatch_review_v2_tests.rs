@@ -868,7 +868,7 @@ fn seed_current_pass_review(db: &Database, task: &str, repo: &Path) -> i64 {
         )
         .unwrap();
     let (_, worktree_path) = db.get_worktree_metadata(task).unwrap().unwrap();
-    let changes = orc::git::inspect_worktree(&repo.join(worktree_path), repo).unwrap();
+    let changes = orc::git::inspect_worktree(repo.join(worktree_path), repo).unwrap();
     db.store_change_evidence(run, &changes).unwrap();
     db.commit_task_review_result(task, run, &[], None, true, r#"{"verdict":"PASS"}"#, None)
         .unwrap();

@@ -345,7 +345,7 @@ new file mode 100644
 }
 
 #[test]
-fn test_patch_submission_defers_configured_validation_to_review() {
+fn patch_submission_defers_configured_validation_until_manual_validation_is_added() {
     let (dir, db, task_id) = setup_test_env();
 
     // Create custom .orc/validation.toml
@@ -380,7 +380,7 @@ new file mode 100644
 }
 
 #[test]
-fn test_failing_validation_runner_is_not_invoked_during_patch_submission() {
+fn manual_patch_submission_does_not_invoke_validation_runner() {
     let (dir, db, task_id) = setup_test_env();
 
     std::fs::write(

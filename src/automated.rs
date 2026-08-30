@@ -495,11 +495,11 @@ pub struct RevisionClaim {
     pub unresolved_risk: Option<String>,
 }
 
-/// Task-specific validation captured by automated review after the current
+/// Task-specific validation captured by Orc after the current
 /// diff was inspected. The fingerprint ties the report to the exact worktree
 /// state it applies to, so a stale report cannot validate a changed
-/// implementation. Validation ownership belongs to review, not to the
-/// dispatch/revision provider sessions this evidence used to be attached to.
+/// implementation. Validation ownership belongs to Orc's dispatch/revision
+/// pipeline, not to the provider sessions that produce the implementation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionValidationEvidence {
@@ -535,9 +535,9 @@ pub fn validate_revision_handoff(
 }
 
 /// Validate a revision handoff against the change evidence captured for this
-/// revision. Validation ownership belongs to automated review: this check
-/// only confirms the handoff is structurally sound and each claim is tied to
-/// real changed files, not that the revision provider ran validation.
+/// revision. This check only confirms the handoff is structurally sound and
+/// each claim is tied to real changed files; Orc runs deterministic validation
+/// after the revision and before semantic Review.
 pub fn validate_revision_handoff_with_evidence(
     contract: &RevisionContract,
     output: &str,
@@ -2056,10 +2056,10 @@ mod tests {
         (changes, handoff)
     }
 
-    // Validation ownership moved to automated review (see run_review_mode);
-    // revision handoff validation no longer requires provider-proven
-    // validation evidence. These tests cover what remains: the claim must be
-    // structurally sound and tied to real changed files.
+    // Revision handoff validation is structural; Orc runs deterministic
+    // validation after the revision and before semantic Review. These tests
+    // cover the handoff contract: claims must be structurally sound and tied
+    // to real changed files, without provider-proven validation evidence.
 
     #[test]
     fn claim_without_current_change_evidence_is_rejected() {

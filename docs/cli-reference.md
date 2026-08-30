@@ -282,12 +282,12 @@ Lists agent runs, optionally filtered to a single task.
 - `TASK_ID` — optional task ID to filter runs for.
 
 ### `orc run submit RUN_ID [--file PATH]`
-Submits output for a waiting manual run, moving its task to review.
+Submits output for a waiting manual run, moving its task to review under the current manual-submission behavior. Orc-owned validation before Review is planned for Task 9.
 - `RUN_ID` — the manual run to submit output for.
 - `--file PATH` — read output from a file instead of stdin.
 
 ### `orc run submit-patch RUN_ID PATCH_FILE`
-Submits a Git patch for a waiting manual run: applies and validates the patch in the run's worktree, printing the validation report and moving the task to review on success.
+Submits a Git patch for a waiting manual run: applies the patch in the run's worktree, records its change evidence, and moves the task to review under the current manual-submission behavior. Orc-owned validation before Review is planned for Task 9.
 - `RUN_ID` — the manual run to submit a patch for.
 - `PATCH_FILE` — path to the patch file, or `-` for stdin.
 

@@ -5392,11 +5392,21 @@ impl Database {
                 params![id], |row| row.get(0),
             ).optional()?;
             if status == "active" {
-                let run_id = active_run_id.ok_or_else(|| DbError::NoRecoverableRun(id.into()))?;
-                self.conn.execute(
-                    "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
-                    params![reason, run_id],
-                )?;
+                if let Some(run_id) = active_run_id {
+                    self.conn.execute(
+                        "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+                        params![reason, run_id],
+                    )?;
+                } else {
+                    let terminal_recovery_run_exists: bool = self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('failed', 'cancelled'))",
+                        params![id],
+                        |row| row.get(0),
+                    )?;
+                    if !terminal_recovery_run_exists {
+                        return Err(DbError::NoRecoverableRun(id.into()));
+                    }
+                }
             } else {
                 if active_run_id.is_some() {
                     return Err(DbError::TaskNotActive(id.into()));

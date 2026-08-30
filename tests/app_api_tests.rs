@@ -1123,6 +1123,31 @@ fn blocked_failed_task_can_be_requeued_without_losing_run_history() {
 }
 
 #[test]
+fn active_task_with_already_failed_run_can_be_requeued() {
+    let (directory, app, task) = app_with_task("interrupted recovery");
+    let db = Database::open(directory.path().join("state.sqlite")).unwrap();
+    let run = db.list_agent_runs_for_task(&task).unwrap()[0].id;
+
+    db.update_agent_run_status(
+        run,
+        "failed",
+        Some("execution interrupted before completion"),
+    )
+    .unwrap();
+
+    app.requeue(&task).unwrap();
+
+    assert_eq!(
+        app.task(&task).unwrap().unwrap().status,
+        orc::task::TaskStatus::Backlog
+    );
+    assert_eq!(
+        db.list_agent_runs_for_task(&task).unwrap()[0].status,
+        "failed"
+    );
+}
+
+#[test]
 fn app_subscription_receives_domain_events_in_order_without_replay() {
     let (_directory, app, task) = app_with_task("events");
     let subscription = app.subscribe();

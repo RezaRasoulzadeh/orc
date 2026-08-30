@@ -1408,54 +1408,58 @@ fn append_validation_failure_blocker(
     if validation_run.report.is_success() {
         return;
     }
-    let Some(step) = validation_run.report.steps.iter().find(|step| !step.passed) else {
-        return;
-    };
     let subsystem = if validation_run.selection.groups.is_empty() {
         "task-specific validation".to_owned()
     } else {
         validation_run.selection.groups.join(", ")
     };
-    let blocker_key = format!("task-validation:{}", step.command);
-    if result
-        .blockers
+    for step in validation_run
+        .report
+        .steps
         .iter()
-        .any(|blocker| blocker.blocker_key == blocker_key)
+        .filter(|step| !step.passed)
     {
-        // The reviewer already surfaced this exact failing command.
-        return;
-    }
-    let output: String = step.output().chars().take(2000).collect();
-    let evidence = if output.trim().is_empty() {
-        format!("`{}` failed for the {subsystem} subsystem.", step.command)
-    } else {
-        format!(
-            "`{}` failed for the {subsystem} subsystem.\n\n{output}",
+        let blocker_key = format!("task-validation:{}", step.command);
+        if result
+            .blockers
+            .iter()
+            .any(|blocker| blocker.blocker_key == blocker_key)
+        {
+            // The reviewer already surfaced this exact failing command.
+            continue;
+        }
+        let output: String = step.output().chars().take(2000).collect();
+        let evidence = if output.trim().is_empty() {
+            format!("`{}` failed for the {subsystem} subsystem.", step.command)
+        } else {
+            format!(
+                "`{}` failed for the {subsystem} subsystem.\n\n{output}",
+                step.command
+            )
+        };
+        let prior_match = prior.iter().find(|old| old.blocker_key == blocker_key);
+        let status = if prior_match.map(|old| old.status.as_str()) == Some("resolved") {
+            "regression"
+        } else {
+            "unresolved"
+        };
+        let finding = format!(
+            "Task-specific validation command `{}` failed.",
             step.command
-        )
-    };
-    let prior_match = prior.iter().find(|old| old.blocker_key == blocker_key);
-    let status = if prior_match.map(|old| old.status.as_str()) == Some("resolved") {
-        "regression"
-    } else {
-        "unresolved"
-    };
-    let finding = format!(
-        "Task-specific validation command `{}` failed.",
-        step.command
-    );
-    result.blockers.push(ReviewBlocker {
-        id: String::new(),
-        prior_blocker_id: prior_match.map(|old| old.blocker_id.clone()),
-        blocker_key,
-        requirement_ref: format!("task-specific validation ({subsystem})"),
-        evidence,
-        severity: "high".into(),
-        acceptance_condition: format!("`{}` must pass", step.command),
-        status: status.into(),
-        finding: finding.clone(),
-    });
-    result.blocking_findings.push(finding);
+        );
+        result.blockers.push(ReviewBlocker {
+            id: String::new(),
+            prior_blocker_id: prior_match.map(|old| old.blocker_id.clone()),
+            blocker_key,
+            requirement_ref: format!("task-specific validation ({subsystem})"),
+            evidence,
+            severity: "high".into(),
+            acceptance_condition: format!("`{}` must pass", step.command),
+            status: status.into(),
+            finding: finding.clone(),
+        });
+        result.blocking_findings.push(finding);
+    }
 }
 
 /// Task review: produces the PASS/REVISE/REJECT verdict that gates task
@@ -2598,6 +2602,7 @@ mod tests {
     struct RecordingValidationRunner {
         fail_on: Vec<String>,
         executed: std::sync::Mutex<Vec<String>>,
+        failure_output: Option<String>,
     }
 
     impl RecordingValidationRunner {
@@ -2605,6 +2610,15 @@ mod tests {
             Self {
                 fail_on: fail_on.iter().map(|value| (*value).to_owned()).collect(),
                 executed: std::sync::Mutex::new(Vec::new()),
+                failure_output: None,
+            }
+        }
+
+        fn with_failure_output(fail_on: &[&str], output: String) -> Self {
+            Self {
+                fail_on: fail_on.iter().map(|value| (*value).to_owned()).collect(),
+                executed: std::sync::Mutex::new(Vec::new()),
+                failure_output: Some(output),
             }
         }
 
@@ -2633,7 +2647,9 @@ mod tests {
                 stderr: if passed {
                     String::new()
                 } else {
-                    format!("{command} failed")
+                    self.failure_output
+                        .clone()
+                        .unwrap_or_else(|| format!("{command} failed"))
                 },
                 exit_status: Some(if passed { 0 } else { 1 }),
                 diagnostics: None,
@@ -2804,9 +2820,16 @@ commands = ["npm run typecheck", "npm run build"]
         assert_eq!(result.verdict, "REVISE");
         assert_eq!(result.blockers.len(), 1);
         assert!(result.blockers[0].finding.contains("cargo fmt --check"));
-        // Only the failing command ran; the pipeline stops at the first
-        // failure instead of running every selected command regardless.
-        assert_eq!(runner.executed(), vec!["cargo fmt --check"]);
+        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        let validation: crate::validation::ValidationReport = serde_json::from_str(
+            &db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(validation.steps.len(), 2);
+        assert!(!validation.steps[0].passed);
+        assert!(validation.steps[1].passed);
         let contract: RevisionContract = serde_json::from_str(
             &db.actionable_revision_contract(&summary.task.id)
                 .unwrap()
@@ -2821,6 +2844,115 @@ commands = ["npm run typecheck", "npm run build"]
             contract.validation_failures
         );
         let _ = run_id;
+    }
+
+    #[test]
+    fn every_failed_review_validation_command_becomes_a_blocker() {
+        let (db, summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [], "blockers": [],
+                "non_blocking_findings": [], "severity": null, "revision_feedback": null
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let runner = RecordingValidationRunner::new(&["cargo fmt --check", "cargo test"]);
+        let (run_id, result) = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(runner.executed(), vec!["cargo fmt --check", "cargo test"]);
+        assert_eq!(result.blockers.len(), 2);
+        assert!(
+            result
+                .blockers
+                .iter()
+                .any(|blocker| blocker.blocker_key == "task-validation:cargo fmt --check")
+        );
+        assert!(
+            result
+                .blockers
+                .iter()
+                .any(|blocker| blocker.blocker_key == "task-validation:cargo test")
+        );
+        let validation: crate::validation::ValidationReport = serde_json::from_str(
+            &db.latest_validation_result_for_run(run_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(validation.steps.len(), 2);
+        assert!(validation.steps.iter().all(|step| !step.passed));
+        let contract: RevisionContract = serde_json::from_str(
+            &db.actionable_revision_contract(&summary.task.id)
+                .unwrap()
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(contract.validation_failures.len(), 2);
+    }
+
+    #[test]
+    fn reviewer_validation_summary_is_bounded_after_collecting_all_results() {
+        struct CapturingBackend(RefCell<String>);
+
+        impl ActionBackend for CapturingBackend {
+            fn invoke(
+                &self,
+                _agent: &AgentDefinition,
+                action: AgentAction,
+                input: &str,
+                _model: Option<&str>,
+                _effort: Option<ReasoningEffort>,
+            ) -> Result<ActionExecution> {
+                assert_eq!(action, AgentAction::Review);
+                *self.0.borrow_mut() = input.to_owned();
+                Ok(ActionExecution {
+                    output: serde_json::json!({
+                        "verdict": "PASS", "findings": [], "blocking_findings": [], "blockers": [],
+                        "non_blocking_findings": [], "severity": null, "revision_feedback": null
+                    })
+                    .to_string(),
+                    token_usage: None,
+                })
+            }
+        }
+
+        let (db, summary, _backend, directory) = validation_review_fixture(
+            serde_json::json!({}),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let backend = CapturingBackend(RefCell::new(String::new()));
+        let runner = RecordingValidationRunner::with_failure_output(
+            &["cargo fmt --check", "cargo test"],
+            "diagnostic ".repeat(1_000),
+        );
+        run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &runner,
+        )
+        .unwrap();
+
+        let prompt = backend.0.borrow();
+        assert!(prompt.contains("... (truncated)"));
+        assert!(
+            prompt.len() < 10_000,
+            "review prompt was not bounded: {}",
+            prompt.len()
+        );
     }
 
     #[test]

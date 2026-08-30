@@ -521,11 +521,7 @@ pub fn run_validation_pipeline(
     let mut steps = Vec::new();
     for cmd in commands {
         let step = runner.run(cmd, working_dir)?;
-        let passed = step.passed;
         steps.push(step);
-        if !passed {
-            break;
-        }
     }
     Ok(ValidationReport { steps })
 }
@@ -917,6 +913,16 @@ pub mod test_helpers {
             }
         }
 
+        pub fn failing_on_commands(commands: &[&str]) -> Self {
+            Self {
+                fail_commands: commands
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
+                executed: Mutex::new(Vec::new()),
+            }
+        }
+
         pub fn executed_commands(&self) -> Vec<String> {
             self.executed.lock().unwrap().clone()
         }
@@ -1263,12 +1269,35 @@ groups = [
     #[test]
     fn fake_runner_execution_and_pipeline() {
         let runner = FakeValidationRunner::failing_on("cargo test");
+        let commands = vec![
+            "cargo fmt --check".to_string(),
+            "cargo test".to_string(),
+            "cargo clippy --all-targets -- -D warnings".to_string(),
+        ];
+        let report = run_validation_pipeline(&runner, &commands, Path::new(".")).unwrap();
+        assert!(!report.is_success());
+        assert_eq!(report.steps.len(), 3);
+        assert!(report.steps[0].passed);
+        assert!(!report.steps[1].passed);
+        assert!(report.steps[2].passed);
+        assert_eq!(runner.executed_commands(), commands);
+    }
+
+    #[test]
+    fn pipeline_reports_every_failure_without_stopping() {
         let commands = vec!["cargo fmt --check".to_string(), "cargo test".to_string()];
+        let runner = FakeValidationRunner::failing_on("cargo fmt --check");
         let report = run_validation_pipeline(&runner, &commands, Path::new(".")).unwrap();
         assert!(!report.is_success());
         assert_eq!(report.steps.len(), 2);
-        assert!(report.steps[0].passed);
-        assert!(!report.steps[1].passed);
+        assert_eq!(runner.executed_commands(), commands);
+
+        let runner =
+            FakeValidationRunner::failing_on_commands(&["cargo fmt --check", "cargo test"]);
+        let report = run_validation_pipeline(&runner, &commands, Path::new(".")).unwrap();
+        assert!(!report.is_success());
+        assert_eq!(report.steps.len(), 2);
+        assert!(report.steps.iter().all(|step| !step.passed));
         assert_eq!(runner.executed_commands(), commands);
     }
 

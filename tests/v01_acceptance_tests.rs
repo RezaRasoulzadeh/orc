@@ -183,7 +183,7 @@ fn v01_happy_path_is_provider_independent() {
         .expect("worktree metadata")
         .expect("task worktree");
     let changes =
-        orc::git::inspect_worktree(&directory.path().join(worktree_path), directory.path())
+        orc::git::inspect_worktree(directory.path().join(worktree_path), directory.path())
             .expect("review current changes");
     db.store_change_evidence(review_run, &changes)
         .expect("store review evidence");

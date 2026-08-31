@@ -287,9 +287,9 @@ fn start_provider_invocation_bounded(
     task_id: &str,
     purpose: &str,
     attempt: usize,
-    effort: ReasoningEffort,
+    resolution: &crate::registry::ResolutionRecord,
 ) -> Result<i64> {
-    match db.start_provider_invocation(run_id, purpose, attempt, Some(effort)) {
+    match db.start_provider_invocation_with_resolution(run_id, purpose, attempt, resolution) {
         Ok(id) => Ok(id),
         Err(error) => {
             let diagnostics =
@@ -300,10 +300,69 @@ fn start_provider_invocation_bounded(
         }
     }
 }
+
+fn repair_resolution_record(
+    db: &Database,
+    run_id: i64,
+    task_id: &str,
+    purpose: &str,
+    effort: ReasoningEffort,
+) -> Result<crate::registry::ResolutionRecord> {
+    let run = db
+        .get_agent_run(run_id)?
+        .context("provider invocation parent run disappeared")?;
+    let task = db
+        .get_task(task_id)?
+        .context("provider invocation task disappeared")?;
+    Ok(crate::scheduler::resolve_run_invocation_economy(
+        db,
+        &task,
+        &run.agent,
+        run.resolved_model,
+        Some(effort),
+        purpose,
+        crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+    )?
+    .record)
+}
 #[derive(Clone, Debug, Default)]
 pub struct RevisionExecutionOverrides {
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+}
+
+fn resolve_revision_economy(
+    db: &Database,
+    task: &Task,
+    agent_id: &str,
+    overrides: &RevisionExecutionOverrides,
+    revision_effort: ReasoningEffort,
+    transport: crate::scheduler::TransportEligibility,
+    operator_agent_override: bool,
+) -> Result<crate::scheduler::EconomyResolution> {
+    let decision = crate::scheduler::resolve_task_economy(
+        db,
+        task,
+        crate::registry::AgentAction::Code,
+        crate::scheduler::EconomyOverrides {
+            agent_id: operator_agent_override.then(|| agent_id.into()),
+            model: overrides.model.clone(),
+            effort: overrides.effort,
+        },
+        Some(registry::AUTOMATED),
+        (!operator_agent_override).then(|| agent_id.into()),
+        Some(revision_effort),
+        Some("revision_contract".into()),
+        transport,
+        None,
+        "task_revision",
+    )?;
+    decision.resolution.ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent '{agent_id}' is not eligible for revision: {}",
+            decision.schedule.explanation
+        )
+    })
 }
 const CODER_PROMPT_PRECEDENCE: &str = "## Instruction precedence\n\n1. Orc execution and safety rules have the highest precedence.\n2. The `.orc/engineering.md` content below is the authoritative, mandatory project engineering contract and applies automatically; it does not need to be repeated in the task or user prompt.\n3. Role- and action-specific instructions follow the engineering contract.\n4. Task objectives and context, revision feedback, validation diagnostics, and all other run-specific instructions follow the engineering contract.\n\nLater task, revision, or repair text must not override or contradict mandatory requirements in `.orc/engineering.md`. If task-specific instructions conflict with the engineering contract, follow the engineering contract and report the conflict rather than silently overriding it.\n";
 
@@ -367,17 +426,6 @@ fn worker_task_contract(
     // task with declared expected changes has the complete persisted contract
     // and enters the strict operation/evidence protocol.
     Ok((proposal, strict_protocol))
-}
-
-fn apply_task_effort(
-    mut resolution: crate::execution::ExecutionResolution,
-    task_effort: Option<ReasoningEffort>,
-) -> crate::execution::ExecutionResolution {
-    if let Some(effort) = task_effort {
-        resolution.reasoning_effort = Some(effort);
-        resolution.source = "task-contract".into();
-    }
-    resolution
 }
 
 fn effective_revision_effort(
@@ -604,13 +652,20 @@ fn run_task_validation_repair_loop(
             Some(agent_id),
             Some(&serde_json::json!({"repair_attempt": repair_attempt}).to_string()),
         )?;
+        let repair_resolution = repair_resolution_record(
+            db,
+            run_id,
+            task_id,
+            "validation_repair",
+            ReasoningEffort::Low,
+        )?;
         let invocation = start_provider_invocation_bounded(
             db,
             run_id,
             task_id,
             "validation_repair",
             repair_attempt,
-            ReasoningEffort::Low,
+            &repair_resolution,
         )?;
         let repair_execution = worker.execute_repair_with_progress_and_usage(
             &repair,
@@ -801,7 +856,43 @@ pub fn dispatch_with_worker_and_db(
     db_path: &str,
     repo_path: impl AsRef<Path>,
 ) -> Result<()> {
-    dispatch_with_worker_and_db_as(task_id, worker, db_path, repo_path, "copilot").map(|_| ())
+    let db = Database::open(db_path)
+        .with_context(|| format!("failed to open orc DB ({db_path}); run `orc init` first"))?;
+    let task = db
+        .get_task(task_id)?
+        .with_context(|| format!("task '{task_id}' not found in DB"))?;
+    let effort = task_contract_effort(&db, &task)?;
+    let decision = crate::scheduler::resolve_task_economy(
+        &db,
+        &task,
+        crate::registry::AgentAction::Code,
+        crate::scheduler::EconomyOverrides::default(),
+        Some(registry::AUTOMATED),
+        None,
+        Some(effort),
+        Some("task_contract".into()),
+        crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+        None,
+        "injected_worker_dispatch",
+    )?;
+    let resolution = decision.resolution.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no eligible agent found for task '{task_id}': {}",
+            decision.schedule.explanation
+        )
+    })?;
+    let selected_agent = resolution.agent.id.clone();
+    dispatch_with_worker_on_db_cancellable_resolved(
+        task_id,
+        worker,
+        &db,
+        repo_path,
+        &selected_agent,
+        &SystemValidationRunner,
+        None,
+        Some(resolution),
+    )
+    .map(|_| ())
 }
 
 pub fn dispatch_with_worker_and_db_as(
@@ -866,6 +957,32 @@ pub fn dispatch_with_worker_on_db_cancellable(
     validation_runner: &dyn ValidationRunner,
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<DispatchSummary> {
+    dispatch_with_worker_on_db_cancellable_resolved(
+        task_id,
+        worker,
+        db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        cancellation,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the injected transport seam carries an optional authoritative resolution"
+)]
+fn dispatch_with_worker_on_db_cancellable_resolved(
+    task_id: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    cancellation: Option<&crate::worker::CancellationControl>,
+    provided_resolution: Option<crate::scheduler::EconomyResolution>,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
@@ -899,13 +1016,41 @@ pub fn dispatch_with_worker_on_db_cancellable(
     crate::queue::ensure_dispatchable(db, task_id)
         .map_err(|e| anyhow::anyhow!("dispatch eligibility check failed: {e}"))?;
 
+    let proposal_effort = task_contract_effort(db, &task)?;
+    let resolution = match provided_resolution {
+        Some(resolution) => resolution,
+        None => {
+            let decision = crate::scheduler::resolve_task_economy(
+                db,
+                &task,
+                crate::registry::AgentAction::Code,
+                crate::scheduler::EconomyOverrides {
+                    agent_id: Some(agent_id.into()),
+                    ..crate::scheduler::EconomyOverrides::default()
+                },
+                Some(registry::AUTOMATED),
+                None,
+                Some(proposal_effort),
+                Some("task_contract".into()),
+                crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+                None,
+                "injected_worker_dispatch",
+            )?;
+            decision.resolution.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent '{agent_id}' is not eligible for dispatch: {}",
+                    decision.schedule.explanation
+                )
+            })?
+        }
+    };
+
     // PREPARE is intentionally completed before task status, run, or worktree
     // mutation.  The snapshot is captured from the authoritative repository.
     let snapshot = git::inspect_worktree(repo_path, repo_path)
         .context("failed to inspect repository during Worker PREPARE")?;
     let (proposal, enforce_worker_protocol) =
         worker_task_contract(db, &task).context("persisted task contract is invalid")?;
-    let proposal_effort = task_contract_effort(db, &task)?;
     let acceptance_criteria =
         worker_requirements(&proposal.acceptance_criteria, "acceptance-criterion");
     let required_tests = worker_requirements(&proposal.required_tests, "required-test");
@@ -949,10 +1094,10 @@ pub fn dispatch_with_worker_on_db_cancellable(
             agent_id,
             registry::AUTOMATED,
             crate::storage::AgentRunExecution {
-                class: "general",
-                model: None,
-                effort: Some(proposal_effort),
-                source: "task-contract",
+                class: resolution.execution.class.as_str(),
+                model: resolution.execution.model.as_deref(),
+                effort: resolution.execution.reasoning_effort,
+                source: &resolution.record.source,
             },
         )
         .with_context(|| "failed to create agent run")?;
@@ -1030,7 +1175,7 @@ pub fn dispatch_with_worker_on_db_cancellable(
         task_id,
         "implementation",
         1,
-        proposal_effort,
+        &resolution.record,
     )?;
     let execution = match cancellation {
         Some(cancellation) => worker.execute_structured_with_progress_and_usage_cancellable(
@@ -1148,13 +1293,20 @@ pub fn dispatch_with_worker_on_db_cancellable(
                                 .map(|(before, _)| before.clone())
                                 .context("completion repair lost the step snapshot")?;
                             progress(&format!("completion repair attempt {completion_repair}"));
+                            let repair_resolution = repair_resolution_record(
+                                db,
+                                run_id,
+                                task_id,
+                                "completion_repair",
+                                ReasoningEffort::Low,
+                            )?;
                             let repair_invocation = start_provider_invocation_bounded(
                                 db,
                                 run_id,
                                 task_id,
                                 "completion_repair",
                                 completion_repair,
-                                ReasoningEffort::Low,
+                                &repair_resolution,
                             )?;
                             let repaired = worker.execute_planned_step_repair(
                                 &plan.steps[index],
@@ -1521,6 +1673,8 @@ where
         agent_id,
         validation_runner,
         overrides,
+        crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+        true,
         factory,
     )
 }
@@ -1558,18 +1712,23 @@ where
         agent_id,
         validation_runner,
         overrides,
+        crate::scheduler::TransportEligibility::Strict,
+        true,
         factory,
     )
 }
 
+/// Revision entry point for a workflow-owned agent reservation. The selected
+/// agent remains an eligibility constraint and is not relabeled as an
+/// operator override in the final resolution record.
 #[expect(
     clippy::too_many_arguments,
-    reason = "shared revision resolution boundary"
+    reason = "keeps the CLI revision seam explicit"
 )]
-fn revise_with_factory_on_db_as_with_runner<F>(
+pub fn revise_with_factory_and_global_db_as_constrained_with_runner<F>(
     task_id: &str,
     feedback: &str,
-    db: &Database,
+    db_path: &str,
     repo_path: impl AsRef<Path>,
     agent_id: &str,
     validation_runner: &dyn ValidationRunner,
@@ -1583,47 +1742,66 @@ where
         Option<ReasoningEffort>,
     ) -> Result<Box<dyn Worker>, String>,
 {
+    let db = Database::open_global(db_path)?;
+    revise_with_factory_on_db_as_with_runner(
+        task_id,
+        feedback,
+        &db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        overrides,
+        crate::scheduler::TransportEligibility::Strict,
+        false,
+        factory,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared revision resolution boundary"
+)]
+pub(crate) fn revise_with_factory_on_db_as_with_runner<F>(
+    task_id: &str,
+    feedback: &str,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+    transport: crate::scheduler::TransportEligibility,
+    operator_agent_override: bool,
+    factory: F,
+) -> Result<DispatchSummary>
+where
+    F: FnOnce(
+        &AgentDefinition,
+        Option<String>,
+        Option<ReasoningEffort>,
+    ) -> Result<Box<dyn Worker>, String>,
+{
     let task = db.get_task(task_id)?.context("task not found")?;
-    let agent = db
-        .list_schedulable_agents()?
-        .into_iter()
-        .find(|candidate| candidate.id == agent_id)
-        .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
     let source_review_id = db
         .actionable_revision_review(task_id)?
         .map(|(id, _)| id)
         .context("task has no actionable revision review")?;
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
-    let task_hints = db
-        .get_task_execution_hints(&task.id)?
-        .context("task execution hints are missing")?;
-    let execution_class = task_hints
-        .class
-        .as_deref()
-        .map(crate::execution::ExecutionClass::parse)
-        .transpose()
-        .map_err(anyhow::Error::msg)?
-        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
-    let resolution = crate::execution::resolve_with_template(
-        execution_class.as_str(),
-        &db.execution_template(execution_class)?,
-        agent.model.as_deref(),
-        agent.reasoning_effort,
-        overrides.model.clone().or_else(|| task_hints.model.clone()),
-        overrides.effort,
-    );
-    let resolution = if overrides.effort == Some(revision_effort) {
-        resolution
-    } else {
-        apply_task_effort(resolution, Some(revision_effort))
-    };
+    let resolution = resolve_revision_economy(
+        db,
+        &task,
+        agent_id,
+        overrides,
+        revision_effort,
+        transport,
+        operator_agent_override,
+    )?;
     let worker = factory(
-        &agent,
-        resolution.model.clone(),
-        resolution.reasoning_effort,
+        &resolution.agent,
+        resolution.execution.model.clone(),
+        resolution.execution.reasoning_effort,
     )
     .map_err(anyhow::Error::msg)?;
-    revise_with_worker_on_db_with_overrides(
+    revise_with_worker_on_db_with_overrides_resolved(
         task_id,
         feedback,
         worker.as_ref(),
@@ -1632,6 +1810,7 @@ where
         agent_id,
         validation_runner,
         overrides,
+        Some(resolution),
     )
 }
 
@@ -1699,6 +1878,34 @@ pub fn revise_with_worker_on_db_with_overrides(
     // compatibility with existing callers.
     validation_runner: &dyn ValidationRunner,
     overrides: &RevisionExecutionOverrides,
+) -> Result<DispatchSummary> {
+    revise_with_worker_on_db_with_overrides_resolved(
+        task_id,
+        feedback,
+        worker,
+        db,
+        repo_path,
+        agent_id,
+        validation_runner,
+        overrides,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the injected transport seam carries an optional authoritative resolution"
+)]
+fn revise_with_worker_on_db_with_overrides_resolved(
+    task_id: &str,
+    feedback: &str,
+    worker: &dyn Worker,
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    agent_id: &str,
+    validation_runner: &dyn ValidationRunner,
+    overrides: &RevisionExecutionOverrides,
+    provided_resolution: Option<crate::scheduler::EconomyResolution>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
@@ -1834,33 +2041,17 @@ pub fn revise_with_worker_on_db_with_overrides(
         .validate_contract(&acceptance_criteria, &required_tests, &proposal.unchanged)
         .context("Worker revision PREPARE is incomplete")?;
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
-    let agent = db
-        .list_schedulable_agents()?
-        .into_iter()
-        .find(|agent| agent.id == agent_id)
-        .with_context(|| format!("agent '{}' not found in registry", agent_id))?;
-    let task_hints = db
-        .get_task_execution_hints(&task.id)?
-        .context("task execution hints are missing")?;
-    let execution_class = task_hints
-        .class
-        .as_deref()
-        .map(crate::execution::ExecutionClass::parse)
-        .transpose()
-        .map_err(anyhow::Error::msg)?
-        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
-    let resolution = crate::execution::resolve_with_template(
-        execution_class.as_str(),
-        &db.execution_template(execution_class)?,
-        agent.model.as_deref(),
-        agent.reasoning_effort,
-        overrides.model.clone().or_else(|| task_hints.model.clone()),
-        overrides.effort,
-    );
-    let resolution = if overrides.effort == Some(revision_effort) {
-        resolution
-    } else {
-        apply_task_effort(resolution, Some(revision_effort))
+    let resolution = match provided_resolution {
+        Some(resolution) => resolution,
+        None => resolve_revision_economy(
+            db,
+            &task,
+            agent_id,
+            overrides,
+            revision_effort,
+            crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+            true,
+        )?,
     };
     let run_id = db.create_agent_run_with_execution(
         project_id,
@@ -1868,10 +2059,10 @@ pub fn revise_with_worker_on_db_with_overrides(
         agent_id,
         registry::AUTOMATED,
         crate::storage::AgentRunExecution {
-            class: resolution.class.as_str(),
-            model: resolution.model.as_deref(),
-            effort: resolution.reasoning_effort,
-            source: &resolution.source,
+            class: resolution.execution.class.as_str(),
+            model: resolution.execution.model.as_deref(),
+            effort: resolution.execution.reasoning_effort,
+            source: &resolution.record.source,
         },
     )?;
     let _run_finalizer = db.run_finalizer(run_id);
@@ -1939,7 +2130,7 @@ pub fn revise_with_worker_on_db_with_overrides(
     let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to capture pre-revision change evidence")?;
     let invocation_id =
-        start_provider_invocation_bounded(db, run_id, task_id, "revision", 1, revision_effort)?;
+        start_provider_invocation_bounded(db, run_id, task_id, "revision", 1, &resolution.record)?;
     let execution = worker.execute_structured_with_progress_and_usage(
         &prompt,
         &worktree_dir,
@@ -2062,13 +2253,20 @@ pub fn revise_with_worker_on_db_with_overrides(
                 .map(|(before, _)| before.clone())
                 .context("completion repair lost the revision step snapshot")?;
             progress(&format!("completion repair attempt {completion_repair}"));
+            let repair_resolution = repair_resolution_record(
+                db,
+                run_id,
+                task_id,
+                "completion_repair",
+                ReasoningEffort::Low,
+            )?;
             let repair_invocation = start_provider_invocation_bounded(
                 db,
                 run_id,
                 task_id,
                 "completion_repair",
                 completion_repair,
-                ReasoningEffort::Low,
+                &repair_resolution,
             )?;
             let repaired = worker.execute_planned_step_repair(
                 &revision_plan.steps[index],
@@ -2245,10 +2443,10 @@ pub fn revise_with_worker_on_db_with_overrides(
             .get_task(task_id)?
             .context("task disappeared after revision")?,
         agent: agent_id.into(),
-        backend: agent.backend,
-        profile: agent.profile_path,
-        model: resolution.model,
-        reasoning_effort: resolution.reasoning_effort,
+        backend: resolution.agent.backend.clone(),
+        profile: resolution.agent.profile_path.clone(),
+        model: resolution.execution.model.clone(),
+        reasoning_effort: resolution.execution.reasoning_effort,
         worktree_path,
         run_id,
         run_status: "completed".into(),
@@ -2389,6 +2587,32 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     effort_override: Option<crate::registry::ReasoningEffort>,
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<DispatchSummary> {
+    dispatch_selected_with_db_and_repo_authority(
+        db,
+        repo_path,
+        task_id,
+        requested_agent,
+        true,
+        model_override,
+        effort_override,
+        cancellation,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "automatic assignment and operator override have distinct provenance"
+)]
+fn dispatch_selected_with_db_and_repo_authority(
+    db: &Database,
+    repo_path: impl AsRef<Path>,
+    task_id: &str,
+    requested_agent: Option<&str>,
+    operator_agent_override: bool,
+    model_override: Option<String>,
+    effort_override: Option<crate::registry::ReasoningEffort>,
+    cancellation: Option<&crate::worker::CancellationControl>,
+) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
     crate::queue::ensure_dispatchable(db, task_id)
         .map_err(|e| anyhow::anyhow!("dispatch eligibility check failed: {e}"))?;
@@ -2396,49 +2620,42 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
         .get_task(task_id)?
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
     let task_effort = task_contract_effort(db, &task)?;
-    let explicit_effort = effort_override.is_some();
-    let agent = if let Some(agent_id) = requested_agent {
-        let agent = db
-            .list_schedulable_agents()?
-            .into_iter()
-            .find(|agent| agent.id == agent_id)
-            .with_context(|| {
-                format!("agent '{agent_id}' is not referenced by the current project")
-            })?;
-        let busy_agents = db.list_busy_agents()?.into_iter().collect();
-        crate::scheduler::validate_override_with_constraints(
-            &agent,
-            &task,
-            &busy_agents,
-            db.quota_reserve()?,
-        )?;
-        agent
-    } else {
-        let agents = db.list_schedulable_agents()?;
-        let busy_agents = db.list_busy_agents()?.into_iter().collect();
-        let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
-            &task,
-            &agents,
-            None,
-            &busy_agents,
-            db.quota_reserve()?,
-        )?;
-        let selected_id = decision.selected_agent_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no eligible agent found for task '{}': {}",
-                task_id,
-                decision.explanation
-            )
-        })?;
-        agents
-            .into_iter()
-            .find(|a| a.id == selected_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("selected agent '{}' not found in registry", selected_id)
-            })?
-    };
+    let has_execution_override = model_override.is_some() || effort_override.is_some();
+    let decision = crate::scheduler::resolve_task_economy(
+        db,
+        &task,
+        crate::registry::AgentAction::Code,
+        crate::scheduler::EconomyOverrides {
+            agent_id: if operator_agent_override {
+                requested_agent.map(str::to_owned)
+            } else {
+                None
+            },
+            model: model_override,
+            effort: effort_override,
+        },
+        None,
+        if operator_agent_override {
+            None
+        } else {
+            requested_agent.map(str::to_owned)
+        },
+        Some(task_effort),
+        Some("task_contract".into()),
+        crate::scheduler::TransportEligibility::Strict,
+        None,
+        "task_dispatch",
+    )?;
+    let resolution = decision.resolution.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no eligible agent found for task '{}': {}",
+            task_id,
+            decision.schedule.explanation
+        )
+    })?;
+    let agent = resolution.agent.clone();
     if agent.execution_mode == registry::MANUAL {
-        if model_override.is_some() || effort_override.is_some() {
+        if has_execution_override {
             anyhow::bail!(
                 "manual agent '{}' does not support model or reasoning-effort overrides",
                 agent.id
@@ -2467,34 +2684,11 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
             changes: Default::default(),
         });
     }
-    let task_hints = db
-        .get_task_execution_hints(&task.id)?
-        .context("task execution hints are missing")?;
-    let execution_class = task_hints
-        .class
-        .as_deref()
-        .map(crate::execution::ExecutionClass::parse)
-        .transpose()
-        .map_err(anyhow::Error::msg)?
-        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
-    let resolution = crate::execution::resolve_with_template(
-        execution_class.as_str(),
-        &db.execution_template(execution_class)?,
-        agent.model.as_deref(),
-        agent.reasoning_effort,
-        model_override.or(task_hints.model),
-        effort_override,
-    );
-    let resolution = if explicit_effort {
-        resolution
-    } else {
-        apply_task_effort(resolution, Some(task_effort))
-    };
-    let model = resolution.model.clone();
-    let reasoning_effort = resolution.reasoning_effort;
+    let model = resolution.execution.model.clone();
+    let reasoning_effort = resolution.execution.reasoning_effort;
     let worker = WorkerFactory::build_with_overrides(&agent, model.clone(), reasoning_effort)
         .map_err(anyhow::Error::msg)?;
-    let mut summary = dispatch_with_worker_on_db_cancellable(
+    let mut summary = dispatch_with_worker_on_db_cancellable_resolved(
         task_id,
         worker.as_ref(),
         db,
@@ -2502,13 +2696,7 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
         &agent.id,
         &SystemValidationRunner,
         cancellation,
-    )?;
-    db.set_agent_run_execution(
-        summary.run_id,
-        resolution.class.as_str(),
-        model.as_deref(),
-        reasoning_effort,
-        &resolution.source,
+        Some(resolution),
     )?;
     db.set_agent_run_profile(summary.run_id, agent.profile_path.as_deref())?;
     summary.backend = agent.backend;
@@ -2518,12 +2706,44 @@ pub fn dispatch_selected_with_db_and_repo_cancellable(
     Ok(summary)
 }
 
+fn dispatch_automatic_assignment(task_id: &str, agent_id: &str) -> Result<DispatchSummary> {
+    let db = Database::open_global(".orc/orc.db")?;
+    dispatch_selected_with_db_and_repo_authority(
+        &db,
+        ".",
+        task_id,
+        Some(agent_id),
+        false,
+        None,
+        None,
+        None,
+    )
+}
+
 pub fn plan_dispatch_assignments(
     ready: &[QueueEntry],
     agents: &[AgentDefinition],
     busy_agents: &HashSet<String>,
     quota_reserve: i64,
     concurrency: Option<usize>,
+) -> Result<Vec<(String, String)>> {
+    plan_dispatch_assignments_with_costs(
+        ready,
+        agents,
+        busy_agents,
+        quota_reserve,
+        concurrency,
+        &crate::registry::EconomyCostConfiguration::default(),
+    )
+}
+
+pub fn plan_dispatch_assignments_with_costs(
+    ready: &[QueueEntry],
+    agents: &[AgentDefinition],
+    busy_agents: &HashSet<String>,
+    quota_reserve: i64,
+    concurrency: Option<usize>,
+    costs: &crate::registry::EconomyCostConfiguration,
 ) -> Result<Vec<(String, String)>> {
     if concurrency == Some(0) {
         anyhow::bail!("concurrency must be greater than zero");
@@ -2534,13 +2754,33 @@ pub fn plan_dispatch_assignments(
         if concurrency.is_some_and(|limit| assignments.len() == limit) {
             break;
         }
-        let decision = crate::scheduler::schedule_with_busy_and_quota_reserve(
-            &entry.task,
-            agents,
-            Some(registry::AUTOMATED),
-            &reserved,
+        let profiles = std::collections::BTreeMap::new();
+        let template = crate::execution::ExecutionTemplate::default();
+        let decision = crate::scheduler::resolve_economy(crate::scheduler::EconomyResolverInput {
+            action: crate::registry::AgentAction::Code,
+            candidates: agents,
+            task: Some(&entry.task),
+            required_capabilities: &entry.task.required_capabilities(),
+            requested_mode: Some(registry::AUTOMATED),
+            busy_agents: &reserved,
             quota_reserve,
-        )?;
+            overrides: crate::scheduler::EconomyOverrides::default(),
+            constrained_agent_id: None,
+            action_profiles: &profiles,
+            execution_class: crate::execution::class_for_role(&entry.task.role),
+            execution_template: &template,
+            task_model: None,
+            task_effort: entry.task.reasoning_effort,
+            task_source: Some("task_contract".into()),
+            policy_model: None,
+            policy_effort: None,
+            policy_source: None,
+            cost_configuration: costs,
+            transport_eligibility: crate::scheduler::TransportEligibility::Strict,
+            escalation_reason: None,
+            lineage: "dispatch_queue_assignment".into(),
+        })?
+        .schedule;
         if let Some(agent_id) = decision.selected_agent_id {
             reserved.insert(agent_id.clone());
             assignments.push((entry.task.id.clone(), agent_id));
@@ -2554,24 +2794,41 @@ pub type DispatchQueueOutcomes = BTreeMap<String, Result<DispatchSummary, String
 pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcomes> {
     let db = Database::open_global(".orc/orc.db")?;
     let report = crate::queue::compute_queue(&db)?;
-    let agents = db.list_schedulable_agents()?;
-    let quota_reserve = db.quota_reserve()?;
-    let assignments = plan_dispatch_assignments(
-        &report.ready,
-        &agents,
-        &db.list_busy_agents()?.into_iter().collect::<HashSet<_>>(),
-        quota_reserve,
-        concurrency,
-    )?;
+    if concurrency == Some(0) {
+        anyhow::bail!("concurrency must be greater than zero");
+    }
+    let mut reserved = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    let mut assignments = Vec::new();
+    for entry in &report.ready {
+        if concurrency.is_some_and(|limit| assignments.len() == limit) {
+            break;
+        }
+        let decision = crate::scheduler::resolve_task_economy_with_additional_busy(
+            &db,
+            &entry.task,
+            crate::registry::AgentAction::Code,
+            crate::scheduler::EconomyOverrides::default(),
+            Some(registry::AUTOMATED),
+            None,
+            entry.task.reasoning_effort,
+            Some("task_contract".into()),
+            crate::scheduler::TransportEligibility::Strict,
+            None,
+            "dispatch_queue_assignment",
+            &reserved,
+        )?;
+        if let Some(agent_id) = decision.schedule.selected_agent_id {
+            reserved.insert(agent_id.clone());
+            assignments.push((entry.task.id.clone(), agent_id));
+        }
+    }
     let mut outcomes = BTreeMap::new();
     let handles = assignments
         .iter()
         .map(|(task_id, agent_id)| {
             let task_id = task_id.clone();
             let agent_id = agent_id.clone();
-            thread::spawn(move || {
-                dispatch_selected_with_options(&task_id, Some(&agent_id), None, None)
-            })
+            thread::spawn(move || dispatch_automatic_assignment(&task_id, &agent_id))
         })
         .collect::<Vec<_>>();
     for ((task_id, _), handle) in assignments.into_iter().zip(handles) {

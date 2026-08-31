@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use orc::app::OrcApp;
 use orc::lead::LeadDecisionKind;
-use orc::registry::{AgentAction, AgentDefinition, ReasoningEffort};
+use orc::registry::{AgentAction, AgentDefinition, EconomyTier, ReasoningEffort, ResolutionRecord};
 use orc::storage::Database;
 use orc::storage::db::AgentRunExecution;
 use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
@@ -20,6 +20,18 @@ enum Intake {
     Direct,
     Plan,
     UserThenDirect,
+}
+
+fn fake_resolution(purpose: &str) -> ResolutionRecord {
+    ResolutionRecord {
+        selected_agent: "fake".into(),
+        selected_model: Some("fake-model".into()),
+        effort: Some(ReasoningEffort::Low),
+        tier: EconomyTier::Unknown,
+        source: "workflow-test".into(),
+        escalation_reason: Some("initial semantic invocation".into()),
+        input_lineage: format!("workflow-test:{purpose}"),
+    }
 }
 
 struct FakeActions<'a> {
@@ -70,9 +82,12 @@ impl<'a> FakeActions<'a> {
                 source: "workflow-test",
             },
         )?;
-        let invocation =
-            self.db
-                .start_provider_invocation(run, purpose, 1, Some(ReasoningEffort::Low))?;
+        let invocation = self.db.start_provider_invocation_with_resolution(
+            run,
+            purpose,
+            1,
+            &fake_resolution(purpose),
+        )?;
         self.db
             .finish_provider_invocation(invocation, "completed", None)?;
         self.db.update_agent_run_status(run, "completed", None)?;
@@ -575,11 +590,11 @@ fn provider_completion_without_a_completed_semantic_run_stops_recovery() {
         )
         .unwrap();
     let invocation = db
-        .start_provider_invocation(
+        .start_provider_invocation_with_resolution(
             provider_run,
             "implementation",
             1,
-            Some(ReasoningEffort::Low),
+            &fake_resolution("implementation"),
         )
         .unwrap();
     db.finish_provider_invocation(invocation, "completed", None)

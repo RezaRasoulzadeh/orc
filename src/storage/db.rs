@@ -1,7 +1,7 @@
 use crate::execution::{ExecutionClass, ExecutionTemplate};
 use crate::registry::{
-    AgentAction, AgentActionProfile, AgentDefinition, EconomyTier, QuotaLimits, ReasoningEffort,
-    ResolutionRecord,
+    AgentAction, AgentActionProfile, AgentDefinition, EconomyCostConfiguration, EconomyTier,
+    QuotaLimits, ReasoningEffort, ResolutionRecord,
 };
 use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
@@ -159,6 +159,21 @@ mod reservation_lifecycle_tests {
         assert!(db.list_busy_agents().unwrap().is_empty());
     }
 
+    fn invocation_resolution(
+        effort: Option<ReasoningEffort>,
+        escalation_reason: &str,
+    ) -> ResolutionRecord {
+        ResolutionRecord {
+            selected_agent: "codex-main".into(),
+            selected_model: None,
+            effort,
+            tier: EconomyTier::Unknown,
+            source: "test_resolver".into(),
+            escalation_reason: Some(escalation_reason.into()),
+            input_lineage: "storage_test".into(),
+        }
+    }
+
     #[test]
     fn dispatch_marks_agent_busy_while_run_active() {
         let (_directory, _path, db, project, task) = fixture();
@@ -246,7 +261,12 @@ mod reservation_lifecycle_tests {
         let (_directory, _path, db, project, task) = fixture();
         let run = db.create_agent_run(project, &task, "codex-main").unwrap();
         let first = db
-            .start_provider_invocation(run, "implementation", 1, None)
+            .start_provider_invocation_with_resolution(
+                run,
+                "implementation",
+                1,
+                &invocation_resolution(None, "initial semantic invocation"),
+            )
             .unwrap();
         db.finish_provider_invocation(
             first,
@@ -263,7 +283,12 @@ mod reservation_lifecycle_tests {
         // A second invocation on the same parent run, after cumulative usage
         // already far exceeds the old 500_000-token budget, must still be
         // permitted: token accounting is observability only.
-        let second = db.start_provider_invocation(run, "completion_repair", 1, None);
+        let second = db.start_provider_invocation_with_resolution(
+            run,
+            "completion_repair",
+            1,
+            &invocation_resolution(None, "bounded evidence-backed repair"),
+        );
 
         match previous {
             Some(value) => unsafe { std::env::set_var("ORC_PROVIDER_TOKEN_BUDGET", value) },
@@ -2756,12 +2781,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn start_provider_invocation(
+    pub fn start_provider_invocation_with_resolution(
         &self,
         parent_run_id: i64,
         purpose: &str,
         attempt: usize,
-        effort: Option<ReasoningEffort>,
+        resolution: &ResolutionRecord,
     ) -> Result<i64, DbError> {
         let phase_limit = match purpose {
             "implementation" | "revision" => 1,
@@ -2813,32 +2838,58 @@ impl Database {
         let (workflow_id, workflow_stage, workflow_version) = workflow_match
             .map(|(id, stage, version)| (Some(id), Some(stage), Some(version)))
             .unwrap_or((None, None, None));
-        self.conn.execute(
-            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason, tier)
-             SELECT ?1, ?6, ?7, ?8, ?2, ?3, ?4, ?5, agent, resolved_model,
-                    CASE WHEN ?4 = 1 THEN 'initial semantic invocation' ELSE 'bounded evidence-backed repair' END, 'unknown'
-             FROM agent_runs WHERE id = ?1",
-            params![parent_run_id, purpose, format!("{purpose}:{attempt}"), attempt, effort.map(|value| value.as_str()), workflow_id, workflow_stage, workflow_version],
+        let parent_agent: String = self.conn.query_row(
+            "SELECT agent FROM agent_runs WHERE id=?1",
+            [parent_run_id],
+            |row| row.get(0),
         )?;
-        if self.conn.changes() != 1 {
+        if parent_agent != resolution.selected_agent {
             return Err(DbError::Scheduler(format!(
-                "provider invocation parent run {parent_run_id} does not exist"
+                "provider invocation resolution selected agent '{}' but parent run {parent_run_id} owns '{}'",
+                resolution.selected_agent, parent_agent
             )));
         }
-        let id = self.conn.last_insert_rowid();
-        self.conn.execute(
-            "INSERT INTO resolution_records(provider_invocation_id, selected_agent, selected_model, effort, tier, source, escalation_reason, input_lineage)
-             SELECT id, selected_agent, selected_model, effort, tier,
-                    CASE WHEN attempt = 1 THEN 'provider' ELSE 'escalation' END,
-                    escalation_reason, lineage FROM provider_invocations WHERE id=?1",
-            [id],
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason, tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                parent_run_id,
+                workflow_id,
+                workflow_stage,
+                workflow_version,
+                purpose,
+                resolution.input_lineage,
+                attempt,
+                resolution.effort.map(ReasoningEffort::as_str),
+                resolution.selected_agent,
+                resolution.selected_model,
+                resolution.escalation_reason,
+                resolution.tier.as_str(),
+            ],
         )?;
+        let id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO resolution_records(provider_invocation_id, selected_agent, selected_model, effort, tier, source, escalation_reason, input_lineage)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                resolution.selected_agent,
+                resolution.selected_model,
+                resolution.effort.map(ReasoningEffort::as_str),
+                resolution.tier.as_str(),
+                resolution.source,
+                resolution.escalation_reason,
+                resolution.input_lineage,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(id)
     }
 
     pub fn resolution_records(&self, parent_run_id: i64) -> Result<Vec<ResolutionRecord>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT selected_agent, selected_model, effort, tier, source, escalation_reason, input_lineage
+            "SELECT r.selected_agent, r.selected_model, r.effort, r.tier, r.source, r.escalation_reason, r.input_lineage
              FROM resolution_records r JOIN provider_invocations p ON p.id=r.provider_invocation_id
              WHERE p.parent_run_id=?1 ORDER BY r.id",
         )?;
@@ -4707,6 +4758,33 @@ impl Database {
             .transpose()
             .map(|value| value.unwrap_or(0))
             .map_err(DbError::from)
+    }
+
+    pub fn economy_cost_configuration(&self) -> Result<EconomyCostConfiguration, DbError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'economy_cost_configuration'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value.map_or_else(
+            || Ok(EconomyCostConfiguration::default()),
+            |value| Ok(serde_json::from_str(&value)?),
+        )
+    }
+
+    pub fn set_economy_cost_configuration(
+        &self,
+        configuration: &EconomyCostConfiguration,
+    ) -> Result<(), DbError> {
+        let value = serde_json::to_string(configuration)?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('economy_cost_configuration', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        Ok(())
     }
 
     pub fn set_quota_reserve(&self, reserve: i64) -> Result<(), DbError> {

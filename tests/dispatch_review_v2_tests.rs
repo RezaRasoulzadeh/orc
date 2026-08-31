@@ -8,7 +8,10 @@ use orc::agent::{
 use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker, blocker_id};
 use orc::git;
-use orc::registry::{AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, ReasoningEffort};
+use orc::registry::{
+    AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, EconomyTier, ReasoningEffort,
+    ResolutionRecord,
+};
 use orc::review;
 use orc::storage::{AgentRunExecution, Database};
 use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
@@ -30,6 +33,18 @@ struct ProtocolOperationWorker {
     operation: &'static str,
     verify: bool,
     calls: Mutex<Vec<String>>,
+}
+
+fn fake_resolution(purpose: &str, model: Option<&str>) -> ResolutionRecord {
+    ResolutionRecord {
+        selected_agent: "fake".into(),
+        selected_model: model.map(str::to_owned),
+        effort: None,
+        tier: EconomyTier::Unknown,
+        source: "test_resolver".into(),
+        escalation_reason: Some("initial semantic invocation".into()),
+        input_lineage: format!("dispatch-review-test:{purpose}"),
+    }
 }
 
 struct CompletionRepairWorker {
@@ -959,8 +974,17 @@ fn setup() -> (TempDir, Database, String) {
     let project = db.create_project("test").unwrap();
     let mut eligible_agent = automated_agent("scheduler-eligible", vec![AgentAction::Code]);
     eligible_agent.backend = "codex".into();
-    eligible_agent.capabilities = vec!["code".into(), "terminal".into()];
     db.insert_agent(&eligible_agent).unwrap();
+    db.insert_agent(&automated_agent(
+        "fake",
+        vec![
+            AgentAction::Code,
+            AgentAction::Review,
+            AgentAction::Plan,
+            AgentAction::Lead,
+        ],
+    ))
+    .unwrap();
     let task = db
         .insert_task(
             project,
@@ -1180,8 +1204,6 @@ impl Worker for StructuredRevisionWorker {
 
 fn structured_revision_fixture() -> (TempDir, Database, String, i64) {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -1504,8 +1526,6 @@ fn persist_known_contract(db: &Database, task: &str, review_id: i64, blocker_id:
 
 fn revision_fixture() -> (TempDir, Database, String, i64) {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -1595,7 +1615,12 @@ impl ProductionReviewWorkflowActions<'_> {
                 source: "non-convergence-test",
             },
         )?;
-        let invocation = self.db.start_provider_invocation(run, purpose, 1, None)?;
+        let invocation = self.db.start_provider_invocation_with_resolution(
+            run,
+            purpose,
+            1,
+            &fake_resolution(purpose, None),
+        )?;
         self.db
             .finish_provider_invocation(invocation, "completed", None)?;
         self.db.update_agent_run_status(run, "completed", None)?;
@@ -1725,11 +1750,6 @@ fn explicit_blocker_review_output(
 #[test]
 fn resolved_blocker_reference_stays_resolved_and_explicit_regression_reopens_after_restart() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review],
-    ))
-    .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -2038,11 +2058,6 @@ fn blocker_from_other_task_is_rejected() {
 
 fn production_contract_fixture() -> (TempDir, Database, String, i64) {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review],
-    ))
-    .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -2303,8 +2318,6 @@ fn terminal_tasks_reject_persisted_contract_and_no_pending_is_actionable_error()
             .is_some()
     );
     let (dir2, db2, task2) = setup();
-    db2.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     assert!(
         revise_with_worker_on_db(
             &task2,
@@ -2514,8 +2527,6 @@ fn persisted_contract_is_not_cross_task_consumable() {
 #[test]
 fn no_feedback_without_production_contract_returns_actionable_error() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     let error = revise_with_worker_on_db(
         &task,
         "",
@@ -2533,11 +2544,6 @@ fn no_feedback_without_production_contract_returns_actionable_error() {
 #[test]
 fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review],
-    ))
-    .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -2622,11 +2628,6 @@ fn automated_review_production_path_persists_and_manages_contract_lifecycle() {
 #[test]
 fn automated_review_resolves_blockers_incrementally_across_revisions() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review],
-    ))
-    .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -2772,11 +2773,6 @@ fn automated_review_resolves_blockers_incrementally_across_revisions() {
 #[test]
 fn production_review_revision_loop_stops_at_task_revision_bound_after_restart() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review, AgentAction::Lead],
-    ))
-    .unwrap();
     let project = db.get_project_id().unwrap().unwrap();
     let policy = WorkflowPolicy {
         acceptance: AcceptancePolicy::Automatic,
@@ -2884,11 +2880,6 @@ fn production_review_revision_loop_stops_at_task_revision_bound_after_restart() 
 #[test]
 fn production_reject_review_blocks_workflow_without_revision_or_acceptance() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent(
-        "fake",
-        vec![AgentAction::Code, AgentAction::Review, AgentAction::Lead],
-    ))
-    .unwrap();
     let project = db.get_project_id().unwrap().unwrap();
     let backend = QueuedReviewBackend {
         outputs: Mutex::new(VecDeque::from([multi_blocker_review_output(
@@ -3043,8 +3034,6 @@ fn blocked_task_with_actionable_revise_review_can_revise() {
 #[test]
 fn blocked_task_without_actionable_review_cannot_revise() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     db.update_task_status(&task, TaskStatus::Blocked).unwrap();
     let error = revise_with_worker_on_db(
         &task,
@@ -3385,7 +3374,11 @@ fn automated_agent(id: &str, actions: Vec<AgentAction>) -> AgentDefinition {
         display_name: id.into(),
         enabled: true,
         priority: 100,
-        capabilities: Vec::new(),
+        capabilities: if actions.contains(&AgentAction::Code) {
+            vec!["code".into(), "terminal".into()]
+        } else {
+            Vec::new()
+        },
         status: AVAILABLE.into(),
         unavailable_reason: None,
         profile_path: None,
@@ -3467,8 +3460,6 @@ fn conflicting_task_instruction_does_not_change_precedence() {
 #[test]
 fn revision_worker_includes_current_engineering_contract() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     let marker = "REVISION_CONTRACT_UNIQUE_MARKER";
     let feedback = "Revision feedback must remain byte-for-byte recognizable";
     std::fs::write(dir.path().join(".orc/engineering.md"), marker).unwrap();
@@ -3537,6 +3528,7 @@ fn dispatch_with_no_selected_validation_commands_skips_runner_and_repair() {
     let invocations = db.provider_invocations(summary.run_id).unwrap();
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].purpose, "implementation");
+    assert_eq!(db.resolution_records(summary.run_id).unwrap().len(), 1);
     assert_eq!(
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Review
@@ -3639,8 +3631,6 @@ fn requeued_execution_includes_current_engineering_contract() {
 #[test]
 fn contract_is_reloaded_at_execution_time() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     let db_path = dir.path().join(".orc/orc.db");
     let worker = CapturingWorker::successful();
     std::fs::write(dir.path().join(".orc/engineering.md"), "CONTRACT_A").unwrap();
@@ -3951,6 +3941,7 @@ fn revision_with_no_selected_validation_commands_skips_runner_and_repair() {
     let invocations = db.provider_invocations(summary.run_id).unwrap();
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].purpose, "revision");
+    assert_eq!(db.resolution_records(summary.run_id).unwrap().len(), 1);
     assert_eq!(
         db.get_agent_run(summary.run_id).unwrap().unwrap().status,
         "completed"
@@ -4084,6 +4075,10 @@ fn failed_revision_keeps_initial_and_validation_repair_token_usage() {
         })
         .unwrap();
     assert_eq!(revision.status, "failed");
+    assert_eq!(
+        db.resolution_records(revision.id).unwrap().len(),
+        db.provider_invocations(revision.id).unwrap().len()
+    );
     let result = db.get_worker_result(revision.id).unwrap().unwrap();
     assert_eq!(result.total_tokens, Some(31));
     assert_eq!(result.input_tokens, Some(27));
@@ -4233,8 +4228,6 @@ fn revise_and_requeue_reject_review_and_acceptance_ready() {
 #[test]
 fn workflow_resolve_cli_accepts_persisted_gate_without_provider_invocation() {
     let (dir, db, task) = setup();
-    db.insert_agent(&automated_agent("fake", vec![AgentAction::Code]))
-        .unwrap();
     dispatch_with_worker_and_db_as_with_runner(
         &task,
         &WritingWorker,
@@ -4524,13 +4517,9 @@ fn six_step_plan_uses_one_initial_invocation_and_persists_checkpoint_lineage() {
     assert_eq!(invocations[0].purpose, "implementation");
     assert_eq!(invocations[0].attempt, 1);
     assert_eq!(invocations[0].outcome, "completed");
+    let record = db.resolution_records(summary.run_id).unwrap().remove(0);
     let budget_error = db
-        .start_provider_invocation(
-            summary.run_id,
-            "implementation",
-            2,
-            Some(ReasoningEffort::Low),
-        )
+        .start_provider_invocation_with_resolution(summary.run_id, "implementation", 2, &record)
         .unwrap_err();
     assert!(budget_error.to_string().contains("budget exhausted"));
     assert!(

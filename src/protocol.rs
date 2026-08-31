@@ -243,14 +243,99 @@ impl TaskRiskFactor {
         }
     }
 
-    pub const fn minimum_effort(self) -> crate::registry::ReasoningEffort {
+    pub const fn required_guard(self) -> TaskRiskGuard {
         match self {
-            Self::StateMachineLifecycle
-            | Self::Persistence
-            | Self::RestartRecovery
-            | Self::Concurrency
-            | Self::CrossRoleProtocol => crate::registry::ReasoningEffort::High,
-            Self::SchemaDataFlow | Self::Verification => crate::registry::ReasoningEffort::Medium,
+            Self::StateMachineLifecycle => TaskRiskGuard::LifecycleTransitionInvariantCoverage,
+            Self::Persistence => TaskRiskGuard::PersistenceReopenCoverage,
+            Self::RestartRecovery => TaskRiskGuard::RestartRecoveryCoverage,
+            Self::Concurrency => TaskRiskGuard::ConcurrencyCancellationCoverage,
+            Self::CrossRoleProtocol => TaskRiskGuard::ProtocolBoundarySerializationCoverage,
+            Self::SchemaDataFlow => TaskRiskGuard::SchemaDataFlowCoverage,
+            Self::Verification => TaskRiskGuard::DeterministicVerificationEvidence,
+        }
+    }
+}
+
+/// Deterministic engineering rigor derived from task risk metadata.
+///
+/// Guards constrain implementation and evidence. They never select a model,
+/// reasoning effort, agent, or economy tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRiskGuard {
+    LifecycleTransitionInvariantCoverage,
+    PersistenceReopenCoverage,
+    RestartRecoveryCoverage,
+    ConcurrencyCancellationCoverage,
+    ProtocolBoundarySerializationCoverage,
+    SchemaDataFlowCoverage,
+    DeterministicVerificationEvidence,
+}
+
+impl TaskRiskGuard {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LifecycleTransitionInvariantCoverage => "lifecycle_transition_invariant_coverage",
+            Self::PersistenceReopenCoverage => "persistence_reopen_coverage",
+            Self::RestartRecoveryCoverage => "restart_recovery_coverage",
+            Self::ConcurrencyCancellationCoverage => "concurrency_cancellation_coverage",
+            Self::ProtocolBoundarySerializationCoverage => {
+                "protocol_boundary_serialization_coverage"
+            }
+            Self::SchemaDataFlowCoverage => "schema_data_flow_coverage",
+            Self::DeterministicVerificationEvidence => "deterministic_verification_evidence",
+        }
+    }
+
+    pub const fn requirement(self) -> &'static str {
+        match self {
+            Self::LifecycleTransitionInvariantCoverage => {
+                "require lifecycle transition and invariant coverage"
+            }
+            Self::PersistenceReopenCoverage => {
+                "require persistence round-trip and database reopen coverage"
+            }
+            Self::RestartRecoveryCoverage => {
+                "require restart, reopen, and interrupted-state recovery coverage"
+            }
+            Self::ConcurrencyCancellationCoverage => {
+                "require deterministic concurrency and cancellation coverage"
+            }
+            Self::ProtocolBoundarySerializationCoverage => {
+                "require cross-role protocol boundary and serialization coverage"
+            }
+            Self::SchemaDataFlowCoverage => {
+                "require producer, consumer, persistence, and schema data-path coverage"
+            }
+            Self::DeterministicVerificationEvidence => {
+                "require explicit deterministic validation and acceptance evidence"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRiskPolicy {
+    pub required_guards: Vec<TaskRiskGuard>,
+    /// Eligibility is metadata for a future escalation policy. It does not
+    /// itself promote execution settings.
+    pub escalation_eligible: bool,
+}
+
+impl TaskRiskPolicy {
+    pub fn from_factors(factors: &[TaskRiskFactor]) -> Self {
+        let factors = factors
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let required_guards = TaskRiskFactor::ALL
+            .into_iter()
+            .filter(|factor| factors.contains(factor))
+            .map(TaskRiskFactor::required_guard)
+            .collect::<Vec<_>>();
+        Self {
+            escalation_eligible: !required_guards.is_empty(),
+            required_guards,
         }
     }
 }
@@ -258,6 +343,10 @@ impl TaskRiskFactor {
 impl TaskProposal {
     pub const MAX_EXPECTED_CHANGES: usize = 8;
     pub const MAX_ACCEPTANCE_CRITERIA: usize = 8;
+
+    pub fn risk_policy(&self) -> TaskRiskPolicy {
+        TaskRiskPolicy::from_factors(&self.risk_factors)
+    }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
@@ -338,12 +427,6 @@ impl TaskProposal {
                 self.local_id
             )
         }
-        let minimum = self
-            .risk_factors
-            .iter()
-            .map(|risk| risk.minimum_effort())
-            .max_by_key(|value| value.rank())
-            .unwrap_or(crate::registry::ReasoningEffort::Low);
         let unique_risks = self
             .risk_factors
             .iter()
@@ -352,14 +435,6 @@ impl TaskProposal {
             anyhow::bail!(
                 "task proposal '{}' contains duplicate risk factors",
                 self.local_id
-            )
-        }
-        if effort.rank() < minimum.rank() {
-            anyhow::bail!(
-                "task proposal '{}' effort '{}' is too low for declared risk factors; minimum is '{}'",
-                self.local_id,
-                effort.as_str(),
-                minimum.as_str()
             )
         }
         if self
@@ -532,7 +607,8 @@ mod tests {
 
     #[test]
     fn task_proposal_round_trips_and_validates() {
-        let value = proposal();
+        let mut value = proposal();
+        value.risk_factors = vec![TaskRiskFactor::Persistence];
         let json = serde_json::to_string(&value).unwrap();
         assert_eq!(serde_json::from_str::<TaskProposal>(&json).unwrap(), value);
         assert!(value.validate().is_ok());
@@ -561,6 +637,11 @@ mod tests {
         value.required_tests.push("production test".into());
         let error = value.validate().unwrap_err().to_string();
         assert!(error.contains("duplicate"));
+
+        let mut value = proposal();
+        value.risk_factors = vec![TaskRiskFactor::Concurrency, TaskRiskFactor::Concurrency];
+        let error = value.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate risk factors"));
     }
 
     #[test]
@@ -589,13 +670,75 @@ mod tests {
     }
 
     #[test]
-    fn declared_high_risk_cannot_use_low_effort() {
-        let mut value = proposal();
-        value.risk_factors = vec![TaskRiskFactor::Persistence];
-        let error = value.validate().unwrap_err().to_string();
-        assert!(error.contains("minimum is 'high'"));
-        value.execution_hints.effort = Some("high".into());
-        assert!(value.validate().is_ok());
+    fn every_risk_factor_is_legal_with_a_low_effort_hint() {
+        for risk in TaskRiskFactor::ALL {
+            let mut value = proposal();
+            value.risk_factors = vec![risk];
+            value.execution_hints.effort = Some("low".into());
+            assert!(value.validate().is_ok(), "{}", risk.as_str());
+        }
+    }
+
+    #[test]
+    fn each_risk_factor_maps_to_its_deterministic_engineering_guard() {
+        let expected = [
+            (
+                TaskRiskFactor::StateMachineLifecycle,
+                TaskRiskGuard::LifecycleTransitionInvariantCoverage,
+            ),
+            (
+                TaskRiskFactor::Persistence,
+                TaskRiskGuard::PersistenceReopenCoverage,
+            ),
+            (
+                TaskRiskFactor::RestartRecovery,
+                TaskRiskGuard::RestartRecoveryCoverage,
+            ),
+            (
+                TaskRiskFactor::Concurrency,
+                TaskRiskGuard::ConcurrencyCancellationCoverage,
+            ),
+            (
+                TaskRiskFactor::CrossRoleProtocol,
+                TaskRiskGuard::ProtocolBoundarySerializationCoverage,
+            ),
+            (
+                TaskRiskFactor::SchemaDataFlow,
+                TaskRiskGuard::SchemaDataFlowCoverage,
+            ),
+            (
+                TaskRiskFactor::Verification,
+                TaskRiskGuard::DeterministicVerificationEvidence,
+            ),
+        ];
+        for (risk, guard) in expected {
+            assert_eq!(risk.required_guard(), guard, "{}", risk.as_str());
+            assert_eq!(
+                TaskRiskPolicy::from_factors(&[risk]).required_guards,
+                vec![guard]
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_risks_union_guards_in_canonical_order_without_duplicates() {
+        let policy = TaskRiskPolicy::from_factors(&[
+            TaskRiskFactor::Verification,
+            TaskRiskFactor::Persistence,
+            TaskRiskFactor::Verification,
+            TaskRiskFactor::Concurrency,
+        ]);
+        assert_eq!(
+            policy.required_guards,
+            vec![
+                TaskRiskGuard::PersistenceReopenCoverage,
+                TaskRiskGuard::ConcurrencyCancellationCoverage,
+                TaskRiskGuard::DeterministicVerificationEvidence,
+            ]
+        );
+        assert!(policy.escalation_eligible);
+        assert_eq!(TaskRiskPolicy::default().required_guards, vec![]);
+        assert!(!TaskRiskPolicy::default().escalation_eligible);
     }
 }
 

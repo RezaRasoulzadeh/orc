@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lead::{LeadBackend, LeadBackendResponse, LeadContext, LeadResponse, LeadService};
 use crate::protocol::{PlanResponse, PlanningRequest};
-use crate::registry::{self, AgentAction, AgentActionProfile, AgentDefinition, ReasoningEffort};
+use crate::registry::{AgentAction, AgentDefinition, ReasoningEffort, ResolutionRecord};
 use crate::review::ReviewSummary;
 use crate::storage::{AgentRunExecution, Database};
 use crate::validation::ValidationRunner;
@@ -25,6 +25,7 @@ pub struct ResolvedAction {
     pub agent: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub resolution_record: ResolutionRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,53 +44,53 @@ pub fn resolve_action(
     action: AgentAction,
     overrides: &ActionOverrides,
 ) -> Result<(AgentDefinition, ResolvedAction)> {
-    let agents = db.list_schedulable_agents()?;
-    let agent = if let Some(id) = &overrides.agent_id {
-        let agent = agents
-            .iter()
-            .find(|agent| agent.id == *id)
-            .cloned()
-            .with_context(|| format!("agent '{id}' is not referenced by the current project"))?;
-        if agent.execution_mode != registry::AUTOMATED
-            || !agent.is_selectable(&[])
-            || !agent.supports_action(action)
-        {
-            bail!(
-                "agent '{}' is unavailable or ineligible for '{}'",
-                id,
-                action.as_str()
-            );
-        }
-        agent
-    } else {
-        registry::select_agent_for_action(&agents, action, &[])?.clone()
-    };
-    let profile = db
-        .agent_action_profiles(&agent.id)?
-        .into_iter()
-        .find(|profile| profile.action == action)
-        .unwrap_or(AgentActionProfile {
-            action,
-            model: None,
-            reasoning_effort: None,
-        });
+    resolve_action_with_transport(
+        db,
+        action,
+        overrides,
+        crate::scheduler::TransportEligibility::Strict,
+    )
+}
+
+fn resolve_action_with_transport(
+    db: &Database,
+    action: AgentAction,
+    overrides: &ActionOverrides,
+    transport: crate::scheduler::TransportEligibility,
+) -> Result<(AgentDefinition, ResolvedAction)> {
+    let decision = crate::scheduler::resolve_action_economy(
+        db,
+        action,
+        crate::scheduler::EconomyOverrides {
+            agent_id: overrides.agent_id.clone(),
+            model: overrides.model.clone(),
+            effort: overrides.reasoning_effort,
+        },
+        transport,
+    )?;
+    let resolution = decision.resolution.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no eligible agent supports action '{}': {}",
+            action.as_str(),
+            decision.schedule.explanation
+        )
+    })?;
+    let agent = resolution.agent;
     let resolved = ResolvedAction {
         action,
         agent: agent.id.clone(),
-        model: overrides
-            .model
-            .clone()
-            .or(profile.model)
-            .or(agent.model.clone()),
-        reasoning_effort: overrides
-            .reasoning_effort
-            .or(profile.reasoning_effort)
-            .or(agent.reasoning_effort),
+        model: resolution.execution.model,
+        reasoning_effort: resolution.execution.reasoning_effort,
+        resolution_record: resolution.record,
     };
     Ok((agent, resolved))
 }
 
 pub trait ActionBackend {
+    fn transport_eligibility(&self) -> crate::scheduler::TransportEligibility {
+        crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend
+    }
+
     fn invoke(
         &self,
         agent: &AgentDefinition,
@@ -190,6 +191,10 @@ impl WorkerActionBackend {
 }
 
 impl ActionBackend for WorkerActionBackend {
+    fn transport_eligibility(&self) -> crate::scheduler::TransportEligibility {
+        crate::scheduler::TransportEligibility::Strict
+    }
+
     fn invoke(
         &self,
         agent: &AgentDefinition,
@@ -1121,7 +1126,7 @@ fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> R
             class: action.as_str(),
             model: resolved.model.as_deref(),
             effort: resolved.reasoning_effort,
-            source: "action",
+            source: &resolved.resolution_record.source,
         },
     )?)
 }
@@ -1157,8 +1162,12 @@ fn invoke_action(
     prompt: &str,
 ) -> Result<ActionExecution> {
     announce_run(backend, run, resolved);
-    let invocation =
-        db.start_provider_invocation(run, resolved.action.as_str(), 1, resolved.reasoning_effort)?;
+    let invocation = db.start_provider_invocation_with_resolution(
+        run,
+        resolved.action.as_str(),
+        1,
+        &resolved.resolution_record,
+    )?;
     let phase = if resolved.action == AgentAction::Review {
         "Reviewing implementation      ..."
     } else {
@@ -1368,7 +1377,12 @@ fn run_review_mode(
             summary.task.status
         );
     }
-    let (agent, resolved) = resolve_action(db, AgentAction::Review, overrides)?;
+    let (agent, resolved) = resolve_action_with_transport(
+        db,
+        AgentAction::Review,
+        overrides,
+        backend.transport_eligibility(),
+    )?;
     let review_agent = review_agent_without_command_execution(&agent);
     let run = db.create_project_action_run(
         db.get_project_id()?.context("no project found in DB")?,
@@ -1379,7 +1393,7 @@ fn run_review_mode(
             class: AgentAction::Review.as_str(),
             model: resolved.model.as_deref(),
             effort: resolved.reasoning_effort,
-            source: "action",
+            source: &resolved.resolution_record.source,
         },
     )?;
     let _run_finalizer = db.run_finalizer(run);
@@ -1630,7 +1644,12 @@ pub fn run_plan(
     backend: &dyn ActionBackend,
 ) -> Result<(i64, PlanResponse)> {
     request.validate()?;
-    let (agent, resolved) = resolve_action(db, AgentAction::Plan, overrides)?;
+    let (agent, resolved) = resolve_action_with_transport(
+        db,
+        AgentAction::Plan,
+        overrides,
+        backend.transport_eligibility(),
+    )?;
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
     let packet = planner_packet(db, request)?;
@@ -1674,26 +1693,27 @@ pub fn run_plan(
 
 fn planner_prompt(packet: &serde_json::Value) -> Result<String> {
     Ok(format!(
-        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, choose the minimum sufficient execution_hints.effort (low, medium, or high) expected to complete it correctly in the initial implementation or at most one focused revision. {} Base that choice on semantic complexity, coupling, uncertainty, lifecycle or persistence risk, concurrency/protocol behavior, and verification burden rather than description length. Give a concise effort_reason and use only the normalized risk_factors categories in the response.\n{}",
-        planner_effort_guidance(),
+        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, supply execution_hints.effort (low, medium, or high) only as non-authoritative metadata describing expected execution depth; Orc's shared economy resolver makes the final agent, model, effort, and tier decision. Do not infer or raise the hint mechanically from risk_factors. Give a concise effort_reason based on semantic complexity, coupling, and uncertainty rather than risk labels or description length. {} Declare risk factors accurately, make acceptance criteria, required tests, and validation precise enough to satisfy their deterministic safeguards, and decompose work when a task is too broad for reliable bounded execution.\n{}",
+        planner_risk_guidance(),
         serde_json::to_string(packet)?
     ))
 }
 
-fn planner_effort_guidance() -> String {
-    let risks_for = |effort| {
-        crate::protocol::TaskRiskFactor::ALL
-            .iter()
-            .copied()
-            .filter(|risk| risk.minimum_effort() == effort)
-            .map(crate::protocol::TaskRiskFactor::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+fn planner_risk_guidance() -> String {
+    let mappings = crate::protocol::TaskRiskFactor::ALL
+        .into_iter()
+        .map(|risk| {
+            format!(
+                "{} -> {} ({})",
+                risk.as_str(),
+                risk.required_guard().as_str(),
+                risk.required_guard().requirement()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
-        "Deterministic risk-factor minimums are mandatory: high minimum: {}; medium minimum: {}; low minimum: no declared risk factors. execution_hints.effort must be at least the maximum minimum effort required by all declared risk_factors. It may be higher when semantic complexity warrants it, but must never be lower than this deterministic mapping. If no risk factor applies, do not invent one merely to justify effort.",
-        risks_for(ReasoningEffort::High),
-        risks_for(ReasoningEffort::Medium),
+        "Risk factors describe engineering risk; they never select or promote model tier or reasoning effort. Their deterministic guard mapping is: {mappings}. If no risk factor applies, do not invent one. Risk increases deterministic rigor and evidence, not model strength."
     )
 }
 
@@ -1742,7 +1762,12 @@ pub fn run_lead(
     overrides: &ActionOverrides,
     backend: &dyn ActionBackend,
 ) -> Result<(i64, LeadResponse)> {
-    let (agent, resolved) = resolve_action(db, AgentAction::Lead, overrides)?;
+    let (agent, resolved) = resolve_action_with_transport(
+        db,
+        AgentAction::Lead,
+        overrides,
+        backend.transport_eligibility(),
+    )?;
     let run = start_run(db, AgentAction::Lead, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
     let adapter = LeadActionAdapter {
@@ -1895,43 +1920,40 @@ mod tests {
     }
 
     #[test]
-    fn planner_prompt_communicates_the_deterministic_risk_effort_contract() {
+    fn planner_prompt_separates_risk_guards_from_economy_selection() {
         let packet = serde_json::json!({"objective": "test planner guidance"});
         let prompt = planner_prompt(&packet).unwrap();
 
         assert!(prompt.contains(
-            "high minimum: state_machine_lifecycle, persistence, restart_recovery, concurrency, cross_role_protocol"
+            "Risk factors describe engineering risk; they never select or promote model tier or reasoning effort"
         ));
-        assert!(prompt.contains(
-            "medium minimum: schema_data_flow, verification; low minimum: no declared risk factors"
-        ));
-        assert!(prompt.contains(
-            "execution_hints.effort must be at least the maximum minimum effort required by all declared risk_factors"
-        ));
-        assert!(prompt.contains("It may be higher when semantic complexity warrants it"));
-        assert!(prompt.contains("must never be lower than this deterministic mapping"));
+        assert!(prompt.contains("shared economy resolver makes the final agent, model, effort"));
+        assert!(prompt.contains("Do not infer or raise the hint mechanically from risk_factors"));
         assert!(
-            prompt
-                .contains("If no risk factor applies, do not invent one merely to justify effort")
+            prompt.contains("Risk increases deterministic rigor and evidence, not model strength")
         );
     }
 
     #[test]
-    fn planner_effort_guidance_derives_each_risk_from_its_deterministic_minimum() {
-        let guidance = planner_effort_guidance();
+    fn planner_guidance_requires_guards_and_reliable_decomposition() {
+        let guidance = planner_risk_guidance();
 
         for risk in crate::protocol::TaskRiskFactor::ALL {
-            let expected_section = match risk.minimum_effort() {
-                ReasoningEffort::High => "high minimum:",
-                ReasoningEffort::Medium => "medium minimum:",
-                ReasoningEffort::None | ReasoningEffort::Low => {
-                    unreachable!("risk factor minimums are medium or high")
-                }
-            };
-            let risk_position = guidance.find(risk.as_str()).unwrap();
-            let section_position = guidance.find(expected_section).unwrap();
-            assert!(risk_position > section_position, "{}", risk.as_str());
+            assert!(guidance.contains(risk.as_str()), "{}", risk.as_str());
+            assert!(
+                guidance.contains(risk.required_guard().as_str()),
+                "{}",
+                risk.as_str()
+            );
+            assert!(
+                guidance.contains(risk.required_guard().requirement()),
+                "{}",
+                risk.as_str()
+            );
         }
+        let prompt = planner_prompt(&serde_json::json!({"objective": "bounded"})).unwrap();
+        assert!(prompt.contains("acceptance criteria, required tests, and validation precise"));
+        assert!(prompt.contains("decompose work when a task is too broad"));
     }
 
     #[test]
@@ -2429,6 +2451,16 @@ mod tests {
         let runs = reopened.list_agent_runs(project, 10).unwrap();
         assert_eq!(runs.len(), 3);
         assert!(runs.iter().all(|run| run.status == "completed"));
+        assert!(
+            runs.iter()
+                .all(|run| reopened.resolution_records(run.id).unwrap().len() == 1)
+        );
+        assert!(runs.iter().all(|run| {
+            let record = reopened.resolution_records(run.id).unwrap().remove(0);
+            record.selected_agent == "multi"
+                && record.selected_model.as_deref() == run.resolved_model.as_deref()
+                && record.effort == run.resolved_reasoning_effort
+        }));
         assert!(runs.iter().all(|run| {
             reopened
                 .get_worker_result(run.id)

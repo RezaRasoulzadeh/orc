@@ -115,6 +115,10 @@ impl Task {
             _ => Vec::new(),
         }
     }
+
+    pub fn risk_policy(&self) -> crate::protocol::TaskRiskPolicy {
+        crate::protocol::TaskRiskPolicy::from_factors(&self.risk_factors)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

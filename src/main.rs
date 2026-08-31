@@ -1125,20 +1125,45 @@ fn run(cli: Cli) -> Result<()> {
             let task = db
                 .get_task(&task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found"))?;
-            let selected = if let Some(id) = agent {
-                registry::get_agent(&db, &id)?
+            let explicit_agent = agent.is_some();
+            let selected_id = if let Some(id) = agent.as_ref() {
+                id.clone()
             } else {
                 let run = db
                     .list_agent_runs_for_task(&task_id)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("task has no agent run"))?;
-                registry::get_agent(&db, &run.agent)?
+                run.agent
             };
-            if selected.execution_mode == registry::MANUAL {
+            let selected_mode = db
+                .get_agent(&selected_id)?
+                .ok_or_else(|| anyhow::anyhow!("agent '{selected_id}' not found"))?
+                .execution_mode;
+            if selected_mode == registry::MANUAL {
                 if model.is_some() || effort.is_some() {
                     anyhow::bail!("--model and --effort require an automated revision agent");
                 }
+                let decision = orc::scheduler::resolve_task_economy(
+                    &db,
+                    &task,
+                    registry::AgentAction::Code,
+                    orc::scheduler::EconomyOverrides {
+                        agent_id: explicit_agent.then_some(selected_id.clone()),
+                        ..Default::default()
+                    },
+                    Some(registry::MANUAL),
+                    (!explicit_agent).then_some(selected_id),
+                    task.reasoning_effort,
+                    Some("revision_contract".into()),
+                    orc::scheduler::TransportEligibility::Strict,
+                    None,
+                    "cli_manual_revision",
+                )?;
+                let selected = decision
+                    .resolution
+                    .ok_or_else(|| anyhow::anyhow!(decision.schedule.explanation))?
+                    .agent;
                 orc::agent::revise_manual(
                     &task_id,
                     feedback.as_deref().unwrap_or(""),
@@ -1147,22 +1172,36 @@ fn run(cli: Cli) -> Result<()> {
                     ".",
                 )?;
             } else {
-                let summary = orc::agent::revise_with_factory_and_global_db_as_with_runner(
-                    &task_id,
-                    feedback.as_deref().unwrap_or(""),
-                    DB_PATH,
-                    ".",
-                    &selected.id,
-                    &orc::SystemValidationRunner,
-                    &orc::agent::RevisionExecutionOverrides { model, effort },
-                    |agent, model, effort| {
-                        orc::backend::WorkerFactory::build_with_overrides(agent, model, effort)
-                    },
-                )?;
+                let revision_overrides = orc::agent::RevisionExecutionOverrides { model, effort };
+                let factory = |agent: &registry::AgentDefinition, model, effort| {
+                    orc::backend::WorkerFactory::build_with_overrides(agent, model, effort)
+                };
+                let summary = if explicit_agent {
+                    orc::agent::revise_with_factory_and_global_db_as_with_runner(
+                        &task_id,
+                        feedback.as_deref().unwrap_or(""),
+                        DB_PATH,
+                        ".",
+                        &selected_id,
+                        &orc::SystemValidationRunner,
+                        &revision_overrides,
+                        factory,
+                    )?
+                } else {
+                    orc::agent::revise_with_factory_and_global_db_as_constrained_with_runner(
+                        &task_id,
+                        feedback.as_deref().unwrap_or(""),
+                        DB_PATH,
+                        ".",
+                        &selected_id,
+                        &orc::SystemValidationRunner,
+                        &revision_overrides,
+                        factory,
+                    )?
+                };
                 println!("{}", orc::review::format_dispatch(&summary));
                 sync_enabled_agents_after_automated_run(&task_id);
             }
-            let _ = task;
         }
         Command::Schedule {
             task_id,
@@ -1174,17 +1213,21 @@ fn run(cli: Cli) -> Result<()> {
                 .get_task(&task_id)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .ok_or_else(|| anyhow::anyhow!("task '{}' not found in DB", task_id))?;
-            let agents = db
-                .list_schedulable_agents()
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let reserve = db.quota_reserve().map_err(|e| anyhow::anyhow!(e))?;
-            let decision = orc::scheduler::schedule_with_quota_reserve(
+            let decision = orc::scheduler::resolve_task_economy(
+                &db,
                 &task,
-                &agents,
+                orc::registry::AgentAction::Code,
+                orc::scheduler::EconomyOverrides::default(),
                 mode.as_deref(),
-                reserve,
+                None,
+                task.reasoning_effort,
+                Some("task_contract".into()),
+                orc::scheduler::TransportEligibility::Strict,
+                None,
+                "cli_schedule",
             )
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))?
+            .schedule;
             if explain {
                 println!("{}", decision.format_explanation());
             } else {

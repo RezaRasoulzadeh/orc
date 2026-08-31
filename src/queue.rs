@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -302,8 +301,12 @@ impl QueueReport {
                                     .map(|q| format!("{q}%"))
                                     .unwrap_or_else(|| "unknown".to_string());
                                 out.push_str(&format!(
-                                    "    - {}: ELIGIBLE (mode: {}, priority: {}, quota: {})\n",
-                                    cand.agent_id, cand.execution_mode, cand.priority, quota_str
+                                    "    - {}: ELIGIBLE (mode: {}, priority: {}, quota: {}, tier: {})\n",
+                                    cand.agent_id,
+                                    cand.execution_mode,
+                                    cand.priority,
+                                    quota_str,
+                                    cand.economy_tier.as_str()
                                 ));
                             }
                             CandidateStatus::Rejected(reason) => {
@@ -333,9 +336,6 @@ impl QueueReport {
 
 pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
     let tasks = db.list_tasks()?;
-    let agents = db.list_schedulable_agents()?;
-    let quota_reserve = db.quota_reserve()?;
-    let busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
     let all_deps = db.list_all_dependencies()?;
 
     let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -509,32 +509,26 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         recommended_execution: Some(persisted_execution.clone()),
                     });
                 } else {
-                    let decision = scheduler::schedule_with_busy_and_quota_reserve(
+                    let economy = scheduler::resolve_task_economy(
+                        db,
                         &task,
-                        &agents,
+                        crate::registry::AgentAction::Code,
+                        scheduler::EconomyOverrides::default(),
                         None,
-                        &busy_agents,
-                        quota_reserve,
+                        None,
+                        None,
+                        None,
+                        scheduler::TransportEligibility::Strict,
+                        None,
+                        "queue_explanation",
                     )
                     .map_err(|e| DbError::Scheduler(e.to_string()))?;
+                    let decision = economy.schedule;
 
                     if let Some(ref selected) = decision.selected_agent_id {
                         let selected = selected.clone();
-                        let template =
-                            db.execution_template(crate::execution::class_for_role(&task.role))?;
-                        let recommended_execution = agents
-                            .iter()
-                            .find(|agent| agent.id == selected)
-                            .map(|agent| {
-                                crate::execution::resolve_with_template(
-                                    &task.role,
-                                    &template,
-                                    agent.model.as_deref(),
-                                    agent.reasoning_effort,
-                                    None,
-                                    None,
-                                )
-                            });
+                        let recommended_execution =
+                            economy.resolution.map(|resolution| resolution.execution);
                         report.ready.push(QueueItem {
                             task,
                             category: QueueCategory::Ready,

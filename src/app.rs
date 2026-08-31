@@ -780,7 +780,7 @@ impl OrcApp {
             deliverables: vec!["A validated PlanResponse JSON document.".into()],
             definition_of_done: vec![
                 "Every task has a unique id and valid dependencies.".into(),
-                "Every task selects low, medium, or high execution effort with a concise semantic reason and bounded risk factors.".into(),
+                "Every task supplies a non-authoritative low, medium, or high execution-effort hint with a concise semantic reason, accurate bounded risk factors, and deterministic safeguards expressed through precise acceptance, test, and validation requirements.".into(),
             ],
             response_schema: crate::protocol::PlanResponseSchema::v1(),
             role_boundaries: report.role_boundaries.clone(),
@@ -1088,20 +1088,63 @@ impl OrcApp {
         Ok(result)
     }
     pub fn revise(&self, task_id: &str, feedback: &str, agent_id: &str) -> Result<()> {
+        self.revise_with_agent_selection(task_id, feedback, agent_id, true)
+    }
+
+    pub(crate) fn revise_constrained(
+        &self,
+        task_id: &str,
+        feedback: &str,
+        agent_id: &str,
+    ) -> Result<()> {
+        self.revise_with_agent_selection(task_id, feedback, agent_id, false)
+    }
+
+    fn revise_with_agent_selection(
+        &self,
+        task_id: &str,
+        feedback: &str,
+        agent_id: &str,
+        operator_agent_override: bool,
+    ) -> Result<()> {
         let agent = self.db.get_agent(agent_id)?.context("agent not found")?;
         if agent.execution_mode == registry::MANUAL {
-            agent::revise_manual(task_id, feedback, &agent, &self.db, &self.repo_path)?;
+            let task = self.db.get_task(task_id)?.context("task not found")?;
+            let decision = crate::scheduler::resolve_task_economy(
+                &self.db,
+                &task,
+                registry::AgentAction::Code,
+                crate::scheduler::EconomyOverrides {
+                    agent_id: operator_agent_override.then(|| agent_id.into()),
+                    ..Default::default()
+                },
+                Some(registry::MANUAL),
+                (!operator_agent_override).then(|| agent_id.into()),
+                task.reasoning_effort,
+                Some("revision_contract".into()),
+                crate::scheduler::TransportEligibility::Strict,
+                None,
+                "application_manual_revision",
+            )?;
+            let selected = decision
+                .resolution
+                .ok_or_else(|| anyhow::anyhow!(decision.schedule.explanation))?
+                .agent;
+            agent::revise_manual(task_id, feedback, &selected, &self.db, &self.repo_path)?;
         } else {
-            let worker =
-                crate::backend::WorkerFactory::build(&agent).map_err(anyhow::Error::msg)?;
-            agent::revise_with_worker_on_db(
+            agent::revise_with_factory_on_db_as_with_runner(
                 task_id,
                 feedback,
-                worker.as_ref(),
                 &self.db,
                 &self.repo_path,
-                &agent.id,
+                agent_id,
                 &crate::SystemValidationRunner,
+                &agent::RevisionExecutionOverrides::default(),
+                crate::scheduler::TransportEligibility::Strict,
+                operator_agent_override,
+                |agent, model, effort| {
+                    crate::backend::WorkerFactory::build_with_overrides(agent, model, effort)
+                },
             )?;
         }
         Ok(())

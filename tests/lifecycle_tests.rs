@@ -809,7 +809,7 @@ fn agent_run_status_output_timestamps_persist() {
 
     assert_eq!(run.status, "completed");
     assert_eq!(run.output, Some(output_text));
-    assert_eq!(run.agent, "copilot");
+    assert_eq!(run.agent, "eligible-codex");
     assert_eq!(run.task_id, Some(tid));
     assert!(!run.started_at.is_empty());
     assert!(run.finished_at.is_some());

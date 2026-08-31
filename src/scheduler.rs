@@ -1,9 +1,14 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::registry::{self, AgentDefinition};
+use crate::execution::{ExecutionClass, ExecutionResolution, ExecutionTemplate};
+use crate::registry::{
+    self, AgentAction, AgentActionProfile, AgentDefinition, EconomyCostConfiguration, EconomyTier,
+    ReasoningEffort, ResolutionRecord,
+};
+use crate::storage::Database;
 use crate::task::Task;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +23,8 @@ pub enum RejectionReason {
     QuotaReserve { remaining: i64, reserve: i64 },
     Busy,
     ModeMismatch { requested: String, actual: String },
+    UnsupportedAction { action: String },
+    AgentConstraint { selected: String },
 }
 
 impl RejectionReason {
@@ -39,6 +46,10 @@ impl RejectionReason {
             Self::ModeMismatch { requested, actual } => {
                 format!("mode mismatch (requested: {requested}, actual: {actual})")
             }
+            Self::UnsupportedAction { action } => format!("unsupported action: {action}"),
+            Self::AgentConstraint { selected } => {
+                format!("agent selection constrained to: {selected}")
+            }
         }
     }
 }
@@ -59,12 +70,74 @@ pub struct CandidateEvaluation {
     pub quota_remaining_percent: Option<i64>,
     pub quota_reset_at: Option<String>,
     pub capacity_score: Option<i64>,
+    #[serde(default)]
+    pub resolved_model: Option<String>,
+    #[serde(default)]
+    pub economy_tier: EconomyTier,
     pub status: CandidateStatus,
+}
+
+/// The only exception transport injection may make to normal eligibility.
+/// It exists so tests and embedders can supply a transport for an otherwise
+/// unknown backend name; every Orc-owned eligibility rule still applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportEligibility {
+    #[default]
+    Strict,
+    IgnoreUnsupportedBackend,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EconomyOverrides {
+    pub agent_id: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EconomyResolverInput<'a> {
+    pub action: AgentAction,
+    pub candidates: &'a [AgentDefinition],
+    pub task: Option<&'a Task>,
+    pub required_capabilities: &'a [String],
+    pub requested_mode: Option<&'a str>,
+    pub busy_agents: &'a HashSet<String>,
+    pub quota_reserve: i64,
+    pub overrides: EconomyOverrides,
+    /// A non-operator constraint, used for an already-owned run or workflow.
+    pub constrained_agent_id: Option<String>,
+    pub action_profiles: &'a BTreeMap<String, AgentActionProfile>,
+    pub execution_class: ExecutionClass,
+    pub execution_template: &'a ExecutionTemplate,
+    pub task_model: Option<String>,
+    pub task_effort: Option<ReasoningEffort>,
+    pub task_source: Option<String>,
+    pub policy_model: Option<String>,
+    pub policy_effort: Option<ReasoningEffort>,
+    pub policy_source: Option<String>,
+    pub cost_configuration: &'a EconomyCostConfiguration,
+    pub transport_eligibility: TransportEligibility,
+    pub escalation_reason: Option<String>,
+    pub lineage: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct EconomyResolution {
+    pub agent: AgentDefinition,
+    pub execution: ExecutionResolution,
+    pub record: ResolutionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct EconomyDecision {
+    pub schedule: ScheduleDecision,
+    pub resolution: Option<EconomyResolution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
+    CheapestEconomyTier,
     HighestPriority,
     HealthierCapacity,
     LexicographicTieBreak,
@@ -97,6 +170,10 @@ impl ScheduleDecision {
                     out.push_str("  ELIGIBLE\n");
                     out.push_str(&format!("  mode: {}\n", cand.execution_mode));
                     out.push_str(&format!("  priority: {}\n", cand.priority));
+                    out.push_str(&format!("  economy tier: {}\n", cand.economy_tier.as_str()));
+                    if let Some(model) = &cand.resolved_model {
+                        out.push_str(&format!("  model: {model}\n"));
+                    }
                     let quota_str = cand
                         .quota_remaining_percent
                         .map(|q| format!("{q}%"))
@@ -140,6 +217,22 @@ pub fn evaluate_candidate_with_quota_reserve(
     requested_mode: Option<&str>,
     quota_reserve: i64,
 ) -> CandidateEvaluation {
+    evaluate_candidate_for_requirements(
+        agent,
+        &task.required_capabilities(),
+        requested_mode,
+        quota_reserve,
+        TransportEligibility::Strict,
+    )
+}
+
+fn evaluate_candidate_for_requirements(
+    agent: &AgentDefinition,
+    required: &[String],
+    requested_mode: Option<&str>,
+    quota_reserve: i64,
+    transport_eligibility: TransportEligibility,
+) -> CandidateEvaluation {
     let make_eval = |status: CandidateStatus| CandidateEvaluation {
         agent_id: agent.id.clone(),
         backend: agent.backend.clone(),
@@ -148,6 +241,8 @@ pub fn evaluate_candidate_with_quota_reserve(
         quota_remaining_percent: agent.quota_remaining_percent,
         quota_reset_at: agent.quota_reset_at.clone(),
         capacity_score: capacity_score(agent),
+        resolved_model: None,
+        economy_tier: EconomyTier::Unknown,
         status,
     };
 
@@ -164,14 +259,28 @@ pub fn evaluate_candidate_with_quota_reserve(
     }
 
     // 3. backend/mode combination must be supported
-    if registry::validate_backend(&agent.backend).is_err() {
+    let backend_supported = registry::validate_backend(&agent.backend).is_ok();
+    if !backend_supported && transport_eligibility != TransportEligibility::IgnoreUnsupportedBackend
+    {
         return make_eval(CandidateStatus::Rejected(
             RejectionReason::UnsupportedBackend {
                 backend: agent.backend.clone(),
             },
         ));
     }
-    if !is_backend_mode_supported(&agent.backend, &agent.execution_mode) {
+    let mode_supported = match agent.execution_mode.as_str() {
+        registry::AUTOMATED => {
+            (backend_supported
+                && matches!(agent.backend.as_str(), "copilot" | "codex" | "antigravity"))
+                || transport_eligibility == TransportEligibility::IgnoreUnsupportedBackend
+        }
+        registry::MANUAL => {
+            backend_supported
+                || transport_eligibility == TransportEligibility::IgnoreUnsupportedBackend
+        }
+        _ => false,
+    };
+    if !mode_supported {
         return make_eval(CandidateStatus::Rejected(
             RejectionReason::UnsupportedMode {
                 mode: agent.execution_mode.clone(),
@@ -180,7 +289,6 @@ pub fn evaluate_candidate_with_quota_reserve(
     }
 
     // 4. required task capabilities must be satisfied
-    let required = task.required_capabilities();
     let available = agent
         .capabilities
         .iter()
@@ -260,14 +368,6 @@ fn ranking_score(candidate: &CandidateEvaluation) -> i64 {
     candidate.priority * 10 + capacity_value(candidate.capacity_score)
 }
 
-fn sort_eligible(eligible: &mut [CandidateEvaluation]) {
-    eligible.sort_by(|a, b| {
-        ranking_score(b)
-            .cmp(&ranking_score(a))
-            .then_with(|| a.agent_id.cmp(&b.agent_id))
-    });
-}
-
 fn selection_reason(eligible: &[CandidateEvaluation]) -> SelectionReason {
     if eligible.len() == 1 {
         SelectionReason::SingleEligibleCandidate
@@ -281,6 +381,239 @@ fn selection_reason(eligible: &[CandidateEvaluation]) -> SelectionReason {
     } else {
         SelectionReason::LexicographicTieBreak
     }
+}
+
+fn execution_class_for_action(action: AgentAction) -> ExecutionClass {
+    match action {
+        AgentAction::Code => ExecutionClass::Coder,
+        AgentAction::Review => ExecutionClass::Reviewer,
+        AgentAction::Plan => ExecutionClass::Architect,
+        AgentAction::Lead => ExecutionClass::General,
+    }
+}
+
+fn candidate_execution(
+    input: &EconomyResolverInput<'_>,
+    agent: &AgentDefinition,
+) -> Result<ExecutionResolution> {
+    if input
+        .overrides
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        bail!("model override must not be empty");
+    }
+    let mut resolution = crate::execution::resolve_with_template(
+        input.execution_class.as_str(),
+        input.execution_template,
+        agent.model.as_deref(),
+        agent.reasoning_effort,
+        None,
+        None,
+    );
+    if input.task_model.is_some() || input.task_effort.is_some() {
+        if let Some(model) = &input.task_model {
+            resolution.model = Some(model.clone());
+        }
+        if let Some(effort) = input.task_effort {
+            resolution.reasoning_effort = Some(effort);
+        }
+        resolution.source = input
+            .task_source
+            .clone()
+            .unwrap_or_else(|| "task_hint".into());
+    }
+    if let Some(profile) = input.action_profiles.get(&agent.id) {
+        // Registry insertion mirrors agent defaults into each supported action
+        // for compatibility. Only a profile that differs from those defaults
+        // is an action-specific input and may outrank the template.
+        let action_specific =
+            profile.model != agent.model || profile.reasoning_effort != agent.reasoning_effort;
+        if action_specific && (profile.model.is_some() || profile.reasoning_effort.is_some()) {
+            if let Some(model) = &profile.model {
+                resolution.model = Some(model.clone());
+            }
+            if let Some(effort) = profile.reasoning_effort {
+                resolution.reasoning_effort = Some(effort);
+            }
+            resolution.source = "action_profile".into();
+        }
+    }
+    if input.policy_model.is_some() || input.policy_effort.is_some() {
+        if let Some(model) = &input.policy_model {
+            resolution.model = Some(model.clone());
+        }
+        if let Some(effort) = input.policy_effort {
+            resolution.reasoning_effort = Some(effort);
+        }
+        resolution.source = input
+            .policy_source
+            .clone()
+            .unwrap_or_else(|| "policy_constraint".into());
+    }
+    if input.overrides.agent_id.is_some()
+        || input.overrides.model.is_some()
+        || input.overrides.effort.is_some()
+    {
+        if let Some(model) = &input.overrides.model {
+            resolution.model = Some(model.clone());
+        }
+        if let Some(effort) = input.overrides.effort {
+            resolution.reasoning_effort = Some(effort);
+        }
+        resolution.source = "operator_override".into();
+    }
+    Ok(resolution)
+}
+
+/// Resolve eligibility, execution identity, and economy ordering in one place.
+/// Callers may supply constraints and policy inputs, but this function alone
+/// creates the final provider-independent [`ResolutionRecord`].
+pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecision> {
+    let selected_constraint = input
+        .overrides
+        .agent_id
+        .as_ref()
+        .or(input.constrained_agent_id.as_ref());
+    let mut eligible = Vec::<(CandidateEvaluation, AgentDefinition, ExecutionResolution)>::new();
+    let mut rejected = Vec::new();
+    for agent in input.candidates {
+        if let Some(selected) = selected_constraint
+            && &agent.id != selected
+        {
+            let mut evaluation = evaluate_candidate_for_requirements(
+                agent,
+                input.required_capabilities,
+                input.requested_mode,
+                input.quota_reserve,
+                input.transport_eligibility,
+            );
+            evaluation.status = CandidateStatus::Rejected(RejectionReason::AgentConstraint {
+                selected: selected.clone(),
+            });
+            rejected.push(evaluation);
+            continue;
+        }
+        let mut evaluation = evaluate_candidate_for_requirements(
+            agent,
+            input.required_capabilities,
+            input.requested_mode,
+            input.quota_reserve,
+            input.transport_eligibility,
+        );
+        if matches!(evaluation.status, CandidateStatus::Eligible)
+            && !agent.supports_action(input.action)
+        {
+            evaluation.status = CandidateStatus::Rejected(RejectionReason::UnsupportedAction {
+                action: input.action.as_str().into(),
+            });
+        }
+        if matches!(evaluation.status, CandidateStatus::Eligible)
+            && input.busy_agents.contains(&agent.id)
+        {
+            evaluation.status = CandidateStatus::Rejected(RejectionReason::Busy);
+        }
+        if matches!(evaluation.status, CandidateStatus::Eligible) {
+            let execution = candidate_execution(&input, agent)?;
+            evaluation.resolved_model = execution.model.clone();
+            evaluation.economy_tier = input
+                .cost_configuration
+                .tier_for(execution.model.as_deref());
+            eligible.push((evaluation, agent.clone(), execution));
+        } else {
+            rejected.push(evaluation);
+        }
+    }
+    eligible.sort_by(|(left, _, _), (right, _, _)| {
+        left.economy_tier
+            .rank()
+            .cmp(&right.economy_tier.rank())
+            .then_with(|| ranking_score(right).cmp(&ranking_score(left)))
+            .then_with(|| left.agent_id.cmp(&right.agent_id))
+    });
+    rejected.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+
+    let selected_agent_id = eligible.first().map(|(item, _, _)| item.agent_id.clone());
+    let selection_reason = match eligible.as_slice() {
+        [] => SelectionReason::NoEligibleCandidates,
+        [_] => SelectionReason::SingleEligibleCandidate,
+        [first, second, ..] if first.0.economy_tier != second.0.economy_tier => {
+            SelectionReason::CheapestEconomyTier
+        }
+        _ => selection_reason(
+            &eligible
+                .iter()
+                .map(|(evaluation, _, _)| evaluation.clone())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let task_id = input
+        .task
+        .map(|task| task.id.clone())
+        .unwrap_or_else(|| format!("action:{}", input.action.as_str()));
+    let explanation = match eligible.first() {
+        Some((winner, _, _)) if selection_reason == SelectionReason::CheapestEconomyTier => {
+            format!(
+                "{} selected from the cheapest eligible economy tier ({}).",
+                winner.agent_id,
+                winner.economy_tier.as_str()
+            )
+        }
+        Some((winner, _, _)) => format!(
+            "{} selected by deterministic capacity, priority, and lexicographic order within economy tier {}.",
+            winner.agent_id,
+            winner.economy_tier.as_str()
+        ),
+        None => format!("No eligible agent satisfies requirements for '{task_id}'."),
+    };
+
+    let resolution = eligible.first().map(|(evaluation, agent, execution)| {
+        let input_lineage = serde_json::json!({
+            "lineage": input.lineage,
+            "action": input.action.as_str(),
+            "task_id": input.task.map(|task| task.id.as_str()),
+            "execution_class": input.execution_class.as_str(),
+            "requested_mode": input.requested_mode,
+            "operator_agent": input.overrides.agent_id,
+            "operator_model": input.overrides.model,
+            "operator_effort": input.overrides.effort.map(ReasoningEffort::as_str),
+            "task_model": input.task_model,
+            "task_effort": input.task_effort.map(ReasoningEffort::as_str),
+            "policy_model": input.policy_model,
+            "policy_effort": input.policy_effort.map(ReasoningEffort::as_str),
+            "source": execution.source,
+        })
+        .to_string();
+        EconomyResolution {
+            agent: agent.clone(),
+            execution: execution.clone(),
+            record: ResolutionRecord {
+                selected_agent: agent.id.clone(),
+                selected_model: execution.model.clone(),
+                effort: execution.reasoning_effort,
+                tier: evaluation.economy_tier,
+                source: execution.source.clone(),
+                escalation_reason: input.escalation_reason.clone(),
+                input_lineage,
+            },
+        }
+    });
+    let mut candidates = eligible
+        .into_iter()
+        .map(|(evaluation, _, _)| evaluation)
+        .collect::<Vec<_>>();
+    candidates.extend(rejected);
+    Ok(EconomyDecision {
+        schedule: ScheduleDecision {
+            task_id,
+            selected_agent_id,
+            candidates,
+            selection_reason,
+            explanation,
+        },
+        resolution,
+    })
 }
 
 fn parse_rfc3339_epoch(value: &str) -> Option<i64> {
@@ -386,70 +719,13 @@ pub fn schedule_with_quota_reserve(
     requested_mode: Option<&str>,
     quota_reserve: i64,
 ) -> Result<ScheduleDecision> {
-    let mut eligible = Vec::new();
-    let mut rejected = Vec::new();
-
-    for agent in agents {
-        let eval =
-            evaluate_candidate_with_quota_reserve(agent, task, requested_mode, quota_reserve);
-        match eval.status {
-            CandidateStatus::Eligible => eligible.push(eval),
-            CandidateStatus::Rejected(_) => rejected.push(eval),
-        }
-    }
-
-    sort_eligible(&mut eligible);
-
-    rejected.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
-
-    let selected_agent_id = eligible.first().map(|c| c.agent_id.clone());
-
-    let (selection_reason, explanation) = if let Some(ref winner) = selected_agent_id {
-        if eligible.len() == 1 {
-            (
-                SelectionReason::SingleEligibleCandidate,
-                format!("{winner} selected by highest priority."),
-            )
-        } else if ranking_score(&eligible[0]) > ranking_score(&eligible[1])
-            && capacity_value(eligible[0].capacity_score)
-                > capacity_value(eligible[1].capacity_score)
-            && eligible[0].priority <= eligible[1].priority
-        {
-            (
-                SelectionReason::HealthierCapacity,
-                format!("{winner} selected by healthier usable capacity."),
-            )
-        } else if eligible[0].priority > eligible[1].priority {
-            (
-                SelectionReason::HighestPriority,
-                format!("{winner} selected by highest priority."),
-            )
-        } else {
-            (
-                SelectionReason::LexicographicTieBreak,
-                format!("{winner} selected by lexicographic tie-break."),
-            )
-        }
-    } else {
-        (
-            SelectionReason::NoEligibleCandidates,
-            format!(
-                "No eligible agent satisfies requirements for task '{}'.",
-                task.id
-            ),
-        )
-    };
-
-    let mut all_candidates = eligible;
-    all_candidates.extend(rejected);
-
-    Ok(ScheduleDecision {
-        task_id: task.id.clone(),
-        selected_agent_id,
-        candidates: all_candidates,
-        selection_reason,
-        explanation,
-    })
+    schedule_with_busy_and_quota_reserve(
+        task,
+        agents,
+        requested_mode,
+        &HashSet::new(),
+        quota_reserve,
+    )
 }
 
 pub fn schedule_with_busy(
@@ -468,47 +744,253 @@ pub fn schedule_with_busy_and_quota_reserve(
     busy_agents: &HashSet<String>,
     quota_reserve: i64,
 ) -> Result<ScheduleDecision> {
-    let mut eligible = Vec::new();
-    let mut rejected = Vec::new();
-    for agent in agents {
-        let evaluation = evaluate_candidate_with_busy_and_quota_reserve(
-            agent,
-            task,
-            requested_mode,
-            busy_agents,
-            quota_reserve,
-        );
-        match evaluation.status {
-            CandidateStatus::Eligible => eligible.push(evaluation),
-            CandidateStatus::Rejected(_) => rejected.push(evaluation),
+    let profiles = BTreeMap::new();
+    let template = ExecutionTemplate::default();
+    let costs = EconomyCostConfiguration::default();
+    Ok(resolve_economy(EconomyResolverInput {
+        action: AgentAction::Code,
+        candidates: agents,
+        task: Some(task),
+        required_capabilities: &task.required_capabilities(),
+        requested_mode,
+        busy_agents,
+        quota_reserve,
+        overrides: EconomyOverrides::default(),
+        constrained_agent_id: None,
+        action_profiles: &profiles,
+        execution_class: crate::execution::class_for_role(&task.role),
+        execution_template: &template,
+        task_model: None,
+        task_effort: task.reasoning_effort,
+        task_source: Some("task_contract".into()),
+        policy_model: None,
+        policy_effort: None,
+        policy_source: None,
+        cost_configuration: &costs,
+        transport_eligibility: TransportEligibility::Strict,
+        escalation_reason: None,
+        lineage: "scheduler".into(),
+    })?
+    .schedule)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the authoritative boundary keeps every policy input explicit"
+)]
+pub fn resolve_task_economy(
+    db: &Database,
+    task: &Task,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    requested_mode: Option<&str>,
+    constrained_agent_id: Option<String>,
+    task_effort: Option<ReasoningEffort>,
+    task_source: Option<String>,
+    transport_eligibility: TransportEligibility,
+    escalation_reason: Option<String>,
+    lineage: impl Into<String>,
+) -> Result<EconomyDecision> {
+    resolve_task_economy_with_additional_busy(
+        db,
+        task,
+        action,
+        overrides,
+        requested_mode,
+        constrained_agent_id,
+        task_effort,
+        task_source,
+        transport_eligibility,
+        escalation_reason,
+        lineage,
+        &HashSet::new(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the authoritative boundary keeps every policy input explicit"
+)]
+pub(crate) fn resolve_task_economy_with_additional_busy(
+    db: &Database,
+    task: &Task,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    requested_mode: Option<&str>,
+    constrained_agent_id: Option<String>,
+    task_effort: Option<ReasoningEffort>,
+    task_source: Option<String>,
+    transport_eligibility: TransportEligibility,
+    escalation_reason: Option<String>,
+    lineage: impl Into<String>,
+    additional_busy: &HashSet<String>,
+) -> Result<EconomyDecision> {
+    let candidates = db.list_schedulable_agents()?;
+    let mut profiles = BTreeMap::new();
+    for agent in &candidates {
+        if let Some(profile) = db
+            .agent_action_profiles(&agent.id)?
+            .into_iter()
+            .find(|profile| profile.action == action)
+        {
+            profiles.insert(agent.id.clone(), profile);
         }
     }
-    sort_eligible(&mut eligible);
-    rejected.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
-    let selected_agent_id = eligible.first().map(|candidate| candidate.agent_id.clone());
-    let explanation = selected_agent_id.as_ref().map_or_else(
-        || {
-            format!(
-                "No eligible agent satisfies requirements for task '{}'.",
-                task.id
-            )
-        },
-        |id| format!("{id} selected by deterministic capacity, priority, and lexicographic order."),
-    );
-    let selection_reason = match selected_agent_id {
-        None => SelectionReason::NoEligibleCandidates,
-        Some(_) if eligible.len() == 1 => SelectionReason::SingleEligibleCandidate,
-        Some(_) => selection_reason(&eligible),
-    };
-    let selected = selected_agent_id.clone();
-    let mut candidates = eligible;
-    candidates.extend(rejected);
-    Ok(ScheduleDecision {
-        task_id: task.id.clone(),
-        selected_agent_id: selected,
-        candidates,
-        selection_reason,
-        explanation,
+    let hints = db
+        .get_task_execution_hints(&task.id)?
+        .ok_or_else(|| anyhow::anyhow!("task execution hints are missing"))?;
+    let execution_class = hints
+        .class
+        .as_deref()
+        .map(ExecutionClass::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
+    let template = db.execution_template(execution_class)?;
+    let costs = db.economy_cost_configuration()?;
+    let mut busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    busy_agents.extend(additional_busy.iter().cloned());
+    // An invocation continuing an existing run already owns this reservation.
+    if let Some(agent) = constrained_agent_id.as_ref() {
+        busy_agents.remove(agent);
+    }
+    resolve_economy(EconomyResolverInput {
+        action,
+        candidates: &candidates,
+        task: Some(task),
+        required_capabilities: &task.required_capabilities(),
+        requested_mode,
+        busy_agents: &busy_agents,
+        quota_reserve: db.quota_reserve()?,
+        overrides,
+        constrained_agent_id,
+        action_profiles: &profiles,
+        execution_class,
+        execution_template: &template,
+        task_model: hints.model,
+        task_effort,
+        task_source,
+        policy_model: None,
+        policy_effort: None,
+        policy_source: None,
+        cost_configuration: &costs,
+        transport_eligibility,
+        escalation_reason,
+        lineage: lineage.into(),
+    })
+}
+
+pub fn resolve_action_economy(
+    db: &Database,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    transport_eligibility: TransportEligibility,
+) -> Result<EconomyDecision> {
+    let candidates = db.list_schedulable_agents()?;
+    let mut profiles = BTreeMap::new();
+    for agent in &candidates {
+        if let Some(profile) = db
+            .agent_action_profiles(&agent.id)?
+            .into_iter()
+            .find(|profile| profile.action == action)
+        {
+            profiles.insert(agent.id.clone(), profile);
+        }
+    }
+    let class = execution_class_for_action(action);
+    let template = db.execution_template(class)?;
+    let costs = db.economy_cost_configuration()?;
+    let busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    resolve_economy(EconomyResolverInput {
+        action,
+        candidates: &candidates,
+        task: None,
+        required_capabilities: &[],
+        requested_mode: Some(registry::AUTOMATED),
+        busy_agents: &busy_agents,
+        quota_reserve: db.quota_reserve()?,
+        overrides,
+        constrained_agent_id: None,
+        action_profiles: &profiles,
+        execution_class: class,
+        execution_template: &template,
+        task_model: None,
+        task_effort: None,
+        task_source: None,
+        policy_model: None,
+        policy_effort: None,
+        policy_source: None,
+        cost_configuration: &costs,
+        transport_eligibility,
+        escalation_reason: None,
+        lineage: format!("action:{}", action.as_str()),
+    })
+}
+
+pub fn resolve_run_invocation_economy(
+    db: &Database,
+    task: &Task,
+    agent_id: &str,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    purpose: &str,
+    transport_eligibility: TransportEligibility,
+) -> Result<EconomyResolution> {
+    let candidates = db.list_schedulable_agents()?;
+    let mut profiles = BTreeMap::new();
+    for agent in &candidates {
+        if let Some(profile) = db
+            .agent_action_profiles(&agent.id)?
+            .into_iter()
+            .find(|profile| profile.action == AgentAction::Code)
+        {
+            profiles.insert(agent.id.clone(), profile);
+        }
+    }
+    let hints = db
+        .get_task_execution_hints(&task.id)?
+        .ok_or_else(|| anyhow::anyhow!("task execution hints are missing"))?;
+    let class = hints
+        .class
+        .as_deref()
+        .map(ExecutionClass::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| crate::execution::class_for_role(&task.role));
+    let template = db.execution_template(class)?;
+    let costs = db.economy_cost_configuration()?;
+    let mut busy_agents = db.list_busy_agents()?.into_iter().collect::<HashSet<_>>();
+    busy_agents.remove(agent_id);
+    let decision = resolve_economy(EconomyResolverInput {
+        action: AgentAction::Code,
+        candidates: &candidates,
+        task: Some(task),
+        required_capabilities: &task.required_capabilities(),
+        requested_mode: Some(registry::AUTOMATED),
+        busy_agents: &busy_agents,
+        quota_reserve: db.quota_reserve()?,
+        overrides: EconomyOverrides::default(),
+        constrained_agent_id: Some(agent_id.into()),
+        action_profiles: &profiles,
+        execution_class: class,
+        execution_template: &template,
+        task_model: hints.model,
+        task_effort: task.reasoning_effort,
+        task_source: Some("task_contract".into()),
+        policy_model: model,
+        policy_effort: effort,
+        policy_source: Some(purpose.into()),
+        cost_configuration: &costs,
+        transport_eligibility,
+        escalation_reason: (purpose.contains("repair"))
+            .then(|| "bounded evidence-backed repair".into()),
+        lineage: format!("{purpose}:task:{}", task.id),
+    })?;
+    decision.resolution.ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent '{agent_id}' is not eligible for provider invocation '{purpose}': {}",
+            decision.schedule.explanation
+        )
     })
 }
 
@@ -585,6 +1067,255 @@ mod tests {
             quota_limits: None,
             actions: vec![crate::registry::AgentAction::Code],
         }
+    }
+
+    fn economy(
+        task: &Task,
+        agents: &[AgentDefinition],
+        costs: &EconomyCostConfiguration,
+        overrides: EconomyOverrides,
+        profiles: &BTreeMap<String, AgentActionProfile>,
+        template: &ExecutionTemplate,
+        transport: TransportEligibility,
+    ) -> EconomyDecision {
+        resolve_economy(EconomyResolverInput {
+            action: AgentAction::Code,
+            candidates: agents,
+            task: Some(task),
+            required_capabilities: &task.required_capabilities(),
+            requested_mode: Some(registry::AUTOMATED),
+            busy_agents: &HashSet::new(),
+            quota_reserve: 0,
+            overrides,
+            constrained_agent_id: None,
+            action_profiles: profiles,
+            execution_class: ExecutionClass::Coder,
+            execution_template: template,
+            task_model: None,
+            task_effort: task.reasoning_effort,
+            task_source: None,
+            policy_model: None,
+            policy_effort: None,
+            policy_source: None,
+            cost_configuration: costs,
+            transport_eligibility: transport,
+            escalation_reason: None,
+            lineage: "test".into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn cheapest_economy_tier_precedes_agent_priority() {
+        let task = test_task(vec!["code"]);
+        let mut expensive = test_agent("expensive", 1_000, vec!["code"]);
+        expensive.model = Some("large".into());
+        let mut cheap = test_agent("cheap", 1, vec!["code"]);
+        cheap.model = Some("small".into());
+        let costs = EconomyCostConfiguration {
+            model_costs: BTreeMap::from([("small".into(), 1.0), ("large".into(), 4.0)]),
+            unknown_tier: EconomyTier::Unknown,
+        };
+        let decision = economy(
+            &task,
+            &[expensive, cheap],
+            &costs,
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        );
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("cheap")
+        );
+        assert_eq!(
+            decision.schedule.selection_reason,
+            SelectionReason::CheapestEconomyTier
+        );
+        assert_eq!(
+            decision.resolution.unwrap().record.tier,
+            EconomyTier::Default
+        );
+    }
+
+    #[test]
+    fn same_economy_tier_preserves_scheduler_ordering() {
+        let task = test_task(vec!["code"]);
+        let mut high = test_agent("high", 200, vec!["code"]);
+        high.model = Some("small-a".into());
+        let mut low = test_agent("low", 100, vec!["code"]);
+        low.model = Some("small-b".into());
+        let costs = EconomyCostConfiguration {
+            model_costs: BTreeMap::from([("small-a".into(), 1.0), ("small-b".into(), 0.5)]),
+            unknown_tier: EconomyTier::Unknown,
+        };
+        let decision = economy(
+            &task,
+            &[low, high],
+            &costs,
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        );
+        assert_eq!(decision.schedule.selected_agent_id.as_deref(), Some("high"));
+        assert_eq!(
+            decision.schedule.selection_reason,
+            SelectionReason::HighestPriority
+        );
+    }
+
+    #[test]
+    fn task_risk_never_promotes_reasoning_effort_or_economy_tier() {
+        let mut task = test_task(vec!["code"]);
+        task.reasoning_effort = Some(ReasoningEffort::Low);
+        task.risk_factors = crate::protocol::TaskRiskFactor::ALL.to_vec();
+        let mut agent = test_agent("cheap", 1, vec!["code"]);
+        agent.model = Some("small".into());
+        let costs = EconomyCostConfiguration {
+            model_costs: BTreeMap::from([("small".into(), 1.0)]),
+            unknown_tier: EconomyTier::Unknown,
+        };
+        let resolution = economy(
+            &task,
+            &[agent],
+            &costs,
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        )
+        .resolution
+        .unwrap();
+        assert_eq!(
+            resolution.execution.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(resolution.record.tier, EconomyTier::Default);
+        assert_eq!(resolution.record.escalation_reason, None);
+    }
+
+    #[test]
+    fn operator_override_preserves_provenance_without_bypassing_eligibility() {
+        let task = test_task(vec!["code"]);
+        let mut disabled = test_agent("disabled", 100, vec!["code"]);
+        disabled.enabled = false;
+        let decision = economy(
+            &task,
+            &[disabled],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides {
+                agent_id: Some("disabled".into()),
+                model: Some("operator-model".into()),
+                effort: Some(ReasoningEffort::High),
+            },
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        );
+        assert!(decision.resolution.is_none());
+        assert!(matches!(
+            decision.schedule.candidates[0].status,
+            CandidateStatus::Rejected(RejectionReason::Disabled)
+        ));
+
+        let eligible = test_agent("eligible", 100, vec!["code"]);
+        let decision = economy(
+            &task,
+            &[eligible],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides {
+                agent_id: Some("eligible".into()),
+                model: Some("operator-model".into()),
+                effort: Some(ReasoningEffort::High),
+            },
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        );
+        let record = decision.resolution.unwrap().record;
+        assert_eq!(record.source, "operator_override");
+        assert_eq!(record.selected_model.as_deref(), Some("operator-model"));
+        assert_eq!(record.effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn action_profile_precedes_execution_template_inside_resolver() {
+        let task = test_task(vec!["code"]);
+        let agent = test_agent("agent", 100, vec!["code"]);
+        let profiles = BTreeMap::from([(
+            "agent".into(),
+            AgentActionProfile {
+                action: AgentAction::Code,
+                model: Some("profile-model".into()),
+                reasoning_effort: None,
+            },
+        )]);
+        let template = ExecutionTemplate {
+            model: Some("template-model".into()),
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        };
+        let resolution = economy(
+            &task,
+            &[agent],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides::default(),
+            &profiles,
+            &template,
+            TransportEligibility::Strict,
+        )
+        .resolution
+        .unwrap();
+        assert_eq!(resolution.execution.model.as_deref(), Some("profile-model"));
+        assert_eq!(
+            resolution.execution.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(resolution.record.source, "action_profile");
+    }
+
+    #[test]
+    fn injected_transport_ignores_only_unsupported_backend() {
+        let task = test_task(vec!["code"]);
+        let mut fake = test_agent("fake", 100, vec!["code"]);
+        fake.backend = "fake".into();
+        let strict = economy(
+            &task,
+            &[fake.clone()],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+        );
+        assert!(strict.resolution.is_none());
+        let injected = economy(
+            &task,
+            &[fake.clone()],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::IgnoreUnsupportedBackend,
+        );
+        assert!(injected.resolution.is_some());
+
+        fake.quota_remaining_percent = Some(0);
+        let exhausted = economy(
+            &task,
+            &[fake],
+            &EconomyCostConfiguration::default(),
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::IgnoreUnsupportedBackend,
+        );
+        assert!(exhausted.resolution.is_none());
+        assert!(matches!(
+            exhausted.schedule.candidates[0].status,
+            CandidateStatus::Rejected(RejectionReason::QuotaExhausted)
+        ));
     }
 
     #[test]

@@ -1067,7 +1067,8 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             .run
             .context("task has no implementation run")?
             .agent;
-        self.app.revise(task_id, feedback, &implementation_agent)?;
+        self.app
+            .revise_constrained(task_id, feedback, &implementation_agent)?;
         let run = self
             .app
             .review(task_id)?

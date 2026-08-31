@@ -299,9 +299,20 @@ fn execute(
         RuntimeRequest::Agents => RuntimeValue::Agents(app.agents()?),
         RuntimeRequest::DispatchCandidates(task_id) => {
             let task = app.task(task_id)?.context("task not found")?;
-            let agents = app.agents()?;
-            let decision =
-                crate::scheduler::schedule_with_busy(&task, &agents, None, &app.busy_agents()?)?;
+            let decision = crate::scheduler::resolve_task_economy(
+                app.database(),
+                &task,
+                crate::registry::AgentAction::Code,
+                crate::scheduler::EconomyOverrides::default(),
+                None,
+                None,
+                task.reasoning_effort,
+                Some("task_contract".into()),
+                crate::scheduler::TransportEligibility::Strict,
+                None,
+                "runtime_dispatch_candidates",
+            )?
+            .schedule;
             let eligible = decision
                 .candidates
                 .into_iter()

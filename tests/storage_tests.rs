@@ -1,8 +1,7 @@
 use orc::execution::ExecutionClass;
 use orc::lead::LeadDecisionKind;
 use orc::protocol::{ExecutionHints, PROTOCOL_VERSION, PlanResponse, TaskProposal};
-use orc::registry::AUTOMATED;
-use orc::registry::ReasoningEffort;
+use orc::registry::{AUTOMATED, EconomyTier, ReasoningEffort, ResolutionRecord};
 use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database, WorkerResult};
 use orc::task::TaskScopeMode;
@@ -237,7 +236,7 @@ fn applied_plan_persists_complete_execution_contract_after_reopen() {
             execution_hints: ExecutionHints {
                 class: Some("coder".into()),
                 model: Some("task-selected-model".into()),
-                effort: Some("medium".into()),
+                effort: Some("low".into()),
                 effort_reason: Some("schema and data-flow verification".into()),
             },
             risk_factors: vec![orc::protocol::TaskRiskFactor::SchemaDataFlow],
@@ -248,13 +247,13 @@ fn applied_plan_persists_complete_execution_contract_after_reopen() {
     let mapping = db.apply_plan(project, &response).unwrap();
     let task_id = mapping["contract"].clone();
     let task = db.get_task(&task_id).unwrap().unwrap();
-    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Low));
     assert_eq!(
         db.get_task_execution_hints(&task_id).unwrap().unwrap(),
         ExecutionHints {
             class: Some("coder".into()),
             model: Some("task-selected-model".into()),
-            effort: Some("medium".into()),
+            effort: Some("low".into()),
             effort_reason: Some("schema and data-flow verification".into()),
         }
     );
@@ -273,12 +272,16 @@ fn applied_plan_persists_complete_execution_contract_after_reopen() {
             .execution_hints
             .effort
             .as_deref(),
-        Some("medium")
+        Some("low")
     );
     drop(db);
     let reopened = Database::open(&path).unwrap();
     let task = reopened.get_task(&task_id).unwrap().unwrap();
-    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(task.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        task.risk_policy().required_guards,
+        vec![orc::protocol::TaskRiskGuard::SchemaDataFlowCoverage]
+    );
     assert_eq!(
         reopened
             .get_task_execution_hints(&task_id)
@@ -287,7 +290,7 @@ fn applied_plan_persists_complete_execution_contract_after_reopen() {
         ExecutionHints {
             class: Some("coder".into()),
             model: Some("task-selected-model".into()),
-            effort: Some("medium".into()),
+            effort: Some("low".into()),
             effort_reason: Some("schema and data-flow verification".into()),
         }
     );
@@ -1071,4 +1074,57 @@ fn task_dependency_persistence_survives_reopen() {
     let db2 = Database::open(&path).expect("open");
     assert_eq!(db2.list_task_dependencies(&t2).unwrap(), vec![t1.clone()]);
     assert_eq!(db2.list_task_dependents(&t1).unwrap(), vec![t2]);
+}
+
+#[test]
+fn exact_resolution_is_persisted_once_and_survives_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let run = {
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("economy").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "task",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let run = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "selected-agent",
+                AUTOMATED,
+                AgentRunExecution {
+                    class: "coder",
+                    model: Some("small-model"),
+                    effort: Some(ReasoningEffort::Medium),
+                    source: "operator_override",
+                },
+            )
+            .unwrap();
+        let record = ResolutionRecord {
+            selected_agent: "selected-agent".into(),
+            selected_model: Some("small-model".into()),
+            effort: Some(ReasoningEffort::Medium),
+            tier: EconomyTier::Default,
+            source: "operator_override".into(),
+            escalation_reason: None,
+            input_lineage: r#"{"operator_model":"small-model"}"#.into(),
+        };
+        db.start_provider_invocation_with_resolution(run, "implementation", 1, &record)
+            .unwrap();
+        assert_eq!(db.resolution_records(run).unwrap(), vec![record]);
+        run
+    };
+
+    let reopened = Database::open(&path).unwrap();
+    let records = reopened.resolution_records(run).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source, "operator_override");
+    assert_eq!(records[0].tier, EconomyTier::Default);
+    assert_eq!(records[0].selected_model.as_deref(), Some("small-model"));
 }

@@ -1225,42 +1225,172 @@ fn parse_structured<T: for<'de> Deserialize<'de>>(output: &str, label: &str) -> 
         .with_context(|| format!("{label} returned malformed structured output"))
 }
 
-/// Build the compact, action-specific Planner contract. Full reports and Lead
-/// snapshots remain in SQLite and are referenced by their persisted IDs.
-pub fn planner_packet(db: &Database, request: &PlanningRequest) -> Result<serde_json::Value> {
-    let decision = db.pending_lead_decision_context()?;
-    Ok(serde_json::json!({
-        "protocol_version": request.protocol_version,
-        "kind": request.kind,
-        "objective": request.objective,
-        "project": request.project,
-        "engineering_contract": request.engineering_contract,
-        "constraints": request.constraints,
-        "non_goals": request.non_goals,
-        "deliverables": request.deliverables,
-        "definition_of_done": request.definition_of_done,
-        "role_boundaries": request.role_boundaries,
-        "planning_constraints": request.planning_constraints,
-        "approval_requirements": request.approval_requirements,
-        "current_state": request.current_state,
-        "discovery_snapshot": request.discovery_snapshot,
-        "source_lead_decision": decision,
-        "response_schema": request.response_schema,
-    }))
+/// Build the bounded, typed Planner contract. Full reports and operational
+/// histories remain in SQLite and are not replayed to the provider.
+pub fn build_planner_packet(
+    db: &Database,
+    request: &PlanningRequest,
+) -> Result<crate::execution_packet::PlannerPacket> {
+    let mut decisions = db.pending_lead_decision_context()?;
+    decisions.sort_by_key(|decision| decision.id);
+    let omitted_decisions = decisions.len().saturating_sub(4);
+    decisions.truncate(4);
+    let decisions = decisions
+        .into_iter()
+        .map(|decision| crate::execution_packet::PlannerDecisionContext {
+            id: decision.id,
+            kind: decision.kind,
+            source_request: crate::execution_packet::BoundedText::new(
+                &decision.source_request,
+                8_000,
+            ),
+            summary: crate::execution_packet::BoundedText::new(&decision.summary, 4_000),
+            details: crate::execution_packet::BoundedText::new(&decision.details, 12_000),
+            resolution: decision
+                .resolution
+                .as_deref()
+                .map(|value| crate::execution_packet::BoundedText::new(value, 4_000)),
+        })
+        .collect::<Vec<_>>();
+    let mut state = request.current_state.clone();
+    let mut omitted_state = 0;
+    if let Some(state) = &mut state {
+        for tasks in [
+            &mut state.ready_tasks,
+            &mut state.active_tasks,
+            &mut state.review_tasks,
+            &mut state.blocked_tasks,
+        ] {
+            omitted_state += tasks.len().saturating_sub(32);
+            tasks.truncate(32);
+        }
+        state.usable_agents.truncate(32);
+        state.busy_agents.truncate(32);
+    }
+    let (discovery_snapshot, omitted_discovery) = request
+        .discovery_snapshot
+        .clone()
+        .map(bound_discovery)
+        .map_or((None, 0), |(snapshot, omitted)| (Some(snapshot), omitted));
+    let engineering_contract = crate::execution_packet::BoundedText::new(
+        &request.engineering_contract,
+        crate::execution_packet::MAX_ENGINEERING_BYTES,
+    );
+    let objective = crate::execution_packet::BoundedText::new(&request.objective, 8_000);
+    let mut truncations = Vec::new();
+    if engineering_contract.truncated() {
+        truncations.push(crate::execution_packet::Truncation {
+            field: "engineering_contract".into(),
+            omitted_items: 0,
+            omitted_bytes: engineering_contract.omitted_bytes,
+        });
+    }
+    if objective.truncated() {
+        truncations.push(crate::execution_packet::Truncation {
+            field: "objective".into(),
+            omitted_items: 0,
+            omitted_bytes: objective.omitted_bytes,
+        });
+    }
+    for (field, omitted) in [
+        ("source_lead_decision", omitted_decisions),
+        ("current_state.tasks", omitted_state),
+        ("discovery_snapshot", omitted_discovery),
+    ] {
+        if omitted != 0 {
+            truncations.push(crate::execution_packet::Truncation {
+                field: field.into(),
+                omitted_items: omitted,
+                omitted_bytes: 0,
+            });
+        }
+    }
+    for (field, values) in [
+        ("constraints", &request.constraints),
+        ("non_goals", &request.non_goals),
+        ("deliverables", &request.deliverables),
+        ("definition_of_done", &request.definition_of_done),
+        ("role_boundaries", &request.role_boundaries),
+        ("planning_constraints", &request.planning_constraints),
+        ("approval_requirements", &request.approval_requirements),
+    ] {
+        let omitted = values
+            .len()
+            .saturating_sub(crate::execution_packet::MAX_LIST_ITEMS);
+        if omitted != 0 {
+            truncations.push(crate::execution_packet::Truncation {
+                field: field.into(),
+                omitted_items: omitted,
+                omitted_bytes: 0,
+            });
+        }
+    }
+    let list = |values: &[String]| {
+        values
+            .iter()
+            .take(crate::execution_packet::MAX_LIST_ITEMS)
+            .cloned()
+            .collect()
+    };
+    Ok(crate::execution_packet::PlannerPacket {
+        metadata: crate::execution_packet::PacketMetadata {
+            packet_type: "planner".into(),
+            truncations,
+            ..Default::default()
+        },
+        protocol_version: request.protocol_version,
+        kind: request.kind.clone(),
+        objective,
+        project: request.project.clone(),
+        engineering_contract,
+        constraints: list(&request.constraints),
+        non_goals: list(&request.non_goals),
+        deliverables: list(&request.deliverables),
+        definition_of_done: list(&request.definition_of_done),
+        role_boundaries: list(&request.role_boundaries),
+        planning_constraints: list(&request.planning_constraints),
+        approval_requirements: list(&request.approval_requirements),
+        current_state: state,
+        discovery_snapshot,
+        source_lead_decision: decisions,
+        response_schema: request.response_schema.clone(),
+    })
 }
 
-/// Build the compact Review contract without the duplicated
-/// `prior_reviews`/`automated_reviews` projections from the read model.
+pub fn planner_packet(db: &Database, request: &PlanningRequest) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(build_planner_packet(db, request)?)?)
+}
+
+/// Build the typed semantic Review packet. Lifecycle freshness is checked
+/// before this collector is reached; the packet additionally refuses failed
+/// evidence and contains no command output or repository access request.
+pub fn build_review_packet(
+    db: &Database,
+    summary: &ReviewSummary,
+) -> Result<crate::execution_packet::ReviewPacket> {
+    let contract = db
+        .get_task_contract(&summary.task.id)?
+        .unwrap_or_else(|| crate::task::TaskContract::defaults(&summary.task.objective));
+    let validation = summary
+        .validation_evidence
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("persisted validation evidence is invalid")?
+        .unwrap_or(crate::validation::ValidationReport { steps: Vec::new() });
+    crate::execution_packet::ReviewPacket::build(
+        &summary.task,
+        &contract,
+        summary.run.as_ref().map(|run| run.id),
+        &summary.changes,
+        &validation,
+        &db.review_blocker_ledger(&summary.task.id)?,
+    )
+}
+
+/// Compatibility inspection surface for callers that consume JSON values.
 pub fn review_packet(db: &Database, summary: &ReviewSummary) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "task": summary.task,
-        "task_contract": db.get_task_contract(&summary.task.id)?,
-        "implementation_run_id": summary.run.as_ref().map(|run| run.id),
-        "changes": summary.changes,
-        "change_evidence": summary.change_evidence,
-        "validation_evidence": summary.validation_evidence,
-        "blocker_ledger": db.review_blocker_ledger(&summary.task.id)?,
-    }))
+    Ok(serde_json::to_value(build_review_packet(db, summary)?)?)
 }
 
 fn review_agent_without_command_execution(agent: &AgentDefinition) -> AgentDefinition {
@@ -1274,29 +1404,180 @@ fn review_agent_without_command_execution(agent: &AgentDefinition) -> AgentDefin
     review_agent
 }
 
-fn lead_packet(context: &LeadContext, message: &str) -> serde_json::Value {
-    let active_tasks = context
+pub fn build_lead_packet(
+    context: &LeadContext,
+    message: &str,
+) -> crate::execution_packet::LeadPacket {
+    let mut active_tasks = context
         .tasks
         .iter()
         .filter(|task| !task.status.is_terminal())
+        .cloned()
         .collect::<Vec<_>>();
-    serde_json::json!({
-        "request": message,
-        "project": {
-            "id": context.project_id,
-            "name": context.project_name,
-            "repository": context.repository_path,
+    active_tasks.sort_by(|left, right| left.id.cmp(&right.id));
+    let omitted_tasks = active_tasks.len().saturating_sub(50);
+    active_tasks.truncate(50);
+    let active_ids = active_tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let dependencies = context
+        .dependencies
+        .iter()
+        .filter(|(task, _)| active_ids.contains(task.as_str()))
+        .map(|(task, dependencies)| (task.clone(), dependencies.clone()))
+        .collect();
+    let mut pending_approvals = context
+        .approvals
+        .iter()
+        .filter(|item| !item.resolved)
+        .cloned()
+        .collect::<Vec<_>>();
+    let omitted_approvals = pending_approvals.len().saturating_sub(20);
+    pending_approvals.truncate(20);
+    let omitted_facts = context.facts.len().saturating_sub(50);
+    let mut planning_state = context.state.clone();
+    let mut omitted_state = 0;
+    for tasks in [
+        &mut planning_state.ready_tasks,
+        &mut planning_state.active_tasks,
+        &mut planning_state.review_tasks,
+        &mut planning_state.blocked_tasks,
+    ] {
+        omitted_state += tasks.len().saturating_sub(32);
+        tasks.truncate(32);
+    }
+    planning_state.usable_agents.truncate(32);
+    planning_state.busy_agents.truncate(32);
+    let (discovery, omitted_discovery) = context
+        .discovery
+        .clone()
+        .map(bound_discovery)
+        .map_or((None, 0), |(snapshot, omitted)| (Some(snapshot), omitted));
+    let mut truncations = Vec::new();
+    for (field, omitted) in [
+        ("active_tasks", omitted_tasks),
+        ("discovery", omitted_discovery),
+        ("pending_approvals", omitted_approvals),
+        ("facts", omitted_facts),
+        ("planning_state.tasks", omitted_state),
+    ] {
+        if omitted != 0 {
+            truncations.push(crate::execution_packet::Truncation {
+                field: field.into(),
+                omitted_items: omitted,
+                omitted_bytes: 0,
+            });
+        }
+    }
+    let request = crate::execution_packet::BoundedText::new(message, 48_000);
+    let engineering_contract = crate::execution_packet::BoundedText::new(
+        &context.engineering_contract,
+        crate::execution_packet::MAX_ENGINEERING_BYTES,
+    );
+    let architecture = context
+        .architecture
+        .as_deref()
+        .map(|value| crate::execution_packet::BoundedText::new(value, 16_000));
+    let facts = context
+        .facts
+        .iter()
+        .take(50)
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                crate::execution_packet::BoundedText::new(value, 2_000),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let omitted_fact_bytes = facts.values().map(|value| value.omitted_bytes).sum();
+    for (field, value) in [
+        ("request", Some(&request)),
+        ("engineering_contract", Some(&engineering_contract)),
+        ("architecture", architecture.as_ref()),
+    ] {
+        if let Some(value) = value
+            && value.truncated()
+        {
+            truncations.push(crate::execution_packet::Truncation {
+                field: field.into(),
+                omitted_items: 0,
+                omitted_bytes: value.omitted_bytes,
+            });
+        }
+    }
+    if omitted_fact_bytes != 0 {
+        truncations.push(crate::execution_packet::Truncation {
+            field: "facts".into(),
+            omitted_items: 0,
+            omitted_bytes: omitted_fact_bytes,
+        });
+    }
+    crate::execution_packet::LeadPacket {
+        metadata: crate::execution_packet::PacketMetadata {
+            packet_type: "lead".into(),
+            truncations,
+            ..Default::default()
         },
-        "discovery": context.discovery,
-        "engineering_contract": context.engineering_contract,
-        "architecture": context.architecture,
-        "facts": context.facts,
-        "planning_state": context.state,
-        "active_tasks": active_tasks,
-        "dependencies": context.dependencies,
-        "queue": context.queue,
-        "pending_approvals": context.approvals.iter().filter(|item| !item.resolved).collect::<Vec<_>>(),
-    })
+        request,
+        project_id: context.project_id,
+        project_name: context.project_name.clone(),
+        discovery,
+        engineering_contract,
+        architecture,
+        facts: facts
+            .into_iter()
+            .map(|(key, value)| (key, value.text))
+            .collect(),
+        planning_state,
+        active_tasks,
+        dependencies,
+        pending_approvals,
+    }
+}
+
+fn bound_discovery(
+    mut snapshot: crate::discovery::ProjectDiscoverySnapshot,
+) -> (crate::discovery::ProjectDiscoverySnapshot, usize) {
+    let mut omitted = 0;
+    for values in [
+        &mut snapshot.important_files,
+        &mut snapshot.manifests,
+        &mut snapshot.test_locations,
+        &mut snapshot.architecture_boundaries,
+        &mut snapshot.unknowns_and_risks,
+        &mut snapshot.validation_commands,
+        &mut snapshot.technology_stack,
+        &mut snapshot.architecture.entry_points,
+        &mut snapshot.architecture.source_directories,
+    ] {
+        omitted += values.len().saturating_sub(64);
+        values.truncate(64);
+    }
+    omitted += snapshot.repository.changed_files.len().saturating_sub(64);
+    snapshot.repository.changed_files.truncate(64);
+    if let Some(contract) = snapshot.project.engineering_contract.take() {
+        // The authoritative bounded engineering contract is already a stable
+        // top-level packet field; do not repeat it in volatile discovery.
+        omitted += usize::from(!contract.is_empty());
+    }
+    if let Some(description) = &mut snapshot.project.description {
+        let bounded = crate::execution_packet::BoundedText::new(description, 4_000);
+        omitted += usize::from(bounded.truncated());
+        *description = bounded.text;
+    }
+    for tasks in [
+        &mut snapshot.task_state.ready_tasks,
+        &mut snapshot.task_state.active_tasks,
+        &mut snapshot.task_state.review_tasks,
+        &mut snapshot.task_state.blocked_tasks,
+    ] {
+        omitted += tasks.len().saturating_sub(32);
+        tasks.truncate(32);
+    }
+    snapshot.task_state.usable_agents.truncate(32);
+    snapshot.task_state.busy_agents.truncate(32);
+    (snapshot, omitted)
 }
 
 /// Task review consumes fresh deterministic validation evidence created by
@@ -1405,10 +1686,25 @@ fn run_review_mode(
     } else {
         TASK_REVIEW_INSTRUCTIONS
     };
-    let prompt = format!(
-        "{instructions} Return only JSON matching {{\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}}]}}. blocker_key is required for readability but is not identity. Reference an existing blocker_id as prior_blocker_id for the same underlying issue; use null only for genuinely new blockers. Copy every prior_blocker_id verbatim from the packet ledger. Deterministic validation was already executed by Orc; review only semantic task-contract concerns. Do not accept or merge the task.\nReview packet:\n{}",
-        serde_json::to_string(&review_packet(db, summary)?)?
-    );
+    let result_contract = "Return only JSON matching {\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}]}. blocker_key is readable context, not identity. Copy an existing blocker_id verbatim into prior_blocker_id for the same concern; use null only for a genuinely new blocker. Review semantic task-contract concerns only. Do not accept or merge the task.";
+    let prompt = if project_review {
+        let contract = db
+            .get_task_contract(&summary.task.id)?
+            .unwrap_or_else(|| crate::task::TaskContract::defaults(&summary.task.objective));
+        crate::execution_packet::render_packet(
+            &format!("{instructions} {result_contract}"),
+            &crate::execution_packet::ProjectReviewPacket::build(
+                &summary.task,
+                &contract,
+                &summary.changes,
+            ),
+        )?
+    } else {
+        crate::execution_packet::render_packet(
+            &format!("{instructions} {result_contract}"),
+            &build_review_packet(db, summary)?,
+        )?
+    };
     let execution = invoke_action(db, run, backend, &review_agent, &resolved, &prompt);
     match execution {
         Ok(execution) => {
@@ -1692,11 +1988,13 @@ pub fn run_plan(
 }
 
 fn planner_prompt(packet: &serde_json::Value) -> Result<String> {
-    Ok(format!(
-        "Produce a plan for this compact authoritative request packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, supply execution_hints.effort (low, medium, or high) only as non-authoritative metadata describing expected execution depth; Orc's shared economy resolver makes the final agent, model, effort, and tier decision. Do not infer or raise the hint mechanically from risk_factors. Give a concise effort_reason based on semantic complexity, coupling, and uncertainty rather than risk labels or description length. {} Declare risk factors accurately, make acceptance criteria, required tests, and validation precise enough to satisfy their deterministic safeguards, and decompose work when a task is too broad for reliable bounded execution.\n{}",
-        planner_risk_guidance(),
-        serde_json::to_string(packet)?
-    ))
+    crate::execution_packet::render_packet(
+        &format!(
+            "Produce a plan from this bounded authoritative Planner packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, supply execution_hints.effort (low, medium, or high) only as non-authoritative metadata describing expected execution depth; Orc's shared economy resolver makes the final agent, model, effort, and tier decision. Do not infer or raise the hint mechanically from risk_factors. Give a concise effort_reason based on semantic complexity, coupling, and uncertainty rather than risk labels or description length. {} Declare risk factors accurately, make acceptance criteria, required tests, and validation precise enough to satisfy their deterministic safeguards, and decompose work when a task is too broad for reliable bounded execution.",
+            planner_risk_guidance()
+        ),
+        packet,
+    )
 }
 
 fn planner_risk_guidance() -> String {
@@ -1729,11 +2027,11 @@ struct LeadActionAdapter<'a> {
 
 impl LeadBackend for LeadActionAdapter<'_> {
     fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String> {
-        let input = serde_json::to_string(&lead_packet(context, message))
-            .map_err(|error| error.to_string())?;
-        let prompt = format!(
-            "Act as Orc's project Lead. Return only JSON matching {{\"message\":string,\"proposals\":array,\"decision\":{{\"kind\":\"DIRECT_TASKS\"|\"PLAN_REQUIRED\"|\"USER_DECISION_REQUIRED\"|\"APPROVE\"|\"REVISE_PLAN\",\"details\":object}}}}. Return exactly one decision. Proposals are human-gated and must not be applied.\n{input}"
-        );
+        let prompt = crate::execution_packet::render_packet(
+            "Act as Orc's project Lead using only the bounded authoritative Lead packet. Return only JSON matching {\"message\":string,\"proposals\":array,\"decision\":{\"kind\":\"DIRECT_TASKS\"|\"PLAN_REQUIRED\"|\"USER_DECISION_REQUIRED\"|\"APPROVE\"|\"REVISE_PLAN\",\"details\":object}}. Return exactly one decision. Proposals are human-gated and must not be applied.",
+            &build_lead_packet(context, message),
+        )
+        .map_err(|error| error.to_string())?;
         let execution = invoke_action(
             self.db,
             self.run,
@@ -2736,6 +3034,76 @@ commands = ["npm run typecheck", "npm run build"]
     }
 
     #[test]
+    fn review_packet_is_rejected_before_provider_invocation_when_validation_is_stale() {
+        let (db, mut summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null,
+                "revision_feedback": null, "blockers": []
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let project = db.get_project_id().unwrap().unwrap();
+        let run = db
+            .create_agent_run_with_mode(
+                project,
+                &summary.task.id,
+                "multi",
+                crate::registry::AUTOMATED,
+            )
+            .unwrap();
+        db.store_worktree_metadata(run, &summary.task.id, "branch", "worktree")
+            .unwrap();
+        let report = crate::validation::ValidationReport {
+            steps: vec![crate::validation::ValidationStepResult {
+                command: "cargo test".into(),
+                category: crate::validation::ValidationCategory::Success,
+                passed: true,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_status: Some(0),
+                diagnostics: None,
+                failure_classification: None,
+                fallback_command: None,
+            }],
+        };
+        let report_json = serde_json::to_string(&report).unwrap();
+        db.record_lifecycle_event(
+            "validation_result",
+            Some(&summary.task.id),
+            Some(run),
+            Some("multi"),
+            Some(&report_json),
+        )
+        .unwrap();
+        let fingerprint = revision_worktree_fingerprint(&summary.changes);
+        db.record_lifecycle_event(
+            "validation_selection",
+            Some(&summary.task.id),
+            Some(run),
+            Some("multi"),
+            Some(&serde_json::json!({"worktree_fingerprint": fingerprint}).to_string()),
+        )
+        .unwrap();
+        summary.run = db.get_agent_run(run).unwrap();
+        summary.validation_evidence = Some(report_json);
+        summary.changes.diff = "new current worktree state".into();
+
+        let error = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert!(backend.calls.borrow().is_empty());
+    }
+
+    #[test]
     fn rust_core_task_review_does_not_run_frontend_validation() {
         let (db, summary, backend, directory) = validation_review_fixture(
             serde_json::json!({
@@ -3019,7 +3387,7 @@ commands = ["npm run typecheck", "npm run build"]
         assert_eq!(expanded.len(), baseline.len());
         assert!(packet.get("prior_reviews").is_none());
         assert!(packet.get("automated_reviews").is_none());
-        assert!(packet.get("blocker_ledger").is_some());
+        assert!(packet.get("prior_blockers").is_some());
         assert!(packet.get("worktree_path").is_none());
     }
 

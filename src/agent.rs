@@ -570,26 +570,16 @@ fn completion_repair_prompt(
     failure: &str,
     attempt: usize,
 ) -> String {
+    let diff =
+        crate::execution_packet::BoundedText::new(diff, crate::execution_packet::MAX_DIFF_BYTES);
+    let failure = crate::execution_packet::BoundedText::new(failure, 6_000);
     format!(
-        "WORKER COMPLETION REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the missing implementation effect for the checkpoint below. Preserve the existing worktree and unrelated changes. Do not run tests, validation, acceptance checks, or reviewer-style verification; Orc owns deterministic validation.\n\nEXACT FAILURE:\n{failure}\n\nCURRENT DIFF:\n{diff}\n\nPERSISTED STEP:\n{}\n\nReturn a structured Worker completion object using the canonical `step_results` envelope. Completion metadata is descriptive only; Orc will derive changed files from the worktree.",
+        "WORKER COMPLETION REPAIR (attempt {attempt} of {MAX_COMPLETION_REPAIRS}). Repair only the missing implementation effect for the checkpoint below. Preserve the existing worktree and unrelated changes. Do not run tests, validation, acceptance checks, or reviewer-style verification; Orc owns deterministic validation.\n\nEXACT FAILURE:\n{}\n\nCURRENT DIFF (bounded; omitted bytes={}):\n{}\n\nPERSISTED STEP:\n{}\n\nReturn a structured Worker completion object using the canonical `step_results` envelope. Completion metadata is descriptive only; Orc will derive changed files from the worktree.",
+        failure.text,
+        diff.omitted_bytes,
+        diff.text,
         serde_json::to_string_pretty(step).unwrap_or_else(|_| step.id.clone())
     )
-}
-
-fn validation_diagnostics(report: &ValidationReport) -> String {
-    report
-        .steps
-        .iter()
-        .filter(|step| !step.passed)
-        .map(|step| {
-            let diagnostics: String = step.output().chars().take(4_000).collect();
-            format!(
-                "command: {}\nstatus: failed\ndiagnostics:\n{diagnostics}",
-                step.command
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 fn merge_token_usage(accumulated: &mut Option<TokenUsage>, additional: Option<TokenUsage>) {
@@ -689,11 +679,20 @@ fn run_task_validation_repair_loop(
             return Ok((report, selection));
         }
         repair_attempt += 1;
-        let repair = format!(
-            "## Focused automatic validation repair\n\nRepair attempt {repair_attempt} of {MAX_VALIDATION_REPAIRS}. Preserve the existing worktree. Repair only these current failed commands and bounded diagnostics; do not run validation commands yourself.\n\n## Current diff\n\n{}\n\n## Current failures\n\n{}",
-            git::inspect_worktree(worktree, repo_path)?.diff,
-            validation_diagnostics(&report),
-        );
+        let task = db
+            .get_task(task_id)?
+            .context("validation repair task disappeared")?;
+        let packet = crate::execution_packet::ValidationRepairPacket::build(
+            worktree,
+            &task,
+            repair_attempt,
+            &report,
+            &current,
+        )?;
+        let repair = crate::execution_packet::render_packet(
+            "Fix only the current deterministic validation failures in this packet. Preserve the existing worktree and avoid broad or unrelated changes. Do not run validation commands; Orc will rerun them after this bounded same-agent repair.",
+            &packet,
+        )?;
         db.record_lifecycle_event(
             "validation_repair_started",
             Some(task_id),
@@ -1207,16 +1206,28 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
         anyhow::bail!("{}", error_msg);
     }
 
-    let prompt = format!(
-        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory):\nExecute the persisted PREPARE plan in the exact order below and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — Orc owns deterministic validation.\n{}",
-        build_worker_prompt(&contract, &project_name, &task),
-        serde_json::to_string_pretty(&plan).context("failed to serialize execution plan")?
-    );
-
     // Execute the worker in the worktree directory
     let worktree_dir = repo_path.join(&worktree_path);
     let before_plan = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect worktree before Worker plan")?;
+    let task_contract = db
+        .get_task_contract(task_id)?
+        .unwrap_or_else(|| crate::task::TaskContract::defaults(&task.objective));
+    let packet = crate::execution_packet::DispatchPacket::build(
+        &worktree_dir,
+        &project_name,
+        &contract,
+        &task,
+        &task_contract,
+        &plan,
+        &before_plan,
+    )?;
+    let prompt = crate::execution_packet::render_packet(
+        &format!(
+            "{CODER_PROMPT_PRECEDENCE}\nImplement this task using only the authoritative bounded Dispatch packet below. Relevant source context and current worktree state were selected deterministically by Orc. Execute the persisted plan in order. Do not run the project's validation/test suite, acceptance checks, or reviewer-style verification; Orc owns deterministic validation. Return the required structured completion envelope; changed files are derived from the worktree, not self-report."
+        ),
+        &packet,
+    )?;
     progress("worker spawned");
     progress("worker running");
     let invocation_id = start_provider_invocation_bounded(
@@ -2161,22 +2172,26 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     let extra_feedback = if !feedback.trim().is_empty()
         && !contract_already_contains_feedback(&revision_contract, feedback)
     {
-        format!("\n\n## Additional operator feedback\n\n{feedback}")
+        Some(feedback)
     } else {
-        String::new()
+        None
     };
-    let prompt = format!(
-        "{}\n\n## Selected revision effort\n\nReasoning effort: {}\n\n{}{}\n\nFix ONLY the active blockers listed above, using the supplied blocker and relevant-file context. Do not broadly rediscover the repository and do not run the project's validation/test suite \u{2014} automated review will validate the result. Stop as soon as the fixes are implemented.",
-        build_worker_prompt(&contract, &project_name, &task),
-        revision_effort.as_str(),
-        crate::automated::format_revision_contract(&revision_contract),
+    let packet = crate::execution_packet::RevisionPacket::build(
+        &worktree_dir,
+        &project_name,
+        &contract,
+        &task,
+        &revision_contract,
         extra_feedback,
-    );
-    let prompt = format!(
-        "{}\n\nWORKER EXECUTION PROTOCOL (mandatory): execute the persisted revision PREPARE plan in exact order and return the required structured completion envelope. Completion metadata is descriptive; Orc derives changed files from the worktree. Do not run project validation, tests, acceptance checks, or reviewer-style verification — Orc owns deterministic validation.\n{}",
-        prompt,
-        serde_json::to_string_pretty(&revision_plan)?
-    );
+        &revision_snapshot,
+        &revision_plan,
+    )?;
+    let prompt = crate::execution_packet::render_packet(
+        &format!(
+            "{CODER_PROMPT_PRECEDENCE}\nFix only the active unresolved or regressed blockers in this bounded Revision packet. Preserve unrelated and already-correct behavior. Relevant files and current changes were selected deterministically by Orc; avoid broad repository discovery. Execute the persisted revision plan in order. Do not run the project's validation/test suite or reviewer checks; Orc owns them. Return the required structured revision handoff, while Orc treats worktree evidence as authoritative for changed files."
+        ),
+        &packet,
+    )?;
     let fail = |message: String| -> Result<DispatchSummary> {
         progress(if message.to_ascii_lowercase().contains("timeout") {
             "worker timeout"

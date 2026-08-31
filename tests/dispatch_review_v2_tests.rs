@@ -117,12 +117,14 @@ impl Worker for TokenBudgetWorker {
 }
 
 fn prompt_plan(prompt: &str) -> orc::worker_protocol::WorkerPlan {
-    let json = prompt
-        .split("WORKER EXECUTION PROTOCOL (mandatory):")
+    let packet = prompt
+        .split("## Authoritative Orc packet")
         .nth(1)
-        .and_then(|value| value.find("\n{").map(|index| &value[index + 1..]))
+        .and_then(|value| value.find('{').map(|index| &value[index..]))
         .expect("worker prompt contains persisted plan");
-    serde_json::from_str(json).expect("worker prompt plan is valid")
+    let packet: serde_json::Value =
+        serde_json::from_str(packet).expect("worker prompt packet is valid");
+    serde_json::from_value(packet["execution_plan"].clone()).expect("worker prompt plan is valid")
 }
 
 impl Worker for CompletionRepairWorker {

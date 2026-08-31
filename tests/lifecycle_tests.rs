@@ -124,13 +124,16 @@ impl Worker for CountingWorker {
         self.calls.fetch_add(1, Ordering::SeqCst);
         std::fs::write(cwd.join("eligibility-change.txt"), "dispatched\n")
             .map_err(|e| e.to_string())?;
-        let plan_json = prompt
-            .split("WORKER EXECUTION PROTOCOL (mandatory):")
+        let packet_json = prompt
+            .split("## Authoritative Orc packet")
             .nth(1)
-            .and_then(|value| value.find("\n{").map(|i| &value[i + 1..]))
+            .and_then(|value| value.find('{').map(|i| &value[i..]))
             .ok_or("missing plan")?;
+        let packet: serde_json::Value =
+            serde_json::from_str(packet_json).map_err(|error| error.to_string())?;
         let plan: orc::worker_protocol::WorkerPlan =
-            serde_json::from_str(plan_json).map_err(|e| e.to_string())?;
+            serde_json::from_value(packet["execution_plan"].clone())
+                .map_err(|error| error.to_string())?;
         let step = &plan.steps[0];
         Ok(WorkerExecution {
             outcome: WorkerOutcome::Success,

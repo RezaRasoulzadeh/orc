@@ -654,11 +654,11 @@ impl CodexLeadBackend {
     }
 
     fn prompt(context: &LeadContext, message: &str) -> Result<String, String> {
-        let context = serde_json::to_string(context)
-            .map_err(|error| format!("failed to serialize Lead context: {error}"))?;
-        Ok(format!(
-            "You are Orc's project Lead. You are strictly read-only: inspect the supplied persisted project and repository state only. You must not edit files, create commits, create or apply tasks, invoke Planner, dispatch, review, revise, or accept work. Return exactly one decision with kind DIRECT_TASKS, PLAN_REQUIRED, or USER_DECISION_REQUIRED, plus a message. Proposals are optional human-gated suggestions and are never applied by Lead. Respond with only structured JSON.\nProject context:\n{context}\nUser message:\n{message}"
-        ))
+        crate::execution_packet::render_packet(
+            "You are Orc's project Lead. Use only the bounded authoritative Lead packet. You are strictly read-only and must not edit files, create commits, create or apply tasks, invoke Planner, dispatch, review, revise, or accept work. Return exactly one decision with kind DIRECT_TASKS, PLAN_REQUIRED, or USER_DECISION_REQUIRED, plus a message. Proposals are optional human-gated suggestions and are never applied by Lead. Respond with only structured JSON.",
+            &crate::automated::build_lead_packet(context, message),
+        )
+        .map_err(|error| format!("failed to render Lead packet: {error}"))
     }
 
     pub fn parse_response(output: &str) -> Result<LeadBackendResponse, String> {

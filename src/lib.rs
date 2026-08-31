@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod events;
 pub mod execution;
+pub mod execution_packet;
 pub mod format;
 pub mod git;
 pub mod interactive;

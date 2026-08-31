@@ -509,6 +509,9 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         recommended_execution: Some(persisted_execution.clone()),
                     });
                 } else {
+                    let pending_escalation = db
+                        .pending_escalation_request(&task.id)?
+                        .map(|persisted| persisted.request);
                     let economy = scheduler::resolve_task_economy(
                         db,
                         &task,
@@ -519,7 +522,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
                         None,
                         None,
                         scheduler::TransportEligibility::Strict,
-                        None,
+                        pending_escalation,
                         "queue_explanation",
                     )
                     .map_err(|e| DbError::Scheduler(e.to_string()))?;

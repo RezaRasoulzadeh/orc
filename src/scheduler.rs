@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::execution::{ExecutionClass, ExecutionResolution, ExecutionTemplate};
 use crate::registry::{
     self, AgentAction, AgentActionProfile, AgentDefinition, EconomyCostConfiguration, EconomyTier,
-    ReasoningEffort, ResolutionRecord,
+    EscalationPolicyConfiguration, EscalationRequest, EscalationTrigger, ReasoningEffort,
+    ResolutionRecord,
 };
 use crate::storage::Database;
 use crate::task::Task;
@@ -25,6 +26,7 @@ pub enum RejectionReason {
     ModeMismatch { requested: String, actual: String },
     UnsupportedAction { action: String },
     AgentConstraint { selected: String },
+    BelowEscalationTier { required: EconomyTier },
 }
 
 impl RejectionReason {
@@ -49,6 +51,12 @@ impl RejectionReason {
             Self::UnsupportedAction { action } => format!("unsupported action: {action}"),
             Self::AgentConstraint { selected } => {
                 format!("agent selection constrained to: {selected}")
+            }
+            Self::BelowEscalationTier { required } => {
+                format!(
+                    "economy tier is below required escalation tier: {}",
+                    required.as_str()
+                )
             }
         }
     }
@@ -117,8 +125,140 @@ pub struct EconomyResolverInput<'a> {
     pub policy_source: Option<String>,
     pub cost_configuration: &'a EconomyCostConfiguration,
     pub transport_eligibility: TransportEligibility,
-    pub escalation_reason: Option<String>,
+    pub escalation_request: Option<EscalationRequest>,
     pub lineage: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalationObservation {
+    Retry,
+    SingleSemanticRevision,
+    SingleValidationFailure,
+    InfrastructureValidationFailure,
+    TransientProviderFailure,
+    RiskMetadataOnly,
+    ValidationRepairNonConvergence,
+    SemanticRevisionNonConvergence,
+    ExplicitPolicyRequest,
+}
+
+#[derive(Clone, Debug)]
+pub struct EscalationPolicyInput<'a> {
+    pub observation: EscalationObservation,
+    pub previous_provider_invocation_id: Option<i64>,
+    pub previous_resolution: Option<&'a ResolutionRecord>,
+    pub previous_attempt: usize,
+    pub policy_attempt: usize,
+    pub configuration: &'a EscalationPolicyConfiguration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscalationDecision {
+    NoEscalation { reason: String },
+    Escalate(EscalationRequest),
+    Exhausted { reason: String },
+}
+
+pub fn evaluate_escalation_policy(input: EscalationPolicyInput<'_>) -> EscalationDecision {
+    let trigger = match input.observation {
+        EscalationObservation::ValidationRepairNonConvergence => {
+            if !input.configuration.validation_repair_non_convergence {
+                return EscalationDecision::NoEscalation {
+                    reason: "validation-repair escalation policy is disabled".into(),
+                };
+            }
+            EscalationTrigger::ValidationRepairNonConvergence
+        }
+        EscalationObservation::SemanticRevisionNonConvergence => {
+            if !input.configuration.semantic_revision_non_convergence {
+                return EscalationDecision::NoEscalation {
+                    reason: "semantic-revision escalation policy is disabled".into(),
+                };
+            }
+            EscalationTrigger::SemanticRevisionNonConvergence
+        }
+        EscalationObservation::ExplicitPolicyRequest => EscalationTrigger::ExplicitPolicyRequest,
+        EscalationObservation::Retry => {
+            return EscalationDecision::NoEscalation {
+                reason: "ordinary retry remains on the current economy tier".into(),
+            };
+        }
+        EscalationObservation::SingleSemanticRevision => {
+            return EscalationDecision::NoEscalation {
+                reason: "one semantic revision is part of the normal lifecycle".into(),
+            };
+        }
+        EscalationObservation::SingleValidationFailure => {
+            return EscalationDecision::NoEscalation {
+                reason: "one deterministic validation failure receives same-tier repair".into(),
+            };
+        }
+        EscalationObservation::InfrastructureValidationFailure => {
+            return EscalationDecision::NoEscalation {
+                reason: "validation infrastructure failure is not model insufficiency".into(),
+            };
+        }
+        EscalationObservation::TransientProviderFailure => {
+            return EscalationDecision::NoEscalation {
+                reason: "transient provider failure does not imply model insufficiency".into(),
+            };
+        }
+        EscalationObservation::RiskMetadataOnly => {
+            return EscalationDecision::NoEscalation {
+                reason: "task risk metadata requires guards but never triggers escalation".into(),
+            };
+        }
+    };
+    let (Some(previous_invocation), Some(previous)) = (
+        input.previous_provider_invocation_id,
+        input.previous_resolution,
+    ) else {
+        return EscalationDecision::Exhausted {
+            reason: "escalation requires a persisted previous provider resolution".into(),
+        };
+    };
+    let Some(next_tier) = previous.tier.next() else {
+        return EscalationDecision::Exhausted {
+            reason: format!(
+                "economy escalation exhausted at tier '{}'",
+                previous.tier.as_str()
+            ),
+        };
+    };
+    if next_tier.rank() > input.configuration.maximum_tier.rank() {
+        return EscalationDecision::Exhausted {
+            reason: format!(
+                "economy escalation is bounded at tier '{}'",
+                input.configuration.maximum_tier.as_str()
+            ),
+        };
+    }
+    let reason = match trigger {
+        EscalationTrigger::ValidationRepairNonConvergence => format!(
+            "deterministic validation did not converge after {} same-tier repair attempts",
+            input.previous_attempt
+        ),
+        EscalationTrigger::SemanticRevisionNonConvergence => {
+            "the same semantic blocker survived a completed revision".into()
+        }
+        EscalationTrigger::ExplicitPolicyRequest => {
+            "higher-level orchestration explicitly requested bounded escalation".into()
+        }
+    };
+    EscalationDecision::Escalate(EscalationRequest {
+        reason,
+        lineage: crate::registry::EscalationLineage {
+            request_id: None,
+            trigger,
+            previous_provider_invocation_id: previous_invocation,
+            previous_tier: previous.tier,
+            previous_model: previous.selected_model.clone(),
+            previous_effort: previous.effort,
+            previous_attempt: input.previous_attempt,
+            requested_minimum_tier: next_tier,
+            policy_attempt: input.policy_attempt,
+        },
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -452,6 +592,9 @@ fn candidate_execution(
             .clone()
             .unwrap_or_else(|| "policy_constraint".into());
     }
+    if automatic_escalation(input).is_some() {
+        resolution.source = "policy_escalation".into();
+    }
     if input.overrides.agent_id.is_some()
         || input.overrides.model.is_some()
         || input.overrides.effort.is_some()
@@ -467,10 +610,19 @@ fn candidate_execution(
     Ok(resolution)
 }
 
+fn automatic_escalation<'a>(input: &'a EconomyResolverInput<'a>) -> Option<&'a EscalationRequest> {
+    (input.overrides.agent_id.is_none()
+        && input.overrides.model.is_none()
+        && input.overrides.effort.is_none())
+    .then_some(input.escalation_request.as_ref())
+    .flatten()
+}
+
 /// Resolve eligibility, execution identity, and economy ordering in one place.
 /// Callers may supply constraints and policy inputs, but this function alone
 /// creates the final provider-independent [`ResolutionRecord`].
 pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecision> {
+    let escalation = automatic_escalation(&input).cloned();
     let selected_constraint = input
         .overrides
         .agent_id
@@ -520,7 +672,19 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
             evaluation.economy_tier = input
                 .cost_configuration
                 .tier_for(execution.model.as_deref());
-            eligible.push((evaluation, agent.clone(), execution));
+            if escalation.as_ref().is_some_and(|request| {
+                evaluation.economy_tier == EconomyTier::Unknown
+                    || evaluation.economy_tier.rank()
+                        < request.lineage.requested_minimum_tier.rank()
+            }) {
+                evaluation.status =
+                    CandidateStatus::Rejected(RejectionReason::BelowEscalationTier {
+                        required: escalation.as_ref().unwrap().lineage.requested_minimum_tier,
+                    });
+                rejected.push(evaluation);
+            } else {
+                eligible.push((evaluation, agent.clone(), execution));
+            }
         } else {
             rejected.push(evaluation);
         }
@@ -582,6 +746,7 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
             "task_effort": input.task_effort.map(ReasoningEffort::as_str),
             "policy_model": input.policy_model,
             "policy_effort": input.policy_effort.map(ReasoningEffort::as_str),
+            "escalation": escalation,
             "source": execution.source,
         })
         .to_string();
@@ -594,8 +759,9 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
                 effort: execution.reasoning_effort,
                 tier: evaluation.economy_tier,
                 source: execution.source.clone(),
-                escalation_reason: input.escalation_reason.clone(),
+                escalation_reason: escalation.as_ref().map(|request| request.reason.clone()),
                 input_lineage,
+                escalation: escalation.clone().map(|request| request.lineage),
             },
         }
     });
@@ -768,7 +934,7 @@ pub fn schedule_with_busy_and_quota_reserve(
         policy_source: None,
         cost_configuration: &costs,
         transport_eligibility: TransportEligibility::Strict,
-        escalation_reason: None,
+        escalation_request: None,
         lineage: "scheduler".into(),
     })?
     .schedule)
@@ -788,7 +954,7 @@ pub fn resolve_task_economy(
     task_effort: Option<ReasoningEffort>,
     task_source: Option<String>,
     transport_eligibility: TransportEligibility,
-    escalation_reason: Option<String>,
+    escalation_request: Option<EscalationRequest>,
     lineage: impl Into<String>,
 ) -> Result<EconomyDecision> {
     resolve_task_economy_with_additional_busy(
@@ -801,7 +967,7 @@ pub fn resolve_task_economy(
         task_effort,
         task_source,
         transport_eligibility,
-        escalation_reason,
+        escalation_request,
         lineage,
         &HashSet::new(),
     )
@@ -821,7 +987,7 @@ pub(crate) fn resolve_task_economy_with_additional_busy(
     task_effort: Option<ReasoningEffort>,
     task_source: Option<String>,
     transport_eligibility: TransportEligibility,
-    escalation_reason: Option<String>,
+    escalation_request: Option<EscalationRequest>,
     lineage: impl Into<String>,
     additional_busy: &HashSet<String>,
 ) -> Result<EconomyDecision> {
@@ -875,7 +1041,7 @@ pub(crate) fn resolve_task_economy_with_additional_busy(
         policy_source: None,
         cost_configuration: &costs,
         transport_eligibility,
-        escalation_reason,
+        escalation_request,
         lineage: lineage.into(),
     })
 }
@@ -922,7 +1088,7 @@ pub fn resolve_action_economy(
         policy_source: None,
         cost_configuration: &costs,
         transport_eligibility,
-        escalation_reason: None,
+        escalation_request: None,
         lineage: format!("action:{}", action.as_str()),
     })
 }
@@ -982,8 +1148,7 @@ pub fn resolve_run_invocation_economy(
         policy_source: Some(purpose.into()),
         cost_configuration: &costs,
         transport_eligibility,
-        escalation_reason: (purpose.contains("repair"))
-            .then(|| "bounded evidence-backed repair".into()),
+        escalation_request: None,
         lineage: format!("{purpose}:task:{}", task.id),
     })?;
     decision.resolution.ok_or_else(|| {
@@ -1078,6 +1243,25 @@ mod tests {
         template: &ExecutionTemplate,
         transport: TransportEligibility,
     ) -> EconomyDecision {
+        economy_with_escalation(
+            task, agents, costs, overrides, profiles, template, transport, None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture exposes policy input"
+    )]
+    fn economy_with_escalation(
+        task: &Task,
+        agents: &[AgentDefinition],
+        costs: &EconomyCostConfiguration,
+        overrides: EconomyOverrides,
+        profiles: &BTreeMap<String, AgentActionProfile>,
+        template: &ExecutionTemplate,
+        transport: TransportEligibility,
+        escalation_request: Option<EscalationRequest>,
+    ) -> EconomyDecision {
         resolve_economy(EconomyResolverInput {
             action: AgentAction::Code,
             candidates: agents,
@@ -1099,10 +1283,209 @@ mod tests {
             policy_source: None,
             cost_configuration: costs,
             transport_eligibility: transport,
-            escalation_reason: None,
+            escalation_request,
             lineage: "test".into(),
         })
         .unwrap()
+    }
+
+    fn previous_resolution(tier: EconomyTier) -> ResolutionRecord {
+        ResolutionRecord {
+            selected_agent: "cheap".into(),
+            selected_model: Some("small".into()),
+            effort: Some(ReasoningEffort::Low),
+            tier,
+            source: "agent".into(),
+            escalation_reason: None,
+            input_lineage: "previous".into(),
+            escalation: None,
+        }
+    }
+
+    #[test]
+    fn escalation_policy_distinguishes_retry_and_observable_non_convergence() {
+        let configuration = EscalationPolicyConfiguration::default();
+        let previous = previous_resolution(EconomyTier::Default);
+        for observation in [
+            EscalationObservation::Retry,
+            EscalationObservation::SingleSemanticRevision,
+            EscalationObservation::SingleValidationFailure,
+            EscalationObservation::InfrastructureValidationFailure,
+            EscalationObservation::TransientProviderFailure,
+            EscalationObservation::RiskMetadataOnly,
+        ] {
+            assert!(matches!(
+                evaluate_escalation_policy(EscalationPolicyInput {
+                    observation,
+                    previous_provider_invocation_id: Some(7),
+                    previous_resolution: Some(&previous),
+                    previous_attempt: 1,
+                    policy_attempt: 1,
+                    configuration: &configuration,
+                }),
+                EscalationDecision::NoEscalation { .. }
+            ));
+        }
+        let EscalationDecision::Escalate(request) =
+            evaluate_escalation_policy(EscalationPolicyInput {
+                observation: EscalationObservation::ValidationRepairNonConvergence,
+                previous_provider_invocation_id: Some(7),
+                previous_resolution: Some(&previous),
+                previous_attempt: MAX_VALIDATION_REPAIRS_FOR_POLICY_TEST,
+                policy_attempt: 1,
+                configuration: &configuration,
+            })
+        else {
+            panic!("bounded validation non-convergence should request escalation")
+        };
+        assert_eq!(
+            request.lineage.requested_minimum_tier,
+            EconomyTier::Escalation
+        );
+        assert_eq!(
+            request.lineage.trigger,
+            EscalationTrigger::ValidationRepairNonConvergence
+        );
+    }
+
+    const MAX_VALIDATION_REPAIRS_FOR_POLICY_TEST: usize = 3;
+
+    #[test]
+    fn escalation_is_bounded_at_the_maximum_tier() {
+        let previous = previous_resolution(EconomyTier::Exceptional);
+        assert!(matches!(
+            evaluate_escalation_policy(EscalationPolicyInput {
+                observation: EscalationObservation::SemanticRevisionNonConvergence,
+                previous_provider_invocation_id: Some(9),
+                previous_resolution: Some(&previous),
+                previous_attempt: 1,
+                policy_attempt: 2,
+                configuration: &EscalationPolicyConfiguration::default(),
+            }),
+            EscalationDecision::Exhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn resolver_applies_policy_request_without_selecting_a_model_in_policy() {
+        let task = test_task(vec!["code"]);
+        let mut cheap = test_agent("cheap", 1_000, vec!["code"]);
+        cheap.model = Some("small".into());
+        let mut next = test_agent("next", 1, vec!["code"]);
+        next.model = Some("medium".into());
+        let costs = EconomyCostConfiguration {
+            model_costs: BTreeMap::from([("small".into(), 1.0), ("medium".into(), 2.0)]),
+            unknown_tier: EconomyTier::Unknown,
+        };
+        let previous = previous_resolution(EconomyTier::Default);
+        let EscalationDecision::Escalate(request) =
+            evaluate_escalation_policy(EscalationPolicyInput {
+                observation: EscalationObservation::SemanticRevisionNonConvergence,
+                previous_provider_invocation_id: Some(11),
+                previous_resolution: Some(&previous),
+                previous_attempt: 1,
+                policy_attempt: 1,
+                configuration: &EscalationPolicyConfiguration::default(),
+            })
+        else {
+            panic!("expected escalation request")
+        };
+        assert_eq!(request.lineage.previous_model.as_deref(), Some("small"));
+        let decision = economy_with_escalation(
+            &task,
+            &[cheap, next],
+            &costs,
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+            Some(request.clone()),
+        );
+        let resolution = decision.resolution.unwrap();
+        assert_eq!(resolution.agent.id, "next");
+        assert_eq!(resolution.record.source, "policy_escalation");
+        assert_eq!(resolution.record.escalation_reason, Some(request.reason));
+        assert_eq!(
+            resolution.record.escalation.unwrap().trigger,
+            EscalationTrigger::SemanticRevisionNonConvergence
+        );
+        assert!(
+            decision
+                .schedule
+                .candidates
+                .iter()
+                .any(|candidate| matches!(
+                    candidate.status,
+                    CandidateStatus::Rejected(RejectionReason::BelowEscalationTier { .. })
+                ))
+        );
+    }
+
+    #[test]
+    fn escalation_never_bypasses_eligibility_and_operator_override_stays_distinct() {
+        let task = test_task(vec!["code"]);
+        let mut cheap = test_agent("cheap", 100, vec!["code"]);
+        cheap.model = Some("small".into());
+        let mut unclassified = test_agent("unclassified", 200, vec!["code"]);
+        unclassified.model = Some("unpriced".into());
+        let costs = EconomyCostConfiguration {
+            model_costs: BTreeMap::from([("small".into(), 1.0)]),
+            unknown_tier: EconomyTier::Unknown,
+        };
+        let previous = previous_resolution(EconomyTier::Default);
+        let EscalationDecision::Escalate(request) =
+            evaluate_escalation_policy(EscalationPolicyInput {
+                observation: EscalationObservation::ValidationRepairNonConvergence,
+                previous_provider_invocation_id: Some(12),
+                previous_resolution: Some(&previous),
+                previous_attempt: 3,
+                policy_attempt: 1,
+                configuration: &EscalationPolicyConfiguration::default(),
+            })
+        else {
+            panic!("expected escalation request")
+        };
+        let unavailable = economy_with_escalation(
+            &task,
+            &[cheap.clone(), unclassified],
+            &costs,
+            EconomyOverrides::default(),
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+            Some(request.clone()),
+        );
+        assert!(unavailable.resolution.is_none());
+        assert!(
+            unavailable
+                .schedule
+                .candidates
+                .iter()
+                .all(|candidate| matches!(
+                    candidate.status,
+                    CandidateStatus::Rejected(RejectionReason::BelowEscalationTier { .. })
+                ))
+        );
+
+        let operator = economy_with_escalation(
+            &task,
+            &[cheap],
+            &costs,
+            EconomyOverrides {
+                agent_id: Some("cheap".into()),
+                model: Some("small".into()),
+                effort: Some(ReasoningEffort::Low),
+            },
+            &BTreeMap::new(),
+            &ExecutionTemplate::default(),
+            TransportEligibility::Strict,
+            Some(request),
+        )
+        .resolution
+        .unwrap();
+        assert_eq!(operator.record.source, "operator_override");
+        assert_eq!(operator.record.escalation_reason, None);
+        assert_eq!(operator.record.escalation, None);
     }
 
     #[test]

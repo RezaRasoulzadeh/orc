@@ -85,6 +85,24 @@ impl EconomyTier {
             Self::Unknown => "unknown",
         }
     }
+
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::Default => Some(Self::Escalation),
+            Self::Escalation => Some(Self::Exceptional),
+            Self::Exceptional | Self::Unknown => None,
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "escalation" => Ok(Self::Escalation),
+            "exceptional" => Ok(Self::Exceptional),
+            "unknown" => Ok(Self::Unknown),
+            _ => anyhow::bail!("invalid economy tier '{value}'"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +144,71 @@ pub struct ResolutionRecord {
     pub source: String,
     pub escalation_reason: Option<String>,
     pub input_lineage: String,
+    #[serde(default)]
+    pub escalation: Option<EscalationLineage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationTrigger {
+    ValidationRepairNonConvergence,
+    SemanticRevisionNonConvergence,
+    ExplicitPolicyRequest,
+}
+
+impl EscalationTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidationRepairNonConvergence => "validation_repair_non_convergence",
+            Self::SemanticRevisionNonConvergence => "semantic_revision_non_convergence",
+            Self::ExplicitPolicyRequest => "explicit_policy_request",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "validation_repair_non_convergence" => Ok(Self::ValidationRepairNonConvergence),
+            "semantic_revision_non_convergence" => Ok(Self::SemanticRevisionNonConvergence),
+            "explicit_policy_request" => Ok(Self::ExplicitPolicyRequest),
+            _ => anyhow::bail!("invalid escalation trigger '{value}'"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscalationLineage {
+    pub request_id: Option<i64>,
+    pub trigger: EscalationTrigger,
+    pub previous_provider_invocation_id: i64,
+    pub previous_tier: EconomyTier,
+    pub previous_model: Option<String>,
+    pub previous_effort: Option<ReasoningEffort>,
+    pub previous_attempt: usize,
+    pub requested_minimum_tier: EconomyTier,
+    pub policy_attempt: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscalationRequest {
+    pub reason: String,
+    pub lineage: EscalationLineage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscalationPolicyConfiguration {
+    pub validation_repair_non_convergence: bool,
+    pub semantic_revision_non_convergence: bool,
+    pub maximum_tier: EconomyTier,
+}
+
+impl Default for EscalationPolicyConfiguration {
+    fn default() -> Self {
+        Self {
+            validation_repair_non_convergence: true,
+            semantic_revision_non_convergence: true,
+            maximum_tier: EconomyTier::Exceptional,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

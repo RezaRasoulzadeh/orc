@@ -1,6 +1,7 @@
 use crate::execution::{ExecutionClass, ExecutionTemplate};
 use crate::registry::{
     AgentAction, AgentActionProfile, AgentDefinition, EconomyCostConfiguration, EconomyTier,
+    EscalationLineage, EscalationPolicyConfiguration, EscalationRequest, EscalationTrigger,
     QuotaLimits, ReasoningEffort, ResolutionRecord,
 };
 use crate::task::{Task, TaskPriority, TaskScopeMode, TaskStatus};
@@ -66,6 +67,23 @@ pub struct ProviderInvocation {
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub tier: EconomyTier,
+    pub escalation: Option<EscalationLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedEscalationRequest {
+    pub id: i64,
+    pub task_id: String,
+    pub request: EscalationRequest,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResolution {
+    pub invocation_id: i64,
+    pub attempt: usize,
+    pub resolution: ResolutionRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -159,18 +177,16 @@ mod reservation_lifecycle_tests {
         assert!(db.list_busy_agents().unwrap().is_empty());
     }
 
-    fn invocation_resolution(
-        effort: Option<ReasoningEffort>,
-        escalation_reason: &str,
-    ) -> ResolutionRecord {
+    fn invocation_resolution(effort: Option<ReasoningEffort>) -> ResolutionRecord {
         ResolutionRecord {
             selected_agent: "codex-main".into(),
             selected_model: None,
             effort,
             tier: EconomyTier::Unknown,
             source: "test_resolver".into(),
-            escalation_reason: Some(escalation_reason.into()),
+            escalation_reason: None,
             input_lineage: "storage_test".into(),
+            escalation: None,
         }
     }
 
@@ -265,7 +281,7 @@ mod reservation_lifecycle_tests {
                 run,
                 "implementation",
                 1,
-                &invocation_resolution(None, "initial semantic invocation"),
+                &invocation_resolution(None),
             )
             .unwrap();
         db.finish_provider_invocation(
@@ -287,7 +303,7 @@ mod reservation_lifecycle_tests {
             run,
             "completion_repair",
             1,
-            &invocation_resolution(None, "bounded evidence-backed repair"),
+            &invocation_resolution(None),
         );
 
         match previous {
@@ -300,6 +316,70 @@ mod reservation_lifecycle_tests {
         assert_eq!(invocations.len(), 2);
         assert_eq!(invocations[0].total_tokens, Some(900_000));
         assert_eq!(invocations[0].cached_input_tokens, Some(50_000));
+    }
+
+    #[test]
+    fn escalation_lineage_is_consumed_once_and_survives_reopen() {
+        let (_directory, path, db, project, task) = fixture();
+        let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        let initial = ResolutionRecord {
+            selected_agent: "codex-main".into(),
+            selected_model: Some("small".into()),
+            effort: Some(ReasoningEffort::Low),
+            tier: EconomyTier::Default,
+            source: "agent".into(),
+            escalation_reason: None,
+            input_lineage: "initial".into(),
+            escalation: None,
+        };
+        let previous_invocation = db
+            .start_provider_invocation_with_resolution(run, "implementation", 1, &initial)
+            .unwrap();
+        db.finish_provider_invocation(previous_invocation, "completed", None)
+            .unwrap();
+        let request = EscalationRequest {
+            reason: "the same semantic blocker survived a completed revision".into(),
+            lineage: EscalationLineage {
+                request_id: None,
+                trigger: EscalationTrigger::SemanticRevisionNonConvergence,
+                previous_provider_invocation_id: previous_invocation,
+                previous_tier: EconomyTier::Default,
+                previous_model: Some("small".into()),
+                previous_effort: Some(ReasoningEffort::Low),
+                previous_attempt: 1,
+                requested_minimum_tier: EconomyTier::Escalation,
+                policy_attempt: 1,
+            },
+        };
+        let persisted = db.persist_escalation_request(&task, &request).unwrap();
+        let escalated = ResolutionRecord {
+            selected_agent: "codex-main".into(),
+            selected_model: Some("medium".into()),
+            effort: Some(ReasoningEffort::Medium),
+            tier: EconomyTier::Escalation,
+            source: "policy_escalation".into(),
+            escalation_reason: Some(persisted.request.reason.clone()),
+            input_lineage: "escalated".into(),
+            escalation: Some(persisted.request.lineage.clone()),
+        };
+        let invocation = db
+            .start_provider_invocation_with_resolution(run, "completion_repair", 1, &escalated)
+            .unwrap();
+        assert_eq!(
+            db.start_provider_invocation_with_resolution(run, "completion_repair", 1, &escalated,)
+                .unwrap(),
+            invocation
+        );
+        assert!(db.pending_escalation_request(&task).unwrap().is_none());
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let resolution = reopened.provider_resolution(invocation).unwrap().unwrap();
+        assert_eq!(resolution.resolution, escalated);
+        assert_eq!(
+            reopened.provider_invocations(run).unwrap()[1].escalation,
+            escalated.escalation
+        );
     }
 
     #[test]
@@ -1768,6 +1848,8 @@ impl Database {
         Self::ensure_worker_results_table(&conn)?;
         Self::ensure_worker_protocol_results_table(&conn)?;
         Self::ensure_provider_invocations_table(&conn)?;
+        Self::ensure_escalation_requests_table(&conn)?;
+        Self::ensure_provider_escalation_columns(&conn)?;
         Self::ensure_resolution_records_table(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
@@ -1996,6 +2078,8 @@ impl Database {
         Self::ensure_worker_results_table(conn)?;
         Self::ensure_worker_protocol_results_table(conn)?;
         Self::ensure_provider_invocations_table(conn)?;
+        Self::ensure_escalation_requests_table(conn)?;
+        Self::ensure_provider_escalation_columns(conn)?;
         Self::ensure_resolution_records_table(conn)?;
         Self::ensure_lifecycle_events_table(conn)?;
         Self::ensure_worktree_metadata_table(conn)?;
@@ -2734,6 +2818,51 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_escalation_requests_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS escalation_requests (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                trigger TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                previous_provider_invocation_id INTEGER NOT NULL REFERENCES provider_invocations(id) ON DELETE CASCADE,
+                previous_tier TEXT NOT NULL,
+                previous_model TEXT,
+                previous_effort TEXT,
+                previous_attempt INTEGER NOT NULL,
+                requested_minimum_tier TEXT NOT NULL,
+                policy_attempt INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                UNIQUE(previous_provider_invocation_id, trigger, policy_attempt)
+            );
+            CREATE INDEX IF NOT EXISTS escalation_requests_task_status
+                ON escalation_requests(task_id, status, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS escalation_requests_one_pending_per_task
+                ON escalation_requests(task_id) WHERE status='pending';",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_provider_escalation_columns(conn: &Connection) -> Result<(), DbError> {
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('provider_invocations') WHERE name='escalation_request_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            conn.execute_batch(
+                "ALTER TABLE provider_invocations ADD COLUMN escalation_request_id INTEGER REFERENCES escalation_requests(id);",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS provider_invocations_escalation_request
+             ON provider_invocations(escalation_request_id)
+             WHERE escalation_request_id IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
     fn ensure_resolution_records_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS resolution_records (
             id INTEGER PRIMARY KEY,
@@ -2781,6 +2910,261 @@ impl Database {
         Ok(())
     }
 
+    pub fn provider_resolution(
+        &self,
+        invocation_id: i64,
+    ) -> Result<Option<ProviderResolution>, DbError> {
+        type Row = (
+            usize,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<usize>,
+            Option<String>,
+            Option<usize>,
+        );
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT p.attempt, r.selected_agent, r.selected_model, r.effort, r.tier,
+                        r.source, r.escalation_reason, r.input_lineage,
+                        e.id, e.trigger, e.previous_provider_invocation_id, e.previous_tier,
+                        e.previous_model, e.previous_effort, e.previous_attempt,
+                        e.requested_minimum_tier, e.policy_attempt
+                 FROM provider_invocations p
+                 JOIN resolution_records r ON r.provider_invocation_id=p.id
+                 LEFT JOIN escalation_requests e ON e.id=p.escalation_request_id
+                 WHERE p.id=?1",
+                [invocation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let tier =
+            EconomyTier::parse(&row.4).map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let effort = row
+            .3
+            .map(|value| ReasoningEffort::parse(&value))
+            .transpose()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let escalation = match (row.8, row.9, row.10, row.11, row.14, row.15, row.16) {
+            (
+                Some(request_id),
+                Some(trigger),
+                Some(previous_id),
+                Some(previous_tier),
+                Some(previous_attempt),
+                Some(requested_tier),
+                Some(policy_attempt),
+            ) => Some(EscalationLineage {
+                request_id: Some(request_id),
+                trigger: EscalationTrigger::parse(&trigger)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_provider_invocation_id: previous_id,
+                previous_tier: EconomyTier::parse(&previous_tier)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_model: row.12,
+                previous_effort: row
+                    .13
+                    .map(|value| ReasoningEffort::parse(&value))
+                    .transpose()
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_attempt,
+                requested_minimum_tier: EconomyTier::parse(&requested_tier)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                policy_attempt,
+            }),
+            (None, None, None, None, None, None, None) => None,
+            _ => {
+                return Err(DbError::Scheduler(format!(
+                    "provider invocation {invocation_id} has incomplete escalation lineage"
+                )));
+            }
+        };
+        Ok(Some(ProviderResolution {
+            invocation_id,
+            attempt: row.0,
+            resolution: ResolutionRecord {
+                selected_agent: row.1,
+                selected_model: row.2,
+                effort,
+                tier,
+                source: row.5,
+                escalation_reason: row.6,
+                input_lineage: row.7,
+                escalation,
+            },
+        }))
+    }
+
+    pub fn persist_escalation_request(
+        &self,
+        task_id: &str,
+        request: &EscalationRequest,
+    ) -> Result<PersistedEscalationRequest, DbError> {
+        let previous = self
+            .provider_resolution(request.lineage.previous_provider_invocation_id)?
+            .ok_or_else(|| {
+                DbError::Scheduler("escalation previous resolution does not exist".into())
+            })?;
+        if previous.resolution.tier != request.lineage.previous_tier
+            || previous.resolution.selected_model != request.lineage.previous_model
+            || previous.resolution.effort != request.lineage.previous_effort
+            || previous.attempt != request.lineage.previous_attempt
+        {
+            return Err(DbError::Scheduler(
+                "escalation request does not match its persisted previous resolution".into(),
+            ));
+        }
+        let owns_task: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM provider_invocations p JOIN agent_runs r ON r.id=p.parent_run_id WHERE p.id=?1 AND r.task_id=?2",
+            params![request.lineage.previous_provider_invocation_id, task_id],
+            |row| row.get(0),
+        )?;
+        if owns_task != 1 {
+            return Err(DbError::Scheduler(
+                "escalation previous invocation does not belong to the task".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO escalation_requests(task_id, trigger, reason, previous_provider_invocation_id, previous_tier, previous_model, previous_effort, previous_attempt, requested_minimum_tier, policy_attempt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                task_id,
+                request.lineage.trigger.as_str(),
+                request.reason,
+                request.lineage.previous_provider_invocation_id,
+                request.lineage.previous_tier.as_str(),
+                request.lineage.previous_model,
+                request.lineage.previous_effort.map(ReasoningEffort::as_str),
+                request.lineage.previous_attempt,
+                request.lineage.requested_minimum_tier.as_str(),
+                request.lineage.policy_attempt,
+            ],
+        )?;
+        self.pending_escalation_request_for_identity(
+            request.lineage.previous_provider_invocation_id,
+            request.lineage.trigger,
+            request.lineage.policy_attempt,
+        )?
+        .ok_or_else(|| DbError::Scheduler("persisted escalation request disappeared".into()))
+    }
+
+    fn pending_escalation_request_for_identity(
+        &self,
+        previous_invocation_id: i64,
+        trigger: EscalationTrigger,
+        policy_attempt: usize,
+    ) -> Result<Option<PersistedEscalationRequest>, DbError> {
+        self.escalation_request_query(
+            "WHERE previous_provider_invocation_id=?1 AND trigger=?2 AND policy_attempt=?3",
+            params![previous_invocation_id, trigger.as_str(), policy_attempt],
+        )
+    }
+
+    pub fn pending_escalation_request(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PersistedEscalationRequest>, DbError> {
+        self.escalation_request_query(
+            "WHERE task_id=?1 AND status='pending' ORDER BY id DESC LIMIT 1",
+            params![task_id],
+        )
+    }
+
+    fn escalation_request_query<P: rusqlite::Params>(
+        &self,
+        suffix: &str,
+        params: P,
+    ) -> Result<Option<PersistedEscalationRequest>, DbError> {
+        let sql = format!(
+            "SELECT id, task_id, trigger, reason, previous_provider_invocation_id, previous_tier, previous_model, previous_effort, previous_attempt, requested_minimum_tier, policy_attempt, status, created_at FROM escalation_requests {suffix}"
+        );
+        let row = self
+            .conn
+            .query_row(&sql, params, |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, usize>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, usize>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            })
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let request = EscalationRequest {
+            reason: row.3,
+            lineage: EscalationLineage {
+                request_id: Some(row.0),
+                trigger: EscalationTrigger::parse(&row.2)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_provider_invocation_id: row.4,
+                previous_tier: EconomyTier::parse(&row.5)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_model: row.6,
+                previous_effort: row
+                    .7
+                    .map(|value| ReasoningEffort::parse(&value))
+                    .transpose()
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                previous_attempt: row.8,
+                requested_minimum_tier: EconomyTier::parse(&row.9)
+                    .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                policy_attempt: row.10,
+            },
+        };
+        Ok(Some(PersistedEscalationRequest {
+            id: row.0,
+            task_id: row.1,
+            request,
+            status: row.11,
+            created_at: row.12,
+        }))
+    }
+
     pub fn start_provider_invocation_with_resolution(
         &self,
         parent_run_id: i64,
@@ -2795,6 +3179,73 @@ impl Database {
             "lead" | "plan" | "review" => 1,
             _ => 0,
         };
+        let escalation_request_id = resolution
+            .escalation
+            .as_ref()
+            .and_then(|lineage| lineage.request_id);
+        match (&resolution.escalation, escalation_request_id) {
+            (Some(_), None) => {
+                return Err(DbError::Scheduler(
+                    "an escalated resolution must reference a persisted escalation request".into(),
+                ));
+            }
+            (None, None) if resolution.source == "policy_escalation" => {
+                return Err(DbError::Scheduler(
+                    "policy_escalation source requires structured escalation lineage".into(),
+                ));
+            }
+            (Some(_), Some(_)) if resolution.source != "policy_escalation" => {
+                return Err(DbError::Scheduler(
+                    "structured automatic escalation must retain policy_escalation provenance"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(request_id) = escalation_request_id {
+            let existing: Option<(i64, i64, String, usize)> = self
+                .conn
+                .query_row(
+                    "SELECT id, parent_run_id, purpose, attempt FROM provider_invocations WHERE escalation_request_id=?1",
+                    [request_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if let Some((id, existing_parent, existing_purpose, existing_attempt)) = existing {
+                let persisted = self.provider_resolution(id)?.ok_or_else(|| {
+                    DbError::Scheduler("escalated provider invocation lost its resolution".into())
+                })?;
+                if existing_parent == parent_run_id
+                    && existing_purpose == purpose
+                    && existing_attempt == attempt
+                    && persisted.resolution == *resolution
+                {
+                    return Ok(id);
+                }
+                return Err(DbError::Scheduler(format!(
+                    "escalation request {request_id} was already consumed by provider invocation {id}"
+                )));
+            }
+            let persisted = self
+                .escalation_request_query("WHERE id=?1", [request_id])?
+                .ok_or_else(|| DbError::Scheduler("escalation request does not exist".into()))?;
+            if persisted.status != "pending"
+                || persisted.request.lineage != *resolution.escalation.as_ref().unwrap()
+                || resolution.escalation_reason.as_deref()
+                    != Some(persisted.request.reason.as_str())
+            {
+                return Err(DbError::Scheduler(format!(
+                    "escalation request {request_id} is not the pending request represented by the resolution"
+                )));
+            }
+            if resolution.tier.rank() < persisted.request.lineage.requested_minimum_tier.rank() {
+                return Err(DbError::Scheduler(format!(
+                    "escalated resolution tier '{}' is below requested tier '{}'",
+                    resolution.tier.as_str(),
+                    persisted.request.lineage.requested_minimum_tier.as_str()
+                )));
+            }
+        }
         let used: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM provider_invocations WHERE parent_run_id=?1 AND purpose=?2",
             params![parent_run_id, purpose],
@@ -2851,8 +3302,8 @@ impl Database {
         }
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason, tier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO provider_invocations(parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, effort, selected_agent, selected_model, escalation_reason, tier, escalation_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 parent_run_id,
                 workflow_id,
@@ -2866,6 +3317,7 @@ impl Database {
                 resolution.selected_model,
                 resolution.escalation_reason,
                 resolution.tier.as_str(),
+                escalation_request_id,
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -2883,36 +3335,44 @@ impl Database {
                 resolution.input_lineage,
             ],
         )?;
+        if let Some(request_id) = escalation_request_id {
+            let consumed = transaction.execute(
+                "UPDATE escalation_requests SET status='consumed' WHERE id=?1 AND status='pending'",
+                [request_id],
+            )?;
+            if consumed != 1 {
+                return Err(DbError::Scheduler(format!(
+                    "escalation request {request_id} was not pending"
+                )));
+            }
+        }
         transaction.commit()?;
         Ok(id)
     }
 
     pub fn resolution_records(&self, parent_run_id: i64) -> Result<Vec<ResolutionRecord>, DbError> {
-        let mut statement = self.conn.prepare(
-            "SELECT r.selected_agent, r.selected_model, r.effort, r.tier, r.source, r.escalation_reason, r.input_lineage
-             FROM resolution_records r JOIN provider_invocations p ON p.id=r.provider_invocation_id
-             WHERE p.parent_run_id=?1 ORDER BY r.id",
-        )?;
-        Ok(statement
-            .query_map([parent_run_id], |row| {
-                Ok(ResolutionRecord {
-                    selected_agent: row.get(0)?,
-                    selected_model: row.get(1)?,
-                    effort: row
-                        .get::<_, Option<String>>(2)?
-                        .and_then(|v| ReasoningEffort::parse(&v).ok()),
-                    tier: match row.get::<_, String>(3)?.as_str() {
-                        "default" => EconomyTier::Default,
-                        "escalation" => EconomyTier::Escalation,
-                        "exceptional" => EconomyTier::Exceptional,
-                        _ => EconomyTier::Unknown,
-                    },
-                    source: row.get(4)?,
-                    escalation_reason: row.get(5)?,
-                    input_lineage: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        let invocation_ids = {
+            let mut statement = self.conn.prepare(
+                "SELECT p.id FROM resolution_records r
+                 JOIN provider_invocations p ON p.id=r.provider_invocation_id
+                 WHERE p.parent_run_id=?1 ORDER BY r.id",
+            )?;
+            statement
+                .query_map([parent_run_id], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        invocation_ids
+            .into_iter()
+            .map(|id| {
+                self.provider_resolution(id)?
+                    .map(|persisted| persisted.resolution)
+                    .ok_or_else(|| {
+                        DbError::Scheduler(format!(
+                            "provider invocation {id} lost its resolution record"
+                        ))
+                    })
+            })
+            .collect()
     }
 
     pub fn finish_provider_invocation(
@@ -2941,7 +3401,7 @@ impl Database {
         let mut statement = self.conn.prepare(
             "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens, tier FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
         )?;
-        Ok(statement
+        let mut invocations = statement
             .query_map([parent_run_id], |row| {
                 Ok(ProviderInvocation {
                     id: row.get(0)?,
@@ -2971,9 +3431,17 @@ impl Database {
                         "exceptional" => EconomyTier::Exceptional,
                         _ => EconomyTier::Unknown,
                     },
+                    escalation: None,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for invocation in &mut invocations {
+            invocation.escalation = self
+                .provider_resolution(invocation.id)?
+                .and_then(|persisted| persisted.resolution.escalation);
+        }
+        Ok(invocations)
     }
 
     pub fn completed_workflow_provider_run(
@@ -4787,6 +5255,35 @@ impl Database {
         Ok(())
     }
 
+    pub fn escalation_policy_configuration(
+        &self,
+    ) -> Result<EscalationPolicyConfiguration, DbError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'economy_escalation_policy'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value.map_or_else(
+            || Ok(EscalationPolicyConfiguration::default()),
+            |value| Ok(serde_json::from_str(&value)?),
+        )
+    }
+
+    pub fn set_escalation_policy_configuration(
+        &self,
+        configuration: &EscalationPolicyConfiguration,
+    ) -> Result<(), DbError> {
+        let value = serde_json::to_string(configuration)?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('economy_escalation_policy', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        Ok(())
+    }
+
     pub fn set_quota_reserve(&self, reserve: i64) -> Result<(), DbError> {
         if !(0..=100).contains(&reserve) {
             return Err(DbError::InvalidQuota(reserve));
@@ -5236,35 +5733,41 @@ impl Database {
         Ok(())
     }
 
-    pub fn completed_revision_effort_for_blocker(
+    pub fn completed_revision_resolution_for_blocker(
         &self,
         task_id: &str,
         review_run_id: i64,
         blocker_id: &str,
-    ) -> Result<Option<ReasoningEffort>, DbError> {
-        let value: Option<String> = self
+    ) -> Result<Option<ProviderResolution>, DbError> {
+        let invocation_id = self
             .conn
             .query_row(
-                "SELECT revision.resolved_reasoning_effort
+                "SELECT invocation.id
                  FROM agent_runs revision
+                 JOIN provider_invocations invocation
+                   ON invocation.parent_run_id=revision.id
+                  AND invocation.purpose='revision'
+                  AND invocation.outcome='completed'
                  JOIN review_blocker_observations prior
-                   ON prior.run_id = revision.source_review_run_id
-                  AND prior.blocker_id = ?3
+                   ON prior.run_id=revision.source_review_run_id
+                  AND prior.blocker_id=?3
                  JOIN review_blocker_observations current
-                   ON current.run_id = ?2
-                  AND current.blocker_id = ?3
-                 WHERE revision.task_id = ?1
+                   ON current.run_id=?2
+                  AND current.blocker_id=?3
+                 WHERE revision.task_id=?1
                    AND revision.source_review_run_id IS NOT NULL
-                   AND revision.status = 'completed'
-                 ORDER BY revision.id DESC LIMIT 1",
+                   AND revision.status='completed'
+                 ORDER BY revision.id DESC, invocation.id DESC LIMIT 1",
                 params![task_id, review_run_id, blocker_id],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        value
-            .map(|value| {
-                ReasoningEffort::parse(&value).map_err(|error| {
-                    DbError::Scheduler(format!("invalid persisted revision effort: {error}"))
+        invocation_id
+            .map(|id| {
+                self.provider_resolution(id)?.ok_or_else(|| {
+                    DbError::Scheduler(format!(
+                        "completed revision provider invocation {id} lost its resolution"
+                    ))
                 })
             })
             .transpose()

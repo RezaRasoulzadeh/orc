@@ -29,8 +29,9 @@ fn fake_resolution(purpose: &str) -> ResolutionRecord {
         effort: Some(ReasoningEffort::Low),
         tier: EconomyTier::Unknown,
         source: "workflow-test".into(),
-        escalation_reason: Some("initial semantic invocation".into()),
+        escalation_reason: None,
         input_lineage: format!("workflow-test:{purpose}"),
+        escalation: None,
     }
 }
 
@@ -346,10 +347,8 @@ fn direct_lifecycle_continues_through_dispatch_review_acceptance_and_done() {
         assert_eq!(invocations[0].workflow_id, Some(run.id));
         assert_eq!(invocations[0].selected_agent.as_deref(), Some("fake"));
         assert_eq!(invocations[0].selected_model.as_deref(), Some("fake-model"));
-        assert_eq!(
-            invocations[0].escalation_reason.as_deref(),
-            Some("initial semantic invocation")
-        );
+        assert_eq!(invocations[0].escalation_reason, None);
+        assert_eq!(invocations[0].escalation, None);
     }
 }
 

@@ -7,7 +7,7 @@ use crate::backend::WorkerFactory;
 use crate::contract;
 use crate::git;
 use crate::queue::QueueEntry;
-use crate::registry::{self, AgentDefinition, ReasoningEffort};
+use crate::registry::{self, AgentDefinition, EscalationRequest, ReasoningEffort};
 use crate::review::DispatchSummary;
 use crate::storage::Database;
 use crate::task::{Task, TaskScopeMode, TaskStatus};
@@ -331,6 +331,10 @@ pub struct RevisionExecutionOverrides {
     pub effort: Option<ReasoningEffort>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "revision resolution keeps authority and policy inputs explicit"
+)]
 fn resolve_revision_economy(
     db: &Database,
     task: &Task,
@@ -339,7 +343,12 @@ fn resolve_revision_economy(
     revision_effort: ReasoningEffort,
     transport: crate::scheduler::TransportEligibility,
     operator_agent_override: bool,
+    escalation_request: Option<EscalationRequest>,
 ) -> Result<crate::scheduler::EconomyResolution> {
+    let automatic_escalation = escalation_request.is_some()
+        && !operator_agent_override
+        && overrides.model.is_none()
+        && overrides.effort.is_none();
     let decision = crate::scheduler::resolve_task_economy(
         db,
         task,
@@ -350,11 +359,11 @@ fn resolve_revision_economy(
             effort: overrides.effort,
         },
         Some(registry::AUTOMATED),
-        (!operator_agent_override).then(|| agent_id.into()),
+        (!operator_agent_override && !automatic_escalation).then(|| agent_id.into()),
         Some(revision_effort),
         Some("revision_contract".into()),
         transport,
-        None,
+        escalation_request,
         "task_revision",
     )?;
     decision.resolution.ok_or_else(|| {
@@ -431,73 +440,103 @@ fn worker_task_contract(
 fn effective_revision_effort(
     db: &Database,
     task: &crate::task::Task,
-    source_review_id: i64,
+    _source_review_id: i64,
     explicit_override: Option<ReasoningEffort>,
 ) -> Result<ReasoningEffort> {
     let base = task_contract_effort(db, task)?;
-    let blockers = db
+    Ok(explicit_override.unwrap_or(base))
+}
+
+fn persist_escalation_decision(
+    db: &Database,
+    task_id: &str,
+    observation: crate::scheduler::EscalationObservation,
+    previous: &crate::storage::db::ProviderResolution,
+    policy_attempt: usize,
+) -> Result<Option<EscalationRequest>> {
+    let configuration = db.escalation_policy_configuration()?;
+    match crate::scheduler::evaluate_escalation_policy(crate::scheduler::EscalationPolicyInput {
+        observation,
+        previous_provider_invocation_id: Some(previous.invocation_id),
+        previous_resolution: Some(&previous.resolution),
+        previous_attempt: previous.attempt,
+        policy_attempt,
+        configuration: &configuration,
+    }) {
+        crate::scheduler::EscalationDecision::NoEscalation { .. } => Ok(None),
+        crate::scheduler::EscalationDecision::Escalate(request) => {
+            let persisted = db.persist_escalation_request(task_id, &request)?;
+            db.record_lifecycle_event(
+                "economy_escalation_requested",
+                Some(task_id),
+                None,
+                None,
+                Some(&serde_json::to_string(&persisted)?),
+            )?;
+            Ok(Some(persisted.request))
+        }
+        crate::scheduler::EscalationDecision::Exhausted { reason } => {
+            let details = serde_json::json!({
+                "previous_provider_invocation_id": previous.invocation_id,
+                "previous_tier": previous.resolution.tier.as_str(),
+                "reason": reason,
+            });
+            db.set_task_execution_condition(
+                task_id,
+                "economy_escalation_exhausted",
+                &details.to_string(),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn semantic_escalation_request(
+    db: &Database,
+    task: &Task,
+    source_review_id: i64,
+    overrides: &RevisionExecutionOverrides,
+    operator_agent_override: bool,
+) -> Result<Option<EscalationRequest>> {
+    if operator_agent_override || overrides.model.is_some() || overrides.effort.is_some() {
+        return Ok(None);
+    }
+    for blocker in db
         .review_blocker_observations(source_review_id)?
         .into_iter()
         .filter(|blocker| blocker.status != "resolved")
-        .collect::<Vec<_>>();
-    let mut effective = base;
-    for blocker in blockers {
-        if let Some(previous) = db.completed_revision_effort_for_blocker(
+    {
+        if let Some(previous) = db.completed_revision_resolution_for_blocker(
             &task.id,
             source_review_id,
             &blocker.blocker_id,
         )? {
-            if previous == ReasoningEffort::High {
-                let acknowledged =
-                    db.get_task_execution_condition(&task.id)?
-                        .is_some_and(|condition| {
-                            condition.kind == "non_convergence_replan_acknowledged"
-                                && serde_json::from_str::<serde_json::Value>(&condition.details)
-                                    .ok()
-                                    .and_then(|details| details.get("original_details").cloned())
-                                    .is_some_and(|details| {
-                                        details.get("blocker_id")
-                                            == Some(&serde_json::Value::String(
-                                                blocker.blocker_id.clone(),
-                                            ))
-                                            && details.get("source_review_id")
-                                                == Some(&serde_json::Value::from(source_review_id))
-                                    })
-                        });
-                if acknowledged {
-                    if ReasoningEffort::High.rank() > effective.rank() {
-                        effective = ReasoningEffort::High;
-                    }
-                    continue;
-                }
-                let details = serde_json::json!({
-                    "blocker_id": blocker.blocker_id,
-                    "source_review_id": source_review_id,
-                    "previous_effort": previous.as_str(),
-                    "condition": "same substantive blocker survived a completed high-effort revision"
-                });
-                db.set_task_execution_condition(
-                    &task.id,
-                    "non_convergence_replan_required",
-                    &details.to_string(),
-                )?;
+            let policy_attempt = previous
+                .resolution
+                .escalation
+                .as_ref()
+                .map_or(1, |lineage| lineage.policy_attempt + 1);
+            let escalation = persist_escalation_decision(
+                db,
+                &task.id,
+                crate::scheduler::EscalationObservation::SemanticRevisionNonConvergence,
+                &previous,
+                policy_attempt,
+            )?;
+            if escalation.is_none()
+                && db
+                    .get_task_execution_condition(&task.id)?
+                    .is_some_and(|condition| condition.kind == "economy_escalation_exhausted")
+            {
                 bail!(
-                    "REPLAN_REQUIRED: task '{}' has a blocker that survived a completed high-effort revision",
+                    "NON_CONVERGENCE: no stronger eligible economy tier remains for task '{}'",
                     task.id
                 );
             }
-            let escalated = previous.next();
-            if escalated.rank() > effective.rank() {
-                effective = escalated;
-            }
+            return Ok(escalation);
         }
     }
-    let selected = explicit_override.unwrap_or(effective);
-    Ok(if selected.rank() < effective.rank() {
-        effective
-    } else {
-        selected
-    })
+    Ok(None)
 }
 
 fn validate_worker_step_completion(
@@ -602,6 +641,7 @@ fn run_task_validation_repair_loop(
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<(ValidationReport, crate::validation::ValidationSelection)> {
     let mut repair_attempt = 0;
+    let mut last_repair_resolution = None;
     loop {
         let current = git::inspect_worktree(worktree, repo_path)?;
         let changed_files = current
@@ -633,10 +673,19 @@ fn run_task_validation_repair_loop(
             "rationale": selection.rationale,
             "worktree_fingerprint": crate::automated::revision_worktree_fingerprint(&current),
         }).to_string()))?;
-        if report.is_success()
-            || report.is_infrastructure_failure()
-            || repair_attempt >= MAX_VALIDATION_REPAIRS
-        {
+        if report.is_success() || report.is_infrastructure_failure() {
+            return Ok((report, selection));
+        }
+        if repair_attempt >= MAX_VALIDATION_REPAIRS {
+            if let Some(previous) = last_repair_resolution.as_ref() {
+                persist_escalation_decision(
+                    db,
+                    task_id,
+                    crate::scheduler::EscalationObservation::ValidationRepairNonConvergence,
+                    previous,
+                    1,
+                )?;
+            }
             return Ok((report, selection));
         }
         repair_attempt += 1;
@@ -686,6 +735,7 @@ fn run_task_validation_repair_loop(
                 .ok()
                 .and_then(|value| value.token_usage),
         )?;
+        last_repair_resolution = db.provider_resolution(invocation)?;
         let repair_execution = repair_execution
             .map_err(|error| anyhow::anyhow!("validation repair worker failed: {error}"))?;
         if let WorkerOutcome::Failure(error) = repair_execution.outcome {
@@ -1786,6 +1836,13 @@ where
         .map(|(id, _)| id)
         .context("task has no actionable revision review")?;
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
+    let escalation_request = semantic_escalation_request(
+        db,
+        &task,
+        source_review_id,
+        overrides,
+        operator_agent_override,
+    )?;
     let resolution = resolve_revision_economy(
         db,
         &task,
@@ -1794,7 +1851,9 @@ where
         revision_effort,
         transport,
         operator_agent_override,
+        escalation_request,
     )?;
+    let resolved_agent_id = resolution.agent.id.clone();
     let worker = factory(
         &resolution.agent,
         resolution.execution.model.clone(),
@@ -1807,7 +1866,7 @@ where
         worker.as_ref(),
         db,
         repo_path,
-        agent_id,
+        &resolved_agent_id,
         validation_runner,
         overrides,
         Some(resolution),
@@ -2051,6 +2110,7 @@ fn revise_with_worker_on_db_with_overrides_resolved(
             revision_effort,
             crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
             true,
+            semantic_escalation_request(db, &task, source_review_id, overrides, true)?,
         )?,
     };
     let run_id = db.create_agent_run_with_execution(
@@ -2621,6 +2681,13 @@ fn dispatch_selected_with_db_and_repo_authority(
         .with_context(|| format!("task '{}' not found in DB", task_id))?;
     let task_effort = task_contract_effort(db, &task)?;
     let has_execution_override = model_override.is_some() || effort_override.is_some();
+    let pending_escalation =
+        if operator_agent_override || model_override.is_some() || effort_override.is_some() {
+            None
+        } else {
+            db.pending_escalation_request(task_id)?
+                .map(|persisted| persisted.request)
+        };
     let decision = crate::scheduler::resolve_task_economy(
         db,
         &task,
@@ -2635,7 +2702,7 @@ fn dispatch_selected_with_db_and_repo_authority(
             effort: effort_override,
         },
         None,
-        if operator_agent_override {
+        if operator_agent_override || pending_escalation.is_some() {
             None
         } else {
             requested_agent.map(str::to_owned)
@@ -2643,7 +2710,7 @@ fn dispatch_selected_with_db_and_repo_authority(
         Some(task_effort),
         Some("task_contract".into()),
         crate::scheduler::TransportEligibility::Strict,
-        None,
+        pending_escalation,
         "task_dispatch",
     )?;
     let resolution = decision.resolution.ok_or_else(|| {
@@ -2777,7 +2844,7 @@ pub fn plan_dispatch_assignments_with_costs(
             policy_source: None,
             cost_configuration: costs,
             transport_eligibility: crate::scheduler::TransportEligibility::Strict,
-            escalation_reason: None,
+            escalation_request: None,
             lineage: "dispatch_queue_assignment".into(),
         })?
         .schedule;
@@ -2803,6 +2870,9 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
         if concurrency.is_some_and(|limit| assignments.len() == limit) {
             break;
         }
+        let pending_escalation = db
+            .pending_escalation_request(&entry.task.id)?
+            .map(|persisted| persisted.request);
         let decision = crate::scheduler::resolve_task_economy_with_additional_busy(
             &db,
             &entry.task,
@@ -2813,7 +2883,7 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
             entry.task.reasoning_effort,
             Some("task_contract".into()),
             crate::scheduler::TransportEligibility::Strict,
-            None,
+            pending_escalation,
             "dispatch_queue_assignment",
             &reserved,
         )?;
@@ -3251,7 +3321,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_effort_escalates_once_per_surviving_blocker_and_stops_at_high() {
+    fn surviving_blockers_do_not_directly_promote_revision_effort() {
         let (_dir, db, task) = setup();
         let project = db.get_project_id().unwrap().unwrap();
         let blocker = || crate::automated::ReviewBlocker {
@@ -3301,6 +3371,21 @@ mod tests {
                 )
                 .unwrap();
             assert!(db.start_revision_execution(run, source_review).unwrap());
+            let resolution = crate::registry::ResolutionRecord {
+                selected_agent: "coder".into(),
+                selected_model: Some("small".into()),
+                effort: Some(effort),
+                tier: crate::registry::EconomyTier::Default,
+                source: "agent".into(),
+                escalation_reason: None,
+                input_lineage: "revision-test".into(),
+                escalation: None,
+            };
+            let invocation = db
+                .start_provider_invocation_with_resolution(run, "revision", 1, &resolution)
+                .unwrap();
+            db.finish_provider_invocation(invocation, "completed", None)
+                .unwrap();
             db.update_agent_run_status(run, "completed", Some("revision"))
                 .unwrap();
         };
@@ -3313,85 +3398,36 @@ mod tests {
         assert_eq!(effort(first_review), ReasoningEffort::Low);
         revision(&db, first_review, ReasoningEffort::Low);
         let second_review = review(&db);
-        assert_eq!(effort(second_review), ReasoningEffort::Medium);
+        assert_eq!(effort(second_review), ReasoningEffort::Low);
+        let escalation = semantic_escalation_request(
+            &db,
+            &db.get_task(&task).unwrap().unwrap(),
+            second_review,
+            &RevisionExecutionOverrides::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            escalation.lineage.trigger,
+            crate::registry::EscalationTrigger::SemanticRevisionNonConvergence
+        );
+        assert_eq!(
+            escalation.lineage.requested_minimum_tier,
+            crate::registry::EconomyTier::Escalation
+        );
         assert_eq!(
             effort_with_override(&db, &task, second_review, ReasoningEffort::Low),
-            ReasoningEffort::Medium
+            ReasoningEffort::Low
         );
-        revision(&db, second_review, ReasoningEffort::Medium);
+        assert_eq!(
+            effort_with_override(&db, &task, second_review, ReasoningEffort::High),
+            ReasoningEffort::High
+        );
+        revision(&db, second_review, ReasoningEffort::Low);
         let third_review = review(&db);
-        assert_eq!(effort(third_review), ReasoningEffort::High);
-        revision(&db, third_review, ReasoningEffort::High);
-        let fourth_review = review(&db);
-        let error = effective_revision_effort(
-            &db,
-            &db.get_task(&task).unwrap().unwrap(),
-            fourth_review,
-            None,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("REPLAN_REQUIRED"));
-        let condition = db.get_task_execution_condition(&task).unwrap().unwrap();
-        assert_eq!(condition.kind, "non_convergence_replan_required");
-        let error = effective_revision_effort(
-            &db,
-            &db.get_task(&task).unwrap().unwrap(),
-            fourth_review,
-            Some(ReasoningEffort::High),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("REPLAN_REQUIRED"));
-
-        let blocker_history = db.review_blocker_ledger(&task).unwrap();
-        let task_before_recovery = db.get_task(&task).unwrap().unwrap();
-        let revision_history = db
-            .list_agent_runs(project, 100)
-            .unwrap()
-            .into_iter()
-            .map(|run| (run.id, run.status, run.output, run.error))
-            .collect::<Vec<_>>();
-        db.acknowledge_non_convergence_replan_required(&task)
-            .unwrap();
-        let condition = db.get_task_execution_condition(&task).unwrap().unwrap();
-        assert_eq!(condition.kind, "non_convergence_replan_acknowledged");
-        assert_eq!(db.get_task(&task).unwrap().unwrap(), task_before_recovery);
-        assert_eq!(db.review_blocker_ledger(&task).unwrap(), blocker_history);
-        assert_eq!(
-            db.list_agent_runs(project, 100)
-                .unwrap()
-                .into_iter()
-                .map(|run| (run.id, run.status, run.output, run.error))
-                .collect::<Vec<_>>(),
-            revision_history
-        );
-        assert!(
-            db.list_lifecycle_events_for_task(&task, 20)
-                .unwrap()
-                .iter()
-                .any(|event| event.kind == "task_execution_condition_acknowledged")
-        );
-        assert_eq!(effort(fourth_review), ReasoningEffort::High);
-
-        // The acknowledgement is scoped to this review observation. A later
-        // review that establishes the same non-convergence condition must
-        // raise the gate again.
-        revision(&db, fourth_review, ReasoningEffort::High);
-        let fifth_review = review(&db);
-        let error = effective_revision_effort(
-            &db,
-            &db.get_task(&task).unwrap().unwrap(),
-            fifth_review,
-            None,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("REPLAN_REQUIRED"));
-        assert_eq!(
-            db.get_task_execution_condition(&task)
-                .unwrap()
-                .unwrap()
-                .kind,
-            "non_convergence_replan_required"
-        );
+        assert_eq!(effort(third_review), ReasoningEffort::Low);
+        assert!(db.get_task_execution_condition(&task).unwrap().is_none());
     }
 
     #[test]

@@ -1114,6 +1114,7 @@ fn exact_resolution_is_persisted_once_and_survives_reopen() {
             source: "operator_override".into(),
             escalation_reason: None,
             input_lineage: r#"{"operator_model":"small-model"}"#.into(),
+            escalation: None,
         };
         db.start_provider_invocation_with_resolution(run, "implementation", 1, &record)
             .unwrap();

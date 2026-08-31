@@ -9,8 +9,8 @@ use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker, blocker_id};
 use orc::git;
 use orc::registry::{
-    AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, EconomyTier, ReasoningEffort,
-    ResolutionRecord,
+    AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, EconomyCostConfiguration, EconomyTier,
+    EscalationTrigger, ReasoningEffort, ResolutionRecord,
 };
 use orc::review;
 use orc::storage::{AgentRunExecution, Database};
@@ -42,8 +42,9 @@ fn fake_resolution(purpose: &str, model: Option<&str>) -> ResolutionRecord {
         effort: None,
         tier: EconomyTier::Unknown,
         source: "test_resolver".into(),
-        escalation_reason: Some("initial semantic invocation".into()),
+        escalation_reason: None,
         input_lineage: format!("dispatch-review-test:{purpose}"),
+        escalation: None,
     }
 }
 
@@ -3572,6 +3573,7 @@ fn dispatch_infrastructure_validation_failure_is_not_repair_non_convergence() {
         TaskStatus::Blocked
     );
     assert_eq!(db.provider_invocations(run.id).unwrap().len(), 1);
+    assert!(db.pending_escalation_request(&task).unwrap().is_none());
     assert_eq!(
         db.provider_invocations(run.id).unwrap()[0].purpose,
         "implementation"
@@ -3608,6 +3610,7 @@ fn requeued_execution_includes_current_engineering_contract() {
         db.get_task(&task).unwrap().unwrap().status,
         TaskStatus::Blocked
     );
+    assert!(db.pending_escalation_request(&task).unwrap().is_none());
     OrcApp::open(&db_path, dir.path())
         .unwrap()
         .requeue(&task)
@@ -3912,6 +3915,44 @@ commands = ["frontend-check"]
         selection["worktree_fingerprint"],
         serde_json::json!(orc::automated::revision_worktree_fingerprint(&current))
     );
+    assert!(db.pending_escalation_request(&task).unwrap().is_none());
+}
+
+#[test]
+fn bounded_validation_non_convergence_persists_policy_request() {
+    let (dir, db, task) = setup();
+    db.set_agent_model("fake", "small").unwrap();
+    db.set_economy_cost_configuration(&EconomyCostConfiguration {
+        model_costs: std::collections::BTreeMap::from([
+            ("small".into(), 1.0),
+            ("medium".into(), 2.0),
+        ]),
+        unknown_tier: EconomyTier::Unknown,
+    })
+    .unwrap();
+    let worker = RepairWorker::new();
+    assert!(
+        dispatch_with_worker_and_db_as_with_runner(
+            &task,
+            &worker,
+            dir.path().join(".orc/orc.db").to_str().unwrap(),
+            dir.path(),
+            "fake",
+            &AlwaysFailValidationRunner,
+        )
+        .is_err()
+    );
+    let pending = db.pending_escalation_request(&task).unwrap().unwrap();
+    assert_eq!(
+        pending.request.lineage.trigger,
+        EscalationTrigger::ValidationRepairNonConvergence
+    );
+    assert_eq!(pending.request.lineage.previous_tier, EconomyTier::Default);
+    assert_eq!(
+        pending.request.lineage.requested_minimum_tier,
+        EconomyTier::Escalation
+    );
+    assert_eq!(pending.request.lineage.previous_attempt, 3);
 }
 
 #[test]

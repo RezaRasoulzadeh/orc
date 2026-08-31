@@ -4,12 +4,13 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum RunCommand {
+    /// Submit structured completion for a waiting manual run and run Orc validation
     Submit {
         run_id: i64,
         #[arg(long)]
         file: Option<String>,
     },
-    /// Submit a git patch for a waiting manual run
+    /// Submit a Git patch for a waiting manual run and run Orc validation
     SubmitPatch {
         run_id: i64,
         /// Path to patch file (use - for stdin)
@@ -57,7 +58,7 @@ pub fn run(command: RunCommand, db_path: &str) -> Result<()> {
                     println!("Patch: valid");
                     println!("Worktree: {}", outcome.worktree_path.display());
                     println!("Applied: yes\n");
-                    println!("Validation: deferred to review");
+                    println!("Validation: passed (Orc-owned deterministic validation)");
                     println!("\nRun: completed");
                     println!("Task {}: review", outcome.task_id);
                 }

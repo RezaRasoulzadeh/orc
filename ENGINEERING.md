@@ -123,6 +123,18 @@ the defect was actually corrected.
 When a task explicitly requires a test matrix or acceptance scenarios, every required scenario
 must be represented by meaningful executable coverage.
 
+### Provider-independent system acceptance gate
+
+`tests/economy_lifecycle_acceptance_tests.rs` freezes Orc's production lifecycle across real Git
+worktrees and reopened SQLite databases. It replaces only external provider, validation-command,
+and quota-refresh transports with deterministic scripts; lifecycle eligibility, economy
+resolution, persistence, escalation, validation freshness, semantic Review prerequisites,
+acceptance, and `ProjectOperations` remain production code.
+
+This target must pass as part of normal `cargo test` and on its own before external disposable-
+repository autonomy trials or self-hosting confidence claims. It never requires provider
+credentials, quota, network access, or a live provider process.
+
 
 ## 7. Review and revision work
 
@@ -137,7 +149,7 @@ For every blocking finding:
 5. Add or improve behavioral test coverage when appropriate.
 6. Check whether the same defect exists in related paths.
 7. Fix only the active blockers; do not run the project's validation/test suite to prove the fix
-   — automated review owns validation and will check the result.
+   — Orc runs deterministic validation after the revision and before semantic Review.
 
 Do not repeatedly append narrow patches when the finding exposes a flawed design.
 
@@ -154,14 +166,20 @@ where applicable:
     cargo clippy --all-targets -- -D warnings
     cargo test
 
-Ownership of proving this belongs to automated review, not to the implementation or revision
-provider session. A coding or revision session must not run the project's validation/test suite,
-focused checks, or any other command to prove completion; it implements the requested change within
-its specified scope and stops. Automated review selects and runs the task-specific validation
-relevant to the changed subsystem, and a failure becomes a blocker for the next revision.
+Ownership of proving this belongs to Orc's post-implementation lifecycle boundary, not to an
+implementation, revision, manual-worker, or reviewer session. A coding or revision session must
+not run the project's validation/test suite, focused checks, or any other command to prove
+completion; it implements the requested change within its specified scope and stops. After every
+automated or manual implementation ingestion, Orc derives changed files from the actual worktree,
+selects and runs the task-specific deterministic validation, and persists the result before the
+task can become Review-ready. Automated ordinary failures may enter the bounded same-worker repair
+loop. Manual ordinary failures block for operator correction. Infrastructure failures are recorded
+distinctly and never trigger model repair.
 
-Review's validation evidence must identify the exact revision tested; stale evidence from a
-worktree state that has since changed must not be treated as proof for the current revision.
+Review performs semantic task-contract judgment only. It requires fresh passing evidence tied to
+the exact revision and current worktree, and rejects missing, failing, infrastructure-failed, or stale evidence
+before provider invocation. A worktree state that has changed since validation must not be treated
+as proven.
 
 Do not claim a check passed, or narrate validation you did not execute. Clearly distinguish
 structural reasoning from validation actually executed.
@@ -267,8 +285,8 @@ Work is complete only when:
 - no known blocking requirement remains unresolved.
 
 A worker must not describe work as complete while knowingly identifying an unmet task requirement.
-Configured project validation is not part of this completion gate: automated review runs it after
-the session ends and raises a blocker if it fails.
+Configured project validation is not part of the worker's self-report gate: Orc runs it after the
+session ends, and only a fresh passing result can publish the task as Review-ready.
 
 
 ## 17. Worker completion report

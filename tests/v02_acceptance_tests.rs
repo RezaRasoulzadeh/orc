@@ -10,6 +10,7 @@ use orc::storage::Database;
 use orc::task::{TaskPriority, TaskStatus};
 use std::cell::RefCell;
 use std::fs;
+use std::process::Command;
 use tempfile::tempdir;
 
 struct ManualLead {
@@ -73,10 +74,41 @@ fn manual_agent() -> AgentDefinition {
 #[test]
 fn v02_shared_api_covers_planning_approvals_reports_agents_and_manual_runs() {
     let directory = tempdir().unwrap();
+    Command::new("git")
+        .current_dir(directory.path())
+        .args(["init", "."])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .current_dir(directory.path())
+        .args(["config", "user.email", "test@example.com"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .current_dir(directory.path())
+        .args(["config", "user.name", "Test User"])
+        .output()
+        .unwrap();
+    fs::write(directory.path().join("README.md"), "initial\n").unwrap();
+    Command::new("git")
+        .current_dir(directory.path())
+        .args(["add", "README.md"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .current_dir(directory.path())
+        .args(["commit", "-m", "initial"])
+        .output()
+        .unwrap();
     fs::create_dir_all(directory.path().join(".orc")).unwrap();
     fs::write(
         directory.path().join(".orc/engineering.md"),
         "# Acceptance engineering context\n\n## Tests and validation\nEvery implementation must pass cargo test.\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".orc/validation.toml"),
+        "commands = [\"test -f manual.txt\"]\n",
     )
     .unwrap();
     let database = directory.path().join("state.sqlite");
@@ -178,7 +210,18 @@ fn v02_shared_api_covers_planning_approvals_reports_agents_and_manual_runs() {
     assert_eq!(manual_runs.len(), 1);
     assert_eq!(manual_runs[0].run.id, run_id);
     assert!(manual_runs[0].task_packet.contains("manual-acceptance"));
-    app.submit_manual_run(run_id, "provider-independent handoff")
+    let db = Database::open(&database).unwrap();
+    let (_, worktree) = db.get_worktree_metadata(&manual_task).unwrap().unwrap();
+    drop(db);
+    fs::write(
+        directory.path().join(worktree).join("manual.txt"),
+        "implemented\n",
+    )
+    .unwrap();
+    app.submit_manual_run(
+        run_id,
+        r#"{"step_results":[{"step_id":"manual","operations_performed":["create"],"affected_files":["manual.txt"],"observed":[],"verification_passed":[]}],"summary":"provider-independent handoff"}"#,
+    )
         .unwrap();
     assert_eq!(app.runs(10).unwrap()[0].status, "completed");
 

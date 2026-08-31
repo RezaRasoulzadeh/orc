@@ -314,6 +314,83 @@ fn validation_freshness_and_infrastructure_failure_are_explicit() {
 }
 
 #[test]
+fn manual_and_automated_validation_have_equivalent_operational_summaries() {
+    let (repo, db, project, automated_task) = setup();
+    let manual_task = db
+        .insert_task(
+            project,
+            "Manual operational task",
+            "Expose the same validation truth",
+            "developer",
+            TaskPriority::Normal,
+        )
+        .unwrap();
+    std::fs::write(repo.path().join("equivalent.txt"), "current\n").unwrap();
+    let changes = orc::git::inspect_worktree(repo.path(), repo.path()).unwrap();
+    let fingerprint = revision_worktree_fingerprint(&changes);
+    let report = passing_report("cargo test");
+
+    let automated_run = create_run(&db, project, &automated_task, "coder", Some("model-a"));
+    db.store_worktree_metadata(automated_run, &automated_task, "operations", ".")
+        .unwrap();
+    db.store_change_evidence(automated_run, &changes).unwrap();
+    persist_validation(&db, &automated_task, automated_run, &report, &fingerprint);
+    db.update_agent_run_status(automated_run, "completed", Some("validated"))
+        .unwrap();
+    db.update_task_status(&automated_task, TaskStatus::Review)
+        .unwrap();
+
+    let manual_run = db
+        .create_agent_run_with_execution(
+            project,
+            &manual_task,
+            "agent-a",
+            registry::MANUAL,
+            AgentRunExecution {
+                class: "coder",
+                model: None,
+                effort: None,
+                source: "manual-submission",
+            },
+        )
+        .unwrap();
+    db.store_worktree_metadata(manual_run, &manual_task, "operations", ".")
+        .unwrap();
+    db.store_change_evidence(manual_run, &changes).unwrap();
+    persist_validation(&db, &manual_task, manual_run, &report, &fingerprint);
+    db.update_agent_run_status(manual_run, "completed", Some("validated"))
+        .unwrap();
+    db.update_task_status(&manual_task, TaskStatus::Review)
+        .unwrap();
+
+    let operations = ProjectOperations::new(&db, repo.path());
+    let automated = operations.task_summary(&automated_task).unwrap().unwrap();
+    let manual = operations.task_summary(&manual_task).unwrap().unwrap();
+
+    assert_eq!(manual.validation.state, automated.validation.state);
+    assert_eq!(
+        manual.validation.recorded_state,
+        automated.validation.recorded_state
+    );
+    assert_eq!(
+        manual.validation.is_current,
+        automated.validation.is_current
+    );
+    assert_eq!(
+        manual.validation.selected_commands,
+        automated.validation.selected_commands
+    );
+    assert_eq!(
+        manual.validation.failure_classification,
+        automated.validation.failure_classification
+    );
+    assert_eq!(
+        manual.review.ready_for_review,
+        automated.review.ready_for_review
+    );
+}
+
+#[test]
 fn review_and_blocker_views_use_current_persisted_ledger() {
     let (repo, db, project, task) = setup();
     let implementation = create_run(&db, project, &task, "coder", Some("model-a"));

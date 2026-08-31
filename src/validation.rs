@@ -14,7 +14,7 @@ pub struct ValidationConfig {
 }
 
 /// A named, deterministically selectable subset of the configured validation
-/// commands. Groups let review pick the smallest authoritative set of
+/// commands. Groups let Orc's post-implementation boundary pick the smallest authoritative set of
 /// commands for a task's affected subsystem instead of running every
 /// configured command for every task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,8 +38,8 @@ pub struct ValidationBoundary {
 }
 
 /// The outcome of selecting task-specific validation commands: which
-/// commands to run, and why, so review can persist and later explain its
-/// selection.
+/// commands to run, and why, so Orc can persist the evidence and Review can
+/// later consume its summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationSelection {
     pub commands: Vec<String>,
@@ -274,8 +274,8 @@ impl ValidationReport {
 
     pub fn is_infrastructure_failure(&self) -> bool {
         self.steps
-            .last()
-            .is_some_and(ValidationStepResult::is_infrastructure_failure)
+            .iter()
+            .any(ValidationStepResult::is_infrastructure_failure)
     }
 
     pub fn infrastructure_failure(command: &str, diagnostics: String) -> Self {

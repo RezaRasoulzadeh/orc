@@ -614,6 +614,81 @@ fn merge_token_usage(accumulated: &mut Option<TokenUsage>, additional: Option<To
         };
 }
 
+/// The single deterministic boundary between an implementation result and
+/// Review readiness. Every caller supplies an already-produced worktree;
+/// Orc captures that worktree, selects and runs validation, and persists the
+/// evidence with the exact worktree fingerprint used by Review freshness
+/// checks.
+struct PostImplementationValidation {
+    changes: git::WorktreeChanges,
+    report: ValidationReport,
+    selection: crate::validation::ValidationSelection,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared boundary records one task/run/worktree validation publication"
+)]
+fn run_post_implementation_validation(
+    validation_runner: &dyn ValidationRunner,
+    validation_config: &crate::validation::ValidationConfig,
+    required_validation: &[String],
+    db: &Database,
+    worktree: &Path,
+    repo_path: &Path,
+    task_id: &str,
+    run_id: i64,
+    agent_id: &str,
+) -> Result<PostImplementationValidation> {
+    let changes = git::inspect_worktree(worktree, repo_path)
+        .context("failed to capture authoritative post-implementation worktree state")?;
+    db.store_change_evidence(run_id, &changes)?;
+    let changed_files = changes
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let selection = validation_config.select_for_task(&changed_files, required_validation);
+    let report =
+        validation::run_validation_pipeline(validation_runner, &selection.commands, worktree)
+            .unwrap_or_else(|error| {
+                ValidationReport::infrastructure_failure(
+                    selection
+                        .commands
+                        .first()
+                        .map_or("validation", String::as_str),
+                    format!("{error:#}"),
+                )
+            });
+    db.record_lifecycle_event(
+        "validation_result",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(&serde_json::to_string(&report)?),
+    )?;
+    db.record_lifecycle_event(
+        "validation_selection",
+        Some(task_id),
+        Some(run_id),
+        Some(agent_id),
+        Some(
+            &serde_json::json!({
+                "selected_groups": selection.groups,
+                "selected_commands": selection.commands,
+                "rationale": selection.rationale,
+                "worktree_fingerprint": crate::automated::revision_worktree_fingerprint(&changes),
+            })
+            .to_string(),
+        ),
+    )?;
+    Ok(PostImplementationValidation {
+        changes,
+        report,
+        selection,
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "validation repair owns one implementation run"
@@ -638,36 +713,20 @@ fn run_task_validation_repair_loop(
     let mut repair_attempt = 0;
     let mut last_repair_resolution = None;
     loop {
-        let current = git::inspect_worktree(worktree, repo_path)?;
-        let changed_files = current
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
-        let selection = validation_config.select_for_task(&changed_files, required_validation);
-        let report =
-            validation::run_validation_pipeline(validation_runner, &selection.commands, worktree)
-                .unwrap_or_else(|error| {
-                    ValidationReport::infrastructure_failure(
-                        selection
-                            .commands
-                            .first()
-                            .map_or("validation", String::as_str),
-                        format!("{error:#}"),
-                    )
-                });
-        db.record_lifecycle_event(
-            "validation_result",
-            Some(task_id),
-            Some(run_id),
-            Some(agent_id),
-            Some(&serde_json::to_string(&report)?),
+        let validation = run_post_implementation_validation(
+            validation_runner,
+            validation_config,
+            required_validation,
+            db,
+            worktree,
+            repo_path,
+            task_id,
+            run_id,
+            agent_id,
         )?;
-        db.record_lifecycle_event("validation_selection", Some(task_id), Some(run_id), Some(agent_id), Some(&serde_json::json!({
-            "selected_groups": selection.groups, "selected_commands": selection.commands,
-            "rationale": selection.rationale,
-            "worktree_fingerprint": crate::automated::revision_worktree_fingerprint(&current),
-        }).to_string()))?;
+        let current = validation.changes;
+        let report = validation.report;
+        let selection = validation.selection;
         if report.is_success() || report.is_infrastructure_failure() {
             return Ok((report, selection));
         }
@@ -885,14 +944,16 @@ pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id:
             )
         })
         .unwrap_or_default();
+    let completion_schema = crate::worker_protocol::plan_completion_schema();
     format!(
-        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\n## Constraints\n\nStay strictly inside this task's scope. Do not modify unrelated project work or assume access to credentials, private memory, or external systems.\n\n## Required validation\n\nDescribe the checks and tests you performed. If you could not run a check, say why.\n\n## Required response / handoff format\n\nSummarize changes or recommendations, list files affected (if any), report validation results, and identify follow-up risks or questions.\n",
+        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\n## Constraints\n\nStay strictly inside this task's scope. Work in the task worktree printed with this packet. Do not modify unrelated project work or assume access to credentials, private memory, or external systems. Do not run the project's deterministic validation suite; Orc selects and runs it after submission.\n\n## Required response / handoff format\n\nSubmit the structured Worker completion JSON described by this schema. Reported affected files and observations are descriptive only; Orc derives authoritative changes from the task worktree.\n\n{completion_schema}\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         id = task.id,
         title = task.title,
         objective = objective,
         role = task.role,
-        execution_contract = execution_contract
+        execution_contract = execution_contract,
+        completion_schema = completion_schema,
     )
 }
 
@@ -1522,8 +1583,7 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
                         }
                     }
                     db.store_change_evidence(run_id, &changes)?;
-                    let validation_config =
-                        crate::validation::ValidationConfig::load(&worktree_dir)?;
+                    let validation_config = crate::validation::ValidationConfig::load(repo_path)?;
                     let required_validation = db
                         .get_task_contract(task_id)?
                         .map(|contract| contract.validation)
@@ -2431,7 +2491,7 @@ fn revise_with_worker_on_db_with_overrides_resolved(
         );
     }
     db.store_change_evidence(run_id, &changes)?;
-    let validation_config = crate::validation::ValidationConfig::load(&worktree_dir)?;
+    let validation_config = crate::validation::ValidationConfig::load(repo_path)?;
     let required_validation = db
         .get_task_contract(task_id)?
         .map(|contract| contract.validation)
@@ -2591,6 +2651,9 @@ pub fn revise_manual(
         };
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
+    if let Some((branch, worktree_path)) = db.get_worktree_metadata(task_id)? {
+        db.store_worktree_metadata(run_id, task_id, &branch, &worktree_path)?;
+    }
     db.update_task_status(task_id, TaskStatus::Active)?;
     db.set_agent_run_waiting_external(run_id)?;
     if !db.start_revision_execution(run_id, source_review_id)? {
@@ -2763,6 +2826,9 @@ fn dispatch_selected_with_db_and_repo_authority(
             .into_iter()
             .next()
             .context("manual run missing")?;
+        let worktree_path = db
+            .get_worktree_metadata_for_run(run.id)?
+            .map_or_else(|| "(task worktree unavailable)".into(), |(_, path)| path);
         return Ok(DispatchSummary {
             task,
             agent: agent.id,
@@ -2770,7 +2836,7 @@ fn dispatch_selected_with_db_and_repo_authority(
             profile: agent.profile_path,
             model: None,
             reasoning_effort: None,
-            worktree_path: "(created when patch is submitted)".into(),
+            worktree_path,
             run_id: run.id,
             run_status: run.status,
             validation: "PENDING".into(),
@@ -3060,9 +3126,17 @@ pub fn dispatch_manual(
             task.status
         );
     }
+    let (branch_name, worktree_path) = git::ensure_worktree(task_id, repo_path)
+        .context("failed to prepare task worktree for manual dispatch")?;
     db.update_task_status(task_id, TaskStatus::Active)?;
     let run_id =
         db.create_agent_run_with_mode(project_id, task_id, &agent.id, &agent.execution_mode)?;
+    db.store_worktree_metadata(
+        run_id,
+        task_id,
+        &branch_name,
+        &worktree_path.to_string_lossy(),
+    )?;
     if !db.set_agent_run_waiting_external(run_id)? {
         anyhow::bail!("failed to put run {} into waiting_external", run_id);
     }
@@ -3070,6 +3144,7 @@ pub fn dispatch_manual(
         "Run {} (agent={}, mode=manual, status=waiting_external)",
         run_id, agent.id
     );
+    println!("Worktree: {}", repo_path.join(&worktree_path).display());
     println!(
         "\n{}",
         build_manual_packet(&contract, &project, &task, &agent.id)
@@ -3078,24 +3153,73 @@ pub fn dispatch_manual(
 }
 
 pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
+    submit_run_with_runner(db, run_id, output, ".", &SystemValidationRunner)
+}
+
+pub fn submit_run_with_runner(
+    db: &Database,
+    run_id: i64,
+    output: &str,
+    repo_path: impl AsRef<Path>,
+    validation_runner: &dyn ValidationRunner,
+) -> Result<String> {
+    let repo_path = repo_path.as_ref();
     let run = db.get_agent_run(run_id)?.context("run not found")?;
     if run.execution_mode != registry::MANUAL || run.status != "waiting_external" {
         anyhow::bail!("run {} is not a waiting manual run", run_id);
     }
     let task_id = run.task_id.clone().context("manual run has no task")?;
+    let completion = crate::worker_protocol::parse_plan_completion(output)
+        .context("invalid manual Worker completion")?;
+    if completion.step_results.is_empty() || completion.summary.trim().is_empty() {
+        anyhow::bail!(
+            "invalid manual Worker completion: step_results and summary must not be empty"
+        );
+    }
+    if completion
+        .step_results
+        .iter()
+        .any(|step| step.step_id.trim().is_empty() || step.operations_performed.is_empty())
+    {
+        anyhow::bail!(
+            "invalid manual Worker completion: every step requires a step_id and performed operation"
+        );
+    }
+    let (_, worktree_path) = db
+        .get_worktree_metadata_for_run(run_id)?
+        .or(db.get_worktree_metadata(&task_id)?)
+        .context("manual run has no task worktree")?;
+    let worktree_path = PathBuf::from(worktree_path);
+    let absolute_worktree = if worktree_path.is_absolute() {
+        worktree_path
+    } else {
+        repo_path.join(worktree_path)
+    };
+    if !absolute_worktree.exists() {
+        anyhow::bail!(
+            "manual task worktree does not exist: {}",
+            absolute_worktree.display()
+        );
+    }
+    let current = git::inspect_worktree(&absolute_worktree, repo_path)
+        .context("failed to inspect manual submission worktree")?;
+    if current.files.is_empty() {
+        anyhow::bail!(
+            "manual completion did not produce a meaningful task-worktree implementation effect"
+        );
+    }
     if let Some(source_review_id) = db.source_review_run_id(run_id)? {
-        let reviews = crate::review::build_review(db, &task_id, Path::new("."))?.prior_reviews;
+        let reviews = crate::review::build_review(db, &task_id, repo_path)?.prior_reviews;
         let contract = crate::automated::build_revision_contract_from_db(
             db,
             &task_id,
             &reviews,
             source_review_id,
         )?;
-        let changes = db.get_change_evidence(run_id)?;
         let handoff = crate::automated::validate_revision_handoff_with_evidence(
             &contract,
             output,
-            changes.as_ref(),
+            Some(&current),
         )
         .context("invalid revision handoff")?;
         db.record_lifecycle_event(
@@ -3105,6 +3229,37 @@ pub fn submit_run(db: &Database, run_id: i64, output: &str) -> Result<String> {
             Some(&run.agent),
             Some(&serde_json::to_string(&handoff)?),
         )?;
+    }
+    let validation_config = crate::validation::ValidationConfig::load(repo_path)?;
+    let required_validation = db
+        .get_task_contract(&task_id)?
+        .map(|contract| contract.validation)
+        .unwrap_or_default();
+    let validation = run_post_implementation_validation(
+        validation_runner,
+        &validation_config,
+        &required_validation,
+        db,
+        &absolute_worktree,
+        repo_path,
+        &task_id,
+        run_id,
+        &run.agent,
+    )?;
+    if !validation.report.is_success() {
+        let message = if validation.report.is_infrastructure_failure() {
+            format!(
+                "manual submission validation infrastructure failure; operator action is required:\n{}",
+                validation.report.summary()
+            )
+        } else {
+            format!(
+                "manual submission failed deterministic validation; submit a new manual revision after correcting the worktree:\n{}",
+                validation.report.summary()
+            )
+        };
+        db.fail_run(run_id, &message)?;
+        anyhow::bail!(message);
     }
     db.complete_agent_run_for_review(&task_id, run_id, output, None)?;
     Ok(task_id)
@@ -3147,7 +3302,7 @@ pub fn submit_patch_with_runner(
     run_id: i64,
     patch_content: &str,
     repo_path: impl AsRef<Path>,
-    _validation_runner: &dyn ValidationRunner,
+    validation_runner: &dyn ValidationRunner,
 ) -> Result<PatchSubmissionOutcome> {
     let repo_path = repo_path.as_ref();
     let run = db
@@ -3238,16 +3393,46 @@ pub fn submit_patch_with_runner(
         Some(&change_evidence),
     )?;
 
-    // Manual patch submission records change evidence and leaves validation to
-    // the current manual workflow; Task 9 will move it onto Orc's validation
-    // boundary before Review.
+    if changes.files.is_empty() {
+        anyhow::bail!("submitted patch produced no meaningful task-worktree change");
+    }
+    let validation_config = crate::validation::ValidationConfig::load(repo_path)?;
+    let required_validation = db
+        .get_task_contract(&task_id)?
+        .map(|contract| contract.validation)
+        .unwrap_or_default();
+    let validation = run_post_implementation_validation(
+        validation_runner,
+        &validation_config,
+        &required_validation,
+        db,
+        &absolute_worktree,
+        repo_path,
+        &task_id,
+        run_id,
+        &run.agent,
+    )?;
+    if !validation.report.is_success() {
+        let message = if validation.report.is_infrastructure_failure() {
+            format!(
+                "manual patch validation infrastructure failure; operator action is required:\n{}",
+                validation.report.summary()
+            )
+        } else {
+            format!(
+                "manual patch failed deterministic validation; correct the worktree and start a new manual run:\n{}",
+                validation.report.summary()
+            )
+        };
+        db.fail_run(run_id, &message)?;
+        anyhow::bail!(message);
+    }
     let success_output = format!(
-        "Worktree: {}\nApplied: yes\n\nValidation: deferred to review\nPatch:\n{}",
+        "Worktree: {}\nApplied: yes\n\nValidation: passed\n{}\nPatch:\n{}",
         worktree_path.display(),
+        validation.report.summary(),
         patch_content
     );
-    let changes = git::inspect_worktree(&absolute_worktree, repo_path)?;
-    db.store_change_evidence(run_id, &changes)?;
     db.complete_agent_run_for_review(&task_id, run_id, &success_output, None)?;
 
     Ok(PatchSubmissionOutcome {
@@ -3553,18 +3738,39 @@ mod tests {
         let (dir, db, task_id) = setup();
         dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
         let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+        let (_, worktree) = db.get_worktree_metadata(&task_id).unwrap().unwrap();
+        std::fs::write(
+            dir.path().join(worktree).join("manual.txt"),
+            "implemented\n",
+        )
+        .unwrap();
+        let output = r#"{"step_results":[{"step_id":"manual","operations_performed":["create"],"affected_files":["reported-only.txt"],"observed":[],"verification_passed":[]}],"summary":"review completed"}"#;
+        let runner = FakeValidationRunner::success();
         assert_eq!(
-            submit_run(&db, run_id, "review completed").unwrap(),
+            submit_run_with_runner(&db, run_id, output, dir.path(), &runner).unwrap(),
             task_id
         );
         let run = db.get_agent_run(run_id).unwrap().unwrap();
         assert_eq!(run.status, "completed");
-        assert_eq!(run.output.as_deref(), Some("review completed"));
+        assert_eq!(run.output.as_deref(), Some(output));
+        assert_eq!(
+            runner.executed_commands(),
+            crate::validation::ValidationConfig::default_commands()
+        );
+        let evidence = db.get_change_evidence(run_id).unwrap().unwrap();
+        assert_eq!(
+            evidence
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["manual.txt"]
+        );
         assert_eq!(
             db.get_task(&task_id).unwrap().unwrap().status,
             TaskStatus::Review
         );
-        assert!(submit_run(&db, run_id, "again").is_err());
+        assert!(submit_run_with_runner(&db, run_id, output, dir.path(), &runner).is_err());
 
         let second_task = db
             .insert_task(
@@ -3607,7 +3813,10 @@ new file mode 100644
 
         assert_eq!(outcome.run_id, run_id);
         assert_eq!(outcome.task_id, task_id);
-        assert!(runner.executed_commands().is_empty());
+        assert_eq!(
+            runner.executed_commands(),
+            crate::validation::ValidationConfig::default_commands()
+        );
 
         // Check task status moved to review
         let task = db.get_task(&task_id).unwrap().unwrap();

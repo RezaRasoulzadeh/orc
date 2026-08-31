@@ -1167,7 +1167,13 @@ impl OrcApp {
         Ok(())
     }
     pub fn submit_manual_run(&self, run_id: i64, output: &str) -> Result<String> {
-        let result = agent::submit_run(&self.db, run_id, output)?;
+        let result = agent::submit_run_with_runner(
+            &self.db,
+            run_id,
+            output,
+            &self.repo_path,
+            &crate::validation::SystemValidationRunner,
+        )?;
         Ok(result)
     }
     pub fn fail_manual_run(&self, run_id: i64, reason: &str) -> Result<String> {

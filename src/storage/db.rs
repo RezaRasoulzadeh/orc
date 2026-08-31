@@ -194,6 +194,26 @@ mod reservation_lifecycle_tests {
         (directory, path, db, project, task)
     }
 
+    fn persist_passing_validation(db: &Database, task: &str, run: i64) {
+        let report = crate::validation::ValidationReport { steps: Vec::new() };
+        db.record_lifecycle_event(
+            "validation_result",
+            Some(task),
+            Some(run),
+            Some("codex-main"),
+            Some(&serde_json::to_string(&report).unwrap()),
+        )
+        .unwrap();
+        db.record_lifecycle_event(
+            "validation_selection",
+            Some(task),
+            Some(run),
+            Some("codex-main"),
+            Some(r#"{"selected_commands":[],"worktree_fingerprint":"test-current"}"#),
+        )
+        .unwrap();
+    }
+
     fn assert_terminal_releases(status: &str) {
         let (_directory, _path, db, project, task) = fixture();
         let run = db.create_agent_run(project, &task, "codex-main").unwrap();
@@ -253,6 +273,7 @@ mod reservation_lifecycle_tests {
                 output_tokens: Some(10),
                 cached_input_tokens: Some(6),
             };
+            persist_passing_validation(&db, &task, run);
 
             db.complete_agent_run_for_review(&task, run, "validated", Some(usage))
                 .unwrap();
@@ -287,6 +308,28 @@ mod reservation_lifecycle_tests {
             );
             assert!(db.list_busy_agents().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn implementation_publication_rejects_missing_validation_evidence() {
+        let (_directory, _path, db, project, task) = fixture();
+        db.update_task_status(&task, TaskStatus::Active).unwrap();
+        let run = db.create_agent_run(project, &task, "manual-coder").unwrap();
+
+        let error = db
+            .complete_agent_run_for_review(&task, run, "worker reported completion", None)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("without deterministic validation evidence")
+        );
+        assert_eq!(db.get_agent_run(run).unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.get_task(&task).unwrap().unwrap().status,
+            TaskStatus::Active
+        );
     }
 
     #[test]
@@ -413,6 +456,7 @@ mod reservation_lifecycle_tests {
         let (_directory, _path, db, project, task) = fixture();
         db.update_task_status(&task, TaskStatus::Active).unwrap();
         let run = db.create_agent_run(project, &task, "codex-main").unwrap();
+        persist_passing_validation(&db, &task, run);
         db.conn
             .execute_batch(
                 "CREATE TRIGGER fail_review_publication
@@ -625,6 +669,7 @@ mod reservation_lifecycle_tests {
                 },
             )
             .unwrap();
+        persist_passing_validation(&db, &task, revision);
 
         assert!(
             db.complete_revision_run_for_review(
@@ -696,6 +741,7 @@ mod reservation_lifecycle_tests {
                 },
             )
             .unwrap();
+        persist_passing_validation(&db, &task, revision);
         db.conn
             .execute_batch(
                 "CREATE TRIGGER fail_revision_publication
@@ -6891,6 +6937,7 @@ impl Database {
         output: &str,
         token_usage: Option<crate::worker::TokenUsage>,
     ) -> Result<LifecycleEvent, DbError> {
+        Self::require_passing_validation_for_publication(conn, run_id)?;
         let changed = conn.execute(
             "UPDATE agent_runs
              SET status = 'completed', output = ?1, error = NULL,
@@ -6915,6 +6962,56 @@ impl Database {
             return Err(DbError::TaskNotFound(task_id.to_owned()));
         }
         Self::persist_worker_result_and_event(conn, run_id, "completed", Some(output), token_usage)
+    }
+
+    fn require_passing_validation_for_publication(
+        conn: &Connection,
+        run_id: i64,
+    ) -> Result<(), DbError> {
+        let report: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM lifecycle_events
+                 WHERE run_id = ?1 AND kind = 'validation_result'
+                 ORDER BY id DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let report = report.ok_or_else(|| {
+            DbError::Scheduler(format!(
+                "run {run_id} cannot become Review-ready without deterministic validation evidence"
+            ))
+        })?;
+        let report: crate::validation::ValidationReport = serde_json::from_str(&report)?;
+        if !report.is_success() {
+            return Err(DbError::Scheduler(format!(
+                "run {run_id} cannot become Review-ready with failing validation evidence"
+            )));
+        }
+        let selection: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM lifecycle_events
+                 WHERE run_id = ?1 AND kind = 'validation_selection'
+                 ORDER BY id DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let selection = selection.ok_or_else(|| {
+            DbError::Scheduler(format!(
+                "run {run_id} cannot become Review-ready without validation freshness evidence"
+            ))
+        })?;
+        let selection: serde_json::Value = serde_json::from_str(&selection)?;
+        if selection["worktree_fingerprint"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        {
+            return Err(DbError::Scheduler(format!(
+                "run {run_id} cannot become Review-ready without an exact worktree validation fingerprint"
+            )));
+        }
+        Ok(())
     }
 
     pub fn update_agent_run_failure(
@@ -7071,16 +7168,6 @@ impl Database {
         Ok(self.conn.query_row(
             "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE id = ?1",
             params![run_id], Self::agent_run_from_row).optional()?)
-    }
-
-    pub fn complete_manual_run(&self, run_id: i64, output: &str) -> Result<String, DbError> {
-        let task_id: String = self.conn.query_row(
-            "SELECT task_id FROM agent_runs WHERE id = ?1 AND status = 'waiting_external'",
-            params![run_id],
-            |row| row.get(0),
-        )?;
-        self.complete_agent_run_for_review(&task_id, run_id, output, None)?;
-        Ok(task_id)
     }
 
     pub fn fail_run(&self, run_id: i64, reason: &str) -> Result<String, DbError> {

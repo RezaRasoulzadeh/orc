@@ -1,10 +1,15 @@
-use orc::agent::{self, submit_patch_with_runner, submit_run};
+use orc::agent::{self, submit_patch_with_runner, submit_run_with_runner};
+use orc::operations::{ProjectOperations, ValidationState};
 use orc::registry::{AVAILABLE, AgentDefinition, MANUAL};
 use orc::storage::Database;
 use orc::task::{TaskPriority, TaskStatus};
 use orc::validation::test_helpers::FakeValidationRunner;
+use orc::validation::{
+    ValidationCategory, ValidationFailureClassification, ValidationRunner, ValidationStepResult,
+};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 fn manual_agent() -> AgentDefinition {
@@ -104,6 +109,90 @@ fn setup_test_env() -> (TempDir, Database, String) {
     (dir, db, task_id)
 }
 
+const MANUAL_COMPLETION: &str = r#"{"step_results":[{"step_id":"manual","operations_performed":["create"],"affected_files":["worker-claimed.txt"],"observed":[],"verification_passed":[]}],"summary":"implementation complete"}"#;
+
+struct InfrastructureRunner {
+    executed: Mutex<Vec<String>>,
+}
+
+impl InfrastructureRunner {
+    fn new() -> Self {
+        Self {
+            executed: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ValidationRunner for InfrastructureRunner {
+    fn run(&self, command: &str, _working_dir: &Path) -> anyhow::Result<ValidationStepResult> {
+        self.executed.lock().unwrap().push(command.to_owned());
+        Ok(ValidationStepResult {
+            command: command.to_owned(),
+            category: ValidationCategory::Infrastructure,
+            passed: false,
+            stdout: String::new(),
+            stderr: "validation host unavailable".into(),
+            exit_status: None,
+            diagnostics: Some("failed to spawn validation process".into()),
+            failure_classification: Some(ValidationFailureClassification::Infrastructure),
+            fallback_command: None,
+        })
+    }
+}
+
+#[test]
+fn manual_completion_alone_cannot_publish_review_ready_state() {
+    let (dir, db, task_id) = setup_test_env();
+    agent::dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+    let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+    let runner = FakeValidationRunner::success();
+
+    let error =
+        submit_run_with_runner(&db, run_id, MANUAL_COMPLETION, dir.path(), &runner).unwrap_err();
+
+    assert!(error.to_string().contains("implementation effect"));
+    assert!(runner.executed_commands().is_empty());
+    assert_eq!(
+        db.get_agent_run(run_id).unwrap().unwrap().status,
+        "waiting_external"
+    );
+    assert_eq!(
+        db.get_task(&task_id).unwrap().unwrap().status,
+        TaskStatus::Active
+    );
+}
+
+#[test]
+fn manual_run_submission_validates_worker_protocol_before_validation() {
+    let (dir, db, task_id) = setup_test_env();
+    agent::dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+    let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+    let (_, worktree) = db.get_worktree_metadata(&task_id).unwrap().unwrap();
+    std::fs::write(
+        dir.path().join(worktree).join("manual.txt"),
+        "implemented\n",
+    )
+    .unwrap();
+    let runner = FakeValidationRunner::success();
+
+    let error = submit_run_with_runner(&db, run_id, "completed", dir.path(), &runner).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("invalid manual Worker completion")
+    );
+    assert!(runner.executed_commands().is_empty());
+    assert_eq!(
+        db.get_agent_run(run_id).unwrap().unwrap().status,
+        "waiting_external"
+    );
+    assert_eq!(
+        db.get_task(&task_id).unwrap().unwrap().status,
+        TaskStatus::Active
+    );
+}
+
 #[test]
 fn test_manual_waiting_run_accepts_patch() {
     let (dir, db, task_id) = setup_test_env();
@@ -125,7 +214,7 @@ new file mode 100644
 
     assert_eq!(outcome.run_id, run.id);
     assert_eq!(outcome.task_id, task_id);
-    assert!(runner.executed_commands().is_empty());
+    assert_eq!(runner.executed_commands(), vec!["cargo test"]);
 
     let updated_run = db.get_agent_run(run.id).unwrap().unwrap();
     assert_eq!(updated_run.status, "completed");
@@ -345,7 +434,7 @@ new file mode 100644
 }
 
 #[test]
-fn patch_submission_defers_configured_validation_until_manual_validation_is_added() {
+fn patch_submission_runs_configured_validation_before_review() {
     let (dir, db, task_id) = setup_test_env();
 
     // Create custom .orc/validation.toml
@@ -370,17 +459,20 @@ new file mode 100644
         submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).expect("submit patch");
 
     assert_eq!(outcome.task_id, task_id);
-    assert!(runner.executed_commands().is_empty());
+    assert_eq!(
+        runner.executed_commands(),
+        vec!["cargo fmt --check", "cargo test --lib"]
+    );
     assert!(
         db.list_lifecycle_events_for_run(run_id, 20)
             .unwrap()
             .iter()
-            .all(|event| event.kind != "validation_result")
+            .any(|event| event.kind == "validation_result")
     );
 }
 
 #[test]
-fn manual_patch_submission_does_not_invoke_validation_runner() {
+fn manual_patch_validation_failure_blocks_without_automated_repair() {
     let (dir, db, task_id) = setup_test_env();
 
     std::fs::write(
@@ -400,17 +492,22 @@ new file mode 100644
 +applied content
 ";
     let runner = FakeValidationRunner::failing_on("cargo test");
-    submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap();
-    assert!(runner.executed_commands().is_empty());
-    let run = db.get_agent_run(run_id).unwrap().unwrap();
-    assert_eq!(run.status, "completed");
+    let error = submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap_err();
     assert!(
-        run.output
-            .unwrap()
-            .contains("Validation: deferred to review")
+        error
+            .to_string()
+            .contains("manual patch failed deterministic validation")
     );
+    assert_eq!(runner.executed_commands(), vec!["cargo test"]);
+    let run = db.get_agent_run(run_id).unwrap().unwrap();
+    assert_eq!(run.status, "failed");
     let events = db.list_lifecycle_events_for_run(run_id, 20).unwrap();
-    assert!(events.iter().all(|event| event.kind != "validation_result"));
+    assert!(events.iter().any(|event| event.kind == "validation_result"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != "validation_repair_started")
+    );
     let changes = events
         .iter()
         .find(|event| event.kind == "change_evidence")
@@ -418,7 +515,7 @@ new file mode 100644
     assert!(changes.payload.as_deref().unwrap().contains("applied.txt"));
 
     let task = db.get_task(&task_id).unwrap().unwrap();
-    assert_eq!(task.status, TaskStatus::Review);
+    assert_eq!(task.status, TaskStatus::Blocked);
 
     // Applied worktree must be preserved for debugging
     let worktree_file = dir
@@ -433,6 +530,74 @@ new file mode 100644
     assert_eq!(
         std::fs::read_to_string(worktree_file).unwrap(),
         "applied content\n"
+    );
+}
+
+#[test]
+fn manual_ordinary_failure_runs_every_selected_command_once() {
+    let (dir, db, task_id) = setup_test_env();
+    std::fs::write(
+        dir.path().join(".orc/validation.toml"),
+        r#"commands = ["first-check", "second-check", "third-check"]"#,
+    )
+    .unwrap();
+    agent::dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+    let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+    let patch = "diff --git a/all.txt b/all.txt\nnew file mode 100644\n--- /dev/null\n+++ b/all.txt\n@@ -0,0 +1 @@\n+all commands\n";
+    let runner = FakeValidationRunner::failing_on("first-check");
+
+    submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap_err();
+
+    assert_eq!(
+        runner.executed_commands(),
+        vec!["first-check", "second-check", "third-check"]
+    );
+    assert!(
+        db.list_lifecycle_events_for_run(run_id, 20)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "validation_repair_started")
+    );
+}
+
+#[test]
+fn manual_infrastructure_failure_is_distinct_and_never_repairs() {
+    let (dir, db, task_id) = setup_test_env();
+    std::fs::write(
+        dir.path().join(".orc/validation.toml"),
+        r#"commands = ["host-check"]"#,
+    )
+    .unwrap();
+    agent::dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
+    let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+    let patch = "diff --git a/infra.txt b/infra.txt\nnew file mode 100644\n--- /dev/null\n+++ b/infra.txt\n@@ -0,0 +1 @@\n+change\n";
+    let runner = InfrastructureRunner::new();
+
+    let error = submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap_err();
+
+    assert!(error.to_string().contains("infrastructure failure"));
+    assert_eq!(db.get_agent_run(run_id).unwrap().unwrap().status, "failed");
+    assert_eq!(
+        db.get_task(&task_id).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    let events = db.list_lifecycle_events_for_run(run_id, 20).unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != "validation_repair_started")
+    );
+    let summary = ProjectOperations::new(&db, dir.path())
+        .task_summary(&task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summary.validation.state,
+        ValidationState::InfrastructureFailure
+    );
+    assert_eq!(
+        summary.validation.failure_classification,
+        Some(ValidationFailureClassification::Infrastructure)
     );
 }
 
@@ -454,6 +619,14 @@ new file mode 100644
     let runner = FakeValidationRunner::success();
     submit_patch_with_runner(&db, run_id, patch, dir.path(), &runner).unwrap();
 
+    let fresh = ProjectOperations::new(&db, dir.path())
+        .task_summary(&task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.validation.state, ValidationState::Passing);
+    assert_eq!(fresh.validation.is_current, Some(true));
+    assert!(fresh.review.ready_for_review);
+
     drop(db);
 
     // Reopen DB
@@ -464,16 +637,33 @@ new file mode 100644
     let run = reopened.get_agent_run(run_id).unwrap().unwrap();
     assert_eq!(run.status, "completed");
     assert!(run.output.as_ref().unwrap().contains("persisted data"));
+    assert!(run.output.as_ref().unwrap().contains("Validation: passed"));
     assert!(
-        run.output
-            .as_ref()
+        reopened
+            .latest_validation_result_for_run(run_id)
             .unwrap()
-            .contains("Validation: deferred to review")
+            .is_some()
     );
 
     let meta = reopened.get_worktree_metadata(&task_id).unwrap().unwrap();
     assert_eq!(meta.0, format!("orc/task/{}", task_id));
     assert_eq!(meta.1, format!(".orc/worktrees/{}", task_id));
+
+    std::fs::write(
+        dir.path().join(&meta.1).join("after-validation.txt"),
+        "stale\n",
+    )
+    .unwrap();
+    let stale = ProjectOperations::new(&reopened, dir.path())
+        .task_summary(&task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.validation.state, ValidationState::Stale);
+    assert_eq!(
+        stale.validation.recorded_state,
+        Some(ValidationState::Passing)
+    );
+    assert!(!stale.review.ready_for_review);
 }
 
 #[test]
@@ -481,8 +671,16 @@ fn test_existing_normal_run_submit_remains_green() {
     let (dir, db, task_id) = setup_test_env();
     agent::dispatch_manual(&task_id, &manual_agent(), &db, dir.path()).unwrap();
     let run_id = db.list_agent_runs_for_task(&task_id).unwrap()[0].id;
+    let (_, worktree) = db.get_worktree_metadata(&task_id).unwrap().unwrap();
+    std::fs::write(
+        dir.path().join(worktree).join("manual.txt"),
+        "implemented\n",
+    )
+    .unwrap();
+    let output = r#"{"step_results":[{"step_id":"manual","operations_performed":["create"],"affected_files":["claimed.txt"],"observed":[],"verification_passed":[]}],"summary":"architecture review completed: approved"}"#;
+    let runner = FakeValidationRunner::success();
 
-    let result = submit_run(&db, run_id, "architecture review completed: approved");
+    let result = submit_run_with_runner(&db, run_id, output, dir.path(), &runner);
     assert!(result.is_ok());
 
     let task = db.get_task(&task_id).unwrap().unwrap();
@@ -490,8 +688,54 @@ fn test_existing_normal_run_submit_remains_green() {
 
     let run = db.get_agent_run(run_id).unwrap().unwrap();
     assert_eq!(run.status, "completed");
-    assert_eq!(
-        run.output.as_deref(),
-        Some("architecture review completed: approved")
-    );
+    assert_eq!(run.output.as_deref(), Some(output));
+    assert_eq!(runner.executed_commands(), vec!["cargo test"]);
+    let changes = db.get_change_evidence(run_id).unwrap().unwrap();
+    assert!(changes.files.iter().any(|file| file.path == "manual.txt"));
+    assert!(changes.files.iter().all(|file| file.path != "claimed.txt"));
+}
+
+#[test]
+fn tracked_contract_text_never_assigns_deterministic_validation_to_review() {
+    fn phrase(parts: &[&str]) -> String {
+        parts.join(" ")
+    }
+    const P1: &str = "validation:";
+    const P2: &str = "deferred";
+    const P3: &str = "to";
+    const P4: &str = "review";
+    const P5: &str = "owns";
+    const P6: &str = "automated review";
+    const P7: &str = "selects and runs";
+    const P8: &str = "runs it after";
+    const P9: &str = "do not yet run";
+    const P10: &str = "orc-owned validation";
+    const P11: &str = "planned for";
+    const P12: &str = "task 9";
+    const P13: &str = "validation";
+    let sources = [
+        include_str!("../README.md"),
+        include_str!("../ENGINEERING.md"),
+        include_str!("../.orc/engineering.md"),
+        include_str!("../docs/cli-reference.md"),
+        include_str!("../docs/workflows/manual-agent.md"),
+        include_str!("../src/agent.rs"),
+        include_str!("../src/cli/run.rs"),
+    ];
+    let prohibited = [
+        phrase(&[P1, P2, P3, P4]),
+        phrase(&[P4, P5, P13]),
+        phrase(&[P6, P5, P13]),
+        phrase(&[P6, P7]),
+        phrase(&[P4, P8]),
+        phrase(&[P9, P10]),
+        phrase(&[P11, P12]),
+    ];
+
+    for source in sources {
+        let lower = source.to_ascii_lowercase();
+        for phrase in &prohibited {
+            assert!(!lower.contains(phrase), "stale lifecycle phrase: {phrase}");
+        }
+    }
 }

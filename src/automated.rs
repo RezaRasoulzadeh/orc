@@ -3052,7 +3052,7 @@ commands = ["npm run typecheck", "npm run build"]
     }
 
     #[test]
-    fn review_packet_is_rejected_before_provider_invocation_when_validation_is_stale() {
+    fn review_rejects_stale_manual_validation_before_provider_invocation() {
         let (db, mut summary, backend, directory) = validation_review_fixture(
             serde_json::json!({
                 "verdict": "PASS", "findings": [], "blocking_findings": [],
@@ -3064,12 +3064,7 @@ commands = ["npm run typecheck", "npm run build"]
         );
         let project = db.get_project_id().unwrap().unwrap();
         let run = db
-            .create_agent_run_with_mode(
-                project,
-                &summary.task.id,
-                "multi",
-                crate::registry::AUTOMATED,
-            )
+            .create_agent_run_with_mode(project, &summary.task.id, "multi", crate::registry::MANUAL)
             .unwrap();
         db.store_worktree_metadata(run, &summary.task.id, "branch", "worktree")
             .unwrap();
@@ -3118,6 +3113,45 @@ commands = ["npm run typecheck", "npm run build"]
         )
         .unwrap_err();
         assert!(error.to_string().contains("stale"));
+        assert!(backend.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn review_rejects_missing_manual_validation_before_provider_invocation() {
+        let (db, mut summary, backend, directory) = validation_review_fixture(
+            serde_json::json!({
+                "verdict": "PASS", "findings": [], "blocking_findings": [],
+                "non_blocking_findings": [], "severity": null,
+                "revision_feedback": null, "blockers": []
+            }),
+            GROUPED_VALIDATION_TOML,
+            &["src/agent.rs"],
+        );
+        let project = db.get_project_id().unwrap().unwrap();
+        let run = db
+            .create_agent_run_with_mode(
+                project,
+                &summary.task.id,
+                "manual-coder",
+                crate::registry::MANUAL,
+            )
+            .unwrap();
+        db.store_worktree_metadata(run, &summary.task.id, "branch", "worktree")
+            .unwrap();
+        summary.run = db.get_agent_run(run).unwrap();
+        summary.validation_evidence = None;
+
+        let error = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            directory.path(),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires current passing"));
         assert!(backend.calls.borrow().is_empty());
     }
 

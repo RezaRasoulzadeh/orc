@@ -49,6 +49,7 @@ pub fn resolve_action(
         action,
         overrides,
         crate::scheduler::TransportEligibility::Strict,
+        &crate::scheduler::ProviderQuotaRefresher,
     )
 }
 
@@ -57,8 +58,9 @@ fn resolve_action_with_transport(
     action: AgentAction,
     overrides: &ActionOverrides,
     transport: crate::scheduler::TransportEligibility,
+    quota_refresher: &dyn crate::scheduler::QuotaRefresher,
 ) -> Result<(AgentDefinition, ResolvedAction)> {
-    let decision = crate::scheduler::resolve_action_economy(
+    let decision = crate::scheduler::resolve_action_economy_for_execution_with_refresher(
         db,
         action,
         crate::scheduler::EconomyOverrides {
@@ -67,6 +69,7 @@ fn resolve_action_with_transport(
             effort: overrides.reasoning_effort,
         },
         transport,
+        quota_refresher,
     )?;
     let resolution = decision.resolution.ok_or_else(|| {
         anyhow::anyhow!(
@@ -89,6 +92,10 @@ fn resolve_action_with_transport(
 pub trait ActionBackend {
     fn transport_eligibility(&self) -> crate::scheduler::TransportEligibility {
         crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend
+    }
+
+    fn quota_refresher(&self) -> &dyn crate::scheduler::QuotaRefresher {
+        &crate::scheduler::UnsupportedQuotaRefresher
     }
 
     fn invoke(
@@ -193,6 +200,14 @@ impl WorkerActionBackend {
 impl ActionBackend for WorkerActionBackend {
     fn transport_eligibility(&self) -> crate::scheduler::TransportEligibility {
         crate::scheduler::TransportEligibility::Strict
+    }
+
+    fn quota_refresher(&self) -> &dyn crate::scheduler::QuotaRefresher {
+        if self.planner_executable.is_some() {
+            &crate::scheduler::UnsupportedQuotaRefresher
+        } else {
+            &crate::scheduler::ProviderQuotaRefresher
+        }
     }
 
     fn invoke(
@@ -1663,6 +1678,7 @@ fn run_review_mode(
         AgentAction::Review,
         overrides,
         backend.transport_eligibility(),
+        backend.quota_refresher(),
     )?;
     let review_agent = review_agent_without_command_execution(&agent);
     let run = db.create_project_action_run(
@@ -1945,6 +1961,7 @@ pub fn run_plan(
         AgentAction::Plan,
         overrides,
         backend.transport_eligibility(),
+        backend.quota_refresher(),
     )?;
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
@@ -2065,6 +2082,7 @@ pub fn run_lead(
         AgentAction::Lead,
         overrides,
         backend.transport_eligibility(),
+        backend.quota_refresher(),
     )?;
     let run = start_run(db, AgentAction::Lead, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);

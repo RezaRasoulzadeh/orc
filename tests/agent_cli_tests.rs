@@ -40,6 +40,14 @@ fn configured_lead_run_executes_cli_and_persists_canonical_direct_tasks() {
             .status
             .success()
     );
+    assert!(
+        orc_command(
+            directory.path(),
+            &["agent", "quota", "lead", "--remaining", "100"],
+        )
+        .status
+        .success()
+    );
 
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).unwrap();

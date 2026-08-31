@@ -314,16 +314,18 @@ fn repair_resolution_record(
     let task = db
         .get_task(task_id)?
         .context("provider invocation task disappeared")?;
-    Ok(crate::scheduler::resolve_run_invocation_economy(
-        db,
-        &task,
-        &run.agent,
-        run.resolved_model,
-        Some(effort),
-        purpose,
-        crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
-    )?
-    .record)
+    Ok(
+        crate::scheduler::resolve_run_invocation_economy_for_execution(
+            db,
+            &task,
+            &run.agent,
+            run.resolved_model,
+            Some(effort),
+            purpose,
+            crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+        )?
+        .record,
+    )
 }
 #[derive(Clone, Debug, Default)]
 pub struct RevisionExecutionOverrides {
@@ -344,12 +346,13 @@ fn resolve_revision_economy(
     transport: crate::scheduler::TransportEligibility,
     operator_agent_override: bool,
     escalation_request: Option<EscalationRequest>,
+    quota_refresher: &dyn crate::scheduler::QuotaRefresher,
 ) -> Result<crate::scheduler::EconomyResolution> {
     let automatic_escalation = escalation_request.is_some()
         && !operator_agent_override
         && overrides.model.is_none()
         && overrides.effort.is_none();
-    let decision = crate::scheduler::resolve_task_economy(
+    let decision = crate::scheduler::resolve_task_economy_for_execution_with_refresher(
         db,
         task,
         crate::registry::AgentAction::Code,
@@ -365,6 +368,8 @@ fn resolve_revision_economy(
         transport,
         escalation_request,
         "task_revision",
+        &HashSet::new(),
+        quota_refresher,
     )?;
     decision.resolution.ok_or_else(|| {
         anyhow::anyhow!(
@@ -911,7 +916,7 @@ pub fn dispatch_with_worker_and_db(
         .get_task(task_id)?
         .with_context(|| format!("task '{task_id}' not found in DB"))?;
     let effort = task_contract_effort(&db, &task)?;
-    let decision = crate::scheduler::resolve_task_economy(
+    let decision = crate::scheduler::resolve_task_economy_for_execution_with_refresher(
         &db,
         &task,
         crate::registry::AgentAction::Code,
@@ -923,6 +928,8 @@ pub fn dispatch_with_worker_and_db(
         crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
         None,
         "injected_worker_dispatch",
+        &HashSet::new(),
+        &crate::scheduler::UnsupportedQuotaRefresher,
     )?;
     let resolution = decision.resolution.ok_or_else(|| {
         anyhow::anyhow!(
@@ -1069,7 +1076,7 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
     let resolution = match provided_resolution {
         Some(resolution) => resolution,
         None => {
-            let decision = crate::scheduler::resolve_task_economy(
+            let decision = crate::scheduler::resolve_task_economy_for_execution_with_refresher(
                 db,
                 &task,
                 crate::registry::AgentAction::Code,
@@ -1084,6 +1091,8 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
                 crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
                 None,
                 "injected_worker_dispatch",
+                &HashSet::new(),
+                &crate::scheduler::UnsupportedQuotaRefresher,
             )?;
             decision.resolution.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1863,6 +1872,7 @@ where
         transport,
         operator_agent_override,
         escalation_request,
+        &crate::scheduler::ProviderQuotaRefresher,
     )?;
     let resolved_agent_id = resolution.agent.id.clone();
     let worker = factory(
@@ -2122,6 +2132,7 @@ fn revise_with_worker_on_db_with_overrides_resolved(
             crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
             true,
             semantic_escalation_request(db, &task, source_review_id, overrides, true)?,
+            &crate::scheduler::UnsupportedQuotaRefresher,
         )?,
     };
     let run_id = db.create_agent_run_with_execution(
@@ -2703,7 +2714,7 @@ fn dispatch_selected_with_db_and_repo_authority(
             db.pending_escalation_request(task_id)?
                 .map(|persisted| persisted.request)
         };
-    let decision = crate::scheduler::resolve_task_economy(
+    let decision = crate::scheduler::resolve_task_economy_for_execution(
         db,
         &task,
         crate::registry::AgentAction::Code,
@@ -2846,6 +2857,7 @@ pub fn plan_dispatch_assignments_with_costs(
             requested_mode: Some(registry::AUTOMATED),
             busy_agents: &reserved,
             quota_reserve,
+            quota_refresh_failures: &std::collections::BTreeMap::new(),
             overrides: crate::scheduler::EconomyOverrides::default(),
             constrained_agent_id: None,
             action_profiles: &profiles,
@@ -2888,7 +2900,7 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
         let pending_escalation = db
             .pending_escalation_request(&entry.task.id)?
             .map(|persisted| persisted.request);
-        let decision = crate::scheduler::resolve_task_economy_with_additional_busy(
+        let decision = crate::scheduler::resolve_task_economy_for_execution_with_refresher(
             &db,
             &entry.task,
             crate::registry::AgentAction::Code,
@@ -2901,6 +2913,7 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
             pending_escalation,
             "dispatch_queue_assignment",
             &reserved,
+            &crate::scheduler::ProviderQuotaRefresher,
         )?;
         if let Some(agent_id) = decision.schedule.selected_agent_id {
             reserved.insert(agent_id.clone());

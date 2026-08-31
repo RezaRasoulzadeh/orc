@@ -296,16 +296,12 @@ impl QueueReport {
                     for cand in &decision.candidates {
                         match &cand.status {
                             CandidateStatus::Eligible => {
-                                let quota_str = cand
-                                    .quota_remaining_percent
-                                    .map(|q| format!("{q}%"))
-                                    .unwrap_or_else(|| "unknown".to_string());
                                 out.push_str(&format!(
                                     "    - {}: ELIGIBLE (mode: {}, priority: {}, quota: {}, tier: {})\n",
                                     cand.agent_id,
                                     cand.execution_mode,
                                     cand.priority,
-                                    quota_str,
+                                    cand.quota_observation.description(),
                                     cand.economy_tier.as_str()
                                 ));
                             }
@@ -337,13 +333,33 @@ impl QueueReport {
 pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
     let tasks = db.list_tasks()?;
     let all_deps = db.list_all_dependencies()?;
+    let runs = match db.get_project_id()? {
+        Some(project_id) => db.list_agent_runs(project_id, usize::MAX)?,
+        None => Vec::new(),
+    };
+    compute_queue_from_facts(db, tasks, all_deps, &runs)
+}
 
+pub(crate) fn compute_queue_from_facts(
+    db: &Database,
+    tasks: Vec<Task>,
+    all_deps: Vec<(String, String)>,
+    runs: &[crate::storage::AgentRun],
+) -> Result<QueueReport, DbError> {
     let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
     for (task_id, depends_on) in all_deps {
         deps_map.entry(task_id).or_default().push(depends_on);
     }
 
     let task_map: HashMap<String, Task> = tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+    let mut latest_agents = HashMap::new();
+    for run in runs {
+        if let Some(task_id) = &run.task_id {
+            latest_agents
+                .entry(task_id.clone())
+                .or_insert_with(|| run.agent.clone());
+        }
+    }
 
     let mut report = QueueReport::default();
 
@@ -380,8 +396,7 @@ pub fn compute_queue(db: &Database) -> Result<QueueReport, DbError> {
             .collect::<Vec<_>>();
 
         let active_agent = if matches!(task.status, TaskStatus::Active | TaskStatus::Review) {
-            let runs = db.list_agent_runs_for_task(&task.id)?;
-            runs.first().map(|r| r.agent.clone())
+            latest_agents.get(&task.id).cloned()
         } else {
             None
         };

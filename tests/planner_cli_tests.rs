@@ -48,6 +48,7 @@ fn plan_run_cli_success_persists_and_terminates_without_repository_or_task_mutat
     let db_path = root.join(".orc/orc.db");
     let db = Database::open(&db_path).unwrap();
     let project = db.get_project_id().unwrap().unwrap();
+    assert!(db.set_agent_quota("planner", 100, None).unwrap());
     db.record_lead_decision(
         project,
         &LeadDecisionKind::PlanRequired,

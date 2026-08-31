@@ -478,15 +478,15 @@ fn run(cli: Cli) -> Result<()> {
             print_agents(&db)?;
         }
         Command::Doctor => print_doctor(&doctor::inspect(".", &doctor::SystemHealthRunner)),
-        Command::Status => match Database::open_global(DB_PATH) {
-            Ok(db) => {
-                let project = db.get_project_name().map_err(|e| anyhow::anyhow!(e))?;
+        Command::Status => match orc::app::OrcApp::open_global(DB_PATH, ".") {
+            Ok(app) => {
+                let project = app.operations().project_name()?;
                 if let Some(name) = project {
                     println!("Project: {}", name);
-                    let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+                    let tasks = app.task_operation_summaries()?;
                     println!("Tasks: {}", tasks.len());
                     for task in tasks {
-                        println!("{}  {:<10} {}", task.id, task.status, task.title);
+                        println!("{}  {:<18} {}", task.task_id, task.lifecycle, task.title);
                     }
                 } else {
                     eprintln!(
@@ -804,9 +804,9 @@ fn run(cli: Cli) -> Result<()> {
                 result.planner_run_id
             );
         }
-        Command::Queue { explain } => match Database::open_global(DB_PATH) {
-            Ok(db) => {
-                let report = orc::queue::compute_queue(&db).map_err(|e| anyhow::anyhow!(e))?;
+        Command::Queue { explain } => match orc::app::OrcApp::open_global(DB_PATH, ".") {
+            Ok(app) => {
+                let report = app.operations().project_queue()?;
                 if explain {
                     print!("{}", report.format_explain());
                 } else {
@@ -1243,21 +1243,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Run { command } => orc::cli::run::run(command, DB_PATH)?,
         Command::Agent { command } => orc::cli::agent::run(command, DB_PATH)?,
         Command::Task { command } => orc::cli::task::run(command, DB_PATH)?,
-        Command::Runs { task_id } => match Database::open_global(DB_PATH) {
-            Ok(db) => {
-                let runs = if let Some(tid) = task_id {
-                    // Show runs for specific task
-                    db.list_agent_runs_for_task(&tid)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                } else {
-                    // Show recent runs for project
-                    let pid = db
-                        .get_project_id()
-                        .map_err(|e| anyhow::anyhow!(e))?
-                        .ok_or_else(|| anyhow::anyhow!("no project found in DB"))?;
-                    db.list_agent_runs(pid, 50)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                };
+        Command::Runs { task_id } => match orc::app::OrcApp::open_global(DB_PATH, ".") {
+            Ok(app) => {
+                let runs = app
+                    .operations()
+                    .execution_summaries(task_id.as_deref(), 50)?;
 
                 if runs.is_empty() {
                     println!("No agent runs found");
@@ -1271,7 +1261,7 @@ fn run(cli: Cli) -> Result<()> {
                             run.execution_mode,
                             run.status
                         );
-                        if run.status == "running" {
+                        if run.is_active {
                             println!("  Phase:    {}", run.phase.as_deref().unwrap_or("unknown"));
                             println!("  Elapsed:  {}", orc::format::elapsed(&run.started_at));
                             println!("  Activity: {}", orc::format::timestamp(&run.last_activity));
@@ -1333,24 +1323,26 @@ fn sync_enabled_agents(db: &Database) {
 fn sync_enabled_agents_after_automated_run(task_id: &str) {
     match Database::open_global(DB_PATH) {
         Ok(db) => {
-            let automated = db
+            let automated_agent = db
                 .list_agent_runs_for_task(task_id)
                 .ok()
-                .and_then(|runs| runs.into_iter().next())
-                .is_some_and(|run| run.execution_mode == registry::AUTOMATED);
-            if automated {
-                match db.list_agents() {
-                    Ok(agents) => {
-                        for agent in agents.into_iter().filter(|agent| {
-                            agent.enabled
-                                && orc::backend::provider_supports_quota(&agent.backend)
-                                && agent.profile_path.is_some()
-                        }) {
-                            if let Err(error) = orc::backend::sync_agent_quota(&db, &agent) {
-                                eprintln!("{}: quota sync failed: {error}", agent.id);
-                            }
+                .and_then(|runs| {
+                    runs.into_iter()
+                        .find(|run| run.execution_mode == registry::AUTOMATED)
+                })
+                .map(|run| run.agent);
+            if let Some(agent_id) = automated_agent {
+                match db.get_agent(&agent_id) {
+                    Ok(Some(agent))
+                        if agent.enabled
+                            && orc::backend::provider_supports_quota(&agent.backend)
+                            && agent.profile_path.is_some() =>
+                    {
+                        if let Err(error) = orc::backend::sync_agent_quota(&db, &agent) {
+                            eprintln!("{}: quota sync failed: {error}", agent.id);
                         }
                     }
+                    Ok(_) => {}
                     Err(error) => eprintln!("quota sync failed: {error}"),
                 }
             }

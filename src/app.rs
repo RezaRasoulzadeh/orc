@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent;
 use crate::protocol::{PlanResponse, PlanningProjectState, ProjectReport};
-use crate::queue::{QueueReport, compute_queue};
+use crate::queue::QueueReport;
 use crate::registry::{self, AgentDefinition};
 use crate::review::{DispatchSummary, PriorReview, ReviewSummary, build_review};
 use crate::storage::db::ApprovalRequest;
@@ -714,7 +714,24 @@ impl OrcApp {
         )?)
     }
     pub fn tasks(&self) -> Result<Vec<Task>> {
-        Ok(self.db.list_tasks()?)
+        self.operations().tasks()
+    }
+    pub fn operations(&self) -> crate::operations::ProjectOperations<'_> {
+        crate::operations::ProjectOperations::new(&self.db, &self.repo_path)
+    }
+    pub fn task_operations(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::operations::TaskOperationsDetail>> {
+        self.operations().task_detail(id)
+    }
+    pub fn task_operation_summaries(
+        &self,
+    ) -> Result<Vec<crate::operations::TaskOperationsSummary>> {
+        self.operations().task_summaries()
+    }
+    pub fn economy_summary(&self) -> Result<crate::operations::ProjectEconomySummary> {
+        self.operations().economy_summary()
     }
     pub fn dashboard(&self, activity_limit: usize) -> Result<crate::read_model::Dashboard> {
         crate::read_model::dashboard(&self.db, &self.repo_path, activity_limit)
@@ -724,7 +741,7 @@ impl OrcApp {
         id: &str,
         activity_limit: usize,
     ) -> Result<Option<crate::read_model::TaskDetails>> {
-        crate::read_model::task_details(&self.db, id, activity_limit)
+        crate::read_model::task_details(&self.db, &self.repo_path, id, activity_limit)
     }
     pub fn run_details(
         &self,
@@ -801,7 +818,7 @@ impl OrcApp {
         Ok(self.db.get_task(id)?)
     }
     pub fn queue(&self) -> Result<QueueReport> {
-        Ok(compute_queue(&self.db)?)
+        self.operations().project_queue()
     }
     pub fn runs(&self, limit: usize) -> Result<Vec<AgentRun>> {
         let id = self

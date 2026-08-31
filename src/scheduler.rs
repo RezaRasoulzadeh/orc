@@ -1,7 +1,12 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::execution::{ExecutionClass, ExecutionResolution, ExecutionTemplate};
 use crate::registry::{
@@ -22,6 +27,7 @@ pub enum RejectionReason {
     MissingCapability { capability: String },
     QuotaExhausted,
     QuotaReserve { remaining: i64, reserve: i64 },
+    QuotaRefreshFailed { error: String },
     Busy,
     ModeMismatch { requested: String, actual: String },
     UnsupportedAction { action: String },
@@ -44,6 +50,9 @@ impl RejectionReason {
                     "quota below automatic reserve ({remaining}% remaining, {reserve}% required)"
                 )
             }
+            Self::QuotaRefreshFailed { error } => {
+                format!("quota refresh failed: {error}")
+            }
             Self::Busy => "busy".to_string(),
             Self::ModeMismatch { requested, actual } => {
                 format!("mode mismatch (requested: {requested}, actual: {actual})")
@@ -58,6 +67,99 @@ impl RejectionReason {
                     required.as_str()
                 )
             }
+        }
+    }
+}
+
+/// One conservative, provider-independent rule for deciding whether persisted
+/// quota is current enough to participate in eligibility and capacity ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaFreshnessPolicy {
+    pub max_age: Duration,
+}
+
+impl Default for QuotaFreshnessPolicy {
+    fn default() -> Self {
+        Self {
+            max_age: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaFreshness {
+    Fresh,
+    Stale,
+    #[default]
+    NeverChecked,
+    RefreshFailed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaObservation {
+    pub remaining_percent: Option<i64>,
+    pub reset_at: Option<String>,
+    pub checked_at: Option<String>,
+    pub source: Option<String>,
+    pub freshness: QuotaFreshness,
+    pub reserve_percent: i64,
+    pub refresh_supported: bool,
+    pub refresh_error: Option<String>,
+}
+
+impl QuotaObservation {
+    pub fn description(&self) -> String {
+        let value = self
+            .remaining_percent
+            .map(|remaining| format!("{remaining}% remaining"))
+            .unwrap_or_else(|| "remaining unknown".into());
+        match self.freshness {
+            QuotaFreshness::Fresh if self.remaining_percent == Some(0) => {
+                format!("fresh; {value}; exhausted")
+            }
+            QuotaFreshness::Fresh
+                if self.reserve_percent > 0
+                    && self
+                        .remaining_percent
+                        .is_some_and(|remaining| remaining < self.reserve_percent) =>
+            {
+                format!("fresh; {value}; below {}% reserve", self.reserve_percent)
+            }
+            QuotaFreshness::Fresh => format!("fresh; {value}; sufficient"),
+            QuotaFreshness::Stale if self.refresh_supported => {
+                format!("stale; {value}; refresh required before execution")
+            }
+            QuotaFreshness::Stale => {
+                format!("stale; {value}; refresh unsupported, conservative fallback")
+            }
+            QuotaFreshness::NeverChecked if self.refresh_supported => {
+                "unknown / never checked; refresh required before execution".into()
+            }
+            QuotaFreshness::NeverChecked => {
+                "unknown / never checked; refresh unsupported, conservative fallback".into()
+            }
+            QuotaFreshness::RefreshFailed => format!(
+                "refresh failed: {}",
+                self.refresh_error.as_deref().unwrap_or("unknown error")
+            ),
+        }
+    }
+}
+
+impl QuotaFreshnessPolicy {
+    pub fn classify(self, agent: &AgentDefinition, now_epoch: i64) -> QuotaFreshness {
+        let Some(checked_at) = agent.quota_checked_at.as_deref() else {
+            return QuotaFreshness::NeverChecked;
+        };
+        let Some(checked_epoch) = parse_timestamp_epoch(checked_at) else {
+            return QuotaFreshness::Stale;
+        };
+        let age = now_epoch.saturating_sub(checked_epoch);
+        if age >= 0 && age <= self.max_age.as_secs() as i64 {
+            QuotaFreshness::Fresh
+        } else {
+            QuotaFreshness::Stale
         }
     }
 }
@@ -78,6 +180,8 @@ pub struct CandidateEvaluation {
     pub quota_remaining_percent: Option<i64>,
     pub quota_reset_at: Option<String>,
     pub capacity_score: Option<i64>,
+    #[serde(default)]
+    pub quota_observation: QuotaObservation,
     #[serde(default)]
     pub resolved_model: Option<String>,
     #[serde(default)]
@@ -111,6 +215,7 @@ pub struct EconomyResolverInput<'a> {
     pub requested_mode: Option<&'a str>,
     pub busy_agents: &'a HashSet<String>,
     pub quota_reserve: i64,
+    pub quota_refresh_failures: &'a BTreeMap<String, String>,
     pub overrides: EconomyOverrides,
     /// A non-operator constraint, used for an already-owned run or workflow.
     pub constrained_agent_id: Option<String>,
@@ -128,6 +233,42 @@ pub struct EconomyResolverInput<'a> {
     pub escalation_request: Option<EscalationRequest>,
     pub lineage: String,
 }
+
+/// Injectable provider-independent seam used only before an execution-side
+/// scheduling decision. Implementations update Orc's persisted normalized
+/// observation; the economy resolver itself remains pure.
+pub trait QuotaRefresher {
+    fn supports(&self, agent: &AgentDefinition) -> bool;
+    fn refresh(&self, db: &Database, agent: &AgentDefinition) -> std::result::Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProviderQuotaRefresher;
+
+impl QuotaRefresher for ProviderQuotaRefresher {
+    fn supports(&self, agent: &AgentDefinition) -> bool {
+        crate::backend::provider_supports_quota(&agent.backend)
+    }
+
+    fn refresh(&self, db: &Database, agent: &AgentDefinition) -> std::result::Result<(), String> {
+        crate::backend::sync_agent_quota(db, agent).map(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnsupportedQuotaRefresher;
+
+impl QuotaRefresher for UnsupportedQuotaRefresher {
+    fn supports(&self, _agent: &AgentDefinition) -> bool {
+        false
+    }
+
+    fn refresh(&self, _db: &Database, _agent: &AgentDefinition) -> std::result::Result<(), String> {
+        Err("quota reconciliation is unsupported by this transport".into())
+    }
+}
+
+static QUOTA_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscalationObservation {
@@ -314,15 +455,18 @@ impl ScheduleDecision {
                     if let Some(model) = &cand.resolved_model {
                         out.push_str(&format!("  model: {model}\n"));
                     }
-                    let quota_str = cand
-                        .quota_remaining_percent
-                        .map(|q| format!("{q}%"))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    out.push_str(&format!("  quota: {}\n", quota_str));
+                    out.push_str(&format!(
+                        "  quota: {}\n",
+                        cand.quota_observation.description()
+                    ));
                 }
                 CandidateStatus::Rejected(reason) => {
                     out.push_str("  REJECTED\n");
                     out.push_str(&format!("  {}\n", reason.description()));
+                    out.push_str(&format!(
+                        "  quota: {}\n",
+                        cand.quota_observation.description()
+                    ));
                 }
             }
             out.push('\n');
@@ -357,12 +501,15 @@ pub fn evaluate_candidate_with_quota_reserve(
     requested_mode: Option<&str>,
     quota_reserve: i64,
 ) -> CandidateEvaluation {
+    let failures = BTreeMap::new();
     evaluate_candidate_for_requirements(
         agent,
         &task.required_capabilities(),
         requested_mode,
         quota_reserve,
         TransportEligibility::Strict,
+        current_epoch(),
+        &failures,
     )
 }
 
@@ -372,7 +519,15 @@ fn evaluate_candidate_for_requirements(
     requested_mode: Option<&str>,
     quota_reserve: i64,
     transport_eligibility: TransportEligibility,
+    now_epoch: i64,
+    quota_refresh_failures: &BTreeMap<String, String>,
 ) -> CandidateEvaluation {
+    let quota_observation = quota_observation_for(
+        agent,
+        quota_reserve,
+        now_epoch,
+        quota_refresh_failures.get(&agent.id).map(String::as_str),
+    );
     let make_eval = |status: CandidateStatus| CandidateEvaluation {
         agent_id: agent.id.clone(),
         backend: agent.backend.clone(),
@@ -380,7 +535,10 @@ fn evaluate_candidate_for_requirements(
         priority: agent.priority,
         quota_remaining_percent: agent.quota_remaining_percent,
         quota_reset_at: agent.quota_reset_at.clone(),
-        capacity_score: capacity_score(agent),
+        capacity_score: (quota_observation.freshness == QuotaFreshness::Fresh)
+            .then(|| capacity_score_at(agent, now_epoch))
+            .flatten(),
+        quota_observation: quota_observation.clone(),
         resolved_model: None,
         economy_tier: EconomyTier::Unknown,
         status,
@@ -451,11 +609,23 @@ fn evaluate_candidate_for_requirements(
         ));
     }
 
-    // 5. known quota_remaining_percent == 0 excludes the agent
-    if agent.quota_remaining_percent == Some(0) {
+    // 5. Only a fresh observation can prove quota insufficiency. Stale and
+    // never-checked values remain provisionally eligible for read-only
+    // explanation; execution paths reconcile them before final resolution.
+    if let Some(error) = quota_refresh_failures.get(&agent.id) {
+        return make_eval(CandidateStatus::Rejected(
+            RejectionReason::QuotaRefreshFailed {
+                error: error.clone(),
+            },
+        ));
+    }
+    if quota_observation.freshness == QuotaFreshness::Fresh
+        && agent.quota_remaining_percent == Some(0)
+    {
         return make_eval(CandidateStatus::Rejected(RejectionReason::QuotaExhausted));
     }
-    if quota_reserve > 0
+    if quota_observation.freshness == QuotaFreshness::Fresh
+        && quota_reserve > 0
         && agent
             .quota_remaining_percent
             .is_some_and(|remaining| remaining < quota_reserve)
@@ -479,12 +649,27 @@ fn evaluate_candidate_for_requirements(
     make_eval(CandidateStatus::Eligible)
 }
 
-fn capacity_score(agent: &AgentDefinition) -> Option<i64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(0, |duration| duration.as_secs() as i64);
-    capacity_score_at(agent, now)
+fn quota_observation_for(
+    agent: &AgentDefinition,
+    quota_reserve: i64,
+    now_epoch: i64,
+    refresh_error: Option<&str>,
+) -> QuotaObservation {
+    let mut observation = QuotaObservation {
+        remaining_percent: agent.quota_remaining_percent,
+        reset_at: agent.quota_reset_at.clone(),
+        checked_at: agent.quota_checked_at.clone(),
+        source: agent.quota_source.clone(),
+        freshness: QuotaFreshnessPolicy::default().classify(agent, now_epoch),
+        reserve_percent: quota_reserve,
+        refresh_supported: crate::backend::provider_supports_quota(&agent.backend),
+        refresh_error: None,
+    };
+    if let Some(error) = refresh_error {
+        observation.freshness = QuotaFreshness::RefreshFailed;
+        observation.refresh_error = Some(error.to_owned());
+    }
+    observation
 }
 
 fn capacity_score_at(agent: &AgentDefinition, now_epoch: i64) -> Option<i64> {
@@ -492,7 +677,7 @@ fn capacity_score_at(agent: &AgentDefinition, now_epoch: i64) -> Option<i64> {
     let horizon_bonus = agent
         .quota_reset_at
         .as_deref()
-        .and_then(parse_rfc3339_epoch)
+        .and_then(parse_timestamp_epoch)
         .map(|reset| reset - now_epoch)
         .filter(|seconds| *seconds > 0)
         .map(|seconds| (2_592_000i64.saturating_sub(seconds) / 86_400).min(30))
@@ -622,6 +807,7 @@ fn automatic_escalation<'a>(input: &'a EconomyResolverInput<'a>) -> Option<&'a E
 /// Callers may supply constraints and policy inputs, but this function alone
 /// creates the final provider-independent [`ResolutionRecord`].
 pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecision> {
+    let now_epoch = current_epoch();
     let escalation = automatic_escalation(&input).cloned();
     let selected_constraint = input
         .overrides
@@ -640,6 +826,8 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
                 input.requested_mode,
                 input.quota_reserve,
                 input.transport_eligibility,
+                now_epoch,
+                input.quota_refresh_failures,
             );
             evaluation.status = CandidateStatus::Rejected(RejectionReason::AgentConstraint {
                 selected: selected.clone(),
@@ -653,6 +841,8 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
             input.requested_mode,
             input.quota_reserve,
             input.transport_eligibility,
+            now_epoch,
+            input.quota_refresh_failures,
         );
         if matches!(evaluation.status, CandidateStatus::Eligible)
             && !agent.supports_action(input.action)
@@ -747,6 +937,9 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
             "policy_model": input.policy_model,
             "policy_effort": input.policy_effort.map(ReasoningEffort::as_str),
             "escalation": escalation,
+            "quota": evaluation.quota_observation,
+            "selection_reason": selection_reason,
+            "selection_explanation": explanation,
             "source": execution.source,
         })
         .to_string();
@@ -782,6 +975,28 @@ pub fn resolve_economy(input: EconomyResolverInput<'_>) -> Result<EconomyDecisio
     })
 }
 
+fn current_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+fn parse_timestamp_epoch(value: &str) -> Option<i64> {
+    if let Ok(epoch) = value.parse::<i64>() {
+        return Some(epoch);
+    }
+    if let Ok(timestamp) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Some(timestamp.unix_timestamp());
+    }
+    const SQLITE_TIMESTAMP: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    PrimitiveDateTime::parse(value, SQLITE_TIMESTAMP)
+        .ok()
+        .map(|timestamp| timestamp.assume_utc().unix_timestamp())
+}
+
+#[cfg(test)]
 fn parse_rfc3339_epoch(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
@@ -911,6 +1126,7 @@ pub fn schedule_with_busy_and_quota_reserve(
     quota_reserve: i64,
 ) -> Result<ScheduleDecision> {
     let profiles = BTreeMap::new();
+    let quota_refresh_failures = BTreeMap::new();
     let template = ExecutionTemplate::default();
     let costs = EconomyCostConfiguration::default();
     Ok(resolve_economy(EconomyResolverInput {
@@ -921,6 +1137,7 @@ pub fn schedule_with_busy_and_quota_reserve(
         requested_mode,
         busy_agents,
         quota_reserve,
+        quota_refresh_failures: &quota_refresh_failures,
         overrides: EconomyOverrides::default(),
         constrained_agent_id: None,
         action_profiles: &profiles,
@@ -938,6 +1155,141 @@ pub fn schedule_with_busy_and_quota_reserve(
         lineage: "scheduler".into(),
     })?
     .schedule)
+}
+
+struct QuotaReconciliation {
+    failures: BTreeMap<String, String>,
+    attempted: bool,
+}
+
+fn reconcile_quota_candidates(
+    db: &Database,
+    preliminary: &EconomyDecision,
+    refresher: &dyn QuotaRefresher,
+) -> Result<QuotaReconciliation> {
+    let mut failures = BTreeMap::new();
+    let mut attempted = false;
+    let target_tier = preliminary
+        .schedule
+        .candidates
+        .iter()
+        .find(|candidate| matches!(candidate.status, CandidateStatus::Eligible))
+        .map(|candidate| candidate.economy_tier);
+    for candidate in &preliminary.schedule.candidates {
+        if !matches!(candidate.status, CandidateStatus::Eligible)
+            || Some(candidate.economy_tier) != target_tier
+            || candidate.quota_observation.freshness == QuotaFreshness::Fresh
+        {
+            continue;
+        }
+        let Some(agent) = db.get_agent(&candidate.agent_id)? else {
+            failures.insert(
+                candidate.agent_id.clone(),
+                "agent disappeared during quota refresh".into(),
+            );
+            continue;
+        };
+        if !refresher.supports(&agent) {
+            continue;
+        }
+        attempted = true;
+
+        // Serialize the cheap check-and-refresh section and re-read after
+        // acquiring it. Concurrent selectors then reuse the first fresh
+        // observation instead of starting duplicate provider calls.
+        let lock = QUOTA_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("quota refresh coordination lock is poisoned"))?;
+        let current = db.get_agent(&agent.id)?.ok_or_else(|| {
+            anyhow::anyhow!("agent '{}' disappeared during quota refresh", agent.id)
+        })?;
+        if QuotaFreshnessPolicy::default().classify(&current, current_epoch())
+            == QuotaFreshness::Fresh
+        {
+            continue;
+        }
+        if let Err(error) = refresher.refresh(db, &current) {
+            failures.insert(agent.id.clone(), error);
+        } else {
+            let updated = db.get_agent(&agent.id)?.ok_or_else(|| {
+                anyhow::anyhow!("agent '{}' disappeared after quota refresh", agent.id)
+            })?;
+            if QuotaFreshnessPolicy::default().classify(&updated, current_epoch())
+                != QuotaFreshness::Fresh
+            {
+                failures.insert(
+                    agent.id.clone(),
+                    "provider refresh did not persist a fresh quota observation".into(),
+                );
+            }
+        }
+    }
+    Ok(QuotaReconciliation {
+        failures,
+        attempted,
+    })
+}
+
+fn ensure_refresh_failures_do_not_promote_tier(
+    preliminary: &EconomyDecision,
+    final_decision: &EconomyDecision,
+    failures: &BTreeMap<String, String>,
+) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let tiers = preliminary
+        .schedule
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.agent_id.as_str(), candidate.economy_tier))
+        .collect::<BTreeMap<_, _>>();
+    let selected_tier = final_decision
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.record.tier);
+    let blocks_selection = failures.keys().any(|agent_id| {
+        let failed_tier = tiers.get(agent_id.as_str()).copied().unwrap_or_default();
+        selected_tier.is_none_or(|selected| failed_tier.rank() < selected.rank())
+    });
+    if blocks_selection {
+        let details = failures
+            .iter()
+            .map(|(agent, error)| format!("{agent}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "quota observation failed for a candidate needed to establish the cheapest eligible economy tier: {details}"
+        );
+    }
+    Ok(())
+}
+
+fn apply_refresher_capability_metadata(
+    db: &Database,
+    decision: &mut EconomyDecision,
+    refresher: &dyn QuotaRefresher,
+) -> Result<()> {
+    for candidate in &mut decision.schedule.candidates {
+        if let Some(agent) = db.get_agent(&candidate.agent_id)? {
+            candidate.quota_observation.refresh_supported = refresher.supports(&agent);
+        }
+    }
+    if let Some(resolution) = decision.resolution.as_mut()
+        && let Some(observation) = decision
+            .schedule
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent_id == resolution.agent.id)
+            .map(|candidate| &candidate.quota_observation)
+    {
+        let mut lineage: serde_json::Value =
+            serde_json::from_str(&resolution.record.input_lineage)?;
+        lineage["quota"] = serde_json::to_value(observation)?;
+        resolution.record.input_lineage = lineage.to_string();
+    }
+    Ok(())
 }
 
 #[expect(
@@ -991,6 +1343,42 @@ pub(crate) fn resolve_task_economy_with_additional_busy(
     lineage: impl Into<String>,
     additional_busy: &HashSet<String>,
 ) -> Result<EconomyDecision> {
+    resolve_task_economy_with_additional_busy_and_failures(
+        db,
+        task,
+        action,
+        overrides,
+        requested_mode,
+        constrained_agent_id,
+        task_effort,
+        task_source,
+        transport_eligibility,
+        escalation_request,
+        lineage.into(),
+        additional_busy,
+        &BTreeMap::new(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the authoritative boundary keeps every policy input explicit"
+)]
+fn resolve_task_economy_with_additional_busy_and_failures(
+    db: &Database,
+    task: &Task,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    requested_mode: Option<&str>,
+    constrained_agent_id: Option<String>,
+    task_effort: Option<ReasoningEffort>,
+    task_source: Option<String>,
+    transport_eligibility: TransportEligibility,
+    escalation_request: Option<EscalationRequest>,
+    lineage: String,
+    additional_busy: &HashSet<String>,
+    quota_refresh_failures: &BTreeMap<String, String>,
+) -> Result<EconomyDecision> {
     let candidates = db.list_schedulable_agents()?;
     let mut profiles = BTreeMap::new();
     for agent in &candidates {
@@ -1028,6 +1416,7 @@ pub(crate) fn resolve_task_economy_with_additional_busy(
         requested_mode,
         busy_agents: &busy_agents,
         quota_reserve: db.quota_reserve()?,
+        quota_refresh_failures,
         overrides,
         constrained_agent_id,
         action_profiles: &profiles,
@@ -1042,8 +1431,107 @@ pub(crate) fn resolve_task_economy_with_additional_busy(
         cost_configuration: &costs,
         transport_eligibility,
         escalation_request,
-        lineage: lineage.into(),
+        lineage,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "execution reconciliation keeps every policy input explicit"
+)]
+pub fn resolve_task_economy_for_execution_with_refresher(
+    db: &Database,
+    task: &Task,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    requested_mode: Option<&str>,
+    constrained_agent_id: Option<String>,
+    task_effort: Option<ReasoningEffort>,
+    task_source: Option<String>,
+    transport_eligibility: TransportEligibility,
+    escalation_request: Option<EscalationRequest>,
+    lineage: impl Into<String>,
+    additional_busy: &HashSet<String>,
+    refresher: &dyn QuotaRefresher,
+) -> Result<EconomyDecision> {
+    let lineage = lineage.into();
+    let mut decision = resolve_task_economy_with_additional_busy_and_failures(
+        db,
+        task,
+        action,
+        overrides.clone(),
+        requested_mode,
+        constrained_agent_id.clone(),
+        task_effort,
+        task_source.clone(),
+        transport_eligibility,
+        escalation_request.clone(),
+        lineage.clone(),
+        additional_busy,
+        &BTreeMap::new(),
+    )?;
+    let mut failures = BTreeMap::new();
+    let maximum_passes = decision.schedule.candidates.len().saturating_add(1);
+    for _ in 0..maximum_passes {
+        let reconciliation = reconcile_quota_candidates(db, &decision, refresher)?;
+        if !reconciliation.attempted {
+            apply_refresher_capability_metadata(db, &mut decision, refresher)?;
+            return Ok(decision);
+        }
+        failures.extend(reconciliation.failures.clone());
+        let next = resolve_task_economy_with_additional_busy_and_failures(
+            db,
+            task,
+            action,
+            overrides.clone(),
+            requested_mode,
+            constrained_agent_id.clone(),
+            task_effort,
+            task_source.clone(),
+            transport_eligibility,
+            escalation_request.clone(),
+            lineage.clone(),
+            additional_busy,
+            &failures,
+        )?;
+        ensure_refresh_failures_do_not_promote_tier(&decision, &next, &reconciliation.failures)?;
+        decision = next;
+    }
+    bail!("quota reconciliation did not converge within the candidate bound")
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "execution reconciliation keeps every policy input explicit"
+)]
+pub fn resolve_task_economy_for_execution(
+    db: &Database,
+    task: &Task,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    requested_mode: Option<&str>,
+    constrained_agent_id: Option<String>,
+    task_effort: Option<ReasoningEffort>,
+    task_source: Option<String>,
+    transport_eligibility: TransportEligibility,
+    escalation_request: Option<EscalationRequest>,
+    lineage: impl Into<String>,
+) -> Result<EconomyDecision> {
+    resolve_task_economy_for_execution_with_refresher(
+        db,
+        task,
+        action,
+        overrides,
+        requested_mode,
+        constrained_agent_id,
+        task_effort,
+        task_source,
+        transport_eligibility,
+        escalation_request,
+        lineage,
+        &HashSet::new(),
+        &ProviderQuotaRefresher,
+    )
 }
 
 pub fn resolve_action_economy(
@@ -1051,6 +1539,22 @@ pub fn resolve_action_economy(
     action: AgentAction,
     overrides: EconomyOverrides,
     transport_eligibility: TransportEligibility,
+) -> Result<EconomyDecision> {
+    resolve_action_economy_with_failures(
+        db,
+        action,
+        overrides,
+        transport_eligibility,
+        &BTreeMap::new(),
+    )
+}
+
+fn resolve_action_economy_with_failures(
+    db: &Database,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    transport_eligibility: TransportEligibility,
+    quota_refresh_failures: &BTreeMap<String, String>,
 ) -> Result<EconomyDecision> {
     let candidates = db.list_schedulable_agents()?;
     let mut profiles = BTreeMap::new();
@@ -1075,6 +1579,7 @@ pub fn resolve_action_economy(
         requested_mode: Some(registry::AUTOMATED),
         busy_agents: &busy_agents,
         quota_reserve: db.quota_reserve()?,
+        quota_refresh_failures,
         overrides,
         constrained_agent_id: None,
         action_profiles: &profiles,
@@ -1093,6 +1598,57 @@ pub fn resolve_action_economy(
     })
 }
 
+pub fn resolve_action_economy_for_execution_with_refresher(
+    db: &Database,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    transport_eligibility: TransportEligibility,
+    refresher: &dyn QuotaRefresher,
+) -> Result<EconomyDecision> {
+    let mut decision = resolve_action_economy_with_failures(
+        db,
+        action,
+        overrides.clone(),
+        transport_eligibility,
+        &BTreeMap::new(),
+    )?;
+    let mut failures = BTreeMap::new();
+    let maximum_passes = decision.schedule.candidates.len().saturating_add(1);
+    for _ in 0..maximum_passes {
+        let reconciliation = reconcile_quota_candidates(db, &decision, refresher)?;
+        if !reconciliation.attempted {
+            apply_refresher_capability_metadata(db, &mut decision, refresher)?;
+            return Ok(decision);
+        }
+        failures.extend(reconciliation.failures.clone());
+        let next = resolve_action_economy_with_failures(
+            db,
+            action,
+            overrides.clone(),
+            transport_eligibility,
+            &failures,
+        )?;
+        ensure_refresh_failures_do_not_promote_tier(&decision, &next, &reconciliation.failures)?;
+        decision = next;
+    }
+    bail!("quota reconciliation did not converge within the candidate bound")
+}
+
+pub fn resolve_action_economy_for_execution(
+    db: &Database,
+    action: AgentAction,
+    overrides: EconomyOverrides,
+    transport_eligibility: TransportEligibility,
+) -> Result<EconomyDecision> {
+    resolve_action_economy_for_execution_with_refresher(
+        db,
+        action,
+        overrides,
+        transport_eligibility,
+        &ProviderQuotaRefresher,
+    )
+}
+
 pub fn resolve_run_invocation_economy(
     db: &Database,
     task: &Task,
@@ -1101,6 +1657,32 @@ pub fn resolve_run_invocation_economy(
     effort: Option<ReasoningEffort>,
     purpose: &str,
     transport_eligibility: TransportEligibility,
+) -> Result<EconomyResolution> {
+    resolve_run_invocation_economy_with_failures(
+        db,
+        task,
+        agent_id,
+        model,
+        effort,
+        purpose,
+        transport_eligibility,
+        &BTreeMap::new(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "provider invocation resolution keeps quota evidence explicit"
+)]
+fn resolve_run_invocation_economy_with_failures(
+    db: &Database,
+    task: &Task,
+    agent_id: &str,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    purpose: &str,
+    transport_eligibility: TransportEligibility,
+    quota_refresh_failures: &BTreeMap<String, String>,
 ) -> Result<EconomyResolution> {
     let candidates = db.list_schedulable_agents()?;
     let mut profiles = BTreeMap::new();
@@ -1135,6 +1717,7 @@ pub fn resolve_run_invocation_economy(
         requested_mode: Some(registry::AUTOMATED),
         busy_agents: &busy_agents,
         quota_reserve: db.quota_reserve()?,
+        quota_refresh_failures,
         overrides: EconomyOverrides::default(),
         constrained_agent_id: Some(agent_id.into()),
         action_profiles: &profiles,
@@ -1157,6 +1740,69 @@ pub fn resolve_run_invocation_economy(
             decision.schedule.explanation
         )
     })
+}
+
+pub fn resolve_run_invocation_economy_for_execution(
+    db: &Database,
+    task: &Task,
+    agent_id: &str,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    purpose: &str,
+    transport_eligibility: TransportEligibility,
+) -> Result<EconomyResolution> {
+    let preliminary = resolve_run_invocation_economy_with_failures(
+        db,
+        task,
+        agent_id,
+        model.clone(),
+        effort,
+        purpose,
+        transport_eligibility,
+        &BTreeMap::new(),
+    )?;
+    let preliminary_decision = EconomyDecision {
+        schedule: ScheduleDecision {
+            task_id: task.id.clone(),
+            selected_agent_id: Some(preliminary.agent.id.clone()),
+            candidates: vec![CandidateEvaluation {
+                agent_id: preliminary.agent.id.clone(),
+                backend: preliminary.agent.backend.clone(),
+                execution_mode: preliminary.agent.execution_mode.clone(),
+                priority: preliminary.agent.priority,
+                quota_remaining_percent: preliminary.agent.quota_remaining_percent,
+                quota_reset_at: preliminary.agent.quota_reset_at.clone(),
+                capacity_score: None,
+                quota_observation: quota_observation_for(
+                    &preliminary.agent,
+                    db.quota_reserve()?,
+                    current_epoch(),
+                    None,
+                ),
+                resolved_model: preliminary.execution.model.clone(),
+                economy_tier: preliminary.record.tier,
+                status: CandidateStatus::Eligible,
+            }],
+            selection_reason: SelectionReason::SingleEligibleCandidate,
+            explanation: String::new(),
+        },
+        resolution: Some(preliminary),
+    };
+    let reconciliation =
+        reconcile_quota_candidates(db, &preliminary_decision, &ProviderQuotaRefresher)?;
+    if let Some(error) = reconciliation.failures.get(agent_id) {
+        bail!("quota refresh failed for explicitly selected agent '{agent_id}': {error}");
+    }
+    resolve_run_invocation_economy_with_failures(
+        db,
+        task,
+        agent_id,
+        model,
+        effort,
+        purpose,
+        transport_eligibility,
+        &reconciliation.failures,
+    )
 }
 
 pub fn validate_override(agent: &AgentDefinition, task: &Task) -> Result<()> {
@@ -1190,6 +1836,8 @@ pub fn validate_override_with_constraints(
 mod tests {
     use super::*;
     use crate::task::TaskPriority;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
 
     fn test_task(capabilities: Vec<&str>) -> Task {
         Task {
@@ -1234,6 +1882,84 @@ mod tests {
         }
     }
 
+    fn mark_quota_fresh(agent: &mut AgentDefinition) {
+        agent.quota_checked_at = Some(current_epoch().to_string());
+        agent.quota_source = Some("test".into());
+    }
+
+    struct FakeQuotaRefresher {
+        outcomes: BTreeMap<String, std::result::Result<i64, String>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeQuotaRefresher {
+        fn new(
+            outcomes: impl IntoIterator<Item = (&'static str, std::result::Result<i64, String>)>,
+        ) -> Self {
+            Self {
+                outcomes: outcomes
+                    .into_iter()
+                    .map(|(agent, outcome)| (agent.to_owned(), outcome))
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl QuotaRefresher for FakeQuotaRefresher {
+        fn supports(&self, agent: &AgentDefinition) -> bool {
+            agent.backend == "codex"
+        }
+
+        fn refresh(
+            &self,
+            db: &Database,
+            agent: &AgentDefinition,
+        ) -> std::result::Result<(), String> {
+            self.calls.lock().unwrap().push(agent.id.clone());
+            match self
+                .outcomes
+                .get(&agent.id)
+                .cloned()
+                .unwrap_or_else(|| Err("unexpected refresh".into()))
+            {
+                Ok(remaining) => db
+                    .set_agent_quota(&agent.id, remaining, None)
+                    .map_err(|error| error.to_string())
+                    .and_then(|updated| {
+                        updated
+                            .then_some(())
+                            .ok_or_else(|| "agent disappeared during fake refresh".into())
+                    }),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn scheduling_db(agents: &[AgentDefinition]) -> (TempDir, Database, Task) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::init(directory.path().join("orc.db")).unwrap();
+        let project_id = database.create_project("quota scheduling").unwrap();
+        for agent in agents {
+            database.insert_agent(agent).unwrap();
+        }
+        let task_id = database
+            .insert_task(
+                project_id,
+                "Quota task",
+                "Exercise quota-aware scheduling",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let task = database.get_task(&task_id).unwrap().unwrap();
+        (directory, database, task)
+    }
+
     fn economy(
         task: &Task,
         agents: &[AgentDefinition],
@@ -1270,6 +1996,7 @@ mod tests {
             requested_mode: Some(registry::AUTOMATED),
             busy_agents: &HashSet::new(),
             quota_reserve: 0,
+            quota_refresh_failures: &BTreeMap::new(),
             overrides,
             constrained_agent_id: None,
             action_profiles: profiles,
@@ -1685,6 +2412,7 @@ mod tests {
         assert!(injected.resolution.is_some());
 
         fake.quota_remaining_percent = Some(0);
+        mark_quota_fresh(&mut fake);
         let exhausted = economy(
             &task,
             &[fake],
@@ -1716,8 +2444,10 @@ mod tests {
         let task = test_task(vec!["code"]);
         let mut priority = test_agent("priority", 105, vec!["code"]);
         priority.quota_remaining_percent = Some(20);
+        mark_quota_fresh(&mut priority);
         let mut healthy = test_agent("healthy", 100, vec!["code"]);
         healthy.quota_remaining_percent = Some(80);
+        mark_quota_fresh(&mut healthy);
         let decision = schedule(&task, &[priority, healthy], None).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("healthy"));
         assert_eq!(
@@ -1731,8 +2461,10 @@ mod tests {
         let task = test_task(vec!["code"]);
         let mut nine = test_agent("nine", 100, vec!["code"]);
         nine.quota_remaining_percent = Some(9);
+        mark_quota_fresh(&mut nine);
         let mut ten = test_agent("ten", 100, vec!["code"]);
         ten.quota_remaining_percent = Some(10);
+        mark_quota_fresh(&mut ten);
         let nine_eval = evaluate_candidate(&nine, &task, None);
         let ten_eval = evaluate_candidate(&ten, &task, None);
         assert_eq!(ten_eval.capacity_score, Some(10));
@@ -1757,9 +2489,11 @@ mod tests {
         let task = test_task(vec!["code"]);
         let mut soon = test_agent("soon", 100, vec!["code"]);
         soon.quota_remaining_percent = Some(50);
-        soon.quota_reset_at = Some("2026-08-22T00:00:00Z".to_string());
+        mark_quota_fresh(&mut soon);
+        soon.quota_reset_at = Some((current_epoch() + 86_400).to_string());
         let mut far = test_agent("far", 100, vec!["code"]);
         far.quota_remaining_percent = Some(50);
+        mark_quota_fresh(&mut far);
         far.quota_reset_at = Some("2999-01-01T00:00:00Z".to_string());
         let soon_eval = evaluate_candidate(&soon, &task, None);
         let far_eval = evaluate_candidate(&far, &task, None);
@@ -1773,7 +2507,8 @@ mod tests {
         let task = test_task(vec!["code"]);
         let mut soon = test_agent("soon", 100, vec!["code"]);
         soon.quota_remaining_percent = Some(50);
-        soon.quota_reset_at = Some("2026-08-22T00:00:00Z".to_string());
+        mark_quota_fresh(&mut soon);
+        soon.quota_reset_at = Some((current_epoch() + 86_400).to_string());
         let mut far = soon.clone();
         far.id = "far".to_string();
         far.quota_reset_at = Some("2999-01-01T00:00:00Z".to_string());
@@ -1842,6 +2577,7 @@ mod tests {
         let task = test_task(vec!["code", "terminal"]);
         let mut a = test_agent("agent-1", 100, vec!["code", "terminal"]);
         a.quota_remaining_percent = Some(0);
+        mark_quota_fresh(&mut a);
         let decision = schedule(&task, &[a], None).unwrap();
         assert_eq!(decision.selected_agent_id, None);
         assert_eq!(
@@ -1885,6 +2621,7 @@ mod tests {
         let task = test_task(vec!["code", "terminal"]);
         let mut agent = test_agent("agent-1", 100, vec!["code", "terminal"]);
         agent.quota_remaining_percent = Some(10);
+        mark_quota_fresh(&mut agent);
         let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
         assert_eq!(decision.selected_agent_id, None);
         assert_eq!(
@@ -1902,6 +2639,430 @@ mod tests {
         let agent = test_agent("agent-1", 100, vec!["code", "terminal"]);
         let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
         assert_eq!(decision.selected_agent_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn freshness_policy_classifies_never_checked_fresh_and_stale() {
+        let now = 1_800_000_000;
+        let policy = QuotaFreshnessPolicy::default();
+        let mut agent = test_agent("quota", 100, vec!["code"]);
+        assert_eq!(policy.classify(&agent, now), QuotaFreshness::NeverChecked);
+        agent.quota_checked_at = Some((now - 60).to_string());
+        assert_eq!(policy.classify(&agent, now), QuotaFreshness::Fresh);
+        agent.quota_checked_at = Some((now - policy.max_age.as_secs() as i64 - 1).to_string());
+        assert_eq!(policy.classify(&agent, now), QuotaFreshness::Stale);
+    }
+
+    #[test]
+    fn stale_low_quota_is_not_rejected_by_read_only_resolution() {
+        let task = test_task(vec!["code"]);
+        let mut agent = test_agent("stale", 100, vec!["code"]);
+        agent.quota_remaining_percent = Some(2);
+        agent.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        agent.quota_source = Some("provider".into());
+        let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("stale"));
+        assert_eq!(
+            decision.candidates[0].quota_observation.freshness,
+            QuotaFreshness::Stale
+        );
+        assert!(
+            decision
+                .format_explanation()
+                .contains("refresh required before execution")
+        );
+    }
+
+    #[test]
+    fn read_only_database_resolution_reports_stale_without_mutating_it() {
+        let mut agent = test_agent("read-only", 100, vec!["code"]);
+        agent.quota_remaining_percent = Some(2);
+        agent.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        agent.quota_source = Some("provider".into());
+        let (_directory, database, _task) = scheduling_db(&[agent]);
+        database.set_quota_reserve(20).unwrap();
+        let decision = resolve_action_economy(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.candidates[0].quota_observation.freshness,
+            QuotaFreshness::Stale
+        );
+        let persisted = database.get_agent("read-only").unwrap().unwrap();
+        assert_eq!(
+            persisted.quota_checked_at.as_deref(),
+            Some("2000-01-01 00:00:00")
+        );
+        assert_eq!(persisted.quota_remaining_percent, Some(2));
+    }
+
+    #[test]
+    fn stale_and_unknown_quota_refresh_before_execution_while_fresh_does_not() {
+        let mut stale = test_agent("stale", 100, vec!["code"]);
+        stale.quota_remaining_percent = Some(2);
+        stale.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        stale.quota_source = Some("provider".into());
+        let (_directory, database, _task) = scheduling_db(&[stale]);
+        database.set_quota_reserve(20).unwrap();
+        let refresher = FakeQuotaRefresher::new([("stale", Ok(80))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("stale")
+        );
+        assert_eq!(refresher.calls(), vec!["stale"]);
+        assert_eq!(
+            decision.schedule.candidates[0].quota_observation.freshness,
+            QuotaFreshness::Fresh
+        );
+
+        let no_refresh = FakeQuotaRefresher::new([]);
+        let repeated = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &no_refresh,
+        )
+        .unwrap();
+        assert_eq!(
+            repeated.schedule.selected_agent_id.as_deref(),
+            Some("stale")
+        );
+        assert!(no_refresh.calls().is_empty());
+
+        database.clear_agent_quota("stale").unwrap();
+        let unknown = FakeQuotaRefresher::new([("stale", Ok(75))]);
+        resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &unknown,
+        )
+        .unwrap();
+        assert_eq!(unknown.calls(), vec!["stale"]);
+    }
+
+    #[test]
+    fn refreshed_below_reserve_remains_ineligible() {
+        let mut agent = test_agent("low", 100, vec!["code"]);
+        agent.quota_remaining_percent = Some(1);
+        agent.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let (_directory, database, _task) = scheduling_db(&[agent]);
+        database.set_quota_reserve(20).unwrap();
+        let refresher = FakeQuotaRefresher::new([("low", Ok(10))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert!(decision.resolution.is_none());
+        assert!(matches!(
+            decision.schedule.candidates[0].status,
+            CandidateStatus::Rejected(RejectionReason::QuotaReserve {
+                remaining: 10,
+                reserve: 20
+            })
+        ));
+    }
+
+    #[test]
+    fn refresh_failure_cannot_silently_promote_to_expensive_tier() {
+        let mut cheap = test_agent("cheap", 10, vec!["code"]);
+        cheap.model = Some("cheap-model".into());
+        cheap.quota_remaining_percent = Some(1);
+        cheap.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let mut expensive = test_agent("expensive", 1000, vec!["code"]);
+        expensive.model = Some("expensive-model".into());
+        expensive.quota_remaining_percent = Some(90);
+        mark_quota_fresh(&mut expensive);
+        let (_directory, database, _task) = scheduling_db(&[cheap, expensive]);
+        database
+            .set_economy_cost_configuration(&EconomyCostConfiguration {
+                model_costs: BTreeMap::from([
+                    ("cheap-model".into(), 1.0),
+                    ("expensive-model".into(), 3.0),
+                ]),
+                unknown_tier: EconomyTier::Unknown,
+            })
+            .unwrap();
+        let refresher = FakeQuotaRefresher::new([("cheap", Err("timeout".into()))]);
+        let error = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cheapest eligible economy tier"));
+        assert!(error.to_string().contains("cheap: timeout"));
+        assert_eq!(refresher.calls(), vec!["cheap"]);
+    }
+
+    #[test]
+    fn same_tier_refresh_failure_can_use_confirmed_alternative() {
+        let mut failed = test_agent("failed", 200, vec!["code"]);
+        failed.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let mut alternative = test_agent("alternative", 100, vec!["code"]);
+        alternative.quota_remaining_percent = Some(70);
+        mark_quota_fresh(&mut alternative);
+        let (_directory, database, _task) = scheduling_db(&[failed, alternative]);
+        let refresher = FakeQuotaRefresher::new([("failed", Err("timeout".into()))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("alternative")
+        );
+        let failed = decision
+            .schedule
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent_id == "failed")
+            .unwrap();
+        assert!(matches!(
+            failed.status,
+            CandidateStatus::Rejected(RejectionReason::QuotaRefreshFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_override_refreshes_and_cannot_bypass_confirmed_reserve() {
+        let mut selected = test_agent("selected", 1, vec!["code"]);
+        selected.quota_remaining_percent = Some(2);
+        selected.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let other = test_agent("other", 100, vec!["code"]);
+        let (_directory, database, _task) = scheduling_db(&[selected, other]);
+        database.set_quota_reserve(20).unwrap();
+        let refresher = FakeQuotaRefresher::new([("selected", Ok(10))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides {
+                agent_id: Some("selected".into()),
+                ..EconomyOverrides::default()
+            },
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert!(decision.resolution.is_none());
+        assert_eq!(refresher.calls(), vec!["selected"]);
+        assert!(matches!(
+            decision
+                .schedule
+                .candidates
+                .iter()
+                .find(|candidate| candidate.agent_id == "selected")
+                .unwrap()
+                .status,
+            CandidateStatus::Rejected(RejectionReason::QuotaReserve { .. })
+        ));
+    }
+
+    #[test]
+    fn selected_resolution_lineage_contains_fresh_quota_observation() {
+        let mut agent = test_agent("lineage", 100, vec!["code"]);
+        agent.quota_remaining_percent = Some(66);
+        mark_quota_fresh(&mut agent);
+        let (_directory, database, _task) = scheduling_db(&[agent]);
+        database.set_quota_reserve(15).unwrap();
+        let refresher = FakeQuotaRefresher::new([]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        let lineage: serde_json::Value =
+            serde_json::from_str(&decision.resolution.unwrap().record.input_lineage).unwrap();
+        assert_eq!(lineage["quota"]["remaining_percent"], 66);
+        assert_eq!(lineage["quota"]["freshness"], "fresh");
+        assert_eq!(lineage["quota"]["reserve_percent"], 15);
+        assert_eq!(lineage["quota"]["source"], "test");
+        assert_eq!(lineage["selection_reason"], "single_eligible_candidate");
+        assert!(
+            lineage["selection_explanation"]
+                .as_str()
+                .is_some_and(|value| value.contains("lineage"))
+        );
+        assert!(refresher.calls().is_empty());
+    }
+
+    #[test]
+    fn refreshed_quota_preserves_cheapest_tier_before_priority() {
+        let mut cheap = test_agent("cheap", 1, vec!["code"]);
+        cheap.model = Some("cheap-model".into());
+        cheap.quota_remaining_percent = Some(1);
+        cheap.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let mut expensive = test_agent("expensive", 10_000, vec!["code"]);
+        expensive.model = Some("expensive-model".into());
+        expensive.quota_remaining_percent = Some(90);
+        mark_quota_fresh(&mut expensive);
+        let (_directory, database, _task) = scheduling_db(&[cheap, expensive]);
+        database
+            .set_economy_cost_configuration(&EconomyCostConfiguration {
+                model_costs: BTreeMap::from([
+                    ("cheap-model".into(), 1.0),
+                    ("expensive-model".into(), 3.0),
+                ]),
+                unknown_tier: EconomyTier::Unknown,
+            })
+            .unwrap();
+        let refresher = FakeQuotaRefresher::new([("cheap", Ok(75))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("cheap")
+        );
+        assert_eq!(
+            decision.schedule.selection_reason,
+            SelectionReason::CheapestEconomyTier
+        );
+        assert_eq!(refresher.calls(), vec!["cheap"]);
+    }
+
+    #[test]
+    fn next_tier_is_refreshed_only_after_cheaper_tier_is_confirmed_insufficient() {
+        let mut cheap = test_agent("cheap", 100, vec!["code"]);
+        cheap.model = Some("cheap-model".into());
+        cheap.quota_remaining_percent = Some(1);
+        cheap.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let mut expensive = test_agent("expensive", 100, vec!["code"]);
+        expensive.model = Some("expensive-model".into());
+        expensive.quota_remaining_percent = Some(1);
+        expensive.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let (_directory, database, _task) = scheduling_db(&[cheap, expensive]);
+        database.set_quota_reserve(20).unwrap();
+        database
+            .set_economy_cost_configuration(&EconomyCostConfiguration {
+                model_costs: BTreeMap::from([
+                    ("cheap-model".into(), 1.0),
+                    ("expensive-model".into(), 3.0),
+                ]),
+                unknown_tier: EconomyTier::Unknown,
+            })
+            .unwrap();
+        let refresher = FakeQuotaRefresher::new([("cheap", Ok(10)), ("expensive", Ok(80))]);
+        let decision = resolve_action_economy_for_execution_with_refresher(
+            &database,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            TransportEligibility::Strict,
+            &refresher,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("expensive")
+        );
+        assert_eq!(refresher.calls(), vec!["cheap", "expensive"]);
+    }
+
+    #[test]
+    fn escalation_reconciles_required_tier_before_declaring_it_unavailable() {
+        let mut baseline = test_agent("baseline", 100, vec!["code", "terminal"]);
+        baseline.model = Some("cheap-model".into());
+        mark_quota_fresh(&mut baseline);
+        baseline.quota_remaining_percent = Some(100);
+        let mut escalated = test_agent("escalated", 10, vec!["code", "terminal"]);
+        escalated.model = Some("strong-model".into());
+        escalated.quota_remaining_percent = Some(1);
+        escalated.quota_checked_at = Some("2000-01-01 00:00:00".into());
+        let (_directory, database, task) = scheduling_db(&[baseline, escalated]);
+        database.set_quota_reserve(20).unwrap();
+        database
+            .set_economy_cost_configuration(&EconomyCostConfiguration {
+                model_costs: BTreeMap::from([
+                    ("cheap-model".into(), 1.0),
+                    ("strong-model".into(), 3.0),
+                ]),
+                unknown_tier: EconomyTier::Unknown,
+            })
+            .unwrap();
+        let escalation = EscalationRequest {
+            reason: "semantic non-convergence".into(),
+            lineage: crate::registry::EscalationLineage {
+                request_id: Some(1),
+                trigger: EscalationTrigger::SemanticRevisionNonConvergence,
+                previous_provider_invocation_id: 9,
+                previous_tier: EconomyTier::Default,
+                previous_model: Some("cheap-model".into()),
+                previous_effort: None,
+                previous_attempt: 1,
+                requested_minimum_tier: EconomyTier::Escalation,
+                policy_attempt: 1,
+            },
+        };
+        let refresher = FakeQuotaRefresher::new([("escalated", Ok(70))]);
+        let decision = resolve_task_economy_for_execution_with_refresher(
+            &database,
+            &task,
+            AgentAction::Code,
+            EconomyOverrides::default(),
+            Some(registry::AUTOMATED),
+            None,
+            task.reasoning_effort,
+            Some("task_contract".into()),
+            TransportEligibility::Strict,
+            Some(escalation),
+            "quota_escalation_test",
+            &HashSet::new(),
+            &refresher,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.schedule.selected_agent_id.as_deref(),
+            Some("escalated"),
+            "{decision:#?}"
+        );
+        assert_eq!(refresher.calls(), vec!["escalated"]);
+    }
+
+    #[test]
+    fn unsupported_unknown_quota_uses_conservative_no_capacity_fallback() {
+        let task = test_task(vec!["code"]);
+        let mut agent = test_agent("copilot", 100, vec!["code"]);
+        agent.backend = "copilot".into();
+        let decision = schedule_with_quota_reserve(&task, &[agent], None, 20).unwrap();
+        assert_eq!(decision.selected_agent_id.as_deref(), Some("copilot"));
+        assert_eq!(decision.candidates[0].capacity_score, None);
+        assert_eq!(
+            decision.candidates[0].quota_observation.freshness,
+            QuotaFreshness::NeverChecked
+        );
+        assert!(!decision.candidates[0].quota_observation.refresh_supported);
     }
 
     #[test]

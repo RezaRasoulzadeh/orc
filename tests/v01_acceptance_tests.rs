@@ -314,6 +314,11 @@ fn automated_dispatch_cli_is_one_shot_and_stops_in_review() {
             .unwrap()
             .is_empty()
     );
+    assert!(
+        before
+            .set_agent_quota("automated-coder", 100, None)
+            .unwrap()
+    );
     drop(before);
 
     let bin = root.join("bin");

@@ -512,16 +512,17 @@ fn quota_metadata_persists_accepts_boundaries_and_clears() {
     assert_eq!(saved.quota_source.as_deref(), Some("manual"));
     assert_eq!(saved.status, registry::AVAILABLE);
     assert!(db.set_agent_quota("codex-main", 100, None).unwrap());
+    let checked_at = db
+        .get_agent("codex-main")
+        .unwrap()
+        .unwrap()
+        .quota_checked_at;
     drop(db);
     let reopened = Database::open(&path).unwrap();
-    assert_eq!(
-        reopened
-            .get_agent("codex-main")
-            .unwrap()
-            .unwrap()
-            .quota_remaining_percent,
-        Some(100)
-    );
+    let reopened_agent = reopened.get_agent("codex-main").unwrap().unwrap();
+    assert_eq!(reopened_agent.quota_remaining_percent, Some(100));
+    assert_eq!(reopened_agent.quota_checked_at, checked_at);
+    assert_eq!(reopened_agent.quota_source.as_deref(), Some("manual"));
     assert!(reopened.clear_agent_quota("codex-main").unwrap());
     let cleared = reopened.get_agent("codex-main").unwrap().unwrap();
     assert_eq!(cleared.quota_remaining_percent, None);

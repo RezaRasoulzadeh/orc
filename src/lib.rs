@@ -17,6 +17,7 @@ pub mod format;
 pub mod git;
 pub mod interactive;
 pub mod lead;
+pub mod operations;
 pub mod protocol;
 pub mod queue;
 pub mod read_model;

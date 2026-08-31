@@ -94,10 +94,17 @@ fn dispatch_planning_excludes_unusable_agents_and_reuses_none() {
     disabled.enabled = false;
     let mut unavailable = dispatch_agent("unavailable");
     unavailable.status = "offline".into();
+    let checked_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let mut exhausted = dispatch_agent("exhausted");
     exhausted.quota_remaining_percent = Some(0);
+    exhausted.quota_checked_at = Some(checked_at.clone());
     let mut reserve = dispatch_agent("reserve");
     reserve.quota_remaining_percent = Some(5);
+    reserve.quota_checked_at = Some(checked_at);
     let agents = [
         disabled,
         unavailable,

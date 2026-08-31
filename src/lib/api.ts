@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 
-export type TaskStatus = 'backlog' | 'ready' | 'active' | 'review' | 'blocked' | 'done' | 'cancelled'
+export type TaskStatus = 'backlog' | 'ready' | 'active' | 'review' | 'acceptance_ready' | 'revision_required' | 'blocked' | 'done' | 'cancelled'
+export type EconomyTier = 'default' | 'escalation' | 'exceptional' | 'unknown'
 
 export interface Task {
   id: string
@@ -40,7 +41,17 @@ export interface AgentAuthentication { verified: boolean; method: string; detail
 export interface AgentConfigurationDocument { configuration_version: number; agent: AgentDefinition; permissions: OperatorPermission[]; authentication: AgentAuthentication }
 export interface AgentOnboardingRequest { id: string; backend: string; execution_mode: 'automated' | 'manual'; display_name: string; profile_path: string | null; model: string | null; reasoning_effort: string | null; priority: number; roles: AgentActionProfile['action'][]; permissions: OperatorPermission[]; declared_capabilities: string[] }
 export interface AgentOnboardingResult { preview: { agent: AgentDefinition; provider_capabilities: string[]; permissions: OperatorPermission[]; authentication: AgentAuthentication }; persisted: boolean }
-export interface Dashboard { project_name: string; repository_path: string; queue: QueueReport; tasks: Task[]; agents: AgentDefinition[]; approvals: ApprovalRequest[]; recent_activity: LifecycleEvent[]; running_agents: AgentRun[]; capacity: AgentCapacity; outcome_trends: Record<string, number>; repository_available: boolean }
+export interface TokenUsageSummary { total_tokens: number | null; input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null; cached_input_ratio: number | null; observations_with_usage: number; observations_without_usage: number }
+export interface QuotaObservationSummary { remaining_percent: number | null; reset_at: string | null; checked_at: string | null; source: string | null; freshness: string | null; reserve_percent: number | null; refresh_supported: boolean | null; refresh_error: string | null }
+export interface EconomyResolutionSummary { invocation_id: number; run_id: number; task_id: string | null; purpose: string; action: string | null; attempt: number; timestamp: string; finished_at: string | null; outcome: string; agent: string | null; model: string | null; effort: string | null; tier: EconomyTier; source: string | null; selection_reason: string | null; selection_explanation: string | null; operator_override: boolean; escalation_reason: string | null; quota: QuotaObservationSummary | null; legacy_missing_resolution: boolean }
+export interface ValidationOperationsSummary { state: 'none' | 'running' | 'passing' | 'failing' | 'infrastructure_failure' | 'stale'; recorded_state: string | null; run_id: number | null; timestamp: string | null; latest_passing_run_id: number | null; latest_passing_timestamp: string | null; is_current: boolean | null; worktree_fingerprint: string | null; selected_commands: { command: string; passed: boolean | null; failure_classification: string | null }[]; failure_classification: string | null }
+export interface ReviewOperationsSummary { run_id: number | null; verdict: string | null; timestamp: string | null; applies_to_current_change: boolean | null; ready_for_review: boolean; actionable_blockers: number; unresolved_blockers: number; regressed_blockers: number; resolved_blockers: number }
+export interface ExecutionSummary { id: number; task_id: string | null; agent: string; execution_mode: string; execution_class: string; status: string; phase: string | null; is_active: boolean; started_at: string; finished_at: string | null; last_activity: string; output: string | null; error: string | null; outcome: string | null; failure_category: string | null; duration_ms: number | null; persisted_model: string | null; persisted_effort: string | null; persisted_resolution_source: string; latest_resolution: EconomyResolutionSummary | null; token_usage: TokenUsageSummary }
+export interface TaskOperationsSummary { task_id: string; title: string; objective: string; role: string; priority: Task['priority']; lifecycle: TaskStatus; phase: string; next_step: string; cancellation_reason: string | null; current_run: ExecutionSummary | null; latest_run: ExecutionSummary | null; validation: ValidationOperationsSummary; review: ReviewOperationsSummary; actionable_blocker_count: number; latest_resolution: EconomyResolutionSummary | null; token_usage: TokenUsageSummary }
+export interface TaskEconomySummary { task_id: string; lifecycle: TaskStatus; accepted: boolean; invocation_count: number; invocations_by_tier: Partial<Record<EconomyTier, number>>; escalation_count: number; latest_resolution: EconomyResolutionSummary | null; token_usage: TokenUsageSummary }
+export interface ProjectEconomySummary { invocation_count: number; invocations_by_tier: Partial<Record<EconomyTier, number>>; invocations_by_action: Record<string, number>; escalation_count: number; token_usage: TokenUsageSummary; accepted_tasks: number; accepted_tasks_with_complete_token_usage: number; accepted_tasks_by_tier: Partial<Record<EconomyTier, number>>; accepted_token_usage: TokenUsageSummary; tokens_per_accepted_task: number | null; tasks: TaskEconomySummary[] }
+export interface TaskOperationsDetail { summary: TaskOperationsSummary; task: Task; contract: unknown; execution_condition: { kind: string; details: string; created_at: string } | null; queue: QueueEntry | null; executions: ExecutionSummary[]; resolutions: EconomyResolutionSummary[]; escalations: unknown[]; blockers: unknown[]; activity: unknown[] }
+export interface Dashboard { project_name: string; repository_path: string; queue: QueueReport; tasks: Task[]; agents: AgentDefinition[]; approvals: ApprovalRequest[]; recent_activity: LifecycleEvent[]; running_agents: AgentRun[]; capacity: AgentCapacity; outcome_trends: Record<string, number>; repository_available: boolean; task_operations: TaskOperationsSummary[]; economy: ProjectEconomySummary }
 export interface AgentCapacity { agents: AgentDefinition[]; busy: string[]; quota_reserve_percent: number }
 export interface ApprovalRequest { id: number; reason: string; resolved: boolean }
 export interface ProjectHealth {
@@ -85,14 +96,14 @@ export interface AgentRun {
 }
 export interface ManualRunContext { run: AgentRun; task: Task; task_packet: string }
 export interface ManualWorkspaceInfo { supported: boolean; url: string | null; error: string | null }
-export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null }
+export interface WorkerResult { run_id: number; outcome: string; failure_category: string | null; duration_ms: number | null; metadata: string | null; total_tokens: number | null; input_tokens: number | null; output_tokens: number | null; cached_input_tokens: number | null }
 export interface LifecycleEvent { id: number; timestamp: string; kind: string; task_id: string | null; run_id: number | null; agent_id: string | null; payload: string | null }
 export type ValidationCategory = 'success' | 'formatting' | 'lint' | 'compilation' | 'test' | 'timeout' | 'infrastructure'
 export interface ValidationStepResult { command: string; category: ValidationCategory; passed: boolean; stdout: string; stderr: string; exit_status: number | null; diagnostics: string | null }
 export interface ValidationReport { steps: ValidationStepResult[] }
-export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[]; validation: ValidationReport | null }
-export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[] }
-export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: AgentRun[]; activity: LifecycleEvent[] }
+export interface RunDetails { run: AgentRun; result: WorkerResult | null; activity: LifecycleEvent[]; validation: ValidationReport | null; operations: ExecutionSummary }
+export interface RunsWorkspace { runs: AgentRun[]; details: RunDetails[]; operations: ExecutionSummary[] }
+export interface TaskDetails { task: Task; queue: QueueEntry | null; runs: AgentRun[]; activity: LifecycleEvent[]; operations: TaskOperationsDetail }
 export interface ReviewSummary { task: Task; run: AgentRun | null; result: WorkerResult | null; worktree_path: string | null; changes: { files: { status: string; path: string }[]; stat: string; diff: string }; change_evidence: { files: { status: string; path: string }[]; stat: string; diff: string } | null }
 export interface PlanningRequest { protocol_version: number; kind: string; project: unknown; engineering_contract: string; objective: string; constraints: string[]; target_platforms: string[]; stack: string[]; non_goals: string[]; deliverables: string[]; definition_of_done: string[]; response_schema: unknown; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[]; current_state: unknown; full_report: ProjectReport | null }
 export interface ProjectReport { protocol_version: number; project: { name: string; repository: string; branch: string | null; commit: string | null }; engineering_contract: string; architecture: { modules: string[]; boundaries: string[]; discovery: Record<string, string> }; lifecycle: { counts: Record<string, number>; tasks: { id: string; title: string; status: string }[] }; agents: unknown[]; queue: QueueReport; recent_work: unknown[]; risks: string[]; open_questions: string[]; role_boundaries: string[]; planning_constraints: string[]; approval_requirements: string[] }
@@ -103,6 +114,8 @@ export const api = {
   selectDirectory: async (defaultPath?: string) => open({ directory: true, multiple: false, defaultPath }) as Promise<string | null>,
   snapshot: () => invoke<DesktopSnapshot>('snapshot'),
   tasks: () => invoke<Task[]>('tasks'),
+  taskOperations: (taskId: string) => invoke<TaskOperationsDetail | null>('task_operations', { taskId }),
+  economySummary: () => invoke<ProjectEconomySummary>('economy_summary'),
   agents: () => invoke<AgentDefinition[]>('agents'),
   createTask: (input: CreateTaskInput) => invoke<string>('create_task', { input }),
   configureAgentRecord: (agent: unknown) => invoke<void>('configure_agent_record', { agent }),

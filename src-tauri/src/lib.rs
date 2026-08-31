@@ -307,6 +307,31 @@ fn tasks(state: tauri::State<'_, AppState>) -> Result<Vec<orc::task::Task>, Stri
 }
 
 #[tauri::command]
+fn task_operations(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<Option<orc::operations::TaskOperationsDetail>, String> {
+    state
+        .0
+        .active()?
+        .app()?
+        .task_operations(&task_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn economy_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<orc::operations::ProjectEconomySummary, String> {
+    state
+        .0
+        .active()?
+        .app()?
+        .economy_summary()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn agents(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<orc::registry::AgentDefinition>, String> {
@@ -1034,6 +1059,8 @@ pub fn run() -> anyhow::Result<()> {
             current_project,
             snapshot,
             tasks,
+            task_operations,
+            economy_summary,
             agents,
             create_task,
             configure_agent_record,

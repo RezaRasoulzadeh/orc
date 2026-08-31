@@ -86,6 +86,32 @@ pub struct ProviderResolution {
     pub resolution: ResolutionRecord,
 }
 
+/// Persisted provider-invocation facts for one project. This is an efficient
+/// storage projection, not an operator-facing read model: application code is
+/// responsible for interpreting current/latest semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProviderInvocation {
+    pub task_id: Option<String>,
+    pub invocation: ProviderInvocation,
+    pub resolution: Option<ResolutionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectChangeEvidence {
+    pub run_id: i64,
+    pub captured_at: String,
+    pub changes: crate::git::WorktreeChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectWorktreeMetadata {
+    pub run_id: i64,
+    pub task_id: String,
+    pub branch_name: String,
+    pub worktree_path: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanReview {
     pub id: i64,
@@ -3104,6 +3130,88 @@ impl Database {
         )
     }
 
+    pub fn project_escalation_requests(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<PersistedEscalationRequest>, DbError> {
+        type Raw = (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            usize,
+            String,
+            usize,
+            String,
+            String,
+        );
+        let mut statement = self.conn.prepare(
+            "SELECT e.id, e.task_id, e.trigger, e.reason,
+                    e.previous_provider_invocation_id, e.previous_tier,
+                    e.previous_model, e.previous_effort, e.previous_attempt,
+                    e.requested_minimum_tier, e.policy_attempt, e.status,
+                    e.created_at
+             FROM escalation_requests e
+             JOIN tasks t ON t.id=e.task_id
+             WHERE t.project_id=?1
+             ORDER BY e.id",
+        )?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            })?
+            .collect::<Result<Vec<Raw>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PersistedEscalationRequest {
+                    id: row.0,
+                    task_id: row.1,
+                    request: EscalationRequest {
+                        reason: row.3,
+                        lineage: EscalationLineage {
+                            request_id: Some(row.0),
+                            trigger: EscalationTrigger::parse(&row.2)
+                                .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                            previous_provider_invocation_id: row.4,
+                            previous_tier: EconomyTier::parse(&row.5)
+                                .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                            previous_model: row.6,
+                            previous_effort: row
+                                .7
+                                .map(|value| ReasoningEffort::parse(&value))
+                                .transpose()
+                                .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                            previous_attempt: row.8,
+                            requested_minimum_tier: EconomyTier::parse(&row.9)
+                                .map_err(|error| DbError::Scheduler(error.to_string()))?,
+                            policy_attempt: row.10,
+                        },
+                    },
+                    status: row.11,
+                    created_at: row.12,
+                })
+            })
+            .collect()
+    }
+
     fn escalation_request_query<P: rusqlite::Params>(
         &self,
         suffix: &str,
@@ -3442,6 +3550,215 @@ impl Database {
                 .and_then(|persisted| persisted.resolution.escalation);
         }
         Ok(invocations)
+    }
+
+    /// Load every provider invocation and its immutable resolution for a
+    /// project in one deterministic query. The left join intentionally keeps
+    /// legacy invocations that predate resolution records visible.
+    pub fn project_provider_invocations(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ProjectProviderInvocation>, DbError> {
+        struct Raw {
+            task_id: Option<String>,
+            id: i64,
+            parent_run_id: i64,
+            workflow_id: Option<i64>,
+            workflow_stage: Option<String>,
+            workflow_version: Option<i64>,
+            purpose: String,
+            lineage: String,
+            attempt: usize,
+            started_at: String,
+            finished_at: Option<String>,
+            outcome: String,
+            invocation_effort: Option<String>,
+            invocation_agent: Option<String>,
+            invocation_model: Option<String>,
+            invocation_escalation_reason: Option<String>,
+            total_tokens: Option<i64>,
+            input_tokens: Option<i64>,
+            output_tokens: Option<i64>,
+            cached_input_tokens: Option<i64>,
+            invocation_tier: String,
+            resolution_agent: Option<String>,
+            resolution_model: Option<String>,
+            resolution_effort: Option<String>,
+            resolution_tier: Option<String>,
+            resolution_source: Option<String>,
+            resolution_escalation_reason: Option<String>,
+            resolution_lineage: Option<String>,
+            escalation_id: Option<i64>,
+            escalation_trigger: Option<String>,
+            previous_invocation_id: Option<i64>,
+            previous_tier: Option<String>,
+            previous_model: Option<String>,
+            previous_effort: Option<String>,
+            previous_attempt: Option<usize>,
+            requested_tier: Option<String>,
+            policy_attempt: Option<usize>,
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT a.task_id,
+                    p.id, p.parent_run_id, p.workflow_id, p.workflow_stage,
+                    p.workflow_version, p.purpose, p.lineage, p.attempt,
+                    p.started_at, p.finished_at, p.outcome, p.effort,
+                    p.selected_agent, p.selected_model, p.escalation_reason,
+                    p.total_tokens, p.input_tokens, p.output_tokens,
+                    p.cached_input_tokens, p.tier,
+                    r.selected_agent, r.selected_model, r.effort, r.tier,
+                    r.source, r.escalation_reason, r.input_lineage,
+                    e.id, e.trigger, e.previous_provider_invocation_id,
+                    e.previous_tier, e.previous_model, e.previous_effort,
+                    e.previous_attempt, e.requested_minimum_tier,
+                    e.policy_attempt
+             FROM provider_invocations p
+             JOIN agent_runs a ON a.id=p.parent_run_id
+             LEFT JOIN resolution_records r ON r.provider_invocation_id=p.id
+             LEFT JOIN escalation_requests e ON e.id=p.escalation_request_id
+             WHERE a.project_id=?1
+             ORDER BY p.id",
+        )?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok(Raw {
+                    task_id: row.get(0)?,
+                    id: row.get(1)?,
+                    parent_run_id: row.get(2)?,
+                    workflow_id: row.get(3)?,
+                    workflow_stage: row.get(4)?,
+                    workflow_version: row.get(5)?,
+                    purpose: row.get(6)?,
+                    lineage: row.get(7)?,
+                    attempt: row.get(8)?,
+                    started_at: row.get(9)?,
+                    finished_at: row.get(10)?,
+                    outcome: row.get(11)?,
+                    invocation_effort: row.get(12)?,
+                    invocation_agent: row.get(13)?,
+                    invocation_model: row.get(14)?,
+                    invocation_escalation_reason: row.get(15)?,
+                    total_tokens: row.get(16)?,
+                    input_tokens: row.get(17)?,
+                    output_tokens: row.get(18)?,
+                    cached_input_tokens: row.get(19)?,
+                    invocation_tier: row.get(20)?,
+                    resolution_agent: row.get(21)?,
+                    resolution_model: row.get(22)?,
+                    resolution_effort: row.get(23)?,
+                    resolution_tier: row.get(24)?,
+                    resolution_source: row.get(25)?,
+                    resolution_escalation_reason: row.get(26)?,
+                    resolution_lineage: row.get(27)?,
+                    escalation_id: row.get(28)?,
+                    escalation_trigger: row.get(29)?,
+                    previous_invocation_id: row.get(30)?,
+                    previous_tier: row.get(31)?,
+                    previous_model: row.get(32)?,
+                    previous_effort: row.get(33)?,
+                    previous_attempt: row.get(34)?,
+                    requested_tier: row.get(35)?,
+                    policy_attempt: row.get(36)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let escalation = match (
+                    row.escalation_id,
+                    row.escalation_trigger.as_deref(),
+                    row.previous_invocation_id,
+                    row.previous_tier.as_deref(),
+                    row.previous_attempt,
+                    row.requested_tier.as_deref(),
+                    row.policy_attempt,
+                ) {
+                    (
+                        Some(request_id),
+                        Some(trigger),
+                        Some(previous_provider_invocation_id),
+                        Some(previous_tier),
+                        Some(previous_attempt),
+                        Some(requested_minimum_tier),
+                        Some(policy_attempt),
+                    ) => EscalationTrigger::parse(trigger)
+                        .ok()
+                        .map(|trigger| EscalationLineage {
+                            request_id: Some(request_id),
+                            trigger,
+                            previous_provider_invocation_id,
+                            previous_tier: EconomyTier::parse(previous_tier)
+                                .unwrap_or(EconomyTier::Unknown),
+                            previous_model: row.previous_model.clone(),
+                            previous_effort: row
+                                .previous_effort
+                                .as_deref()
+                                .and_then(|value| ReasoningEffort::parse(value).ok()),
+                            previous_attempt,
+                            requested_minimum_tier: EconomyTier::parse(requested_minimum_tier)
+                                .unwrap_or(EconomyTier::Unknown),
+                            policy_attempt,
+                        }),
+                    _ => None,
+                };
+                let resolution =
+                    row.resolution_agent
+                        .clone()
+                        .map(|selected_agent| ResolutionRecord {
+                            selected_agent,
+                            selected_model: row.resolution_model,
+                            effort: row
+                                .resolution_effort
+                                .as_deref()
+                                .and_then(|value| ReasoningEffort::parse(value).ok()),
+                            tier: row
+                                .resolution_tier
+                                .as_deref()
+                                .and_then(|value| EconomyTier::parse(value).ok())
+                                .unwrap_or(EconomyTier::Unknown),
+                            source: row
+                                .resolution_source
+                                .unwrap_or_else(|| "legacy/no resolution source".into()),
+                            escalation_reason: row.resolution_escalation_reason,
+                            input_lineage: row.resolution_lineage.unwrap_or_else(|| "{}".into()),
+                            escalation: escalation.clone(),
+                        });
+                ProjectProviderInvocation {
+                    task_id: row.task_id,
+                    invocation: ProviderInvocation {
+                        id: row.id,
+                        parent_run_id: row.parent_run_id,
+                        workflow_id: row.workflow_id,
+                        workflow_stage: row.workflow_stage,
+                        workflow_version: row.workflow_version,
+                        purpose: row.purpose,
+                        lineage: row.lineage,
+                        attempt: row.attempt,
+                        started_at: row.started_at,
+                        finished_at: row.finished_at,
+                        outcome: row.outcome,
+                        effort: row
+                            .invocation_effort
+                            .as_deref()
+                            .and_then(|value| ReasoningEffort::parse(value).ok()),
+                        selected_agent: row.invocation_agent,
+                        selected_model: row.invocation_model,
+                        escalation_reason: row.invocation_escalation_reason,
+                        total_tokens: row.total_tokens,
+                        input_tokens: row.input_tokens,
+                        output_tokens: row.output_tokens,
+                        cached_input_tokens: row.cached_input_tokens,
+                        tier: EconomyTier::parse(&row.invocation_tier)
+                            .unwrap_or(EconomyTier::Unknown),
+                        escalation,
+                    },
+                    resolution,
+                }
+            })
+            .collect())
     }
 
     pub fn completed_workflow_provider_run(
@@ -3871,6 +4188,31 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn project_review_blocker_ledger(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ReviewBlockerRecord>, DbError> {
+        let mut stmt = self.conn.prepare("SELECT b.task_id, b.blocker_id, b.run_id, b.requirement_ref, b.evidence, b.severity, b.acceptance_condition, b.status, b.finding, b.first_seen, b.last_seen, b.blocker_key FROM review_blocker_ledger b JOIN tasks t ON t.id=b.task_id WHERE t.project_id=?1 ORDER BY b.task_id, b.first_seen, b.blocker_id")?;
+        Ok(stmt
+            .query_map([project_id], |r| {
+                Ok(ReviewBlockerRecord {
+                    task_id: r.get(0)?,
+                    blocker_id: r.get(1)?,
+                    run_id: r.get(2)?,
+                    requirement_ref: r.get(3)?,
+                    evidence: r.get(4)?,
+                    severity: r.get(5)?,
+                    acceptance_condition: r.get(6)?,
+                    status: r.get(7)?,
+                    finding: r.get(8)?,
+                    first_seen: r.get(9)?,
+                    last_seen: r.get(10)?,
+                    blocker_key: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn review_blocker_observations(
         &self,
         run_id: i64,
@@ -4004,6 +4346,37 @@ impl Database {
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(DbError::from)
+    }
+
+    pub fn project_change_evidence(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ProjectChangeEvidence>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT e.run_id, e.captured_at, e.evidence
+             FROM run_change_evidence e
+             JOIN agent_runs a ON a.id=e.run_id
+             WHERE a.project_id=?1
+             ORDER BY e.run_id",
+        )?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(run_id, captured_at, evidence)| {
+                Ok(ProjectChangeEvidence {
+                    run_id,
+                    captured_at,
+                    changes: serde_json::from_str(&evidence)?,
+                })
+            })
+            .collect()
     }
 
     fn ensure_lead_tables(conn: &Connection) -> Result<(), DbError> {
@@ -5500,7 +5873,7 @@ impl Database {
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks ORDER BY created_at, id",
         )?;
         Ok(stmt
             .query_map([], Self::task_from_row)?
@@ -5509,7 +5882,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: i64) -> Result<Vec<Task>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE project_id = ?1 ORDER BY created_at",
+            "SELECT id, title, objective, role, priority, status, required_capabilities, scope_mode, context_files, expected_changes, cancellation_reason, execution_class, execution_model, reasoning_effort, effort_reason, risk_factors FROM tasks WHERE project_id = ?1 ORDER BY created_at, id",
         )?;
         Ok(stmt
             .query_map(params![project_id], Self::task_from_row)?
@@ -6661,6 +7034,32 @@ impl Database {
         ).optional()?)
     }
 
+    pub fn project_worker_results(&self, project_id: i64) -> Result<Vec<WorkerResult>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT w.run_id, w.outcome, w.failure_category, w.duration_ms, w.metadata,
+                    w.total_tokens, w.input_tokens, w.output_tokens, w.cached_input_tokens
+             FROM worker_results w
+             JOIN agent_runs a ON a.id=w.run_id
+             WHERE a.project_id=?1
+             ORDER BY w.run_id",
+        )?;
+        Ok(statement
+            .query_map([project_id], |row| {
+                Ok(WorkerResult {
+                    run_id: row.get(0)?,
+                    outcome: row.get(1)?,
+                    failure_category: row.get(2)?,
+                    duration_ms: row.get(3)?,
+                    metadata: row.get(4)?,
+                    total_tokens: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    cached_input_tokens: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_agent_run_waiting_external(&self, run_id: i64) -> Result<bool, DbError> {
         Ok(self.conn.execute(
             "UPDATE agent_runs SET status = 'waiting_external' WHERE id = ?1 AND status = 'running'",
@@ -6722,7 +7121,7 @@ impl Database {
 
     pub fn list_agent_runs(&self, project_id: i64, limit: usize) -> Result<Vec<AgentRun>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+            "SELECT id, project_id, task_id, agent, execution_mode, status, output, error, started_at, finished_at, phase, last_activity, execution_class, resolved_model, resolved_reasoning_effort, resolution_source, resolved_profile FROM agent_runs WHERE project_id = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![project_id, limit as i64], Self::agent_run_from_row)?
@@ -6838,6 +7237,31 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn project_worktree_metadata(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ProjectWorktreeMetadata>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT w.agent_run_id, w.task_id, w.branch_name, w.worktree_path,
+                    w.created_at
+             FROM worktree_metadata w
+             JOIN agent_runs a ON a.id=w.agent_run_id
+             WHERE a.project_id=?1
+             ORDER BY w.created_at, w.agent_run_id",
+        )?;
+        Ok(statement
+            .query_map([project_id], |row| {
+                Ok(ProjectWorktreeMetadata {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    branch_name: row.get(2)?,
+                    worktree_path: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn validate_task_purge(&self, id: &str, force: bool) -> Result<(), DbError> {

@@ -175,6 +175,8 @@ pub struct Dashboard {
     pub capacity: AgentCapacity,
     pub outcome_trends: std::collections::BTreeMap<String, usize>,
     pub repository_available: bool,
+    pub task_operations: Vec<crate::operations::TaskOperationsSummary>,
+    pub economy: crate::operations::ProjectEconomySummary,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskDetails {
@@ -182,6 +184,7 @@ pub struct TaskDetails {
     pub queue: Option<crate::queue::QueueEntry>,
     pub runs: Vec<AgentRun>,
     pub activity: Vec<LifecycleEvent>,
+    pub operations: crate::operations::TaskOperationsDetail,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunDetails {
@@ -189,11 +192,13 @@ pub struct RunDetails {
     pub result: Option<WorkerResult>,
     pub activity: Vec<LifecycleEvent>,
     pub validation: Option<crate::validation::ValidationReport>,
+    pub operations: crate::operations::ExecutionSummary,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunsWorkspace {
     pub runs: Vec<AgentRun>,
     pub details: Vec<RunDetails>,
+    pub operations: Vec<crate::operations::ExecutionSummary>,
 }
 
 pub fn runs_workspace(
@@ -211,17 +216,33 @@ pub fn runs_workspace(
             run
         })
         .collect::<Vec<_>>();
+    let operations =
+        crate::operations::ProjectOperations::new(db, ".").execution_summaries(None, limit)?;
+    let worker_results = db
+        .project_worker_results(project)?
+        .into_iter()
+        .map(|result| (result.run_id, result))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut events_by_run = std::collections::HashMap::<i64, Vec<LifecycleEvent>>::new();
+    for event in db.list_lifecycle_events(usize::MAX)? {
+        if let Some(run_id) = event.run_id {
+            events_by_run.entry(run_id).or_default().push(event);
+        }
+    }
     let details = runs
         .iter()
         .map(|run| {
-            let activity = db
-                .list_lifecycle_events_for_run(run.id, activity_limit)?
-                .into_iter()
+            let run_events = events_by_run.get(&run.id).cloned().unwrap_or_default();
+            let activity = run_events
+                .iter()
                 .filter(|event| event.kind != "worker_output")
+                .take(activity_limit)
+                .cloned()
                 .collect();
-            let validation = db
-                .latest_validation_result_for_run(run.id)?
-                .as_deref()
+            let validation = run_events
+                .iter()
+                .find(|event| event.kind == "validation_result")
+                .and_then(|event| event.payload.as_deref())
                 .and_then(|payload| serde_json::from_str(payload).ok());
             Ok(RunDetails {
                 run: {
@@ -229,15 +250,21 @@ pub fn runs_workspace(
                     compact.output = None;
                     compact
                 },
-                result: db.get_worker_result(run.id)?,
+                result: worker_results.get(&run.id).cloned(),
                 activity,
                 validation,
+                operations: operations
+                    .iter()
+                    .find(|summary| summary.id == run.id)
+                    .cloned()
+                    .context("run disappeared from operational read model")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RunsWorkspace {
         runs: compact_runs,
         details,
+        operations,
     })
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -267,19 +294,26 @@ pub fn dashboard(
     const OUTCOME_LIMIT: usize = 50;
     let runs = db.list_agent_runs(project, usize::MAX)?;
     let recent_runs = db.list_agent_runs(project, OUTCOME_LIMIT)?;
+    let worker_results = db
+        .project_worker_results(project)?
+        .into_iter()
+        .map(|result| (result.run_id, result))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut outcome_trends = std::collections::BTreeMap::new();
     for run in &recent_runs {
-        if let Some(result) = db.get_worker_result(run.id)? {
-            *outcome_trends.entry(result.outcome).or_insert(0) += 1;
+        if let Some(result) = worker_results.get(&run.id) {
+            *outcome_trends.entry(result.outcome.clone()).or_insert(0) += 1;
         }
     }
+    let operations = crate::operations::ProjectOperations::new(db, repository_path);
+    let operations_snapshot = operations.snapshot()?;
     Ok(Dashboard {
         project_name: db
             .get_project_name()?
             .unwrap_or_else(|| "unnamed project".into()),
         repository_path: repository_path.display().to_string(),
-        queue: crate::queue::compute_queue(db)?,
-        tasks: db.list_tasks()?,
+        queue: operations_snapshot.queue,
+        tasks: operations.tasks()?,
         agents: db.list_schedulable_agents()?,
         approvals: db.list_approval_requests(project)?,
         recent_activity: db.list_lifecycle_events(activity_limit)?,
@@ -290,21 +324,27 @@ pub fn dashboard(
         capacity: agent_capacity(db)?,
         outcome_trends,
         repository_available: crate::git::is_usable_repository(repository_path),
+        task_operations: operations_snapshot.tasks,
+        economy: operations_snapshot.economy,
     })
 }
 pub fn task_details(
     db: &crate::storage::Database,
+    repository_path: &std::path::Path,
     id: &str,
     activity_limit: usize,
 ) -> Result<Option<TaskDetails>> {
-    let Some(task) = db.get_task(id)? else {
+    let Some(operations) =
+        crate::operations::ProjectOperations::new(db, repository_path).task_detail(id)?
+    else {
         return Ok(None);
     };
     Ok(Some(TaskDetails {
-        task,
-        queue: crate::queue::compute_queue(db)?.find_item(id).cloned(),
+        task: operations.task.clone(),
+        queue: operations.queue.clone(),
         runs: db.list_agent_runs_for_task(id)?,
         activity: db.list_lifecycle_events_for_task(id, activity_limit)?,
+        operations,
     }))
 }
 pub fn run_details(
@@ -324,11 +364,15 @@ pub fn run_details(
         .latest_validation_result_for_run(id)?
         .as_deref()
         .and_then(|payload| serde_json::from_str(payload).ok());
+    let operations = crate::operations::ProjectOperations::new(db, ".")
+        .execution_detail(id)?
+        .context("run disappeared from operational read model")?;
     Ok(Some(RunDetails {
         result: db.get_worker_result(id)?,
         activity,
         validation,
         run,
+        operations,
     }))
 }
 

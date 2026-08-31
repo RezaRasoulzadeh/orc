@@ -150,11 +150,11 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             })?;
             println!("Created task {id}");
         }
-        TaskCommand::List => match Database::open_global(db_path) {
-            Ok(db) => {
-                let tasks = db.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+        TaskCommand::List => match OrcApp::open_global(db_path, ".") {
+            Ok(app) => {
+                let tasks = app.task_operation_summaries()?;
                 for task in tasks {
-                    println!("{}\t{}\t{}", task.id, task.status, task.title);
+                    println!("{}\t{}\t{}", task.task_id, task.lifecycle, task.title);
                 }
             }
             Err(_) => {
@@ -173,9 +173,10 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
             OrcApp::open_global(db_path, ".")?.unblock_non_convergence(&task_id)?;
             println!("Acknowledged non-convergence condition for task {task_id}");
         }
-        TaskCommand::Show { task_id } => match Database::open_global(db_path) {
-            Ok(db) => match db.get_task(&task_id).map_err(|e| anyhow::anyhow!(e))? {
-                Some(task) => {
+        TaskCommand::Show { task_id } => match OrcApp::open_global(db_path, ".") {
+            Ok(app) => match app.task_operations(&task_id)? {
+                Some(detail) => {
+                    let task = &detail.task;
                     println!("ID:           {}", task.id);
                     println!("Title:        {}", task.title);
                     println!("Objective:    {}", task.objective);
@@ -194,7 +195,7 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                     if !task.risk_factors.is_empty() {
                         println!("Risk factors:  {:?}", task.risk_factors);
                     }
-                    if let Some(condition) = db.get_task_execution_condition(&task_id)? {
+                    if let Some(condition) = &detail.execution_condition {
                         println!("Execution condition: {}", condition.kind);
                         println!("Condition details:  {}", condition.details);
                     }
@@ -216,13 +217,37 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                     for path in &task.expected_changes {
                         println!("  {path}");
                     }
-                    let deps = db
-                        .list_task_dependencies(&task_id)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let deps = detail
+                        .queue
+                        .as_ref()
+                        .map(|entry| {
+                            entry
+                                .dependencies
+                                .iter()
+                                .map(|dependency| dependency.task_id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     if deps.is_empty() {
                         println!("Dependencies: none");
                     } else {
                         println!("Dependencies: {}", deps.join(", "));
+                    }
+                    println!("Operational phase: {}", detail.summary.phase);
+                    println!("Next step: {:?}", detail.summary.next_step);
+                    println!("Validation: {:?}", detail.summary.validation.state);
+                    if let Some(resolution) = &detail.summary.latest_resolution {
+                        println!(
+                            "Latest resolution: agent={} model={} effort={} tier={} source={}",
+                            resolution.agent.as_deref().unwrap_or("unknown"),
+                            resolution.model.as_deref().unwrap_or("unknown"),
+                            resolution
+                                .effort
+                                .map(|effort| effort.as_str())
+                                .unwrap_or("unknown"),
+                            resolution.tier.as_str(),
+                            resolution.source.as_deref().unwrap_or("legacy/unknown")
+                        );
                     }
                 }
                 None => eprintln!("Task {} not found", task_id),

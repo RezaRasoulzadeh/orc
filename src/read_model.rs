@@ -166,6 +166,7 @@ pub fn workflow_history(db: &crate::storage::Database) -> Result<Vec<WorkflowHis
 pub struct Dashboard {
     pub project_name: String,
     pub repository_path: String,
+    pub self_hosting: crate::self_hosting::SelfHostingReadiness,
     pub queue: QueueReport,
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentDefinition>,
@@ -312,6 +313,7 @@ pub fn dashboard(
             .get_project_name()?
             .unwrap_or_else(|| "unnamed project".into()),
         repository_path: repository_path.display().to_string(),
+        self_hosting: operations_snapshot.self_hosting,
         queue: operations_snapshot.queue,
         tasks: operations.tasks()?,
         agents: db.list_schedulable_agents()?,

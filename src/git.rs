@@ -77,6 +77,8 @@ fn patches_by_path(changes: &WorktreeChanges) -> std::collections::BTreeMap<&str
 pub fn is_runtime_artifact(path: &str) -> bool {
     RUNTIME_ARTIFACTS.contains(&path)
         || (path.starts_with(".orc/") && path.contains(".agents.db"))
+        || path == ".orc/history"
+        || path.starts_with(".orc/history/")
         || path == ".orc/worktrees"
         || path.starts_with(".orc/worktrees/")
 }
@@ -197,6 +199,8 @@ pub fn inspect_worktree(
         ":(exclude).orc/orc.db-wal".to_owned(),
         ":(exclude).orc/orc.db-shm".to_owned(),
         ":(exclude).orc/*.agents.db*".to_owned(),
+        ":(exclude).orc/history".to_owned(),
+        ":(exclude).orc/history/**".to_owned(),
         ":(exclude).orc/worktrees/**".to_owned(),
     ];
     let mut diff = git_output_owned(worktree, &diff_args)?;
@@ -212,6 +216,8 @@ pub fn inspect_worktree(
         ":(exclude).orc/orc.db-wal".to_owned(),
         ":(exclude).orc/orc.db-shm".to_owned(),
         ":(exclude).orc/*.agents.db*".to_owned(),
+        ":(exclude).orc/history".to_owned(),
+        ":(exclude).orc/history/**".to_owned(),
         ":(exclude).orc/worktrees/**".to_owned(),
     ];
     let mut files = parse_name_status(&git_output_owned(worktree, &names_args)?);
@@ -241,6 +247,8 @@ pub fn inspect_worktree(
             ":(exclude).orc/orc.db-wal".to_owned(),
             ":(exclude).orc/orc.db-shm".to_owned(),
             ":(exclude).orc/*.agents.db*".to_owned(),
+            ":(exclude).orc/history".to_owned(),
+            ":(exclude).orc/history/**".to_owned(),
             ":(exclude).orc/worktrees/**".to_owned(),
         ];
         let mut text = git_output_owned(worktree, &stat_args)?;
@@ -285,6 +293,69 @@ pub fn branch_name_for_task(task_id: &str) -> String {
 /// Format: .orc/worktrees/<task-id>
 pub fn worktree_path_for_task(task_id: &str) -> PathBuf {
     PathBuf::from(".orc/worktrees").join(task_id)
+}
+
+/// Resolve and verify the sole mutation root assigned to a task. Persisted
+/// metadata is not trusted as a filesystem capability: it must name the
+/// canonical task path, resolve to that checkout, and carry the task branch.
+pub fn validate_task_worktree(
+    repository: impl AsRef<Path>,
+    task_id: &str,
+    recorded_path: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    let repository = repository.as_ref();
+    let recorded_path = recorded_path.as_ref();
+    let expected_relative = worktree_path_for_task(task_id);
+    if !recorded_path.is_absolute() && recorded_path != expected_relative {
+        anyhow::bail!(
+            "task {task_id} worktree metadata points outside its assigned worktree: {}",
+            recorded_path.display()
+        );
+    }
+    let expected = repository.join(&expected_relative);
+    let candidate = if recorded_path.is_absolute() {
+        recorded_path.to_path_buf()
+    } else {
+        repository.join(recorded_path)
+    };
+    let expected = expected.canonicalize().with_context(|| {
+        format!(
+            "task {task_id} worktree does not exist at {}",
+            expected.display()
+        )
+    })?;
+    let candidate = candidate.canonicalize().with_context(|| {
+        format!(
+            "task {task_id} recorded worktree does not exist at {}",
+            candidate.display()
+        )
+    })?;
+    if candidate != expected {
+        anyhow::bail!(
+            "task {task_id} worktree metadata resolves to a different checkout: {}",
+            candidate.display()
+        );
+    }
+    let top_level =
+        PathBuf::from(git_output(&candidate, &["rev-parse", "--show-toplevel"])?.trim())
+            .canonicalize()
+            .context("failed to resolve task worktree top level")?;
+    if top_level != expected {
+        anyhow::bail!(
+            "task {task_id} mutation root is not the assigned worktree top level: {}",
+            top_level.display()
+        );
+    }
+    let branch = git_output(&candidate, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let expected_branch = branch_name_for_task(task_id);
+    if branch.trim() != expected_branch {
+        anyhow::bail!(
+            "task {task_id} worktree is on branch '{}' instead of '{}'",
+            branch.trim(),
+            expected_branch
+        );
+    }
+    Ok(candidate)
 }
 
 /// Create a git worktree for a task.
@@ -582,6 +653,8 @@ pub fn commit_worktree_changes(
             ":(exclude).orc/orc.db-wal",
             ":(exclude).orc/orc.db-shm",
             ":(exclude).orc/*.agents.db*",
+            ":(exclude).orc/history",
+            ":(exclude).orc/history/**",
             ":(exclude).orc/worktrees/**",
         ],
     )?;

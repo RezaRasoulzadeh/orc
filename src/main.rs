@@ -422,6 +422,7 @@ fn entry_route(cli: &Cli) -> Result<EntryRoute> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    orc::self_hosting::reject_recursive_invocation()?;
     match entry_route(&cli)? {
         EntryRoute::Desktop => return desktop::launch_desktop(&desktop::DetachedDesktopProcess),
         EntryRoute::Interactive => return orc::interactive::run(),
@@ -489,6 +490,15 @@ fn run(cli: Cli) -> Result<()> {
                 let project = app.operations().project_name()?;
                 if let Some(name) = project {
                     println!("Project: {}", name);
+                    let self_hosting = app.operations().self_hosting_readiness();
+                    println!(
+                        "Self-hosting: {} ({:?})",
+                        if self_hosting.recognized { "yes" } else { "no" },
+                        self_hosting.state
+                    );
+                    for blocker in self_hosting.blocking_guards {
+                        println!("Self-hosting guard: {blocker}");
+                    }
                     let tasks = app.task_operation_summaries()?;
                     println!("Tasks: {}", tasks.len());
                     for task in tasks {

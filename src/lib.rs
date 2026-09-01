@@ -26,6 +26,7 @@ pub mod registry;
 pub mod review;
 pub mod runtime;
 pub mod scheduler;
+pub mod self_hosting;
 pub mod state;
 pub mod storage;
 pub mod task;

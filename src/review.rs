@@ -106,8 +106,12 @@ pub fn build_review(
     };
     let worktree_path = db.get_worktree_metadata(task_id)?.map(|(_, path)| path);
     let changes = match &worktree_path {
-        Some(path) if repo.join(path).exists() => git::inspect_worktree(repo.join(path), repo)?,
-        _ => WorktreeChanges::default(),
+        Some(path) => {
+            let worktree = git::validate_task_worktree(repo, task_id, path)
+                .context("review task worktree failed isolation checks")?;
+            git::inspect_worktree(worktree, repo)?
+        }
+        None => WorktreeChanges::default(),
     };
     let change_evidence = run
         .as_ref()

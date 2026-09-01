@@ -12,6 +12,8 @@ An Orc project is an adopted Git repository. Tasks are durable units of work wit
 
 Project-local state lives under `.orc/`. The authoritative database is `.orc/orc.db`; `.orc/engineering.md` is the worker contract; discovery can add project, architecture, and roadmap documents; and `.orc/worktrees/` contains isolated task checkouts. Keep the database and its SQLite WAL files together.
 
+This repository carries a source-controlled `.orc/project-identity.json` marker. Orc uses it to recognize a future self-hosted run without checkout-path or remote-URL assumptions; `orc status` reports recognition and any readiness guard that blocks execution. Self-hosting does not change economy, model, effort, lifecycle, validation, or review policy.
+
 ## Installation and initialization
 
 Install Rust stable, Cargo, Git, Node.js, and the native Tauri prerequisites. From an Orc checkout, install the CLI and packaged desktop application with:

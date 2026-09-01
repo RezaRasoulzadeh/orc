@@ -34,6 +34,7 @@ Adoption may create these project-owned documents when they are missing:
 | `.orc/project.md` | Human/discovery project summary. |
 | `.orc/architecture.md` | Human/discovery architecture summary. |
 | `.orc/roadmap.md` | Human/discovery roadmap and unknowns. |
+| `.orc/project-identity.json` | Optional source-controlled durable repository identity. Orc's own repository commits the reserved `dev.orc.orchestrator` identity so self-hosting is path- and remote-independent. |
 
 These files are never overwritten by init, adopt, or import. Discovery updates
 the summaries only through its explicit apply operation; it does not replace
@@ -54,3 +55,11 @@ The following remain Orc-owned local runtime state and must stay untracked:
 The database is the authoritative source of persistent Orc project, task,
 agent, run, review, and lifecycle state. Git remains authoritative for source
 files and the project documents that are intentionally committed.
+
+When the committed project identity recognizes Orc itself, `orc status` and
+the project operations snapshot expose self-hosting readiness. Mutation still
+uses the normal scheduler and lifecycle. Execution is blocked if the identity
+is not valid in both HEAD and the working checkout or if the configured root is
+a linked task worktree. Task worktree metadata is verified against the
+canonical `.orc/worktrees/<task-id>` checkout before mutation, validation,
+review, or acceptance.

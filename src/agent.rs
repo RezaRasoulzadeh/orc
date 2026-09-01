@@ -692,7 +692,9 @@ fn run_post_implementation_validation(
     run_id: i64,
     agent_id: &str,
 ) -> Result<PostImplementationValidation> {
-    let changes = git::inspect_worktree(worktree, repo_path)
+    let worktree = git::validate_task_worktree(repo_path, task_id, worktree)
+        .context("validation task worktree failed isolation checks")?;
+    let changes = git::inspect_worktree(&worktree, repo_path)
         .context("failed to capture authoritative post-implementation worktree state")?;
     db.store_change_evidence(run_id, &changes)?;
     let changed_files = changes
@@ -702,7 +704,7 @@ fn run_post_implementation_validation(
         .collect::<Vec<_>>();
     let selection = validation_config.select_for_task(&changed_files, required_validation);
     let report =
-        validation::run_validation_pipeline(validation_runner, &selection.commands, worktree)
+        validation::run_validation_pipeline(validation_runner, &selection.commands, &worktree)
             .unwrap_or_else(|error| {
                 ValidationReport::infrastructure_failure(
                     selection
@@ -729,7 +731,11 @@ fn run_post_implementation_validation(
                 "selected_groups": selection.groups,
                 "selected_commands": selection.commands,
                 "rationale": selection.rationale,
-                "worktree_fingerprint": crate::automated::revision_worktree_fingerprint(&changes),
+                "worktree_fingerprint": crate::automated::validation_evidence_fingerprint(
+                    task_id,
+                    &git::worktree_path_for_task(task_id).to_string_lossy(),
+                    &changes,
+                ),
             })
             .to_string(),
         ),
@@ -1008,7 +1014,7 @@ pub fn build_manual_packet(contract: &str, project: &str, task: &Task, agent_id:
         .unwrap_or_default();
     let completion_schema = crate::worker_protocol::plan_completion_schema();
     format!(
-        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\n## Constraints\n\nStay strictly inside this task's scope. Work in the task worktree printed with this packet. Do not modify unrelated project work or assume access to credentials, private memory, or external systems. Do not run the project's deterministic validation suite; Orc selects and runs it after submission.\n\n## Required response / handoff format\n\nSubmit the structured Worker completion JSON described by this schema. Reported affected files and observations are descriptive only; Orc derives authoritative changes from the task worktree.\n\n{completion_schema}\n",
+        "# Orc Manual Task Packet\n\nAgent ID: {agent_id}\nProject: {project}\n\n{precedence}\n\n## Engineering Contract\n\n{contract}\n\n## Task\n\nTask ID: {id}\nTitle: {title}\nObjective: {objective}\nRole: {role}{execution_contract}\n\n## Constraints\n\nStay strictly inside this task's scope. Work in the task worktree printed with this packet. Do not modify unrelated project work or assume access to credentials, private memory, or external systems. Do not invoke Orc lifecycle commands or treat Orc runtime databases, registries, worktrees, validation artifacts, or lifecycle state as implementation files. Do not run the project's deterministic validation suite; Orc selects and runs it after submission.\n\n## Required response / handoff format\n\nSubmit the structured Worker completion JSON described by this schema. Reported affected files and observations are descriptive only; Orc derives authoritative changes from the task worktree.\n\n{completion_schema}\n",
         precedence = CODER_PROMPT_PRECEDENCE,
         id = task.id,
         title = task.title,
@@ -1163,6 +1169,7 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
     provided_resolution: Option<crate::scheduler::EconomyResolution>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
 
     let project_id = db
@@ -1339,7 +1346,8 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
     }
 
     // Execute the worker in the worktree directory
-    let worktree_dir = repo_path.join(&worktree_path);
+    let worktree_dir = git::validate_task_worktree(repo_path, task_id, &worktree_path)
+        .context("prepared task worktree failed isolation checks")?;
     let before_plan = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect worktree before Worker plan")?;
     let task_contract = db
@@ -1356,7 +1364,7 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
     )?;
     let prompt = crate::execution_packet::render_packet_accounted(
         &format!(
-            "{CODER_PROMPT_PRECEDENCE}\nImplement this task using only the authoritative bounded Dispatch packet below. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Relevant source context and current worktree state were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted plan in order. Do not run the project's validation/test suite, acceptance checks, or reviewer-style verification; Orc owns deterministic validation. Do not emit progress or intermediate completion envelopes. Return one final structured completion envelope after the edit; changed files are derived from the worktree, not self-report."
+            "{CODER_PROMPT_PRECEDENCE}\nImplement this task using only the authoritative bounded Dispatch packet below. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Relevant source context and current worktree state were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted plan in order. Do not run the project's validation/test suite, acceptance checks, reviewer-style verification, or any Orc lifecycle command; Orc owns orchestration and deterministic validation. Do not treat Orc runtime databases, registries, worktrees, validation artifacts, or lifecycle state as implementation files. Do not emit progress or intermediate completion envelopes. Return one final structured completion envelope after the edit; changed files are derived from the worktree, not self-report."
         ),
         &packet.metadata,
         &packet,
@@ -2136,6 +2144,7 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     provided_resolution: Option<crate::scheduler::EconomyResolution>,
 ) -> Result<DispatchSummary> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project_name = db.get_project_name()?.unwrap_or_else(|| "orc".into());
@@ -2188,10 +2197,8 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     let (_, worktree_path) = db
         .get_worktree_metadata(task_id)?
         .context("task has no worktree")?;
-    let worktree_dir = repo_path.join(&worktree_path);
-    if !worktree_dir.exists() {
-        anyhow::bail!("task worktree does not exist: {}", worktree_dir.display());
-    }
+    let worktree_dir = git::validate_task_worktree(repo_path, task_id, &worktree_path)
+        .context("revision task worktree failed isolation checks")?;
     let revision_snapshot = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to inspect revision worktree during Worker PREPARE")?;
     let (proposal, enforce_worker_protocol) =
@@ -2347,7 +2354,7 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     )?;
     let prompt = crate::execution_packet::render_packet_accounted(
         &format!(
-            "{CODER_PROMPT_PRECEDENCE}\nFix only the active unresolved or regressed blockers in this bounded Revision packet. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Preserve unrelated and already-correct behavior. Relevant files and current changes were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted revision plan in order. Do not run the project's validation/test suite or reviewer checks; Orc owns them. Do not emit progress or intermediate completion envelopes. Return one final structured revision handoff after the edit, while Orc treats worktree evidence as authoritative for changed files."
+            "{CODER_PROMPT_PRECEDENCE}\nFix only the active unresolved or regressed blockers in this bounded Revision packet. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Preserve unrelated and already-correct behavior. Relevant files and current changes were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted revision plan in order. Do not run the project's validation/test suite, reviewer checks, or any Orc lifecycle command; Orc owns orchestration and validation. Do not treat Orc runtime databases, registries, worktrees, validation artifacts, or lifecycle state as implementation files. Do not emit progress or intermediate completion envelopes. Return one final structured revision handoff after the edit, while Orc treats worktree evidence as authoritative for changed files."
         ),
         &packet.metadata,
         &packet,
@@ -2724,6 +2731,7 @@ pub fn revise_manual(
     repo_path: impl AsRef<Path>,
 ) -> Result<()> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
     let task = db.get_task(task_id)?.context("task not found in DB")?;
@@ -2766,9 +2774,15 @@ pub fn revise_manual(
         };
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let run_id = db.create_agent_run_with_mode(project_id, task_id, &agent.id, registry::MANUAL)?;
-    if let Some((branch, worktree_path)) = db.get_worktree_metadata(task_id)? {
-        db.store_worktree_metadata(run_id, task_id, &branch, &worktree_path)?;
+    let (branch, worktree_path) = db
+        .get_worktree_metadata(task_id)?
+        .context("manual revision task has no worktree")?;
+    if branch != git::branch_name_for_task(task_id) {
+        anyhow::bail!("manual revision task has invalid worktree branch metadata");
     }
+    git::validate_task_worktree(repo_path, task_id, &worktree_path)
+        .context("manual revision task worktree failed isolation checks")?;
+    db.store_worktree_metadata(run_id, task_id, &branch, &worktree_path)?;
     db.update_task_status(task_id, TaskStatus::Active)?;
     db.set_agent_run_waiting_external(run_id)?;
     if !db.start_revision_execution(run_id, source_review_id)? {
@@ -3130,6 +3144,7 @@ pub fn dispatch_queue(concurrency: Option<usize>) -> Result<DispatchQueueOutcome
 
 pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) -> Result<()> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let task = db.get_task(task_id)?.context("task not found")?;
     if task.status != TaskStatus::AcceptanceReady {
         anyhow::bail!(
@@ -3171,10 +3186,11 @@ pub fn accept_task(db: &Database, task_id: &str, repo_path: impl AsRef<Path>) ->
     let (branch, path) = db
         .get_worktree_metadata(task_id)?
         .context("task has no worktree")?;
-    let worktree = repo_path.join(&path);
-    if !worktree.exists() {
-        anyhow::bail!("task worktree does not exist: {}", worktree.display());
+    if branch != git::branch_name_for_task(task_id) {
+        anyhow::bail!("task {task_id} has invalid worktree branch metadata");
     }
+    let worktree = git::validate_task_worktree(repo_path, task_id, &path)
+        .context("acceptance task worktree failed isolation checks")?;
     let current_changes = git::inspect_worktree(&worktree, repo_path)?;
     if current_changes.files.is_empty() {
         anyhow::bail!("task {task_id} has no meaningful changes to accept");
@@ -3227,6 +3243,7 @@ pub fn dispatch_manual(
     repo_path: impl AsRef<Path>,
 ) -> Result<()> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let contract = contract::load_contract(repo_path.join(ENGINEERING_CONTRACT_PATH))?;
     let project_id = db.get_project_id()?.context("no project found in DB")?;
     let project = db.get_project_name()?.unwrap_or_else(|| "orc".into());
@@ -3243,6 +3260,8 @@ pub fn dispatch_manual(
     }
     let (branch_name, worktree_path) = git::ensure_worktree(task_id, repo_path)
         .context("failed to prepare task worktree for manual dispatch")?;
+    git::validate_task_worktree(repo_path, task_id, &worktree_path)
+        .context("prepared manual task worktree failed isolation checks")?;
     db.update_task_status(task_id, TaskStatus::Active)?;
     let run_id =
         db.create_agent_run_with_mode(project_id, task_id, &agent.id, &agent.execution_mode)?;
@@ -3279,6 +3298,7 @@ pub fn submit_run_with_runner(
     validation_runner: &dyn ValidationRunner,
 ) -> Result<String> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let run = db.get_agent_run(run_id)?.context("run not found")?;
     if run.execution_mode != registry::MANUAL || run.status != "waiting_external" {
         anyhow::bail!("run {} is not a waiting manual run", run_id);
@@ -3300,22 +3320,15 @@ pub fn submit_run_with_runner(
             "invalid manual Worker completion: every step requires a step_id and performed operation"
         );
     }
-    let (_, worktree_path) = db
+    let (branch, worktree_path) = db
         .get_worktree_metadata_for_run(run_id)?
         .or(db.get_worktree_metadata(&task_id)?)
         .context("manual run has no task worktree")?;
-    let worktree_path = PathBuf::from(worktree_path);
-    let absolute_worktree = if worktree_path.is_absolute() {
-        worktree_path
-    } else {
-        repo_path.join(worktree_path)
-    };
-    if !absolute_worktree.exists() {
-        anyhow::bail!(
-            "manual task worktree does not exist: {}",
-            absolute_worktree.display()
-        );
+    if branch != git::branch_name_for_task(&task_id) {
+        anyhow::bail!("manual run has invalid worktree branch metadata");
     }
+    let absolute_worktree = git::validate_task_worktree(repo_path, &task_id, &worktree_path)
+        .context("manual task worktree failed isolation checks")?;
     let current = git::inspect_worktree(&absolute_worktree, repo_path)
         .context("failed to inspect manual submission worktree")?;
     if current.files.is_empty() {
@@ -3420,6 +3433,7 @@ pub fn submit_patch_with_runner(
     validation_runner: &dyn ValidationRunner,
 ) -> Result<PatchSubmissionOutcome> {
     let repo_path = repo_path.as_ref();
+    crate::self_hosting::ensure_execution_ready(repo_path)?;
     let run = db
         .get_agent_run(run_id)?
         .with_context(|| format!("run {} not found", run_id))?;
@@ -3461,6 +3475,11 @@ pub fn submit_patch_with_runner(
     // Ensure task worktree exists
     let (branch_name, worktree_path) = match db.get_worktree_metadata(&task_id)? {
         Some((branch, path_str)) if repo_path.join(&path_str).exists() => {
+            if branch != git::branch_name_for_task(&task_id) {
+                anyhow::bail!("task {task_id} has invalid worktree branch metadata");
+            }
+            git::validate_task_worktree(repo_path, &task_id, &path_str)
+                .context("persisted patch worktree failed isolation checks")?;
             (branch, PathBuf::from(path_str))
         }
         _ => {
@@ -3478,7 +3497,8 @@ pub fn submit_patch_with_runner(
     )
     .context("failed to store worktree metadata for patch submission")?;
 
-    let absolute_worktree = repo_path.join(&worktree_path);
+    let absolute_worktree = git::validate_task_worktree(repo_path, &task_id, &worktree_path)
+        .context("patch task worktree failed isolation checks")?;
 
     // 1. Validate patch against worktree (git apply --check)
     if let Err(e) = git::validate_patch(&absolute_worktree, patch_content) {

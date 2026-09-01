@@ -980,6 +980,7 @@ impl OrcApp {
         backend: &dyn crate::automated::ActionBackend,
         validation_runner: &dyn crate::validation::ValidationRunner,
     ) -> Result<(i64, crate::automated::ReviewResult)> {
+        crate::self_hosting::ensure_execution_ready(&self.repo_path)?;
         let summary = self.review(task_id)?;
         crate::automated::run_review(
             &self.db,
@@ -1009,6 +1010,7 @@ impl OrcApp {
         overrides: &crate::automated::ActionOverrides,
         backend: &dyn crate::automated::ActionBackend,
     ) -> Result<(i64, crate::automated::ReviewResult)> {
+        crate::self_hosting::ensure_execution_ready(&self.repo_path)?;
         let summary = self.review(task_id)?;
         crate::automated::run_project_review(&self.db, &summary, overrides, backend)
     }

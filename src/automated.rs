@@ -589,6 +589,22 @@ pub fn revision_worktree_fingerprint(changes: &crate::git::WorktreeChanges) -> S
     format!("rev-{hash:016x}")
 }
 
+/// Fingerprint deterministic validation against both the implementation diff
+/// and the task mutation root it was produced from.
+pub fn validation_evidence_fingerprint(
+    task_id: &str,
+    worktree_path: &str,
+    changes: &crate::git::WorktreeChanges,
+) -> String {
+    let value = serde_json::to_vec(&(task_id, worktree_path, changes))
+        .expect("validation evidence is serializable");
+    let mut hash: u64 = 14695981039346656037;
+    for byte in value {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+    }
+    format!("validation-{hash:016x}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionHandoff {
@@ -1836,7 +1852,7 @@ fn require_fresh_passing_validation(db: &Database, summary: &ReviewSummary) -> R
         .and_then(|value| {
             serde_json::from_str(&value).context("persisted validation selection is invalid")
         })?;
-    let current = revision_worktree_fingerprint(&summary.changes);
+    let current = validation_evidence_fingerprint(&summary.task.id, worktree, &summary.changes);
     if selection["worktree_fingerprint"].as_str() != Some(current.as_str()) {
         bail!(
             "review validation evidence is stale for the current worktree; return to implementation-stage validation"
@@ -3612,7 +3628,7 @@ commands = ["npm run typecheck", "npm run build"]
     }
 
     #[test]
-    fn review_rejects_stale_manual_validation_before_provider_invocation() {
+    fn review_rejects_validation_from_a_different_worktree_before_provider_invocation() {
         let (db, mut summary, backend, directory) = validation_review_fixture(
             serde_json::json!({
                 "verdict": "PASS", "findings": [], "blocking_findings": [],
@@ -3650,7 +3666,11 @@ commands = ["npm run typecheck", "npm run build"]
             Some(&report_json),
         )
         .unwrap();
-        let fingerprint = revision_worktree_fingerprint(&summary.changes);
+        let fingerprint = validation_evidence_fingerprint(
+            &summary.task.id,
+            summary.worktree_path.as_deref().unwrap(),
+            &summary.changes,
+        );
         db.record_lifecycle_event(
             "validation_selection",
             Some(&summary.task.id),
@@ -3661,7 +3681,7 @@ commands = ["npm run typecheck", "npm run build"]
         .unwrap();
         summary.run = db.get_agent_run(run).unwrap();
         summary.validation_evidence = Some(report_json);
-        summary.changes.diff = "new current worktree state".into();
+        summary.worktree_path = Some("different-worktree".into());
 
         let error = run_review(
             &db,

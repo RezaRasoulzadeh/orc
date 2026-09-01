@@ -357,6 +357,7 @@ pub struct ProjectEconomySummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectOperationsSnapshot {
+    pub self_hosting: crate::self_hosting::SelfHostingReadiness,
     pub queue: QueueReport,
     pub tasks: Vec<TaskOperationsSummary>,
     pub economy: ProjectEconomySummary,
@@ -392,6 +393,10 @@ impl<'a> ProjectOperations<'a> {
         Ok(self.db.get_project_name()?)
     }
 
+    pub fn self_hosting_readiness(&self) -> crate::self_hosting::SelfHostingReadiness {
+        crate::self_hosting::inspect(&self.repository_path)
+    }
+
     pub fn tasks(&self) -> Result<Vec<Task>> {
         // This compatibility read remains valid before the first project is
         // initialized. Project-scoped operational summaries intentionally
@@ -416,6 +421,7 @@ impl<'a> ProjectOperations<'a> {
             .map(|task| self.task_summary_from_facts(task, &facts))
             .collect::<Result<Vec<_>>>()?;
         Ok(ProjectOperationsSnapshot {
+            self_hosting: self.self_hosting_readiness(),
             queue: facts.queue.clone(),
             tasks,
             economy: self.economy_summary_from_facts(&facts),
@@ -895,7 +901,8 @@ impl<'a> ProjectOperations<'a> {
             .as_ref()
             .and_then(|value| value["worktree_fingerprint"].as_str())
             .map(str::to_owned);
-        let current_fingerprint = self.current_fingerprint(task, run, facts);
+        let current_fingerprint =
+            self.current_fingerprint(task, run, facts, fingerprint.as_deref());
         let is_current = match (fingerprint.as_deref(), current_fingerprint.as_deref()) {
             (Some(persisted), Some(current)) => Some(persisted == current),
             (_, _) if task.status == TaskStatus::Done => Some(true),
@@ -975,8 +982,9 @@ impl<'a> ProjectOperations<'a> {
     fn current_fingerprint(
         &self,
         task: &Task,
-        run: &AgentRun,
+        _run: &AgentRun,
         facts: &ProjectFacts,
+        persisted_fingerprint: Option<&str>,
     ) -> Option<String> {
         let metadata = facts
             .worktrees
@@ -992,13 +1000,20 @@ impl<'a> ProjectOperations<'a> {
             if path.exists()
                 && let Ok(changes) = crate::git::inspect_worktree(&path, &self.repository_path)
             {
-                return Some(crate::automated::revision_worktree_fingerprint(&changes));
+                return Some(
+                    if persisted_fingerprint.is_some_and(|value| value.starts_with("rev-")) {
+                        crate::automated::revision_worktree_fingerprint(&changes)
+                    } else {
+                        crate::automated::validation_evidence_fingerprint(
+                            &task.id,
+                            &metadata.worktree_path,
+                            &changes,
+                        )
+                    },
+                );
             }
         }
-        facts
-            .changes
-            .get(&run.id)
-            .map(|evidence| crate::automated::revision_worktree_fingerprint(&evidence.changes))
+        None
     }
 
     fn review_summary(

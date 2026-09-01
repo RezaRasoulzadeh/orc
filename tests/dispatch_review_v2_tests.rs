@@ -3982,10 +3982,14 @@ commands = ["frontend-check"]
         serde_json::json!(["frontend-check", "rust-check"])
     );
     let (_, worktree_path) = db.get_worktree_metadata(&task).unwrap().unwrap();
-    let current = git::inspect_worktree(dir.path().join(worktree_path), dir.path()).unwrap();
+    let current = git::inspect_worktree(dir.path().join(&worktree_path), dir.path()).unwrap();
     assert_eq!(
         selection["worktree_fingerprint"],
-        serde_json::json!(orc::automated::revision_worktree_fingerprint(&current))
+        serde_json::json!(orc::automated::validation_evidence_fingerprint(
+            &task,
+            &worktree_path,
+            &current,
+        ))
     );
     assert!(db.pending_escalation_request(&task).unwrap().is_none());
 }

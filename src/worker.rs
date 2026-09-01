@@ -532,6 +532,7 @@ impl CopilotWorker {
             command.env("COPILOT_HOME", copilot_home);
         }
         backend::configure_noninteractive(&mut command, cwd);
+        crate::self_hosting::mark_mutation_process(&mut command, cwd);
         command
     }
 }
@@ -996,7 +997,7 @@ impl CodexWorker {
         let isolation = (self.sandbox == "workspace-write")
             .then(|| isolated_codex_execution_directory("mutation"))
             .transpose()?;
-        let command = match isolation.as_deref() {
+        let mut command = match isolation.as_deref() {
             Some(directory) => self.command_with_schema_and_access(
                 prompt,
                 directory,
@@ -1005,6 +1006,9 @@ impl CodexWorker {
             ),
             None => self.command_with_schema(prompt, cwd, schema_path),
         };
+        if repository_access.is_some() {
+            crate::self_hosting::mark_mutation_process(&mut command, cwd);
+        }
         let result = run_command_with_timeout_progress_and_stdin_cancel(
             command,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
@@ -1465,6 +1469,7 @@ impl Worker for AntigravityWorker {
         let mut command = std::process::Command::new("agy");
         command.args(Self::command_args(prompt));
         backend::configure_noninteractive(&mut command, cwd);
+        crate::self_hosting::mark_mutation_process(&mut command, cwd);
         match run_command_with_timeout_progress(
             command,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
@@ -1509,6 +1514,7 @@ impl Worker for AntigravityWorker {
         let mut command = std::process::Command::new("agy");
         command.args(Self::command_args(prompt));
         backend::configure_noninteractive(&mut command, cwd);
+        crate::self_hosting::mark_mutation_process(&mut command, cwd);
         let output = run_command_with_timeout_progress_and_cancel(
             command,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),

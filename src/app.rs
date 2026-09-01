@@ -1077,6 +1077,26 @@ impl OrcApp {
         self.revise_with_agent_selection(task_id, feedback, agent_id, true)
     }
 
+    /// Revise with the most recent implementation agent as a constrained
+    /// scheduler preference. This is the no-override application path shared
+    /// by presentation clients; semantic Review runs are never mistaken for
+    /// implementation-agent selection.
+    pub fn revise_with_previous_agent(&self, task_id: &str, feedback: &str) -> Result<()> {
+        let agent = self
+            .db
+            .list_agent_runs_for_task(task_id)?
+            .into_iter()
+            .find(|run| {
+                matches!(
+                    run.execution_class.as_str(),
+                    "coder" | "reviewer" | "architect" | "researcher" | "general"
+                )
+            })
+            .map(|run| run.agent)
+            .context("task has no prior implementation agent run for revision")?;
+        self.revise_constrained(task_id, feedback, &agent)
+    }
+
     pub(crate) fn revise_constrained(
         &self,
         task_id: &str,

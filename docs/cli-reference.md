@@ -1,6 +1,6 @@
 # CLI reference
 
-This is the complete command surface for the `orc` binary (v0.3.0). Every top-level command and subcommand is listed with its arguments, flags, and behavior. Run `orc --help` or `orc <command> --help` for the same information from the binary itself.
+This is the complete command surface for the `orc` binary (v0.3.0-beta.1). Every top-level command and subcommand is listed with its arguments, flags, and behavior. Run `orc --help` or `orc <command> --help` for the same information from the binary itself.
 
 Conventions used below:
 - `TASK_ID` refers to a task identifier such as `T-0001`.
@@ -22,6 +22,12 @@ Launches the installed desktop application and returns immediately. Cannot be co
 
 ### `orc` (no command)
 With no subcommand and without `--ui`, Orc launches an interactive session in the current terminal: a persistent REPL that accepts the same commands as one-shot invocations (without the leading `orc`), and renders confirmations, selections, progress, and results through the same `Runtime` request/event boundary the desktop application uses. Exit with `exit`, `quit`, or Ctrl-D.
+
+### `orc tui`
+
+Launches the beta full-screen terminal interface for the current initialized project. The queue and task-detail views are read-only until an explicit action key is pressed. Up/Down or `j`/`k` move or scroll, Enter opens task detail, `r` refreshes while preserving selection when possible, Esc returns from detail or exits the main screen, and `q` exits from the main screen.
+
+The footer exposes an action only when the selected task's canonical operational next step permits it: `d` dispatches, `v` runs automated semantic Review, `e` prompts for revision feedback and revises with the prior run's constrained agent selection, and `a` accepts. These invoke the same application methods as one-shot commands and never chain Review or acceptance automatically. Requeue/unblock, task editing, manual-run submission, full diffs/transcripts, and workflow/Lead/plan controls are not included in this beta slice. Provider work runs synchronously; the TUI displays the running action, suppresses duplicate invocation, refreshes afterward, and reports concise errors.
 
 ## Project and health
 

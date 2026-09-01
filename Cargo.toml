@@ -1,6 +1,6 @@
 [package]
 name = "orc"
-version = "0.3.0"
+version = "0.3.0-beta.1"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,8 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing", "local-
 # primitives rather than owning terminal modes and key decoding in Orc.
 rustyline = "17"
 dialoguer = "0.11"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

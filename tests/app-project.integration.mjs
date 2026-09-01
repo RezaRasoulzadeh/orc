@@ -42,6 +42,11 @@ function apiHarness(options = {}) {
     openProject: async id => { calls.push(`openProject:${id}`); if (!options.failActivation) current = registeredProject },
     closeProject: async () => { calls.push('closeProject'); current = null },
     snapshot: async () => { calls.push('snapshot'); return options.snapshot ? options.snapshot() : { dashboard: { tasks: [], queue: {}, agents: [], running_agents: [], project_name: 'orc', repository_path: '/repo', repository_available: true, capacity: { busy: [], agents: [], quota_reserve_percent: 0 }, recent_activity: [], outcome_trends: {} }, health: { task_counts: {}, unresolved_approvals: 0 } } },
+    taskDetails: async id => { calls.push(`taskDetails:${id}`); return options.taskDetails ? options.taskDetails(id) : null },
+    taskAction: async (action, id, reason, agentId) => { calls.push(`taskAction:${action}:${id}${reason ? `:${reason}` : ''}`); return options.taskAction ? options.taskAction(action, id, reason, agentId) : undefined },
+    review: async id => { calls.push(`review:${id}`); return options.review ? options.review(id) : null },
+    agents: async () => { calls.push('agents'); return options.agents ? options.agents() : [] },
+    configureAgentAction: async (id, action, enabled) => { calls.push(`configureAgentAction:${id}:${action}:${enabled}`); return options.configureAgentAction ? options.configureAgentAction(id, action, enabled) : undefined },
     runsWorkspace: async () => { calls.push('runsWorkspace'); return options.runsWorkspace ? options.runsWorkspace() : { runs: [], details: [] } },
     runDetails: async id => { calls.push(`runDetails:${id}`); return options.runDetails ? options.runDetails(id) : null },
     reviewRun: async id => { calls.push(`reviewRun:${id}`); return options.reviewRun ? options.reviewRun(id) : null },
@@ -83,6 +88,8 @@ function nodes(root) {
 
 function textContent(node) { if (node.type === 'comment') return ''; return `${node.text ?? ''}${(node.children ?? []).map(textContent).join('')}` }
 function findButton(root, label) { const all = nodes(root); const button = all.find(node => node.type === 'button' && textContent(node).trim() === label); assert.ok(button, `button ${label} is rendered; found ${all.filter(node => node.type === 'button').map(textContent).join(', ')}`); return button }
+function findButtonContaining(root, label) { const all = nodes(root); const button = all.find(node => node.type === 'button' && textContent(node).includes(label)); assert.ok(button, `button containing ${label} is rendered`); return button }
+function buttonLabels(root) { return nodes(root).filter(node => node.type === 'button').map(node => textContent(node).trim()) }
 function findNavButton(root, label) { const button = nodes(root).find(node => node.type === 'button' && textContent(node).trim().endsWith(label)); assert.ok(button, `navigation button ${label} is rendered`); return button }
 function rendered(root, selector) { return nodes(root).some(node => node.props?.class?.split?.(' ').includes(selector)) }
 async function settle() { for (let index = 0; index < 8; index++) { await Promise.resolve(); await nextTick() } }
@@ -91,6 +98,52 @@ async function click(root, label) { await findButton(root, label).props.onClick(
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 function emitRunEvent(type = 'started', projectId = registeredProject.id, runId = 1) { globalThis.__orcRunEvent({ payload: { project_id: projectId, event: { type, event: { id: Date.now(), run_id: runId, task_id: 'T-1', kind: type, timestamp: '2026-01-01 00:00:00', payload: null } } } }) }
 function setInput(root, index, value) { const input = nodes(root).filter(node => node.type === 'input')[index]; assert.ok(input); input.value = value; input.props.oninput({ target: input }) }
+function setTextarea(root, value) { const input = nodes(root).find(node => node.type === 'textarea'); assert.ok(input); input.value = value; input.props.oninput({ target: input }) }
+async function submitVisibleForm(root) { const form = nodes(root).find(node => node.type === 'form' && typeof node.props?.onSubmit === 'function'); assert.ok(form); await form.props.onSubmit({ preventDefault() {} }) }
+
+function canonicalTask(id, status, nextStep, verdict = null) {
+  const task = { id, title: `Task ${id}`, objective: `Objective ${id}`, role: 'developer', priority: 'normal', status, cancellation_reason: null, required_capabilities: [], scope_mode: null, context_files: [], expected_changes: [], reasoning_effort: null, effort_reason: null, risk_factors: [] }
+  const entry = { task, category: status, dependencies: [], waiting_on: [], blocking_reasons: [], active_agent: null, recommended_agent: 'luna' }
+  return {
+    entry,
+    details: {
+      task,
+      queue: entry,
+      runs: [],
+      activity: [],
+      operations: {
+        task,
+        queue: entry,
+        contract: {},
+        execution_condition: null,
+        executions: [],
+        resolutions: [],
+        escalations: [],
+        blockers: status === 'revision_required' ? [{ id: 'B-1', key: 'criterion', state: 'unresolved', actionable: true, summary: 'Criterion is not satisfied', requirement: 'criterion', evidence: 'diff', severity: 'blocking', acceptance_condition: 'criterion passes', originating_review_run_id: 7, first_seen: '', last_seen: '' }] : [],
+        review_criteria: verdict ? [{ criterion_id: 'criterion-1', criterion: 'Canonical behavior', status: verdict === 'PASS' ? 'satisfied' : 'violated', evidence: [{ kind: 'validation', reference: 'cargo test', explanation: 'passes' }], rationale: 'Persisted criterion result', originating_review_run_id: 7 }] : [],
+        activity: [],
+        summary: {
+          task_id: id,
+          title: task.title,
+          objective: task.objective,
+          role: task.role,
+          priority: task.priority,
+          lifecycle: status,
+          phase: status,
+          next_step: nextStep,
+          cancellation_reason: null,
+          current_run: null,
+          latest_run: null,
+          validation: { state: status === 'review' ? 'passing' : 'stale', recorded_state: 'passing', run_id: 4, timestamp: '', latest_passing_run_id: 4, latest_passing_timestamp: '', is_current: status === 'review', worktree_fingerprint: 'exact-diff', selected_commands: [{ command: 'cargo test', passed: true, failure_classification: null }], failure_classification: null },
+          review: { run_id: verdict ? 7 : null, verdict, timestamp: null, applies_to_current_change: verdict ? true : null, ready_for_review: status === 'review', actionable_blockers: status === 'revision_required' ? 1 : 0, unresolved_blockers: status === 'revision_required' ? 1 : 0, regressed_blockers: 0, resolved_blockers: 0, total_criteria: verdict ? 1 : 0, satisfied_criteria: verdict === 'PASS' ? 1 : 0, violated_criteria: verdict === 'REVISE' ? 1 : 0, insufficient_evidence_criteria: 0 },
+          actionable_blocker_count: status === 'revision_required' ? 1 : 0,
+          latest_resolution: { invocation_id: 8, run_id: 7, task_id: id, purpose: 'review', action: 'review', attempt: 1, timestamp: '', finished_at: '', outcome: 'completed', agent: 'luna', model: 'cheap-model', effort: 'Low', tier: 'default', source: 'agent', selection_reason: 'cheapest eligible tier', selection_explanation: null, operator_override: false, escalation_reason: null, quota: null, context: null, token_usage: { total_tokens: null, input_tokens: null, cached_input_tokens: null, uncached_input_tokens: null, output_tokens: null, cached_input_ratio: null, observations_with_usage: 0, observations_without_usage: 1 }, unattributed_input_cost: false, context_attribution_status: 'not_reported', legacy_missing_resolution: false },
+          token_usage: { total_tokens: null, input_tokens: null, cached_input_tokens: null, uncached_input_tokens: null, output_tokens: null, cached_input_ratio: null, observations_with_usage: 0, observations_without_usage: 1 },
+        },
+      },
+    },
+  }
+}
 let sequence = Promise.resolve()
 function serial(name, run) { test(name, async () => { const previous = sequence; let release; sequence = new Promise(resolve => { release = resolve }); await previous; try { await run() } finally { release() } }) }
 
@@ -280,6 +333,107 @@ serial('complete worker activity remains lazy and cached while worker events upd
   await activity.props.onToggle({ target: { open: true } })
   await settle()
   assert.equal(api.calls.filter(call => call === 'workerLog:1').length, 1)
+  app.unmount()
+})
+
+serial('task workspace follows canonical next steps and keeps validation Review economy and readiness distinct', async () => {
+  const ready = canonicalTask('T-DISPATCH', 'ready', 'dispatch')
+  const review = canonicalTask('T-REVIEW', 'review', 'run_semantic_review')
+  const acceptance = canonicalTask('T-ACCEPT', 'acceptance_ready', 'accept', 'PASS')
+  const revision = canonicalTask('T-REVISE', 'revision_required', 'revise', 'REVISE')
+  const queue = { ready: [ready.entry], blocked: [], active: [], review: [review.entry], acceptance_ready: [acceptance.entry], revision_required: [revision.entry], done: [], cancelled: [], backlog: [] }
+  const details = new Map([[ready.entry.task.id, ready.details], [review.entry.task.id, review.details], [acceptance.entry.task.id, acceptance.details], [revision.entry.task.id, revision.details]])
+  const api = apiHarness({
+    current: registeredProject,
+    snapshot: async () => ({
+      dashboard: {
+        tasks: [...details.values()].map(item => item.task),
+        task_operations: [...details.values()].map(item => item.operations.summary),
+        queue,
+        agents: [],
+        running_agents: [],
+        project_name: 'orc',
+        repository_path: '/repo',
+        repository_available: true,
+        capacity: { busy: [], agents: [], quota_reserve_percent: 0 },
+        recent_activity: [],
+        outcome_trends: {},
+        self_hosting: { recognized: true, repository_id: 'dev.orc.orchestrator', state: 'blocked', blocking_guards: ['identity must be committed'] },
+        economy: { invocation_count: 1, invocations_by_tier: { default: 1 }, invocations_by_action: { review: 1 }, escalation_count: 0, token_usage: { total_tokens: null, input_tokens: null, cached_input_tokens: null, uncached_input_tokens: null, output_tokens: null, cached_input_ratio: null, observations_with_usage: 0, observations_without_usage: 1 }, accepted_tasks: 0, accepted_tasks_with_complete_token_usage: 0, accepted_tasks_by_tier: {}, accepted_token_usage: { total_tokens: null, input_tokens: null, cached_input_tokens: null, uncached_input_tokens: null, output_tokens: null, cached_input_ratio: null, observations_with_usage: 0, observations_without_usage: 0 }, tokens_per_accepted_task: null, invocations_with_context: 0, average_packet_bytes: null, context_attribution_coverage: 0, context_by_action: {}, context_cost_outliers: [], tasks: [] },
+      },
+      health: { task_counts: { review: 1, acceptance_ready: 1, revision_required: 1 }, active_runs: 0, unresolved_approvals: 0 },
+    }),
+    taskDetails: async id => details.get(id),
+  })
+  const app = mountApp()
+  await settle()
+  assert.match(textContent(app.root), /SELF-HOSTING BLOCKED/)
+  assert.match(textContent(app.root), /identity must be committed/)
+
+  await findNavButton(app.root, 'Tasks').props.onClick()
+  await findButtonContaining(app.root, 'T-DISPATCH').props.onClick()
+  await settle()
+  assert.ok(buttonLabels(app.root).includes('DISPATCH'))
+  assert.equal(buttonLabels(app.root).includes('RUN REVIEW'), false)
+  await click(app.root, 'DISPATCH')
+  assert.equal(api.calls.some(call => call === 'taskAction:dispatch:T-DISPATCH'), false)
+  await click(app.root, 'CONFIRM')
+  assert.equal(api.calls.some(call => call === 'taskAction:dispatch:T-DISPATCH'), true)
+  assert.equal(api.calls.some(call => call === 'taskAction:review:T-DISPATCH'), false)
+
+  await findButtonContaining(app.root, 'T-REVIEW').props.onClick()
+  await settle()
+  assert.ok(buttonLabels(app.root).includes('RUN REVIEW'))
+  assert.equal(buttonLabels(app.root).includes('ACCEPT'), false)
+  assert.equal(buttonLabels(app.root).includes('REVISE'), false)
+  assert.match(textContent(app.root), /Passing · current for the exact worktree\/diff/)
+  assert.match(textContent(app.root), /Verdict: not run/)
+  assert.match(textContent(app.root), /cheap-model/)
+  const detailLoads = api.calls.filter(call => call === 'taskDetails:T-REVIEW').length
+  await click(app.root, 'REFRESH ↻')
+  assert.equal(api.calls.filter(call => call === 'taskDetails:T-REVIEW').length, detailLoads + 1)
+  await click(app.root, 'RUN REVIEW')
+  assert.equal(api.calls.some(call => call === 'taskAction:review:T-REVIEW'), false)
+  await click(app.root, 'CONFIRM')
+  assert.equal(api.calls.some(call => call === 'taskAction:review:T-REVIEW'), true)
+  assert.equal(api.calls.some(call => call === 'taskAction:accept:T-REVIEW'), false)
+
+  await findButtonContaining(app.root, 'T-ACCEPT').props.onClick()
+  await settle()
+  assert.ok(buttonLabels(app.root).includes('ACCEPT'))
+  assert.equal(buttonLabels(app.root).includes('RUN REVIEW'), false)
+  assert.equal(api.calls.some(call => call === 'taskAction:accept:T-ACCEPT'), false)
+  await click(app.root, 'ACCEPT')
+  assert.equal(api.calls.some(call => call === 'taskAction:accept:T-ACCEPT'), false)
+  await click(app.root, 'CONFIRM')
+  assert.equal(api.calls.some(call => call === 'taskAction:accept:T-ACCEPT'), true)
+
+  await findButtonContaining(app.root, 'T-REVISE').props.onClick()
+  await settle()
+  assert.ok(buttonLabels(app.root).includes('REVISE'))
+  assert.equal(buttonLabels(app.root).includes('DISPATCH'), false)
+  assert.equal(buttonLabels(app.root).includes('ACCEPT'), false)
+  assert.match(textContent(app.root), /Criterion is not satisfied/)
+  assert.match(textContent(app.root), /Stale · stale for the current worktree\/diff/)
+  await click(app.root, 'REVISE')
+  setTextarea(app.root, 'Address the persisted criterion blocker')
+  await submitVisibleForm(app.root)
+  assert.equal(api.calls.some(call => call.startsWith('taskAction:revise:T-REVISE')), false)
+  await click(app.root, 'CONFIRM')
+  assert.ok(api.calls.includes('taskAction:revise:T-REVISE:Address the persisted criterion blocker'))
+  app.unmount()
+})
+
+serial('agent action controls honor the Rust serialized role casing', async () => {
+  const agent = { id: 'worker', backend: 'codex', execution_mode: 'automated', display_name: 'Worker', enabled: true, priority: 0, capabilities: ['code'], status: 'available', unavailable_reason: null, profile_path: null, model: null, reasoning_effort: null, config_metadata: null, quota_remaining_percent: null, quota_reset_at: null, quota_checked_at: null, quota_source: null, quota_limits: null, actions: ['Code'] }
+  const api = apiHarness({ current: registeredProject, agents: async () => [agent] })
+  const app = mountApp()
+  await settle()
+  await findNavButton(app.root, 'Agents').props.onClick()
+  await settle()
+  assert.ok(buttonLabels(app.root).includes('✓ CODE'))
+  await click(app.root, '✓ CODE')
+  assert.ok(api.calls.includes('configureAgentAction:worker:code:false'))
   app.unmount()
 })
 

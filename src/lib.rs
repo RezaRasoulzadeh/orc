@@ -30,6 +30,7 @@ pub mod self_hosting;
 pub mod state;
 pub mod storage;
 pub mod task;
+pub mod tui;
 pub mod validation;
 pub mod worker;
 pub mod worker_protocol;

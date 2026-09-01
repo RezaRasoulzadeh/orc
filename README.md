@@ -1,6 +1,6 @@
 # Orc
 
-Orc v0.3.0 is a local, operator-controlled orchestrator for AI-assisted engineering. It keeps project, task, agent, run, approval, and lifecycle state in SQLite, uses Git worktrees to isolate dispatched work, and exposes the same state through a CLI and a Tauri desktop application.
+Orc v0.3.0-beta.1 is a local, operator-controlled orchestrator for AI-assisted engineering. It keeps project, task, agent, run, approval, and lifecycle state in SQLite, uses Git worktrees to isolate dispatched work, and exposes the same state through CLI, beta TUI, and Tauri desktop clients. See the [beta release notes](RELEASE_NOTES.md) for supported boundaries and known limitations.
 
 Orc orchestrates external AI providers; it is not an AI model or provider. Provider credentials remain with the provider's own CLI or service. Orc does not silently plan, dispatch, apply patches, merge work, or mutate project state on an AI provider's behalf.
 
@@ -37,6 +37,7 @@ orc status
 orc task create "Document the project" "Write a concise project overview" --role developer
 orc task list
 orc queue --explain
+orc tui
 ```
 
 Register an agent with `orc agent add`, inspect eligibility with `orc schedule TASK_ID --explain`, and dispatch with `orc dispatch TASK_ID` or `orc dispatch-queue --concurrency 2`. Use `orc --help` and the [complete CLI reference](docs/cli-reference.md) for exact options and command-specific usage.
@@ -57,6 +58,7 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc apply-discovery <PATH\|->` | Apply a structured discovery response to project state. |
 | `orc doctor` | Diagnose project and agent health without consuming model quota. |
 | `orc status` | Print project name and a one-line summary of every task. |
+| `orc tui` | Launch the beta terminal queue and task-detail interface. |
 | `orc report [--full]` | Emit a structured project report JSON for a manual planner. |
 
 ### Orchestration and workflow
@@ -205,6 +207,12 @@ Create tasks directly with `orc task create`, or apply a reviewed structured pla
 
 Dispatch a selected task with `orc dispatch TASK_ID`, or dispatch ready automated tasks with bounded concurrency using `orc dispatch-queue --concurrency 2` (the default is `1`; `auto` is supported). Scheduling and dispatch are explicit operator actions.
 
+## Beta terminal interface
+
+Run `orc tui` from an initialized project to inspect the persisted queue and task details. Use Up/Down or `j`/`k` to navigate, Enter to open details, `r` to refresh, Esc to return or exit the main screen, and `q` to exit from the main screen. When the selected task's canonical next step permits it, `d`, `v`, `e`, and `a` explicitly dispatch, run automated semantic Review, revise, or accept. Revision prompts for feedback; no action automatically runs the next lifecycle stage.
+
+The TUI uses the same `OrcApp` lifecycle methods and `ProjectOperations` read model as the CLI. Long-running actions are synchronous in this first beta and show a running status before execution; the interface refreshes and remains usable after completion or failure. Agent configuration, task creation, requeue/unblock recovery, manual-run submission, full diffs/transcripts, and workflow/Lead/plan operations remain CLI or desktop responsibilities.
+
 ## Runs, review, acceptance, and recovery
 
 Automated and manual implementation runs use task-specific Git worktrees. Codex mutation processes start from an isolated launcher directory, but their logical working directory and explicit writable directory are the task worktree so relative edits stay inside it; the bounded packet carries the exact mutation root. Manual runs print the worktree and a task packet, then wait for `orc run submit RUN_ID`, `orc run submit-patch RUN_ID PATCH_FILE`, or `orc run fail RUN_ID`. A manual completion report is descriptive: the actual worktree is authoritative for changed files, and Orc runs configured deterministic validation before publishing Review-ready state. Ordinary manual validation failures block the run for operator correction; automated runs retain their bounded same-worker repair loop. Inspect runs with `orc runs`; inspect changes with `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`.
@@ -223,7 +231,7 @@ Planner and Lead exchanges use structured, versioned protocols. Invalid versions
 
 The Tauri desktop application shares the CLI's SQLite project state and provides dashboard, queue, tasks, agents, runs, review, planning, Lead, approvals, and manual-run views. Its persistent project registry supports registering projects, switching between them, detecting missing or moved projects, and relocating a registered project. Removing a project removes only its registry entry; re-importing it preserves the existing `.orc/orc.db`. A project must already be initialized and adopted before it can be opened.
 
-The v0.3.0 desktop workspace supports the complete normal operator lifecycle through controls and forms, with raw protocol JSON limited to advanced disclosures. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
+The v0.3.0-beta.1 desktop workspace supports the normal operator lifecycle through the same `OrcApp` and `ProjectOperations` semantics as the CLI and TUI. Its task view keeps deterministic validation freshness separate from semantic Review, exposes `acceptance_ready` and `revision_required` explicitly, and shows persisted economy and self-hosting readiness without applying frontend selection policy. Raw protocol JSON remains limited to advanced disclosures. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
 
 ## Development
 

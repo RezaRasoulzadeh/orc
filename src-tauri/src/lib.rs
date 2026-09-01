@@ -786,6 +786,9 @@ fn task_action(
     let app = guard.app()?;
     match action.as_str() {
         "dispatch" => app.dispatch(&task_id, agent_id.as_deref()).map(|_| ()),
+        "review" => app
+            .automated_review(&task_id, &orc::automated::ActionOverrides::default())
+            .map(|_| ()),
         "accept" => app.accept(&task_id),
         "reject" => app.reject(&task_id, reason.as_deref()),
         "cancel" => app
@@ -806,15 +809,16 @@ fn task_action(
                     .ok_or_else(|| "dependency id is required".to_string())?,
             )
             .map(|_| ()),
-        "revise" => app.revise(
-            &task_id,
-            reason
+        "revise" => {
+            let feedback = reason
                 .as_deref()
-                .ok_or_else(|| "feedback is required".to_string())?,
-            agent_id
-                .as_deref()
-                .ok_or_else(|| "agent id is required".to_string())?,
-        ),
+                .ok_or_else(|| "feedback is required".to_string())?;
+            if let Some(agent_id) = agent_id.as_deref() {
+                app.revise(&task_id, feedback, agent_id)
+            } else {
+                app.revise_with_previous_agent(&task_id, feedback)
+            }
+        }
         _ => Err(anyhow::anyhow!("unknown task action: {action}")),
     }
     .map_err(|error| error.to_string())
@@ -1019,6 +1023,14 @@ struct ProjectEvent<'a> {
 #[cfg(test)]
 mod tests {
     use super::resolve_project_paths;
+    use orc::operations::{
+        EconomyResolutionSummary, OperationalNextStep, ReviewOperationsSummary,
+        TaskOperationsSummary, TokenUsageSummary, ValidationState, ValidationSummary,
+    };
+    use orc::queue::QueueCategory;
+    use orc::registry::{EconomyTier, ReasoningEffort};
+    use orc::self_hosting::{SelfHostingReadiness, SelfHostingReadinessState};
+    use orc::task::{TaskPriority, TaskStatus};
     use std::path::Path;
 
     #[test]
@@ -1035,6 +1047,121 @@ mod tests {
     fn missing_project_database_is_reported() {
         let result = resolve_project_paths(Path::new("/workspace/orc"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn desktop_serializes_canonical_task_review_validation_and_economy_state() {
+        let summary = TaskOperationsSummary {
+            task_id: "T-0012".into(),
+            title: "Align desktop".into(),
+            objective: "Use canonical operations".into(),
+            role: "developer".into(),
+            priority: TaskPriority::High,
+            lifecycle: TaskStatus::AcceptanceReady,
+            phase: QueueCategory::AcceptanceReady,
+            next_step: OperationalNextStep::Accept,
+            cancellation_reason: None,
+            current_run: None,
+            latest_run: None,
+            validation: ValidationSummary {
+                state: ValidationState::Stale,
+                recorded_state: Some(ValidationState::Passing),
+                is_current: Some(false),
+                ..ValidationSummary::default()
+            },
+            review: ReviewOperationsSummary {
+                run_id: Some(12),
+                verdict: Some("PASS".into()),
+                timestamp: Some("2026-09-02 00:00:00".into()),
+                applies_to_current_change: Some(true),
+                ready_for_review: false,
+                actionable_blockers: 0,
+                unresolved_blockers: 0,
+                regressed_blockers: 0,
+                resolved_blockers: 1,
+                total_criteria: 3,
+                satisfied_criteria: 3,
+                violated_criteria: 0,
+                insufficient_evidence_criteria: 0,
+            },
+            actionable_blocker_count: 0,
+            latest_resolution: Some(EconomyResolutionSummary {
+                invocation_id: 17,
+                run_id: 12,
+                task_id: Some("T-0012".into()),
+                purpose: "review".into(),
+                action: Some("review".into()),
+                attempt: 1,
+                timestamp: "2026-09-02 00:00:00".into(),
+                finished_at: Some("2026-09-02 00:01:00".into()),
+                outcome: "completed".into(),
+                agent: Some("reviewer".into()),
+                model: Some("economy-model".into()),
+                effort: Some(ReasoningEffort::Low),
+                tier: EconomyTier::Default,
+                source: Some("agent".into()),
+                selection_reason: Some("cheapest eligible tier".into()),
+                selection_explanation: None,
+                operator_override: false,
+                escalation_reason: None,
+                quota: None,
+                context: None,
+                token_usage: TokenUsageSummary::default(),
+                unattributed_input_cost: false,
+                context_attribution_status: "not_reported".into(),
+                legacy_missing_resolution: false,
+            }),
+            token_usage: TokenUsageSummary::default(),
+        };
+
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["lifecycle"], "acceptance_ready");
+        assert_eq!(value["next_step"], "accept");
+        assert_eq!(value["validation"]["state"], "stale");
+        assert_eq!(value["validation"]["is_current"], false);
+        assert_eq!(value["review"]["verdict"], "PASS");
+        assert_eq!(value["review"]["total_criteria"], 3);
+        assert_eq!(value["latest_resolution"]["tier"], "default");
+        assert_eq!(value["latest_resolution"]["model"], "economy-model");
+        assert_ne!(value["lifecycle"], serde_json::json!("done"));
+
+        let mut revision = summary;
+        revision.lifecycle = TaskStatus::RevisionRequired;
+        revision.phase = QueueCategory::RevisionRequired;
+        revision.next_step = OperationalNextStep::Revise;
+        revision.review.verdict = Some("REVISE".into());
+        revision.review.actionable_blockers = 1;
+        revision.review.satisfied_criteria = 2;
+        revision.review.violated_criteria = 1;
+        let value = serde_json::to_value(revision).unwrap();
+        assert_eq!(value["lifecycle"], "revision_required");
+        assert_eq!(value["next_step"], "revise");
+        assert_eq!(value["review"]["verdict"], "REVISE");
+        assert_eq!(value["review"]["actionable_blockers"], 1);
+        assert_eq!(value["validation"]["state"], "stale");
+    }
+
+    #[test]
+    fn desktop_serializes_all_self_hosting_readiness_outcomes() {
+        for (state, expected) in [
+            (SelfHostingReadinessState::NotApplicable, "not_applicable"),
+            (SelfHostingReadinessState::Ready, "ready"),
+            (SelfHostingReadinessState::Blocked, "blocked"),
+        ] {
+            let value = serde_json::to_value(SelfHostingReadiness {
+                recognized: state != SelfHostingReadinessState::NotApplicable,
+                repository_id: None,
+                state,
+                blocking_guards: (state == SelfHostingReadinessState::Blocked)
+                    .then(|| vec!["guard reason".into()])
+                    .unwrap_or_default(),
+            })
+            .unwrap();
+            assert_eq!(value["state"], expected);
+            if state == SelfHostingReadinessState::Blocked {
+                assert_eq!(value["blocking_guards"][0], "guard reason");
+            }
+        }
     }
 }
 

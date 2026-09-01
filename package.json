@@ -1,6 +1,6 @@
 {
   "name": "orc-desktop",
-  "version": "0.3.0",
+  "version": "0.3.0-beta.1",
   "private": true,
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build --configLoader runner", "test": "node --test tests/app-project.integration.mjs", "typecheck": "vue-tsc --noEmit", "tauri": "tauri", "tauri:build": "node scripts/tauri-build.mjs", "validate:package": "node scripts/validate-package.mjs" },

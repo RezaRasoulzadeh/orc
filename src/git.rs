@@ -733,45 +733,31 @@ pub fn remove_worktree(repo: impl AsRef<Path>, path: impl AsRef<Path>) -> Result
 mod tests {
     use super::*;
 
+    fn run_test_git(repo_path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     fn init_test_repo(repo_path: &Path) {
-        Command::new("git")
-            .current_dir(repo_path)
-            .arg("init")
-            .arg(".")
-            .output()
-            .expect("init repo");
-
-        Command::new("git")
-            .current_dir(repo_path)
-            .arg("config")
-            .arg("user.email")
-            .arg("test@example.com")
-            .output()
-            .expect("config email");
-
-        Command::new("git")
-            .current_dir(repo_path)
-            .arg("config")
-            .arg("user.name")
-            .arg("Test User")
-            .output()
-            .expect("config name");
+        run_test_git(repo_path, &["init", "--initial-branch=main", "."]);
+        run_test_git(repo_path, &["config", "user.email", "test@example.com"]);
+        run_test_git(repo_path, &["config", "user.name", "Test User"]);
+        run_test_git(repo_path, &["config", "commit.gpgSign", "false"]);
+        run_test_git(repo_path, &["config", "core.hooksPath", "/dev/null"]);
 
         let file_path = repo_path.join("README.md");
         std::fs::write(&file_path, "test\n").expect("write file");
-        Command::new("git")
-            .current_dir(repo_path)
-            .arg("add")
-            .arg(".")
-            .output()
-            .expect("git add");
-        Command::new("git")
-            .current_dir(repo_path)
-            .arg("commit")
-            .arg("-m")
-            .arg("initial")
-            .output()
-            .expect("git commit");
+        run_test_git(repo_path, &["add", "."]);
+        run_test_git(repo_path, &["commit", "-m", "initial"]);
     }
 
     #[test]

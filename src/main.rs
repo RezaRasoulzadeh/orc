@@ -86,6 +86,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
+    /// Launch the beta terminal interface for the current project.
+    Tui,
     /// Adopt the existing Git repository, then assess an objective with Lead.
     Adopt {
         /// Operator objective to assess after repository discovery and adoption.
@@ -433,6 +435,7 @@ fn run(cli: Cli) -> Result<()> {
         .command
         .ok_or_else(|| anyhow::anyhow!("a command is required unless --ui is used"))?
     {
+        Command::Tui => orc::tui::run(DB_PATH, ".")?,
         Command::Init => {
             // initialize sqlite DB
             let db = Database::init_global(DB_PATH).map_err(|e| anyhow::anyhow!(e))?;
@@ -1512,6 +1515,7 @@ mod cli_tests {
     fn command_variant(command: &Command) -> &'static str {
         match command {
             Command::Init => "Init",
+            Command::Tui => "Tui",
             Command::Adopt { .. } => "Adopt",
             Command::DiscoveryRequest => "DiscoveryRequest",
             Command::ApplyDiscovery { .. } => "ApplyDiscovery",
@@ -1563,6 +1567,13 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["orc", "status"]).unwrap();
         assert!(!cli.ui);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn parses_tui_command() {
+        let cli = Cli::try_parse_from(["orc", "tui"]).unwrap();
+        assert!(!cli.ui);
+        assert!(matches!(cli.command, Some(Command::Tui)));
     }
 
     #[test]

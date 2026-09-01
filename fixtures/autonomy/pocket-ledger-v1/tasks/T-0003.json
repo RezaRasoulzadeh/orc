@@ -1,0 +1,21 @@
+{
+  "local_id": "T-0003",
+  "title": "Extract shared required-field validation",
+  "objective": "Refactor duplicated non-empty text validation used by Record::new and parse_record into one small internal helper while preserving every public type, error variant, message, trim behavior, and parse result. Use it from both production paths and add focused tests only where needed. Required validation: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Non-goals: changing Record fields, ParseError, normalization semantics, dependencies, or CLI output.",
+  "role": "developer",
+  "priority": "normal",
+  "depends_on": [],
+  "capabilities": [],
+  "scope_mode": null,
+  "context_files": ["src/model.rs", "src/parser.rs", "src/lib.rs", "tests/ledger_tests.rs"],
+  "expected_changes": ["src/model.rs", "src/parser.rs"],
+  "unchanged": ["Record fields", "ParseError", "normalization semantics", "dependencies", "CLI output"],
+  "acceptance_criteria": [
+    "Record::new and parse_record use one small internal non-empty text helper.",
+    "Every public type, error variant, message, trim behavior, and parse result remains unchanged."
+  ],
+  "required_tests": ["Focused tests only where needed to preserve existing behavior"],
+  "validation": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"],
+  "execution_hints": {"effort": "low", "effort_reason": "Recovered trial contract uses the default execution depth."},
+  "risk_factors": []
+}

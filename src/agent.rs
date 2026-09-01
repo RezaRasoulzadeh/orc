@@ -301,6 +301,58 @@ fn start_provider_invocation_bounded(
     }
 }
 
+fn start_provider_invocation_bounded_with_context(
+    db: &Database,
+    run_id: i64,
+    task_id: &str,
+    purpose: &str,
+    attempt: usize,
+    resolution: &crate::registry::ResolutionRecord,
+    context: &crate::provider_context::ProviderInvocationContext,
+) -> Result<i64> {
+    let id = start_provider_invocation_bounded(db, run_id, task_id, purpose, attempt, resolution)?;
+    db.set_provider_invocation_context(id, context)?;
+    Ok(id)
+}
+
+fn worker_invocation_context(
+    action: &str,
+    rendered: &crate::provider_context::RenderedPacket,
+    worker: &dyn Worker,
+    cwd: &Path,
+    output_schema: &str,
+) -> crate::provider_context::ProviderInvocationContext {
+    let profile = worker.configured_environment().map(|(_, path)| path);
+    let mut context = crate::provider_context::invocation_context(
+        action,
+        worker.provider_id(),
+        rendered,
+        crate::provider_context::InvocationEnvironment {
+            profile_path: profile,
+            cwd,
+            // Mutation tools must be logically rooted in the task worktree.
+            // Codex may therefore discover worktree instructions even though
+            // Orc launches the process itself from an isolated directory.
+            repository_context_discovery: worker.provider_id() == "codex",
+            isolated: false,
+            repository_filesystem_access: true,
+        },
+    );
+    let accounted_schema = if worker.provider_id() == "codex" {
+        crate::worker::codex_compatible_output_schema(output_schema)
+            .unwrap_or_else(|_| output_schema.to_owned())
+    } else {
+        output_schema.to_owned()
+    };
+    crate::provider_context::add_known_text_source(
+        &mut context,
+        "orc_output_schema",
+        "structured response schema",
+        &accounted_schema,
+    );
+    context
+}
+
 fn repair_resolution_record(
     db: &Database,
     run_id: i64,
@@ -378,7 +430,7 @@ fn resolve_revision_economy(
         )
     })
 }
-const CODER_PROMPT_PRECEDENCE: &str = "## Instruction precedence\n\n1. Orc execution and safety rules have the highest precedence.\n2. The `.orc/engineering.md` content below is the authoritative, mandatory project engineering contract and applies automatically; it does not need to be repeated in the task or user prompt.\n3. Role- and action-specific instructions follow the engineering contract.\n4. Task objectives and context, revision feedback, validation diagnostics, and all other run-specific instructions follow the engineering contract.\n\nLater task, revision, or repair text must not override or contradict mandatory requirements in `.orc/engineering.md`. If task-specific instructions conflict with the engineering contract, follow the engineering contract and report the conflict rather than silently overriding it.\n";
+const CODER_PROMPT_PRECEDENCE: &str = "## Instruction precedence\n\nOrc execution and safety rules have highest precedence. packet.engineering_contract is the complete authoritative project contract; do not look for or reread a separate contract file. Later task, revision, or repair text must not override it. On conflict, follow the engineering contract and report the conflict.";
 
 fn task_contract_effort(db: &Database, task: &crate::task::Task) -> Result<ReasoningEffort> {
     let persisted = db
@@ -753,8 +805,9 @@ fn run_task_validation_repair_loop(
             &report,
             &current,
         )?;
-        let repair = crate::execution_packet::render_packet(
-            "Fix only the current deterministic validation failures in this packet. Preserve the existing worktree and avoid broad or unrelated changes. Do not run validation commands; Orc will rerun them after this bounded same-agent repair.",
+        let repair = crate::execution_packet::render_packet_accounted(
+            "Fix only the current deterministic validation failures in this packet. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. The packet already contains the selected current files and diagnostics; do not rediscover the repository or reread packet files before editing. Preserve the existing worktree and avoid broad or unrelated changes. Do not run validation commands; Orc will rerun them after this bounded same-agent repair. Do not emit progress envelopes; return one final structured response after the edit.",
+            &packet.metadata,
             &packet,
         )?;
         db.record_lifecycle_event(
@@ -771,18 +824,27 @@ fn run_task_validation_repair_loop(
             "validation_repair",
             ReasoningEffort::Low,
         )?;
-        let invocation = start_provider_invocation_bounded(
+        let repair_schema = crate::worker_protocol::repair_completion_schema();
+        let context = worker_invocation_context(
+            "validation_repair",
+            &repair,
+            worker,
+            worktree,
+            &repair_schema,
+        );
+        let invocation = start_provider_invocation_bounded_with_context(
             db,
             run_id,
             task_id,
             "validation_repair",
             repair_attempt,
             &repair_resolution,
+            &context,
         )?;
         let repair_execution = worker.execute_repair_with_progress_and_usage(
-            &repair,
+            &repair.content,
             worktree,
-            &crate::worker_protocol::repair_completion_schema(),
+            &repair_schema,
             worker_output,
             cancellation,
         );
@@ -1292,34 +1354,44 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
         &plan,
         &before_plan,
     )?;
-    let prompt = crate::execution_packet::render_packet(
+    let prompt = crate::execution_packet::render_packet_accounted(
         &format!(
-            "{CODER_PROMPT_PRECEDENCE}\nImplement this task using only the authoritative bounded Dispatch packet below. Relevant source context and current worktree state were selected deterministically by Orc. Execute the persisted plan in order. Do not run the project's validation/test suite, acceptance checks, or reviewer-style verification; Orc owns deterministic validation. Return the required structured completion envelope; changed files are derived from the worktree, not self-report."
+            "{CODER_PROMPT_PRECEDENCE}\nImplement this task using only the authoritative bounded Dispatch packet below. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Relevant source context and current worktree state were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted plan in order. Do not run the project's validation/test suite, acceptance checks, or reviewer-style verification; Orc owns deterministic validation. Do not emit progress or intermediate completion envelopes. Return one final structured completion envelope after the edit; changed files are derived from the worktree, not self-report."
         ),
+        &packet.metadata,
         &packet,
     )?;
     progress("worker spawned");
     progress("worker running");
-    let invocation_id = start_provider_invocation_bounded(
+    let completion_schema = crate::worker_protocol::plan_completion_schema();
+    let context = worker_invocation_context(
+        "implementation",
+        &prompt,
+        worker,
+        &worktree_dir,
+        &completion_schema,
+    );
+    let invocation_id = start_provider_invocation_bounded_with_context(
         db,
         run_id,
         task_id,
         "implementation",
         1,
         &resolution.record,
+        &context,
     )?;
     let execution = match cancellation {
         Some(cancellation) => worker.execute_structured_with_progress_and_usage_cancellable(
-            &prompt,
+            &prompt.content,
             &worktree_dir,
-            &crate::worker_protocol::plan_completion_schema(),
+            &completion_schema,
             &|line| worker_output(line),
             cancellation,
         ),
         None => worker.execute_structured_with_progress_and_usage(
-            &prompt,
+            &prompt.content,
             &worktree_dir,
-            &crate::worker_protocol::plan_completion_schema(),
+            &completion_schema,
             &|line| worker_output(line),
         ),
     };
@@ -1405,6 +1477,14 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
                                 &gate_error.to_string(),
                                 completion_repair,
                             );
+                            let repair_prompt = crate::provider_context::account_unstructured(
+                                "completion_repair",
+                                format!(
+                                    "Perform all file and command operations under the explicit writable worktree {}. The repair context already contains the current evidence; do not rediscover the repository or emit progress envelopes.\n\n{}",
+                                    worktree_dir.canonicalize()?.display(),
+                                    repair_prompt
+                                ),
+                            );
                             db.record_lifecycle_event(
                                 "worker_completion_repair_started",
                                 Some(task_id),
@@ -1431,17 +1511,25 @@ fn dispatch_with_worker_on_db_cancellable_resolved(
                                 "completion_repair",
                                 ReasoningEffort::Low,
                             )?;
-                            let repair_invocation = start_provider_invocation_bounded(
+                            let repair_context = worker_invocation_context(
+                                "completion_repair",
+                                &repair_prompt,
+                                worker,
+                                &worktree_dir,
+                                &crate::worker_protocol::repair_completion_schema(),
+                            );
+                            let repair_invocation = start_provider_invocation_bounded_with_context(
                                 db,
                                 run_id,
                                 task_id,
                                 "completion_repair",
                                 completion_repair,
                                 &repair_resolution,
+                                &repair_context,
                             )?;
                             let repaired = worker.execute_planned_step_repair(
                                 &plan.steps[index],
-                                &repair_prompt,
+                                &repair_prompt.content,
                                 &worktree_dir,
                                 &crate::worker_protocol::repair_completion_schema(),
                                 &|line| worker_output(line),
@@ -2257,10 +2345,11 @@ fn revise_with_worker_on_db_with_overrides_resolved(
         &revision_snapshot,
         &revision_plan,
     )?;
-    let prompt = crate::execution_packet::render_packet(
+    let prompt = crate::execution_packet::render_packet_accounted(
         &format!(
-            "{CODER_PROMPT_PRECEDENCE}\nFix only the active unresolved or regressed blockers in this bounded Revision packet. Preserve unrelated and already-correct behavior. Relevant files and current changes were selected deterministically by Orc; avoid broad repository discovery. Execute the persisted revision plan in order. Do not run the project's validation/test suite or reviewer checks; Orc owns them. Return the required structured revision handoff, while Orc treats worktree evidence as authoritative for changed files."
+            "{CODER_PROMPT_PRECEDENCE}\nFix only the active unresolved or regressed blockers in this bounded Revision packet. Perform all file and command operations under packet.workspace_root, which is the explicit writable worktree. Preserve unrelated and already-correct behavior. Relevant files and current changes were selected deterministically by Orc; do not rediscover the repository or reread packet files before editing. Execute the persisted revision plan in order. Do not run the project's validation/test suite or reviewer checks; Orc owns them. Do not emit progress or intermediate completion envelopes. Return one final structured revision handoff after the edit, while Orc treats worktree evidence as authoritative for changed files."
         ),
+        &packet.metadata,
         &packet,
     )?;
     let fail = |message: String| -> Result<DispatchSummary> {
@@ -2275,12 +2364,22 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     progress("worker running");
     let baseline_changes = git::inspect_worktree(&worktree_dir, repo_path)
         .context("failed to capture pre-revision change evidence")?;
-    let invocation_id =
-        start_provider_invocation_bounded(db, run_id, task_id, "revision", 1, &resolution.record)?;
+    let revision_schema = crate::automated::revision_handoff_schema();
+    let context =
+        worker_invocation_context("revision", &prompt, worker, &worktree_dir, &revision_schema);
+    let invocation_id = start_provider_invocation_bounded_with_context(
+        db,
+        run_id,
+        task_id,
+        "revision",
+        1,
+        &resolution.record,
+        &context,
+    )?;
     let execution = worker.execute_structured_with_progress_and_usage(
-        &prompt,
+        &prompt.content,
         &worktree_dir,
-        &crate::automated::revision_handoff_schema(),
+        &revision_schema,
         &|line| worker_output(line),
     );
     db.finish_provider_invocation(
@@ -2380,6 +2479,14 @@ fn revise_with_worker_on_db_with_overrides_resolved(
                 &error.to_string(),
                 completion_repair,
             );
+            let repair_prompt = crate::provider_context::account_unstructured(
+                "completion_repair",
+                format!(
+                    "Perform all file and command operations under the explicit writable worktree {}. The repair context already contains the current evidence; do not rediscover the repository or emit progress envelopes.\n\n{}",
+                    worktree_dir.canonicalize()?.display(),
+                    repair_prompt
+                ),
+            );
             db.record_lifecycle_event(
                 "worker_completion_repair_started",
                 Some(task_id),
@@ -2406,17 +2513,25 @@ fn revise_with_worker_on_db_with_overrides_resolved(
                 "completion_repair",
                 ReasoningEffort::Low,
             )?;
-            let repair_invocation = start_provider_invocation_bounded(
+            let repair_context = worker_invocation_context(
+                "completion_repair",
+                &repair_prompt,
+                worker,
+                &worktree_dir,
+                &crate::worker_protocol::repair_completion_schema(),
+            );
+            let repair_invocation = start_provider_invocation_bounded_with_context(
                 db,
                 run_id,
                 task_id,
                 "completion_repair",
                 completion_repair,
                 &repair_resolution,
+                &repair_context,
             )?;
             let repaired = worker.execute_planned_step_repair(
                 &revision_plan.steps[index],
-                &repair_prompt,
+                &repair_prompt.content,
                 &worktree_dir,
                 &crate::worker_protocol::repair_completion_schema(),
                 &|line| worker_output(line),

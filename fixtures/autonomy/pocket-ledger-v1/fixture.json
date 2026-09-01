@@ -1,0 +1,14 @@
+{
+  "fixture_version": "pocket-ledger-v1",
+  "schema_version": 1,
+  "expected_seed_baseline_commit": "149d45a00b6d25d7bebcbcfaed398c59231dd376",
+  "task_count": 5,
+  "task_order": ["T-0001", "T-0002", "T-0003", "T-0004", "T-0005"],
+  "dependencies": [],
+  "validation_config": "repository/.orc/validation.toml",
+  "agent_economy_config": "trial.env",
+  "provenance": "provenance.md",
+  "credentials_committed": false,
+  "canonical_for_future_runs": true,
+  "byte_identical_to_lost_ephemeral_fixture": false
+}

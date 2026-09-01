@@ -32,7 +32,7 @@ impl ActionBackend for PassIgnoringValidationReviewBackend {
         &self,
         _: &AgentDefinition,
         action: AgentAction,
-        _: &str,
+        input: &str,
         _: Option<&str>,
         _: Option<registry::ReasoningEffort>,
     ) -> Result<ActionExecution> {
@@ -41,11 +41,39 @@ impl ActionBackend for PassIgnoringValidationReviewBackend {
         // validation Orc executed having failed; automated review must
         // still surface a blocker and not accept this as PASS.
         Ok(ActionExecution {
-            output: r#"{"verdict":"PASS","findings":[],"blocking_findings":[],"blockers":[]}"#
-                .into(),
+            output: pass_review_with_explicit_prior_resolution(input),
             token_usage: None,
         })
     }
+}
+
+fn pass_review_with_explicit_prior_resolution(input: &str) -> String {
+    let packet_json = input
+        .split("## Authoritative Orc packet")
+        .nth(1)
+        .and_then(|text| text.find('{').map(|index| &text[index..]))
+        .expect("review packet JSON");
+    let packet: serde_json::Value = serde_json::from_str(packet_json).unwrap();
+    let blockers = packet["prior_blockers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|prior| prior["status"] != "resolved")
+        .map(|prior| {
+            serde_json::json!({
+                "id":prior["blocker_id"],"prior_blocker_id":prior["blocker_id"],
+                "blocker_key":"explicitly-resolved-prior","requirement_ref":"prior blocker",
+                "evidence":"Current bounded implementation evidence demonstrates resolution.",
+                "severity":"unspecified","acceptance_condition":prior["acceptance_condition"],
+                "status":"resolved","finding":"The prior concern is resolved."
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "verdict":"PASS",
+        "criterion_results":[{"criterion_id":"acceptance-criterion-1","status":"satisfied","evidence":[{"kind":"diff","reference":"current_changes.diff","explanation":"The bounded diff shows the implemented task behavior."}],"rationale":"Current implementation evidence satisfies the criterion."}],
+        "findings":[],"blocking_findings":[],"blockers":blockers
+    }).to_string()
 }
 
 impl ActionBackend for ValidationLifecycleReviewBackend {
@@ -59,7 +87,7 @@ impl ActionBackend for ValidationLifecycleReviewBackend {
     ) -> Result<ActionExecution> {
         assert_eq!(action, AgentAction::Review);
         Ok(ActionExecution {
-            output: r#"{"verdict":"REVISE","findings":["validation failed"],"blocking_findings":["validation failed"],"revision_feedback":"Fix the validation failure","blockers":[{"id":"BLK-validation","blocker_key":"validation","requirement_ref":"validation","evidence":"validation failed","severity":"high","acceptance_condition":"validation passes","status":"unresolved","finding":"validation failed"}]}"#.into(),
+            output: r#"{"verdict":"REVISE","criterion_results":[{"criterion_id":"acceptance-criterion-1","status":"violated","evidence":[{"kind":"diff","reference":"current_changes.diff","explanation":"The bounded diff retains the reported semantic defect."}],"rationale":"The task behavior remains incorrect."}],"findings":["validation failed"],"blocking_findings":["validation failed"],"revision_feedback":"Fix the validation failure","blockers":[{"id":"BLK-validation","blocker_key":"validation","requirement_ref":"validation","evidence":"validation failed","severity":"high","acceptance_condition":"validation passes","status":"unresolved","finding":"validation failed"}]}"#.into(),
             token_usage: None,
         })
     }

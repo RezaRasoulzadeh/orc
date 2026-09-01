@@ -1,0 +1,22 @@
+{
+  "local_id": "T-0001",
+  "title": "Collapse internal label whitespace",
+  "objective": "Fix normalize_label so it trims leading/trailing whitespace, lowercases text, and collapses every run of Unicode whitespace (spaces, tabs, or newlines) to one ASCII space. Acceptance: equivalent labels with irregular whitespace compare identically through Catalog::find_by_label; already-normalized labels remain unchanged; add direct normalization and catalog regression tests. Required validation: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Expected changes: src/normalize.rs and tests/ledger_tests.rs. Non-goals: dependencies, parser behavior, public API redesign, or unrelated formatting.",
+  "role": "developer",
+  "priority": "normal",
+  "depends_on": [],
+  "capabilities": [],
+  "scope_mode": null,
+  "context_files": ["src/normalize.rs", "src/catalog.rs", "tests/ledger_tests.rs"],
+  "expected_changes": ["src/normalize.rs", "tests/ledger_tests.rs"],
+  "unchanged": ["dependencies", "parser behavior", "public API", "unrelated formatting"],
+  "acceptance_criteria": [
+    "normalize_label trims leading and trailing whitespace, lowercases text, and collapses every run of Unicode whitespace to one ASCII space.",
+    "Equivalent labels with irregular whitespace compare identically through Catalog::find_by_label.",
+    "Already-normalized labels remain unchanged."
+  ],
+  "required_tests": ["Direct normalization and catalog regression tests"],
+  "validation": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"],
+  "execution_hints": {"effort": "low", "effort_reason": "Recovered trial contract uses the default execution depth."},
+  "risk_factors": []
+}

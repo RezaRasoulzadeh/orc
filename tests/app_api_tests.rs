@@ -482,6 +482,7 @@ fn persist_review(
 fn review_result(label: &str, verdict: &str) -> ReviewResult {
     ReviewResult {
         verdict: verdict.into(),
+        criterion_results: Vec::new(),
         severity: Some(format!("severity-{label}")),
         findings: vec![format!("finding-{label}")],
         blocking_findings: vec![format!("blocking-{label}")],
@@ -513,6 +514,13 @@ impl ActionBackend for CountingReviewBackend {
         Ok(ActionExecution {
             output: serde_json::to_string(&ReviewResult {
                 verdict: "PASS".into(),
+                criterion_results: vec![orc::protocol::ReviewCriterionResult {
+                    criterion_id: "acceptance-criterion-1".into(),
+                    status: orc::protocol::ReviewCriterionStatus::InsufficientEvidence,
+                    evidence: Vec::new(),
+                    rationale:
+                        "No implementation evidence is present in the bounded review packet.".into(),
+                }],
                 findings: Vec::new(),
                 blocking_findings: Vec::new(),
                 non_blocking_findings: Vec::new(),
@@ -1395,10 +1403,10 @@ fn explicit_automated_review_still_invokes_backend_once() {
         )
         .unwrap();
 
-    assert_eq!(result.verdict, "PASS");
+    assert_eq!(result.verdict, "REVISE");
     assert_eq!(
         app.task(&task).unwrap().unwrap().status,
-        orc::task::TaskStatus::AcceptanceReady
+        orc::task::TaskStatus::Review
     );
     assert_eq!(backend.calls(), 1);
     assert_eq!(app.review_history(&task).unwrap().len(), 1);

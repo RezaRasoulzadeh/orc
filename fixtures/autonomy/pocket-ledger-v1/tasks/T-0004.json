@@ -1,0 +1,22 @@
+{
+  "local_id": "T-0004",
+  "title": "Strengthen parser edge-case coverage",
+  "objective": "Add a focused parser test matrix covering zero and nonnumeric IDs, blank labels, blank categories, extra fields, surrounding field whitespace, and case-insensitive active/inactive states. Assert exact existing ParseError variants and successful Record values. Change production only if a test exposes behavior contradicting the documented format. Required validation: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Non-goals: new states, parser redesign, dependencies, fuzzing, or error-message changes.",
+  "role": "developer",
+  "priority": "normal",
+  "depends_on": [],
+  "capabilities": [],
+  "scope_mode": null,
+  "context_files": ["src/parser.rs", "src/model.rs", "tests/ledger_tests.rs"],
+  "expected_changes": ["tests/ledger_tests.rs"],
+  "unchanged": ["states", "parser design", "dependencies", "error messages"],
+  "acceptance_criteria": [
+    "The parser matrix covers zero and nonnumeric IDs, blank labels and categories, extra fields, surrounding whitespace, and case-insensitive active/inactive states.",
+    "Tests assert exact existing ParseError variants and successful Record values.",
+    "Production changes occur only if a test exposes behavior contradicting the documented format."
+  ],
+  "required_tests": ["Focused parser edge-case matrix; no fuzzing"],
+  "validation": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"],
+  "execution_hints": {"effort": "low", "effort_reason": "Recovered trial contract uses the default execution depth."},
+  "risk_factors": []
+}

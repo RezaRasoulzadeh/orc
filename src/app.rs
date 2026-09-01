@@ -177,41 +177,21 @@ impl OrcApp {
         &self,
         message: &str,
         config: &crate::lead::LeadProviderConfig,
-        context_limit: usize,
+        _context_limit: usize,
     ) -> Result<crate::lead::LeadResponse> {
-        let agent = self.db.get_agent(&config.agent_id)?.with_context(|| {
-            format!(
-                "configured Lead agent '{}' is unavailable: agent does not exist",
-                config.agent_id
-            )
-        })?;
-        if !agent.enabled || agent.status != registry::AVAILABLE {
-            anyhow::bail!(
-                "configured Lead agent '{}' is unavailable{}",
-                agent.id,
-                agent
-                    .unavailable_reason
-                    .as_deref()
-                    .map(|r| format!(": {r}"))
-                    .unwrap_or_default()
-            );
-        }
-        let adapter = crate::backend::provider_adapter(&agent.backend)
-            .ok_or_else(|| anyhow::anyhow!("unsupported provider '{}'.", agent.backend))?;
-        let backend = adapter
-            .build_lead(
-                &agent,
-                &self.repo_path,
-                crate::backend::ProviderExecutionOptions {
-                    model: config.model.clone().or(agent.model.clone()),
-                    reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
-                    read_only: true,
-                    isolated_review: false,
-                    executable: None,
-                },
-            )
-            .map_err(anyhow::Error::msg)?;
-        self.lead().invoke(message, backend.as_ref(), context_limit)
+        let backend = crate::automated::WorkerActionBackend::without_quota_refresh(&self.repo_path);
+        let (_, response) = crate::automated::run_lead(
+            &self.db,
+            &self.repo_path,
+            message,
+            &crate::automated::ActionOverrides {
+                agent_id: Some(config.agent_id.clone()),
+                model: config.model.clone(),
+                reasoning_effort: config.reasoning_effort,
+            },
+            &backend,
+        )?;
+        Ok(response)
     }
     pub fn invoke_persisted_lead(
         &self,
@@ -226,33 +206,9 @@ impl OrcApp {
         message: &str,
         context_limit: usize,
     ) -> Result<crate::lead::LeadResponse> {
-        let config = self
-            .lead_provider_config()?
-            .ok_or_else(|| anyhow::anyhow!("Lead is not configured."))?;
-        let agent = self
-            .db
-            .get_agent(&config.agent_id)?
-            .context("configured Lead agent is unavailable")?;
-        let adapter = crate::backend::provider_adapter(&agent.backend)
-            .ok_or_else(|| anyhow::anyhow!("unsupported provider '{}'.", agent.backend))?;
-        let backend = adapter
-            .build_lead(
-                &agent,
-                &self.repo_path,
-                crate::backend::ProviderExecutionOptions {
-                    model: config.model.or(agent.model.clone()),
-                    reasoning_effort: config.reasoning_effort.or(agent.reasoning_effort),
-                    read_only: true,
-                    isolated_review: false,
-                    executable: None,
-                },
-            )
-            .map_err(anyhow::Error::msg)?;
-        crate::lead::LeadService::new_with_required_discovery(&self.db, &self.repo_path).invoke(
-            message,
-            backend.as_ref(),
-            context_limit,
-        )
+        crate::discovery::snapshot_for_provider(&self.repo_path)
+            .context("Lead requires a current discovery snapshot")?;
+        self.invoke_persisted_lead(message, context_limit)
     }
     pub fn automated_plan_with_backend(
         &self,
@@ -732,6 +688,17 @@ impl OrcApp {
     }
     pub fn economy_summary(&self) -> Result<crate::operations::ProjectEconomySummary> {
         self.operations().economy_summary()
+    }
+    pub fn provider_invocation_summaries(
+        &self,
+    ) -> Result<Vec<crate::operations::EconomyResolutionSummary>> {
+        self.operations().provider_invocation_summaries()
+    }
+    pub fn provider_invocation_summary(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::operations::EconomyResolutionSummary>> {
+        self.operations().provider_invocation_summary(id)
     }
     pub fn dashboard(&self, activity_limit: usize) -> Result<crate::read_model::Dashboard> {
         crate::read_model::dashboard(&self.db, &self.repo_path, activity_limit)

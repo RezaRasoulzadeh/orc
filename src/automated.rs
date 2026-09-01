@@ -98,6 +98,12 @@ pub trait ActionBackend {
         &crate::scheduler::UnsupportedQuotaRefresher
     }
 
+    /// Describe the provider working-directory policy without exposing
+    /// provider-specific transport details to lifecycle callers.
+    fn context_environment(&self, _action: AgentAction) -> (PathBuf, bool, bool) {
+        (PathBuf::from("."), false, false)
+    }
+
     fn invoke(
         &self,
         agent: &AgentDefinition,
@@ -125,6 +131,7 @@ pub trait ActionBackend {
 pub struct WorkerActionBackend {
     repo: PathBuf,
     planner_executable: Option<PathBuf>,
+    refresh_quota: bool,
 }
 
 /// The Planner execution boundary exposes only planning to its provider.
@@ -141,6 +148,10 @@ impl<'a> PlannerActionBackend<'a> {
 }
 
 impl ActionBackend for PlannerActionBackend<'_> {
+    fn context_environment(&self, action: AgentAction) -> (PathBuf, bool, bool) {
+        self.inner.context_environment(action)
+    }
+
     fn observe(&self, message: &str) {
         self.inner.observe(message);
     }
@@ -187,6 +198,17 @@ impl WorkerActionBackend {
         Self {
             repo: repo.as_ref().to_path_buf(),
             planner_executable: None,
+            refresh_quota: true,
+        }
+    }
+
+    /// Compatibility boundary for configured one-shot Lead calls which have
+    /// historically run without mutating quota observations.
+    pub fn without_quota_refresh(repo: impl AsRef<Path>) -> Self {
+        Self {
+            repo: repo.as_ref().to_path_buf(),
+            planner_executable: None,
+            refresh_quota: false,
         }
     }
 
@@ -203,10 +225,21 @@ impl ActionBackend for WorkerActionBackend {
     }
 
     fn quota_refresher(&self) -> &dyn crate::scheduler::QuotaRefresher {
-        if self.planner_executable.is_some() {
+        if self.planner_executable.is_some() || !self.refresh_quota {
             &crate::scheduler::UnsupportedQuotaRefresher
         } else {
             &crate::scheduler::ProviderQuotaRefresher
+        }
+    }
+
+    fn context_environment(&self, action: AgentAction) -> (PathBuf, bool, bool) {
+        if matches!(
+            action,
+            AgentAction::Lead | AgentAction::Plan | AgentAction::Review
+        ) {
+            (std::env::temp_dir(), false, true)
+        } else {
+            (self.repo.clone(), true, false)
         }
     }
 
@@ -259,9 +292,12 @@ impl ActionBackend for WorkerActionBackend {
             ),
         }
         .map_err(anyhow::Error::msg)?;
-        let review_dir = (action == AgentAction::Review)
-            .then(review_execution_directory)
-            .transpose()?;
+        let review_dir = matches!(
+            action,
+            AgentAction::Lead | AgentAction::Plan | AgentAction::Review
+        )
+        .then(review_execution_directory)
+        .transpose()?;
         let working_dir = review_dir.as_deref().unwrap_or(&self.repo);
         let execution = worker
             .execute_structured_with_progress_and_usage(
@@ -364,11 +400,25 @@ fn schema(action: AgentAction) -> String {
         },
         "required":["kind","details"]
     });
+    let criterion_result = serde_json::json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "criterion_id":{"type":"string","minLength":1},
+            "status":{"type":"string","enum":["satisfied","violated","insufficient_evidence"]},
+            "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+                "kind":{"type":"string","enum":["diff","changed_file","validation","task_contract","implementation_fact"]},
+                "reference":{"type":"string","minLength":1},
+                "explanation":{"type":"string","minLength":1}
+            },"required":["kind","reference","explanation"]}},
+            "rationale":{"type":"string","minLength":1}
+        },
+        "required":["criterion_id","status","evidence","rationale"]
+    });
     let value = match action {
         AgentAction::Review => serde_json::json!({
             "type":"object","additionalProperties":false,
-            "properties":{"verdict":{"type":"string","enum":["PASS","REVISE","REJECT"]},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]},"blockers":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"prior_blocker_id":{"type":["string","null"]},"blocker_key":{"type":"string","minLength":1},"requirement_ref":{"type":"string"},"evidence":{"type":"string"},"severity":{"type":"string","enum":["low","medium","high","critical","unspecified"]},"acceptance_condition":{"type":"string"},"status":{"type":"string","enum":["new","unresolved","resolved","regression"]},"finding":{"type":"string"}},"required":["id","prior_blocker_id","blocker_key","requirement_ref","evidence","severity","acceptance_condition","status","finding"]}}},
-            "required":["verdict","findings","blocking_findings","non_blocking_findings","severity","revision_feedback","blockers"]
+            "properties":{"verdict":{"type":"string","enum":["PASS","REVISE","REJECT"]},"criterion_results":{"type":"array","items":criterion_result},"findings":string_array,"blocking_findings":string_array,"non_blocking_findings":string_array,"severity":{"type":["string","null"]},"revision_feedback":{"type":["string","null"]},"blockers":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"prior_blocker_id":{"type":["string","null"]},"blocker_key":{"type":"string","minLength":1},"requirement_ref":{"type":"string"},"evidence":{"type":"string"},"severity":{"type":"string","enum":["low","medium","high","critical","unspecified"]},"acceptance_condition":{"type":"string"},"status":{"type":"string","enum":["new","unresolved","resolved","regression"]},"finding":{"type":"string"}},"required":["id","prior_blocker_id","blocker_key","requirement_ref","evidence","severity","acceptance_condition","status","finding"]}}},
+            "required":["verdict","criterion_results","findings","blocking_findings","non_blocking_findings","severity","revision_feedback","blockers"]
         }),
         AgentAction::Plan => plan,
         AgentAction::Lead => serde_json::json!({
@@ -426,6 +476,8 @@ pub fn revision_handoff_schema() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewResult {
     pub verdict: String,
+    #[serde(default)]
+    pub criterion_results: Vec<crate::protocol::ReviewCriterionResult>,
     #[serde(default)]
     pub findings: Vec<String>,
     #[serde(default)]
@@ -954,6 +1006,7 @@ pub fn format_revision_contract(contract: &RevisionContract) -> String {
 
 impl ReviewResult {
     fn validate_structured_blockers(&self) -> Result<()> {
+        let mut ids = std::collections::BTreeSet::new();
         for blocker in &self.blockers {
             if blocker.blocker_key.trim().is_empty() {
                 bail!("review blockers require a non-empty blocker_key")
@@ -964,9 +1017,111 @@ impl ReviewResult {
             ) {
                 bail!("review blocker has invalid status '{}'", blocker.status)
             }
+            if !ids.insert(blocker.id.as_str()) {
+                bail!("review contains duplicate blocker ID '{}'", blocker.id)
+            }
         }
         Ok(())
     }
+
+    fn validate_criterion_results(
+        &self,
+        packet: &crate::execution_packet::ReviewPacket,
+    ) -> Result<()> {
+        use crate::protocol::{ReviewCriterionStatus, ReviewEvidenceKind};
+
+        let expected = packet
+            .task_contract
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| criterion.criterion_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for result in &self.criterion_results {
+            if !expected.contains(result.criterion_id.as_str()) {
+                bail!(
+                    "review returned unknown acceptance criterion '{}'",
+                    result.criterion_id
+                )
+            }
+            if !seen.insert(result.criterion_id.as_str()) {
+                bail!(
+                    "review returned duplicate acceptance criterion '{}'",
+                    result.criterion_id
+                )
+            }
+            if result.rationale.trim().is_empty() || is_vacuous_review_evidence(&result.rationale) {
+                bail!(
+                    "review criterion '{}' has a vacuous rationale",
+                    result.criterion_id
+                )
+            }
+            if matches!(
+                result.status,
+                ReviewCriterionStatus::Satisfied | ReviewCriterionStatus::Violated
+            ) && result.evidence.is_empty()
+            {
+                bail!(
+                    "review criterion '{}' requires concrete packet evidence",
+                    result.criterion_id
+                )
+            }
+            for evidence in &result.evidence {
+                if evidence.reference.trim().is_empty()
+                    || evidence.explanation.trim().is_empty()
+                    || is_vacuous_review_evidence(&evidence.explanation)
+                {
+                    bail!(
+                        "review criterion '{}' contains malformed evidence",
+                        result.criterion_id
+                    )
+                }
+                if !packet.contains_evidence_ref(evidence) {
+                    bail!(
+                        "review criterion '{}' cites evidence absent from the review packet: {:?} '{}'",
+                        result.criterion_id,
+                        evidence.kind,
+                        evidence.reference
+                    )
+                }
+            }
+            if result.status == ReviewCriterionStatus::Satisfied
+                && !result.evidence.iter().any(|evidence| {
+                    matches!(
+                        evidence.kind,
+                        ReviewEvidenceKind::Diff
+                            | ReviewEvidenceKind::ChangedFile
+                            | ReviewEvidenceKind::ImplementationFact
+                    )
+                })
+            {
+                bail!(
+                    "satisfied review criterion '{}' requires implementation evidence; validation or task-contract text alone is insufficient",
+                    result.criterion_id
+                )
+            }
+        }
+        if seen != expected {
+            let missing = expected.difference(&seen).copied().collect::<Vec<_>>();
+            bail!(
+                "review is missing acceptance criterion judgments: {}",
+                missing.join(", ")
+            )
+        }
+        Ok(())
+    }
+}
+
+fn is_vacuous_review_evidence(value: &str) -> bool {
+    matches!(
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .as_str(),
+        "looks correct" | "tests pass" | "implementation seems fine" | "seems fine" | "ok"
+    )
 }
 
 pub fn blocker_id(finding: &str) -> String {
@@ -1042,6 +1197,25 @@ fn normalize_blockers(result: &mut ReviewResult) {
         .filter(|b| b.status != "resolved")
         .map(|b| b.finding.clone())
         .collect();
+}
+
+fn reconcile_task_review_verdict(result: &mut ReviewResult) {
+    result.blocking_findings = result
+        .blockers
+        .iter()
+        .filter(|blocker| blocker.status != "resolved")
+        .map(|blocker| blocker.finding.clone())
+        .take(5)
+        .collect();
+    let all_criteria_satisfied = result
+        .criterion_results
+        .iter()
+        .all(|criterion| criterion.status == crate::protocol::ReviewCriterionStatus::Satisfied);
+    if all_criteria_satisfied && result.blocking_findings.is_empty() {
+        result.verdict = "PASS".into();
+    } else if !result.verdict.eq_ignore_ascii_case("reject") {
+        result.verdict = "REVISE".into();
+    }
 }
 
 fn structured_blocker_key(
@@ -1128,7 +1302,7 @@ fn review_resolution_ledger(reviews: &[crate::review::PriorReview]) -> String {
     ledger
 }
 
-const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review using only the supplied task contract, submitted diff/change evidence, blocker ledger/revision history, and Orc-produced structured validation evidence. Do not execute shell commands, tests, cargo/npm/formatting commands, validation, or repository discovery; Orc already selected and ran task-specific validation. Treat its validation results as authoritative for command outcomes. On a revision, assess every unresolved blocker against the supplied current evidence before considering a broad review. Check each resolved blocker for regression; equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when supplied current evidence demonstrates a genuine regression. Clearly distinguish RESOLVED from UNRESOLVED prior blockers. Do not restate equivalent findings. Reject vacuous or placeholder tests, assertions, changed-file lists, and validation claims. A blocker must identify an explicit requirement, concrete supplied evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. Keep blocking findings to at most 5. PASS requires no blocking findings; REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation.";
+const TASK_REVIEW_INSTRUCTIONS: &str = "Perform an acceptance-first, task-scoped contract review using only the supplied bounded packet. Evaluate every Orc-supplied task_contract.acceptance_criteria entry exactly once by criterion_id as satisfied, violated, or insufficient_evidence. A satisfied result requires concrete structured evidence references to sources present in this packet; validation passing or vague claims such as 'looks correct' are not semantic evidence by themselves. Use insufficient_evidence when the packet cannot support a legitimate judgment; do not invent a defect and do not inspect the repository or run commands to compensate. For violated criteria, return a focused blocker tied to that criterion_id. Do not execute shell commands, tests, cargo/npm/formatting commands, validation, or repository discovery; Orc already selected and ran task-specific validation. Treat its validation results as authoritative only for command outcomes. On a revision, explicitly assess every unresolved blocker against current packet evidence. Check each resolved blocker for regression; equivalent or reworded findings refer to the same concern and remain resolved. Reopen a resolved concern only when supplied current evidence demonstrates a genuine regression. Reject vacuous or placeholder tests, assertions, changed-file lists, and validation claims. A blocker must identify an explicit requirement, concrete supplied evidence, and why acceptance is prevented; only unmet requirements, incorrect required workflow, material regressions, safety/data-integrity failures, or failed/materially absent structured validation can block. Keep blocking findings to at most 5. Orc derives task-level PASS: it is legal only when every criterion is satisfied and every blocker is resolved. REVISE requires focused in-scope changes; REJECT is only for fundamental contradiction or unsafe implementation.";
 
 fn start_run(db: &Database, action: AgentAction, resolved: &ResolvedAction) -> Result<i64> {
     let project_id = db.get_project_id()?.context("no project found in DB")?;
@@ -1174,7 +1348,7 @@ fn invoke_action(
     backend: &dyn ActionBackend,
     agent: &AgentDefinition,
     resolved: &ResolvedAction,
-    prompt: &str,
+    prompt: &crate::provider_context::RenderedPacket,
 ) -> Result<ActionExecution> {
     announce_run(backend, run, resolved);
     let invocation = db.start_provider_invocation_with_resolution(
@@ -1183,6 +1357,33 @@ fn invoke_action(
         1,
         &resolved.resolution_record,
     )?;
+    let (context_cwd, repository_discovery, isolated) =
+        backend.context_environment(resolved.action);
+    let mut context = crate::provider_context::invocation_context(
+        resolved.action.as_str(),
+        &agent.backend,
+        prompt,
+        crate::provider_context::InvocationEnvironment {
+            profile_path: agent.profile_path.as_deref().map(Path::new),
+            cwd: &context_cwd,
+            repository_context_discovery: repository_discovery,
+            isolated,
+            repository_filesystem_access: false,
+        },
+    );
+    let action_schema = schema(resolved.action);
+    let accounted_schema = if agent.backend == "codex" {
+        crate::worker::codex_compatible_output_schema(&action_schema).map_err(anyhow::Error::msg)?
+    } else {
+        action_schema.clone()
+    };
+    crate::provider_context::add_known_text_source(
+        &mut context,
+        "orc_output_schema",
+        "structured response schema",
+        &accounted_schema,
+    );
+    db.set_provider_invocation_context(invocation, &context)?;
     let phase = if resolved.action == AgentAction::Review {
         "Reviewing implementation      ..."
     } else {
@@ -1198,11 +1399,10 @@ fn invoke_action(
         }
         backend.observe(activity);
     };
-    let action_schema = schema(resolved.action);
     let execution = backend.invoke_with_progress(
         agent,
         resolved.action,
-        prompt,
+        &prompt.content,
         resolved.model.as_deref(),
         resolved.reasoning_effort,
         ActionProgress {
@@ -1702,23 +1902,32 @@ fn run_review_mode(
     } else {
         TASK_REVIEW_INSTRUCTIONS
     };
-    let result_contract = "Return only JSON matching {\"verdict\":string,\"findings\":[string],\"blocking_findings\":[string],\"non_blocking_findings\":[string],\"severity\":string|null,\"revision_feedback\":string|null,\"blockers\":[{\"id\":string,\"prior_blocker_id\":string|null,\"blocker_key\":string,\"requirement_ref\":string,\"evidence\":string,\"severity\":string,\"acceptance_condition\":string,\"status\":\"new|unresolved|resolved|regression\",\"finding\":string}]}. blocker_key is readable context, not identity. Copy an existing blocker_id verbatim into prior_blocker_id for the same concern; use null only for a genuinely new blocker. Review semantic task-contract concerns only. Do not accept or merge the task.";
+    let result_contract = "Return only JSON matching the supplied schema. criterion_results must contain exactly one entry per Orc-supplied criterion_id. Evidence kind is diff, changed_file, validation, task_contract, or implementation_fact; use the exact packet reference (current_changes.diff, a supplied changed path, a passing_validation command, task_contract.objective, a criterion_id, or task_contract.unchanged.N). blocker_key is readable context, not identity. Copy an existing blocker_id verbatim into prior_blocker_id for the same concern; use null only for a genuinely new blocker. Review semantic task-contract concerns only. Do not accept or merge the task.";
+    let review_packet = if project_review {
+        None
+    } else {
+        Some(build_review_packet(db, summary)?)
+    };
     let prompt = if project_review {
         let contract = db
             .get_task_contract(&summary.task.id)?
             .unwrap_or_else(|| crate::task::TaskContract::defaults(&summary.task.objective));
-        crate::execution_packet::render_packet(
+        let packet = crate::execution_packet::ProjectReviewPacket::build(
+            &summary.task,
+            &contract,
+            &summary.changes,
+        );
+        crate::execution_packet::render_packet_accounted(
             &format!("{instructions} {result_contract}"),
-            &crate::execution_packet::ProjectReviewPacket::build(
-                &summary.task,
-                &contract,
-                &summary.changes,
-            ),
+            &packet.metadata,
+            &packet,
         )?
     } else {
-        crate::execution_packet::render_packet(
+        let packet = review_packet.as_ref().expect("task Review has a packet");
+        crate::execution_packet::render_packet_accounted(
             &format!("{instructions} {result_contract}"),
-            &build_review_packet(db, summary)?,
+            &packet.metadata,
+            packet,
         )?
     };
     let execution = invoke_action(db, run, backend, &review_agent, &resolved, &prompt);
@@ -1731,6 +1940,9 @@ fn run_review_mode(
                     }
                     let mut result = result;
                     if !project_review {
+                        result.validate_criterion_results(
+                            review_packet.as_ref().expect("task Review has a packet"),
+                        )?;
                         result.blocking_findings.truncate(5);
                     }
                     if result.blocking_findings.is_empty()
@@ -1741,23 +1953,7 @@ fn run_review_mode(
                     {
                         result.blocking_findings = result.findings.clone();
                     }
-                    if !result.blocking_findings.is_empty()
-                        && result.verdict.eq_ignore_ascii_case("pass")
-                    {
-                        result.verdict = "REVISE".into();
-                    }
-                    if !project_review
-                        && result.blocking_findings.is_empty()
-                        && (result.verdict.eq_ignore_ascii_case("revise")
-                            || result.verdict.eq_ignore_ascii_case("reject"))
-                    {
-                        result.verdict = "PASS".into();
-                    }
-                    if result.verdict.eq_ignore_ascii_case("pass") {
-                        result.blocking_findings.clear();
-                    }
                     normalize_blockers(&mut result);
-                    result.validate_structured_blockers()?;
                     let prior = db.review_blocker_ledger(&summary.task.id)?;
                     let mut referenced = std::collections::HashSet::new();
                     for blocker in &mut result.blockers {
@@ -1817,24 +2013,71 @@ fn run_review_mode(
                             blocker.status = "new".into();
                         }
                     }
-                    if result.verdict.eq_ignore_ascii_case("pass") {
-                        let resolved =
-                            prior
-                                .iter()
-                                .filter(|old| old.status != "resolved")
-                                .map(|old| ReviewBlocker {
-                                    id: old.blocker_id.clone(),
-                                    prior_blocker_id: Some(old.blocker_id.clone()),
-                                    blocker_key: old.blocker_key.clone(),
-                                    requirement_ref: old.requirement_ref.clone(),
-                                    evidence: "No blocking finding in the current review.".into(),
-                                    severity: old.severity.clone(),
-                                    acceptance_condition: old.acceptance_condition.clone(),
-                                    status: "resolved".into(),
-                                    finding: old.finding.clone(),
-                                });
-                        result.blockers.extend(resolved);
+                    let explicitly_referenced = result
+                        .blockers
+                        .iter()
+                        .filter_map(|blocker| blocker.prior_blocker_id.as_deref())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if !project_review && let Some(uncovered) = prior.iter().find(|old| {
+                        old.status != "resolved"
+                            && !explicitly_referenced.contains(old.blocker_id.as_str())
+                    }) {
+                        bail!(
+                            "review omitted unresolved prior blocker '{}'",
+                            uncovered.blocker_id
+                        )
                     }
+                    if !project_review {
+                        // A provider's explicit semantic violation is actionable even
+                        // if it forgot to duplicate that fact in the blocker list.
+                        let packet = review_packet.as_ref().expect("task Review has a packet");
+                        let violations = result
+                            .criterion_results
+                            .iter()
+                            .filter(|criterion| {
+                                criterion.status == crate::protocol::ReviewCriterionStatus::Violated
+                                    && !result
+                                        .blockers
+                                        .iter()
+                                        .any(|blocker| blocker.status != "resolved")
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for criterion in violations {
+                            let text = packet
+                                .task_contract
+                                .acceptance_criteria
+                                .iter()
+                                .find(|value| value.criterion_id == criterion.criterion_id)
+                                .map(|value| value.text.clone())
+                                .unwrap_or_else(|| criterion.criterion_id.clone());
+                            result.blockers.push(ReviewBlocker {
+                                id: structured_blocker_id(
+                                    &criterion.criterion_id,
+                                    &text,
+                                    &criterion.rationale,
+                                ),
+                                prior_blocker_id: None,
+                                blocker_key: format!("criterion:{}", criterion.criterion_id),
+                                requirement_ref: criterion.criterion_id,
+                                evidence: criterion
+                                    .evidence
+                                    .iter()
+                                    .map(|value| value.explanation.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
+                                severity: result
+                                    .severity
+                                    .clone()
+                                    .unwrap_or_else(|| "unspecified".into()),
+                                acceptance_condition: text,
+                                status: "new".into(),
+                                finding: criterion.rationale,
+                            });
+                        }
+                        reconcile_task_review_verdict(&mut result);
+                    }
+                    result.validate_structured_blockers()?;
                     Ok(result)
                 },
             );
@@ -1849,7 +2092,13 @@ fn run_review_mode(
                     let persisted_output = serde_json::to_string(&result)?;
                     if !project_review {
                         db.store_change_evidence(run, &summary.changes)?;
-                        let contract = if result.verdict.eq_ignore_ascii_case("revise") {
+                        let has_actionable_blocker = result
+                            .blockers
+                            .iter()
+                            .any(|blocker| blocker.status != "resolved");
+                        let contract = if result.verdict.eq_ignore_ascii_case("revise")
+                            && has_actionable_blocker
+                        {
                             let records = result.blockers.iter().map(|blocker| {
                                 crate::storage::db::ReviewBlockerRecord {
                                     task_id: summary.task.id.clone(),
@@ -1912,10 +2161,16 @@ fn run_review_mode(
                         } else {
                             None
                         };
-                        db.commit_task_review_result(
+                        db.commit_task_review_result_with_criteria(
                             &summary.task.id,
                             run,
                             &result.blockers,
+                            &review_packet
+                                .as_ref()
+                                .expect("task Review has a packet")
+                                .task_contract
+                                .acceptance_criteria,
+                            &result.criterion_results,
                             contract.as_deref(),
                             result.verdict.eq_ignore_ascii_case("pass"),
                             &persisted_output,
@@ -1965,8 +2220,8 @@ pub fn run_plan(
     )?;
     let run = start_run(db, AgentAction::Plan, &resolved)?;
     let _run_finalizer = db.run_finalizer(run);
-    let packet = planner_packet(db, request)?;
-    let prompt = planner_prompt(&packet)?;
+    let packet = build_planner_packet(db, request)?;
+    let prompt = planner_prompt_accounted(&packet)?;
     let planner_backend = PlannerActionBackend::new(backend);
     let execution = invoke_action(db, run, &planner_backend, &agent, &resolved, &prompt);
     match execution {
@@ -2004,12 +2259,26 @@ pub fn run_plan(
     }
 }
 
+#[cfg(test)]
 fn planner_prompt(packet: &serde_json::Value) -> Result<String> {
     crate::execution_packet::render_packet(
         &format!(
             "Produce a plan from this bounded authoritative Planner packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, supply execution_hints.effort (low, medium, or high) only as non-authoritative metadata describing expected execution depth; Orc's shared economy resolver makes the final agent, model, effort, and tier decision. Do not infer or raise the hint mechanically from risk_factors. Give a concise effort_reason based on semantic complexity, coupling, and uncertainty rather than risk labels or description length. {} Declare risk factors accurately, make acceptance criteria, required tests, and validation precise enough to satisfy their deterministic safeguards, and decompose work when a task is too broad for reliable bounded execution.",
             planner_risk_guidance()
         ),
+        packet,
+    )
+}
+
+fn planner_prompt_accounted(
+    packet: &crate::execution_packet::PlannerPacket,
+) -> Result<crate::provider_context::RenderedPacket> {
+    crate::execution_packet::render_packet_accounted(
+        &format!(
+            "Produce a plan from this bounded authoritative Planner packet. Return only a PlanResponse JSON document and do not mutate project state. For every task, supply execution_hints.effort (low, medium, or high) only as non-authoritative metadata describing expected execution depth; Orc's shared economy resolver makes the final agent, model, effort, and tier decision. Do not infer or raise the hint mechanically from risk_factors. Give a concise effort_reason based on semantic complexity, coupling, and uncertainty rather than risk labels or description length. {} Declare risk factors accurately, make acceptance criteria, required tests, and validation precise enough to satisfy their deterministic safeguards, and decompose work when a task is too broad for reliable bounded execution.",
+            planner_risk_guidance()
+        ),
+        &packet.metadata,
         packet,
     )
 }
@@ -2044,9 +2313,11 @@ struct LeadActionAdapter<'a> {
 
 impl LeadBackend for LeadActionAdapter<'_> {
     fn invoke(&self, context: &LeadContext, message: &str) -> Result<LeadBackendResponse, String> {
-        let prompt = crate::execution_packet::render_packet(
+        let packet = build_lead_packet(context, message);
+        let prompt = crate::execution_packet::render_packet_accounted(
             "Act as Orc's project Lead using only the bounded authoritative Lead packet. Return only JSON matching {\"message\":string,\"proposals\":array,\"decision\":{\"kind\":\"DIRECT_TASKS\"|\"PLAN_REQUIRED\"|\"USER_DECISION_REQUIRED\"|\"APPROVE\"|\"REVISE_PLAN\",\"details\":object}}. Return exactly one decision. Proposals are human-gated and must not be applied.",
-            &build_lead_packet(context, message),
+            &packet.metadata,
+            &packet,
         )
         .map_err(|error| error.to_string())?;
         let execution = invoke_action(
@@ -2710,6 +2981,12 @@ mod tests {
             calls: RefCell::new(Vec::new()),
             output: serde_json::json!({
                 "verdict": "revise",
+                "criterion_results": [{
+                    "criterion_id": "acceptance-criterion-1",
+                    "status": "violated",
+                    "evidence": [{"kind":"task_contract","reference":"acceptance-criterion-1","explanation":"The review identifies missing required coverage for this contract criterion."}],
+                    "rationale": "Required acceptance coverage is missing."
+                }],
                 "findings": ["missing coverage"],
                 "blocking_findings": [],
                 "non_blocking_findings": [],
@@ -2744,7 +3021,7 @@ mod tests {
             )
             .unwrap()
             .1;
-        assert_eq!(review.verdict, "revise");
+        assert_eq!(review.verdict, "REVISE");
         assert_eq!(
             app.task(&task).unwrap().unwrap().status.to_string(),
             "revision_required"
@@ -2786,6 +3063,13 @@ mod tests {
     }
 
     fn review_fixture(output: serde_json::Value) -> (Database, ReviewSummary, FakeBackend) {
+        review_fixture_with_objective(output, "objective")
+    }
+
+    fn review_fixture_with_objective(
+        output: serde_json::Value,
+        objective: &str,
+    ) -> (Database, ReviewSummary, FakeBackend) {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("orc.db");
         let db = Database::init(&db_path).unwrap();
@@ -2794,7 +3078,7 @@ mod tests {
             .insert_task(
                 project,
                 "task",
-                "objective",
+                objective,
                 "developer",
                 TaskPriority::Normal,
             )
@@ -2803,12 +3087,48 @@ mod tests {
         db.update_task_status(&task, crate::task::TaskStatus::Review)
             .unwrap();
         let task = db.get_task(&task).unwrap().unwrap();
+        let mut output = output;
+        if output.get("criterion_results").is_none() {
+            let has_blocker = output
+                .get("blocking_findings")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+                || output
+                    .get("blockers")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|values| !values.is_empty());
+            output["criterion_results"] = serde_json::json!([{
+                "criterion_id": "acceptance-criterion-1",
+                "status": if has_blocker { "violated" } else { "satisfied" },
+                "evidence": [{
+                    "kind": "diff",
+                    "reference": "current_changes.diff",
+                    "explanation": if has_blocker {
+                        "The bounded diff demonstrates the reported semantic gap."
+                    } else {
+                        "The bounded diff shows the objective's implementation behavior."
+                    }
+                }],
+                "rationale": if has_blocker {
+                    "The supplied implementation does not satisfy the criterion."
+                } else {
+                    "The supplied implementation evidence satisfies the criterion."
+                }
+            }]);
+        }
         let summary = ReviewSummary {
             task,
             run: None,
             result: None,
             worktree_path: None,
-            changes: crate::git::WorktreeChanges::default(),
+            changes: crate::git::WorktreeChanges {
+                files: vec![crate::git::ChangedFile {
+                    status: "M".into(),
+                    path: "src/change.rs".into(),
+                }],
+                stat: " src/change.rs | 1 +".into(),
+                diff: "diff --git a/src/change.rs b/src/change.rs\n+implemented objective\n".into(),
+            },
             change_evidence: None,
             validation_evidence: None,
             prior_reviews: Vec::new(),
@@ -3004,10 +3324,250 @@ mod tests {
                     path: (*path).into(),
                 })
                 .collect(),
-            stat: String::new(),
-            diff: String::new(),
+            stat: changed_files.join("\n"),
+            diff: changed_files
+                .iter()
+                .map(|path| format!("diff --git a/{path} b/{path}\n+semantic implementation\n"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
         (db, summary, backend, directory)
+    }
+
+    fn criterion_result(status: &str, reference: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "criterion_id": "acceptance-criterion-1",
+            "status": status,
+            "evidence": reference.map(|reference| vec![serde_json::json!({
+                "kind": "diff",
+                "reference": reference,
+                "explanation": "The bounded diff provides concrete semantic implementation evidence."
+            })]).unwrap_or_default(),
+            "rationale": match status {
+                "satisfied" => "Current implementation evidence satisfies the required behavior.",
+                "violated" => "Current implementation evidence demonstrates the required behavior is absent.",
+                _ => "The bounded packet lacks enough implementation evidence for a legitimate judgment."
+            }
+        })
+    }
+
+    fn criterion_review_output(
+        verdict: &str,
+        criterion_results: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "verdict": verdict,
+            "criterion_results": criterion_results,
+            "findings": [], "blocking_findings": [], "non_blocking_findings": [],
+            "severity": null, "revision_feedback": null, "blockers": []
+        })
+    }
+
+    #[test]
+    fn criterion_complete_satisfaction_deterministically_permits_pass() {
+        let (db, summary, backend) = review_fixture(criterion_review_output(
+            "REVISE",
+            vec![criterion_result("satisfied", Some("current_changes.diff"))],
+        ));
+        let (_, result) = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap();
+        assert_eq!(result.verdict, "PASS");
+    }
+
+    #[test]
+    fn violated_and_insufficient_criteria_deterministically_prevent_pass() {
+        for status in ["violated", "insufficient_evidence"] {
+            let reference = (status == "violated").then_some("current_changes.diff");
+            let (db, summary, backend) = review_fixture(criterion_review_output(
+                "PASS",
+                vec![criterion_result(status, reference)],
+            ));
+            let (_, result) = run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap();
+            assert_eq!(result.verdict, "REVISE");
+            if status == "insufficient_evidence" {
+                assert!(result.blockers.is_empty());
+                assert!(
+                    db.actionable_revision_contract(&summary.task.id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    db.get_task(&summary.task.id).unwrap().unwrap().status,
+                    crate::task::TaskStatus::Review
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_duplicate_and_unknown_criterion_results_are_protocol_errors() {
+        let cases = [
+            criterion_review_output("PASS", Vec::new()),
+            criterion_review_output(
+                "PASS",
+                vec![
+                    criterion_result("satisfied", Some("current_changes.diff")),
+                    criterion_result("satisfied", Some("current_changes.diff")),
+                ],
+            ),
+            {
+                let mut unknown = criterion_result("satisfied", Some("current_changes.diff"));
+                unknown["criterion_id"] = serde_json::json!("provider-invented-criterion");
+                criterion_review_output("PASS", vec![unknown])
+            },
+        ];
+        for output in cases {
+            let (db, summary, backend) = review_fixture(output);
+            let error = run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("criterion"),
+                "unexpected error: {error:#}"
+            );
+            assert_ne!(
+                db.get_task(&summary.task.id).unwrap().unwrap().status,
+                crate::task::TaskStatus::AcceptanceReady
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_references_must_exist_in_the_bounded_packet() {
+        let (db, summary, backend) = review_fixture(criterion_review_output(
+            "PASS",
+            vec![criterion_result("satisfied", Some("repository/secret.rs"))],
+        ));
+        let error = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("absent from the review packet"));
+    }
+
+    #[test]
+    fn malformed_criterion_status_and_evidence_shape_are_rejected_without_semantic_invention() {
+        for criterion in [
+            serde_json::json!({
+                "criterion_id":"acceptance-criterion-1","status":"probably_satisfied",
+                "evidence":[],"rationale":"A provider invented an unsupported status."
+            }),
+            serde_json::json!({
+                "criterion_id":"acceptance-criterion-1","status":"satisfied",
+                "evidence":[{"kind":"diff","reference":"current_changes.diff"}],
+                "rationale":"The evidence object is missing its required explanation."
+            }),
+        ] {
+            let (db, summary, backend) =
+                review_fixture(criterion_review_output("PASS", vec![criterion]));
+            let error = run_review(
+                &db,
+                &summary,
+                &ActionOverrides::default(),
+                &backend,
+                Path::new("."),
+                &RecordingValidationRunner::new(&[]),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("malformed structured output"));
+            assert!(db.review_criterion_observations(1).unwrap().is_empty());
+            assert_ne!(
+                db.get_task(&summary.task.id).unwrap().unwrap().status,
+                crate::task::TaskStatus::AcceptanceReady
+            );
+        }
+    }
+
+    #[test]
+    fn suspended_records_semantic_defect_cannot_be_accepted_by_top_level_pass() {
+        let output = criterion_review_output(
+            "PASS",
+            vec![criterion_result("violated", Some("current_changes.diff"))],
+        );
+        let (db, mut summary, backend) =
+            review_fixture_with_objective(output, "active records exclude Suspended records");
+        summary.changes = crate::git::WorktreeChanges {
+            files: vec![crate::git::ChangedFile {
+                status: "M".into(),
+                path: "src/records.rs".into(),
+            }],
+            stat: "src/records.rs | 2 +".into(),
+            diff: "diff --git a/src/records.rs b/src/records.rs\n+records.iter().filter(|record| record.status != Status::Deleted).count()\n+// Suspended is incorrectly included as active\n".into(),
+        };
+        summary.validation_evidence = Some(
+            serde_json::to_string(&crate::validation::ValidationReport {
+                steps: vec![crate::validation::ValidationStepResult {
+                    command: "cargo test".into(),
+                    category: crate::validation::ValidationCategory::Success,
+                    passed: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_status: Some(0),
+                    diagnostics: None,
+                    failure_classification: None,
+                    fallback_command: None,
+                }],
+            })
+            .unwrap(),
+        );
+        let packet = build_review_packet(&db, &summary).unwrap();
+        assert_eq!(
+            packet.task_contract.acceptance_criteria[0].text,
+            "active records exclude Suspended records"
+        );
+        assert!(packet.current_changes.diff.text.contains("Suspended"));
+        assert!(
+            packet
+                .passing_validation
+                .iter()
+                .any(|step| step.command == "cargo test")
+        );
+
+        let (_, result) = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap();
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(
+            result.criterion_results[0].status,
+            crate::protocol::ReviewCriterionStatus::Violated
+        );
+        assert!(!result.blockers.is_empty());
+        assert_eq!(
+            db.get_task(&summary.task.id).unwrap().unwrap().status,
+            crate::task::TaskStatus::RevisionRequired
+        );
     }
 
     const GROUPED_VALIDATION_TOML: &str = r#"
@@ -3285,6 +3845,7 @@ commands = ["npm run typecheck", "npm run build"]
                 Ok(ActionExecution {
                     output: serde_json::json!({
                         "verdict": "PASS", "findings": [], "blocking_findings": [], "blockers": [],
+                        "criterion_results":[{"criterion_id":"acceptance-criterion-1","status":"satisfied","evidence":[{"kind":"diff","reference":"current_changes.diff","explanation":"The bounded diff supplies concrete implementation evidence."}],"rationale":"Current implementation evidence satisfies the criterion."}],
                         "non_blocking_findings": [], "severity": null, "revision_feedback": null
                     })
                     .to_string(),
@@ -3466,6 +4027,11 @@ commands = ["npm run typecheck", "npm run build"]
                 Ok(ActionExecution {
                     output: serde_json::json!({
                         "verdict": "PASS", "findings": [], "blocking_findings": [],
+                        "criterion_results": [{
+                            "criterion_id":"acceptance-criterion-1","status":"satisfied",
+                            "evidence":[{"kind":"diff","reference":"current_changes.diff","explanation":"The bounded diff contains the required implementation."}],
+                            "rationale":"Current implementation evidence satisfies the criterion."
+                        }],
                         "non_blocking_findings": [], "severity": null,
                         "revision_feedback": null, "blockers": []
                     })
@@ -3630,6 +4196,44 @@ commands = ["npm run typecheck", "npm run build"]
         .1;
         assert_eq!(result.verdict, "PASS");
         assert_eq!(result.non_blocking_findings.len(), 1);
+    }
+
+    #[test]
+    fn task_review_cannot_pass_with_a_new_structured_blocker() {
+        let finding = "the task still changes an out-of-scope public API";
+        let (db, summary, backend) = review_fixture(serde_json::json!({
+            "verdict": "PASS",
+            "findings": [finding],
+            "blocking_findings": [],
+            "non_blocking_findings": [],
+            "severity": "medium",
+            "revision_feedback": null,
+            "blockers": [{
+                "id": "provider-generated-id",
+                "prior_blocker_id": null,
+                "blocker_key": "public API scope",
+                "requirement_ref": "task non-goals",
+                "evidence": "the supplied diff adds a public re-export",
+                "severity": "medium",
+                "acceptance_condition": "remove the public re-export",
+                "status": "new",
+                "finding": finding
+            }]
+        }));
+        let result = run_review(
+            &db,
+            &summary,
+            &ActionOverrides::default(),
+            &backend,
+            Path::new("."),
+            &RecordingValidationRunner::new(&[]),
+        )
+        .unwrap()
+        .1;
+
+        assert_eq!(result.verdict, "REVISE");
+        assert_eq!(result.blocking_findings, vec![finding]);
+        assert_eq!(result.blockers[0].status, "new");
     }
 
     #[test]

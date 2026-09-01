@@ -771,7 +771,10 @@ impl WorkerFactory {
                 reasoning_effort: reasoning_effort
                     .or(canonical.execution.provider.reasoning_effort),
                 read_only: true,
-                isolated_review: false,
+                // Lead and Planner consume Orc-collected state and do not need
+                // Codex repository instruction discovery. The same option also
+                // supplies --skip-git-repo-check for an isolated temp cwd.
+                isolated_review: true,
                 executable,
             },
         )

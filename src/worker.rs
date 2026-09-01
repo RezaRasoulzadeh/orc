@@ -321,6 +321,10 @@ const SIGKILL: i32 = 9;
 /// Trait for task execution backends.
 /// Implementations are responsible for executing a task and returning the outcome.
 pub trait Worker: Send + Sync {
+    /// Stable provider identifier used only for normalized observability.
+    fn provider_id(&self) -> &'static str {
+        "unknown"
+    }
     /// Convert a provider event into an Orc activity message. Event formats
     /// stay inside the provider implementation.
     fn activity(&self, _event: &str) -> String {
@@ -533,6 +537,10 @@ impl CopilotWorker {
 }
 
 impl Worker for CopilotWorker {
+    fn provider_id(&self) -> &'static str {
+        "copilot"
+    }
+
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         self.execute_with_progress(prompt, cwd, &|_| {})
     }
@@ -695,6 +703,8 @@ impl CodexWorker {
         vec![
             "exec".into(),
             "--json".into(),
+            "--ephemeral".into(),
+            "--ignore-user-config".into(),
             "--sandbox".into(),
             sandbox.into(),
         ]
@@ -720,6 +730,16 @@ impl CodexWorker {
         cwd: &Path,
         schema_path: Option<&Path>,
     ) -> std::process::Command {
+        self.command_with_schema_and_access(prompt, cwd, schema_path, None)
+    }
+
+    fn command_with_schema_and_access(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        schema_path: Option<&Path>,
+        repository_access: Option<&Path>,
+    ) -> std::process::Command {
         let mut command = std::process::Command::new(&self.executable);
         let mut args = Self::command_args_with_sandbox(
             prompt,
@@ -736,6 +756,22 @@ impl CodexWorker {
         if self.skip_git_repo_check {
             let stdin_marker = args.pop().expect("Codex command includes stdin marker");
             args.push("--skip-git-repo-check".into());
+            args.push(stdin_marker);
+        }
+        if let Some(path) = repository_access {
+            let stdin_marker = args.pop().expect("Codex command includes stdin marker");
+            args.push("--cd".into());
+            // Codex tools resolve relative paths from its logical `--cd`, not
+            // necessarily from the process working directory. Keep the
+            // launcher process isolated, but anchor mutation tools in the
+            // explicit task worktree so a relative edit cannot escape into
+            // the project's main checkout.
+            args.push(path.to_string_lossy().into_owned());
+            args.push("--add-dir".into());
+            args.push(path.to_string_lossy().into_owned());
+            if !args.iter().any(|arg| arg == "--skip-git-repo-check") {
+                args.push("--skip-git-repo-check".into());
+            }
             args.push(stdin_marker);
         }
         command.args(args);
@@ -762,6 +798,10 @@ impl CodexWorker {
 }
 
 impl Worker for CodexWorker {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
     fn activity(&self, event: &str) -> String {
         codex_activity(event)
     }
@@ -943,13 +983,39 @@ impl CodexWorker {
         progress: &dyn Fn(&str),
         cancellation: Option<&CancellationControl>,
     ) -> Result<WorkerExecution, String> {
-        match run_command_with_timeout_progress_and_stdin_cancel(
-            self.command_with_schema(prompt, cwd, schema_path),
+        let repository_access = (self.sandbox == "workspace-write")
+            .then(|| {
+                cwd.canonicalize().map_err(|error| {
+                    format!(
+                        "failed to resolve explicit Codex repository access {}: {error}",
+                        cwd.display()
+                    )
+                })
+            })
+            .transpose()?;
+        let isolation = (self.sandbox == "workspace-write")
+            .then(|| isolated_codex_execution_directory("mutation"))
+            .transpose()?;
+        let command = match isolation.as_deref() {
+            Some(directory) => self.command_with_schema_and_access(
+                prompt,
+                directory,
+                schema_path,
+                repository_access.as_deref(),
+            ),
+            None => self.command_with_schema(prompt, cwd, schema_path),
+        };
+        let result = run_command_with_timeout_progress_and_stdin_cancel(
+            command,
             configured_timeout("ORC_WORKER_TIMEOUT_SECS", DEFAULT_WORKER_TIMEOUT),
             Some(prompt.as_bytes()),
             cancellation,
             progress,
-        ) {
+        );
+        if let Some(directory) = isolation {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        match result {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -978,6 +1044,24 @@ impl CodexWorker {
             Err(error) => Err(format!("failed to spawn 'codex' executable: {error}")),
         }
     }
+}
+
+fn isolated_codex_execution_directory(label: &str) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "orc-codex-{label}-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&directory).map_err(|error| {
+        format!(
+            "failed to create isolated Codex execution directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
 }
 
 /// Translate Orc's provider-neutral JSON Schema into the strict subset accepted
@@ -1364,6 +1448,10 @@ impl AntigravityWorker {
 }
 
 impl Worker for AntigravityWorker {
+    fn provider_id(&self) -> &'static str {
+        "antigravity"
+    }
+
     fn execute(&self, prompt: &str, cwd: &Path) -> Result<(WorkerOutcome, Option<String>), String> {
         self.execute_with_progress(prompt, cwd, &|_| {})
     }
@@ -1461,7 +1549,18 @@ mod tests {
         let args =
             CodexWorker::with_read_only_execution(PathBuf::from("/profiles/lead"), None, None)
                 .command_args_for_test();
-        assert_eq!(args, vec!["exec", "--json", "--sandbox", "read-only", "-"]);
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--json",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--sandbox",
+                "read-only",
+                "-",
+            ]
+        );
     }
 
     #[test]
@@ -1474,11 +1573,50 @@ mod tests {
             vec![
                 "exec",
                 "--json",
+                "--ephemeral",
+                "--ignore-user-config",
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
                 "-",
             ]
+        );
+    }
+
+    #[test]
+    fn codex_automated_transport_ignores_user_config_and_is_ephemeral() {
+        let worker = CodexWorker::new(PathBuf::from("/profiles/main"));
+        let args = worker.command_args_for_test();
+        assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(!args.iter().any(|arg| arg == "resume"));
+    }
+
+    #[test]
+    fn codex_mutation_command_anchors_tools_in_repository_worktree() {
+        let worker = CodexWorker::new(PathBuf::from("/profiles/main"));
+        let command = worker.command_with_schema_and_access(
+            "bounded",
+            Path::new("/tmp/orc-isolated"),
+            None,
+            Some(Path::new("/worktrees/task")),
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--add-dir", "/worktrees/task"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--cd", "/worktrees/task"])
+        );
+        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new("/tmp/orc-isolated"))
         );
     }
 

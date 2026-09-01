@@ -1,0 +1,22 @@
+{
+  "local_id": "T-0002",
+  "title": "Add bounded label prefix query",
+  "objective": "Add Catalog::labels_with_prefix(&self, prefix: &str, limit: usize) -> Vec<&Record>. Matching uses normalize_label for case/whitespace-insensitive prefix comparison, preserves insertion order, includes active and inactive records, returns at most limit, and is empty for limit zero or empty normalized prefix. Add tests for matching, order, normalization, truncation, zero limit, and empty prefix. Required validation: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Non-goals: sorting, pagination, mutation, dependencies, or CLI changes.",
+  "role": "developer",
+  "priority": "normal",
+  "depends_on": [],
+  "capabilities": [],
+  "scope_mode": null,
+  "context_files": ["src/catalog.rs", "src/normalize.rs", "tests/ledger_tests.rs"],
+  "expected_changes": ["src/catalog.rs", "tests/ledger_tests.rs"],
+  "unchanged": ["sorting", "pagination", "mutation behavior", "dependencies", "CLI behavior"],
+  "acceptance_criteria": [
+    "Matching uses normalize_label for case- and whitespace-insensitive prefix comparison.",
+    "Results preserve insertion order and include active and inactive records.",
+    "Results contain at most limit records and are empty for limit zero or an empty normalized prefix."
+  ],
+  "required_tests": ["Matching, order, normalization, truncation, zero-limit, and empty-prefix tests"],
+  "validation": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"],
+  "execution_hints": {"effort": "low", "effort_reason": "Recovered trial contract uses the default execution depth."},
+  "risk_factors": []
+}

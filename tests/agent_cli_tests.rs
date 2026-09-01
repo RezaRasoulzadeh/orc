@@ -429,6 +429,13 @@ impl ActionBackend for ReviewBackend {
         Ok(ActionExecution {
             output: serde_json::to_string(&ReviewResult {
                 verdict: "accept".into(),
+                criterion_results: vec![orc::protocol::ReviewCriterionResult {
+                    criterion_id: "acceptance-criterion-1".into(),
+                    status: orc::protocol::ReviewCriterionStatus::InsufficientEvidence,
+                    evidence: Vec::new(),
+                    rationale:
+                        "No implementation evidence is present in the bounded review packet.".into(),
+                }],
                 findings: Vec::new(),
                 blocking_findings: Vec::new(),
                 non_blocking_findings: Vec::new(),
@@ -490,7 +497,7 @@ fn cli_configured_review_action_is_selected_for_automated_review() {
             &FakeValidationRunner::success(),
         )
         .unwrap();
-    assert_eq!(result.verdict, "accept");
+    assert_eq!(result.verdict, "REVISE");
 }
 
 #[test]

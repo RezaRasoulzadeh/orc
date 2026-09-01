@@ -232,6 +232,89 @@ fn lifecycle_and_current_latest_run_semantics_survive_restart() {
 }
 
 #[test]
+fn invocation_context_and_usage_survive_reopen_and_ignore_current_profile_changes() {
+    let (repo, db, project, task) = setup();
+    let profile = repo.path().join("profile-original");
+    std::fs::create_dir(&profile).unwrap();
+    std::fs::write(profile.join("AGENTS.md"), "historical profile rules").unwrap();
+    let run = create_run(&db, project, &task, "coder", Some("model-a"));
+    let record = resolution(
+        "model-a",
+        EconomyTier::Default,
+        serde_json::json!({"action": "code"}),
+    );
+    let invocation = db
+        .start_provider_invocation_with_resolution(run, "implementation", 1, &record)
+        .unwrap();
+    let packet_metadata = orc::execution_packet::PacketMetadata {
+        packet_type: "dispatch".into(),
+        ..Default::default()
+    };
+    let rendered = orc::provider_context::render_accounted(
+        "fixed dispatch contract",
+        &packet_metadata,
+        &serde_json::json!({"task_contract": {"objective": "bounded"}}),
+    )
+    .unwrap();
+    let context = orc::provider_context::invocation_context(
+        "code",
+        "codex",
+        &rendered,
+        orc::provider_context::InvocationEnvironment {
+            profile_path: Some(&profile),
+            cwd: repo.path(),
+            repository_context_discovery: false,
+            isolated: true,
+            repository_filesystem_access: true,
+        },
+    );
+    db.set_provider_invocation_context(invocation, &context)
+        .unwrap();
+    db.finish_provider_invocation(
+        invocation,
+        "completed",
+        Some(TokenUsage {
+            total_tokens: 630,
+            input_tokens: Some(600),
+            cached_input_tokens: Some(400),
+            output_tokens: Some(30),
+        }),
+    )
+    .unwrap();
+    db.set_agent_profile_path("agent-a", "/profiles/reconfigured")
+        .unwrap();
+
+    let path = repo.path().join(".orc/orc.db");
+    drop(db);
+    let reopened = Database::open(path).unwrap();
+    let summary = ProjectOperations::new(&reopened, repo.path())
+        .provider_invocation_summary(invocation)
+        .unwrap()
+        .unwrap();
+    let persisted = summary.context.as_ref().unwrap();
+    assert_eq!(persisted.packet.packet_type, "dispatch");
+    assert!(persisted.packet.bytes > 0);
+    assert!(persisted.context_sources.iter().any(|source| {
+        source.category == "agent_profile_instructions"
+            && source.identifier.contains("profile-original")
+            && source.bytes == Some("historical profile rules".len())
+    }));
+    assert!(
+        !persisted
+            .context_sources
+            .iter()
+            .any(|source| source.identifier.contains("reconfigured"))
+    );
+    assert_eq!(summary.token_usage.input_tokens, Some(600));
+    assert_eq!(summary.token_usage.cached_input_tokens, Some(400));
+    assert!(summary.unattributed_input_cost);
+    assert_eq!(
+        summary.context_attribution_status,
+        "known_bytes_provider_token_breakdown_unknown"
+    );
+}
+
+#[test]
 fn validation_freshness_and_infrastructure_failure_are_explicit() {
     let (repo, db, project, task) = setup();
     let run = create_run(&db, project, &task, "coder", Some("model-a"));
@@ -404,6 +487,7 @@ fn review_and_blocker_views_use_current_persisted_ledger() {
     let review = create_run(&db, project, &task, "review", Some("review-model"));
     let output = serde_json::to_string(&ReviewResult {
         verdict: "REVISE".into(),
+        criterion_results: Vec::new(),
         findings: vec!["fix semantics".into()],
         blocking_findings: vec!["fix semantics".into()],
         non_blocking_findings: Vec::new(),
@@ -483,6 +567,81 @@ fn review_and_blocker_views_use_current_persisted_ledger() {
         Some(false),
         "a newer implementation deterministically stales the prior review"
     );
+}
+
+#[test]
+fn criterion_review_evidence_survives_reopen_and_drives_operations_counts() {
+    let (repo, db, project, task) = setup();
+    db.update_task_status(&task, TaskStatus::Review).unwrap();
+    let run = create_run(&db, project, &task, "review", Some("review-model"));
+    let criteria = orc::protocol::AcceptanceCriterion::from_contract(&[
+        "active records exclude Suspended records".into(),
+        "active counts remain deterministic".into(),
+    ]);
+    let results = vec![
+        orc::protocol::ReviewCriterionResult {
+            criterion_id: criteria[0].criterion_id.clone(),
+            status: orc::protocol::ReviewCriterionStatus::Violated,
+            evidence: vec![orc::protocol::ReviewEvidenceRef {
+                kind: orc::protocol::ReviewEvidenceKind::ChangedFile,
+                reference: "src/records.rs".into(),
+                explanation: "The persisted diff includes Suspended records in the active count."
+                    .into(),
+            }],
+            rationale: "Suspended is not excluded by the current predicate.".into(),
+        },
+        orc::protocol::ReviewCriterionResult {
+            criterion_id: criteria[1].criterion_id.clone(),
+            status: orc::protocol::ReviewCriterionStatus::InsufficientEvidence,
+            evidence: Vec::new(),
+            rationale: "The bounded packet does not expose ordering behavior.".into(),
+        },
+    ];
+    let output = serde_json::to_string(&ReviewResult {
+        verdict: "REVISE".into(),
+        criterion_results: results.clone(),
+        findings: Vec::new(),
+        blocking_findings: Vec::new(),
+        non_blocking_findings: Vec::new(),
+        severity: Some("high".into()),
+        revision_feedback: None,
+        blockers: Vec::new(),
+    })
+    .unwrap();
+    db.commit_task_review_result_with_criteria(
+        &task,
+        run,
+        &[],
+        &criteria,
+        &results,
+        None,
+        false,
+        &output,
+        None,
+    )
+    .unwrap();
+    db.set_agent_model("agent-a", "model-changed-after-review")
+        .unwrap();
+    drop(db);
+
+    let reopened = Database::open(repo.path().join(".orc/orc.db")).unwrap();
+    let records = reopened.review_criterion_observations(run).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].criterion,
+        "active records exclude Suspended records"
+    );
+    assert_eq!(records[0].evidence, results[0].evidence);
+    let detail = ProjectOperations::new(&reopened, repo.path())
+        .task_detail(&task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.summary.review.total_criteria, 2);
+    assert_eq!(detail.summary.review.satisfied_criteria, 0);
+    assert_eq!(detail.summary.review.violated_criteria, 1);
+    assert_eq!(detail.summary.review.insufficient_evidence_criteria, 1);
+    assert_eq!(detail.review_criteria.len(), 2);
+    assert_eq!(detail.review_criteria[0].originating_review_run_id, run);
 }
 
 #[test]

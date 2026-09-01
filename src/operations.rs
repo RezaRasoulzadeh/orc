@@ -8,7 +8,7 @@ use crate::queue::{QueueCategory, QueueEntry, QueueReport};
 use crate::registry::{EconomyTier, EscalationTrigger, ReasoningEffort};
 use crate::storage::db::{
     LifecycleEvent, PersistedEscalationRequest, ProjectChangeEvidence, ProjectProviderInvocation,
-    ProjectWorktreeMetadata, ReviewBlockerRecord,
+    ProjectWorktreeMetadata, ReviewBlockerRecord, ReviewCriterionRecord,
 };
 use crate::storage::{AgentRun, Database, WorkerResult};
 use crate::task::{Task, TaskContract, TaskPriority, TaskStatus};
@@ -128,6 +128,20 @@ pub struct ReviewOperationsSummary {
     pub unresolved_blockers: usize,
     pub regressed_blockers: usize,
     pub resolved_blockers: usize,
+    pub total_criteria: usize,
+    pub satisfied_criteria: usize,
+    pub violated_criteria: usize,
+    pub insufficient_evidence_criteria: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCriterionSummary {
+    pub criterion_id: String,
+    pub criterion: String,
+    pub status: crate::protocol::ReviewCriterionStatus,
+    pub evidence: Vec<crate::protocol::ReviewEvidenceRef>,
+    pub rationale: String,
+    pub originating_review_run_id: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -154,7 +168,7 @@ pub struct QuotaObservationSummary {
     pub refresh_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EconomyResolutionSummary {
     pub invocation_id: i64,
     pub run_id: i64,
@@ -175,6 +189,13 @@ pub struct EconomyResolutionSummary {
     pub operator_override: bool,
     pub escalation_reason: Option<String>,
     pub quota: Option<QuotaObservationSummary>,
+    /// Persisted size-only context facts captured before provider transport.
+    pub context: Option<crate::provider_context::ProviderInvocationContext>,
+    pub token_usage: TokenUsageSummary,
+    /// True when input was reported but the provider did not report per-source
+    /// token attribution. Packet bytes are never treated as token counts.
+    pub unattributed_input_cost: bool,
+    pub context_attribution_status: String,
     pub legacy_missing_resolution: bool,
 }
 
@@ -259,6 +280,8 @@ pub struct TaskOperationsDetail {
     pub escalations: Vec<EscalationSummary>,
     /// Actionable blockers first, then stable first-seen/id order.
     pub blockers: Vec<BlockerSummary>,
+    /// Criterion judgments from the latest persisted semantic Review.
+    pub review_criteria: Vec<ReviewCriterionSummary>,
     pub activity: Vec<OperationalEvent>,
 }
 
@@ -292,6 +315,27 @@ pub struct TaskEconomySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionContextEconomySummary {
+    pub invocation_count: usize,
+    pub invocations_with_context: usize,
+    pub total_packet_bytes: usize,
+    pub average_packet_bytes: Option<f64>,
+    pub average_input_tokens: Option<f64>,
+    pub token_usage: TokenUsageSummary,
+    pub context_attribution_coverage: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextCostOutlier {
+    pub invocation_id: i64,
+    pub action: String,
+    pub packet_bytes: usize,
+    pub input_tokens: i64,
+    /// Diagnostic ratio only; it is not a token estimate for packet content.
+    pub input_tokens_per_packet_kib: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectEconomySummary {
     pub invocation_count: usize,
     pub invocations_by_tier: BTreeMap<EconomyTier, usize>,
@@ -303,6 +347,11 @@ pub struct ProjectEconomySummary {
     pub accepted_tasks_by_tier: BTreeMap<EconomyTier, usize>,
     pub accepted_token_usage: TokenUsageSummary,
     pub tokens_per_accepted_task: Option<f64>,
+    pub invocations_with_context: usize,
+    pub average_packet_bytes: Option<f64>,
+    pub context_attribution_coverage: f64,
+    pub context_by_action: BTreeMap<String, ActionContextEconomySummary>,
+    pub context_cost_outliers: Vec<ContextCostOutlier>,
     pub tasks: Vec<TaskEconomySummary>,
 }
 
@@ -321,6 +370,7 @@ struct ProjectFacts {
     invocations: Vec<ProjectProviderInvocation>,
     escalations: Vec<PersistedEscalationRequest>,
     blockers: Vec<ReviewBlockerRecord>,
+    criteria: Vec<ReviewCriterionRecord>,
     events: Vec<LifecycleEvent>,
     changes: HashMap<i64, ProjectChangeEvidence>,
     worktrees: Vec<ProjectWorktreeMetadata>,
@@ -425,6 +475,13 @@ impl<'a> ProjectOperations<'a> {
             .map(operational_event)
             .collect::<Vec<_>>();
         activity.sort_by_key(|event| event.id);
+        let latest_review_id = summary.review.run_id;
+        let review_criteria = facts
+            .criteria
+            .iter()
+            .filter(|criterion| Some(criterion.run_id) == latest_review_id)
+            .map(review_criterion_summary)
+            .collect();
         Ok(Some(TaskOperationsDetail {
             summary,
             task: task.clone(),
@@ -444,6 +501,7 @@ impl<'a> ProjectOperations<'a> {
             resolutions,
             escalations,
             blockers,
+            review_criteria,
             activity,
         }))
     }
@@ -477,23 +535,84 @@ impl<'a> ProjectOperations<'a> {
         Ok(self.economy_summary_from_facts(&facts))
     }
 
+    /// Oldest-first provider invocation evidence with normalized context and
+    /// usage side by side. No raw prompt content is stored or returned.
+    pub fn provider_invocation_summaries(&self) -> Result<Vec<EconomyResolutionSummary>> {
+        let facts = self.load_facts()?;
+        Ok(facts
+            .invocations
+            .iter()
+            .map(economy_resolution_summary)
+            .collect())
+    }
+
+    pub fn provider_invocation_summary(
+        &self,
+        invocation_id: i64,
+    ) -> Result<Option<EconomyResolutionSummary>> {
+        Ok(self
+            .provider_invocation_summaries()?
+            .into_iter()
+            .find(|item| item.invocation_id == invocation_id))
+    }
+
     fn economy_summary_from_facts(&self, facts: &ProjectFacts) -> ProjectEconomySummary {
         let project_runs = facts.runs.iter().collect::<Vec<_>>();
         let token_usage = token_usage_for_runs(&project_runs, facts);
         let mut invocations_by_tier = BTreeMap::new();
         let mut invocations_by_action = BTreeMap::new();
+        let mut context_by_action = BTreeMap::<String, ActionContextAccumulator>::new();
+        let mut total_packet_bytes = 0usize;
+        let mut invocations_with_context = 0usize;
+        let mut context_cost_outliers = Vec::new();
         for item in &facts.invocations {
             let resolution = economy_resolution_summary(item);
             *invocations_by_tier.entry(resolution.tier).or_insert(0) += 1;
-            *invocations_by_action
-                .entry(
-                    resolution
-                        .action
-                        .clone()
-                        .unwrap_or_else(|| resolution.purpose.clone()),
-                )
-                .or_insert(0) += 1;
+            let action = resolution
+                .action
+                .clone()
+                .unwrap_or_else(|| resolution.purpose.clone());
+            *invocations_by_action.entry(action.clone()).or_insert(0) += 1;
+            let accumulator = context_by_action.entry(action.clone()).or_default();
+            accumulator.invocation_count += 1;
+            accumulator.usage.add(
+                item.invocation.total_tokens,
+                item.invocation.input_tokens,
+                item.invocation.cached_input_tokens,
+                item.invocation.output_tokens,
+            );
+            if let Some(context) = &item.invocation.context {
+                invocations_with_context += 1;
+                total_packet_bytes += context.packet.bytes;
+                accumulator.invocations_with_context += 1;
+                accumulator.total_packet_bytes += context.packet.bytes;
+                if let Some(input_tokens) = item.invocation.input_tokens
+                    && context.packet.bytes > 0
+                {
+                    accumulator.input_total += input_tokens;
+                    accumulator.input_observations += 1;
+                    context_cost_outliers.push(ContextCostOutlier {
+                        invocation_id: item.invocation.id,
+                        action,
+                        packet_bytes: context.packet.bytes,
+                        input_tokens,
+                        input_tokens_per_packet_kib: input_tokens as f64
+                            / (context.packet.bytes as f64 / 1024.0),
+                    });
+                }
+            }
         }
+        context_cost_outliers.sort_by(|left, right| {
+            right
+                .input_tokens_per_packet_kib
+                .total_cmp(&left.input_tokens_per_packet_kib)
+                .then(left.invocation_id.cmp(&right.invocation_id))
+        });
+        context_cost_outliers.truncate(10);
+        let context_by_action = context_by_action
+            .into_iter()
+            .map(|(action, value)| (action, value.finish()))
+            .collect();
         let mut accepted_tasks_by_tier = BTreeMap::new();
         let mut accepted_usage = TokenUsageAccumulator::default();
         let mut accepted_tasks = 0;
@@ -561,6 +680,16 @@ impl<'a> ProjectOperations<'a> {
             accepted_tasks_by_tier,
             accepted_token_usage,
             tokens_per_accepted_task,
+            invocations_with_context,
+            average_packet_bytes: (invocations_with_context > 0)
+                .then_some(total_packet_bytes as f64 / invocations_with_context as f64),
+            context_attribution_coverage: if facts.invocations.is_empty() {
+                0.0
+            } else {
+                invocations_with_context as f64 / facts.invocations.len() as f64
+            },
+            context_by_action,
+            context_cost_outliers,
             tasks: task_metrics,
         }
     }
@@ -597,6 +726,7 @@ impl<'a> ProjectOperations<'a> {
             invocations: self.db.project_provider_invocations(project_id)?,
             escalations: self.db.project_escalation_requests(project_id)?,
             blockers: self.db.project_review_blocker_ledger(project_id)?,
+            criteria: self.db.project_review_criterion_observations(project_id)?,
             events: self.db.list_lifecycle_events(usize::MAX)?,
             changes: self
                 .db
@@ -928,6 +1058,15 @@ impl<'a> ProjectOperations<'a> {
             .iter()
             .map(|blocker| blocker_state(&blocker.status))
             .collect::<Vec<_>>();
+        let criteria = latest_review
+            .map(|review| {
+                facts
+                    .criteria
+                    .iter()
+                    .filter(|criterion| criterion.run_id == review.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         ReviewOperationsSummary {
             run_id: latest_review.map(|run| run.id),
             verdict,
@@ -951,6 +1090,25 @@ impl<'a> ProjectOperations<'a> {
             resolved_blockers: states
                 .iter()
                 .filter(|state| **state == BlockerState::Resolved)
+                .count(),
+            total_criteria: criteria.len(),
+            satisfied_criteria: criteria
+                .iter()
+                .filter(|criterion| {
+                    criterion.status == crate::protocol::ReviewCriterionStatus::Satisfied
+                })
+                .count(),
+            violated_criteria: criteria
+                .iter()
+                .filter(|criterion| {
+                    criterion.status == crate::protocol::ReviewCriterionStatus::Violated
+                })
+                .count(),
+            insufficient_evidence_criteria: criteria
+                .iter()
+                .filter(|criterion| {
+                    criterion.status == crate::protocol::ReviewCriterionStatus::InsufficientEvidence
+                })
                 .count(),
         }
     }
@@ -1041,6 +1199,17 @@ fn blocker_summary(blocker: &ReviewBlockerRecord) -> BlockerSummary {
     }
 }
 
+fn review_criterion_summary(criterion: &ReviewCriterionRecord) -> ReviewCriterionSummary {
+    ReviewCriterionSummary {
+        criterion_id: criterion.criterion_id.clone(),
+        criterion: criterion.criterion.clone(),
+        status: criterion.status,
+        evidence: criterion.evidence.clone(),
+        rationale: criterion.rationale.clone(),
+        originating_review_run_id: criterion.run_id,
+    }
+}
+
 fn operational_event(event: &LifecycleEvent) -> OperationalEvent {
     OperationalEvent {
         id: event.id,
@@ -1065,6 +1234,31 @@ fn economy_resolution_summary(item: &ProjectProviderInvocation) -> EconomyResolu
         serde_json::from_str(lineage).unwrap_or(serde_json::Value::Null);
     let quota = lineage.get("quota").and_then(quota_summary);
     let resolution = item.resolution.as_ref();
+    let mut usage = TokenUsageAccumulator::default();
+    usage.add(
+        item.invocation.total_tokens,
+        item.invocation.input_tokens,
+        item.invocation.cached_input_tokens,
+        item.invocation.output_tokens,
+    );
+    let token_usage = usage.finish();
+    let context = item.invocation.context.clone();
+    let unattributed_input_cost = item
+        .invocation
+        .input_tokens
+        .is_some_and(|tokens| tokens > 0)
+        && context
+            .as_ref()
+            .is_none_or(|value| !value.provider_context_breakdown_available);
+    let context_attribution_status = if context.is_none() {
+        "unavailable_legacy_or_unrecorded"
+    } else if item.invocation.input_tokens.is_none() {
+        "known_bytes_provider_usage_unavailable"
+    } else if unattributed_input_cost {
+        "known_bytes_provider_token_breakdown_unknown"
+    } else {
+        "provider_source_breakdown_available"
+    };
     EconomyResolutionSummary {
         invocation_id: item.invocation.id,
         run_id: item.invocation.parent_run_id,
@@ -1095,6 +1289,10 @@ fn economy_resolution_summary(item: &ProjectProviderInvocation) -> EconomyResolu
             .and_then(|value| value.escalation_reason.clone())
             .or_else(|| item.invocation.escalation_reason.clone()),
         quota,
+        context,
+        token_usage,
+        unattributed_input_cost,
+        context_attribution_status: context_attribution_status.into(),
         legacy_missing_resolution: resolution.is_none(),
     }
 }
@@ -1141,6 +1339,36 @@ fn escalation_summary(
         resulting_tier: resulting.map(|item| economy_resolution_summary(item).tier),
         resulting_model: resulting.and_then(|item| economy_resolution_summary(item).model),
         resulting_effort: resulting.and_then(|item| economy_resolution_summary(item).effort),
+    }
+}
+
+#[derive(Default)]
+struct ActionContextAccumulator {
+    invocation_count: usize,
+    invocations_with_context: usize,
+    total_packet_bytes: usize,
+    input_total: i64,
+    input_observations: usize,
+    usage: TokenUsageAccumulator,
+}
+
+impl ActionContextAccumulator {
+    fn finish(self) -> ActionContextEconomySummary {
+        ActionContextEconomySummary {
+            invocation_count: self.invocation_count,
+            invocations_with_context: self.invocations_with_context,
+            total_packet_bytes: self.total_packet_bytes,
+            average_packet_bytes: (self.invocations_with_context > 0)
+                .then_some(self.total_packet_bytes as f64 / self.invocations_with_context as f64),
+            average_input_tokens: (self.input_observations > 0)
+                .then_some(self.input_total as f64 / self.input_observations as f64),
+            token_usage: self.usage.finish(),
+            context_attribution_coverage: if self.invocation_count == 0 {
+                0.0
+            } else {
+                self.invocations_with_context as f64 / self.invocation_count as f64
+            },
+        }
     }
 }
 

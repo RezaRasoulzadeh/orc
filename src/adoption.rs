@@ -126,6 +126,10 @@ pub fn ensure_default_lead(db: &Database) -> Result<()> {
         return Ok(());
     }
     if db.get_agent("codex-main")?.is_none() {
+        let profile_path = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .map(|path| path.display().to_string());
         db.insert_agent(&crate::registry::AgentDefinition {
             id: "codex-main".into(),
             display_name: "Codex Main".into(),
@@ -136,7 +140,7 @@ pub fn ensure_default_lead(db: &Database) -> Result<()> {
             capabilities: vec![],
             status: crate::registry::AVAILABLE.into(),
             unavailable_reason: None,
-            profile_path: None,
+            profile_path,
             model: None,
             reasoning_effort: None,
             config_metadata: None,
@@ -162,7 +166,7 @@ pub fn ensure_default_lead(db: &Database) -> Result<()> {
 pub fn ensure_adoption_files(orc_dir: &Path) -> Result<()> {
     ensure_contract_file(
         &orc_dir.join("engineering.md"),
-        crate::contract::DEFAULT_ENGINEERING_CONTRACT,
+        crate::contract::DEFAULT_ADOPTED_PROJECT_ENGINEERING_CONTRACT,
     )?;
     ensure_file(&orc_dir.join("project.md"), PROJECT_TEMPLATE)?;
     ensure_file(&orc_dir.join("architecture.md"), ARCHITECTURE_TEMPLATE)?;

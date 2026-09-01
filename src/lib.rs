@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod lead;
 pub mod operations;
 pub mod protocol;
+pub mod provider_context;
 pub mod queue;
 pub mod read_model;
 pub mod registry;

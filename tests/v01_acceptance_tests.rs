@@ -329,6 +329,14 @@ fn automated_dispatch_cli_is_one_shot_and_stops_in_review() {
         r#"#!/bin/sh
 if [ "$1" = "exec" ]; then
   printf 'x' >> "$ORC_DISPATCH_PROVIDER_CALLS"
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--cd" ]; then
+      cd "$2" || exit 1
+      shift 2
+    else
+      shift
+    fi
+  done
   printf 'implemented by one-shot dispatch\n' > one-shot.txt
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"step_results\":[{\"step_id\":\"implementation\",\"operations_performed\":[\"create\"],\"affected_files\":[\"one-shot.txt\"],\"observed\":[\"created one-shot.txt\"],\"verification_passed\":[]}],\"summary\":\"implemented\"}"}}'
   exit 0

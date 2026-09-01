@@ -236,6 +236,35 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                     println!("Operational phase: {}", detail.summary.phase);
                     println!("Next step: {:?}", detail.summary.next_step);
                     println!("Validation: {:?}", detail.summary.validation.state);
+                    println!(
+                        "Review:       {}",
+                        detail
+                            .summary
+                            .review
+                            .verdict
+                            .as_deref()
+                            .unwrap_or("not run")
+                    );
+                    println!(
+                        "Criteria:     {} satisfied / {} violated / {} insufficient ({} total)",
+                        detail.summary.review.satisfied_criteria,
+                        detail.summary.review.violated_criteria,
+                        detail.summary.review.insufficient_evidence_criteria,
+                        detail.summary.review.total_criteria,
+                    );
+                    for criterion in &detail.review_criteria {
+                        println!(
+                            "  {} [{:?}] {}",
+                            criterion.criterion_id, criterion.status, criterion.criterion
+                        );
+                        println!("    {}", criterion.rationale);
+                        for evidence in &criterion.evidence {
+                            println!(
+                                "    evidence {:?} {}: {}",
+                                evidence.kind, evidence.reference, evidence.explanation
+                            );
+                        }
+                    }
                     if let Some(resolution) = &detail.summary.latest_resolution {
                         println!(
                             "Latest resolution: agent={} model={} effort={} tier={} source={}",
@@ -248,6 +277,65 @@ pub fn run(command: TaskCommand, db_path: &str) -> Result<()> {
                             resolution.tier.as_str(),
                             resolution.source.as_deref().unwrap_or("legacy/unknown")
                         );
+                    }
+                    if !detail.resolutions.is_empty() {
+                        println!("Provider invocations:");
+                        for invocation in &detail.resolutions {
+                            let (packet_type, packet_bytes, known_bytes, truncated, session) =
+                                invocation
+                                    .context
+                                    .as_ref()
+                                    .map(|context| {
+                                        (
+                                            context.packet.packet_type.as_str(),
+                                            context.packet.bytes.to_string(),
+                                            context
+                                                .context_sources
+                                                .iter()
+                                                .filter(|source| source.included)
+                                                .filter_map(|source| source.bytes)
+                                                .sum::<usize>()
+                                                .to_string(),
+                                            if context.packet.truncated {
+                                                "yes"
+                                            } else {
+                                                "no"
+                                            },
+                                            format!("{:?}", context.session_state)
+                                                .to_ascii_lowercase(),
+                                        )
+                                    })
+                                    .unwrap_or((
+                                        "unknown",
+                                        "unknown".into(),
+                                        "unknown".into(),
+                                        "unknown",
+                                        "unknown".into(),
+                                    ));
+                            println!(
+                                "  {} action={} packet={} packet_bytes={} known_context_bytes={} truncated={} session={} input={} cached={} output={} attribution={}",
+                                invocation.invocation_id,
+                                invocation.action.as_deref().unwrap_or(&invocation.purpose),
+                                packet_type,
+                                packet_bytes,
+                                known_bytes,
+                                truncated,
+                                session,
+                                invocation
+                                    .token_usage
+                                    .input_tokens
+                                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                                invocation
+                                    .token_usage
+                                    .cached_input_tokens
+                                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                                invocation
+                                    .token_usage
+                                    .output_tokens
+                                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                                invocation.context_attribution_status,
+                            );
+                        }
                     }
                 }
                 None => eprintln!("Task {} not found", task_id),

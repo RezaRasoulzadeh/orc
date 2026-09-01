@@ -194,7 +194,7 @@ Creates one task directly in the current project.
 Lists all tasks as `ID  STATUS  TITLE`.
 
 ### `orc task show TASK_ID`
-Prints full task detail: ID, title, objective, role, priority, status, cancellation reason (if any), required capabilities, scope mode, context files, expected changes, and dependencies.
+Prints full task detail: ID, title, objective, role, priority, status, cancellation reason (if any), required capabilities, scope mode, context files, expected changes, dependencies, the latest semantic Review verdict, criterion counts, and each persisted criterion judgment with its packet evidence references.
 
 ### `orc task require TASK_ID CAPABILITY [CAPABILITY...]`
 Sets (replaces) the required capabilities for a task.
@@ -445,6 +445,20 @@ Sets the persistent template for an execution class. At least one of `--model` o
 
 ### `orc template clear CLASS`
 Clears the persistent template for an execution class.
+
+## Economy configuration and evidence
+
+### `orc economy configure [--model-cost MODEL=COST]... [--unknown-tier TIER]`
+
+Merges one or more non-negative finite relative model costs into the project's persisted economy configuration. Costs at or below `1` resolve to `default`, costs through `3` resolve to `escalation`, and higher costs resolve to `exceptional`. `--unknown-tier` controls the tier for unlisted models and accepts `default`, `escalation`, `exceptional`, or `unknown`.
+
+### `orc economy show`
+
+Emits the persisted model-cost configuration and the provider-independent project economy read model as JSON, including invocation tiers, escalation counts, token usage, packet-byte averages, per-action context metrics, attribution coverage, and input-token-to-packet-size outliers.
+
+### `orc economy context [INVOCATION_ID]`
+
+Emits persisted size-only context attribution and provider-reported usage for one provider invocation, or every invocation in oldest-first order when the ID is omitted. The output includes packet type and bytes, deterministic section sizes, truncation details, known included and excluded context sources, execution isolation, session state, and the unattributed-input indicator. Orc does not store or print the raw prompt on this surface.
 
 ## Approvals
 

@@ -1,0 +1,24 @@
+{
+  "local_id": "T-0005",
+  "title": "Add suspended record state across consumers",
+  "objective": "Replace the boolean activity flag with public RecordState { Active, Inactive, Suspended } through Record construction, parsing, catalog filtering, summary aggregation, exports, CLI output, and tests. Parser accepts all three case-insensitively; other words remain InvalidActive; active_by_category returns only Active; LedgerSummary retains total and active and adds suspended; CLI prints total, active, suspended. Required validation: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Non-goals: persistence, serialization, new commands, compatibility shims, dependencies, or unrelated redesign.",
+  "role": "developer",
+  "priority": "normal",
+  "depends_on": [],
+  "capabilities": [],
+  "scope_mode": null,
+  "context_files": ["src/model.rs", "src/parser.rs", "src/catalog.rs", "src/summary.rs", "src/bin/ledger_summary.rs", "src/lib.rs", "tests/ledger_tests.rs"],
+  "expected_changes": ["src/model.rs", "src/parser.rs", "src/catalog.rs", "src/summary.rs", "src/bin/ledger_summary.rs", "tests/ledger_tests.rs"],
+  "unchanged": ["persistence", "serialization", "commands", "compatibility surface", "dependencies", "unrelated design"],
+  "acceptance_criteria": [
+    "RecordState is public and contains distinct Active, Inactive, and Suspended variants used across all listed consumers.",
+    "Parsing accepts all three states case-insensitively and preserves InvalidActive for every other word.",
+    "active_by_category returns only RecordState::Active records.",
+    "Suspended records must not be counted as active; LedgerSummary.active counts only RecordState::Active while LedgerSummary.suspended counts RecordState::Suspended.",
+    "The CLI prints total, active, and suspended as distinct counters."
+  ],
+  "required_tests": ["Existing configured validation pipeline and focused state-consumer coverage; semantic Review remains responsible for the Suspended-versus-active distinction"],
+  "validation": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"],
+  "execution_hints": {"effort": "low", "effort_reason": "Recovered trial contract uses the default execution depth."},
+  "risk_factors": []
+}

@@ -595,18 +595,19 @@ impl ActionBackend for QueuedReviewBackend {
         &self,
         _: &AgentDefinition,
         action: AgentAction,
-        _: &str,
+        input: &str,
         _: Option<&str>,
         _: Option<ReasoningEffort>,
     ) -> Result<ActionExecution> {
         assert_eq!(action, AgentAction::Review);
+        let output = self
+            .outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("review output");
         Ok(ActionExecution {
-            output: self
-                .outputs
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("review output"),
+            output: add_review_criterion_results(input, output),
             token_usage: None,
         })
     }
@@ -617,7 +618,7 @@ impl ActionBackend for NonConvergingReviewBackend {
         &self,
         _: &AgentDefinition,
         action: AgentAction,
-        _: &str,
+        input: &str,
         _: Option<&str>,
         _: Option<ReasoningEffort>,
     ) -> Result<ActionExecution> {
@@ -626,10 +627,79 @@ impl ActionBackend for NonConvergingReviewBackend {
         let prior = (*calls > 0).then(|| blocker_id("persistent"));
         *calls += 1;
         Ok(ActionExecution {
-            output: multi_blocker_review_output("REVISE", &[("persistent", prior.as_deref())]),
+            output: add_review_criterion_results(
+                input,
+                multi_blocker_review_output("REVISE", &[("persistent", prior.as_deref())]),
+            ),
             token_usage: None,
         })
     }
+}
+
+fn add_review_criterion_results(input: &str, output: String) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return output;
+    };
+    if value.get("criterion_results").is_some() {
+        return output;
+    }
+    let packet_json = input
+        .split("## Authoritative Orc packet")
+        .nth(1)
+        .and_then(|text| text.find('{').map(|index| &text[index..]))
+        .expect("review packet JSON");
+    let packet: serde_json::Value = serde_json::from_str(packet_json).unwrap();
+    let blockers = value
+        .as_object_mut()
+        .unwrap()
+        .entry("blockers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .unwrap();
+    for prior in packet["prior_blockers"].as_array().into_iter().flatten() {
+        if prior["status"] != "resolved"
+            && !blockers
+                .iter()
+                .any(|blocker| blocker["prior_blocker_id"] == prior["blocker_id"])
+            && !(packet["prior_blockers"]
+                .as_array()
+                .is_some_and(|values| values.len() == 1)
+                && blockers
+                    .iter()
+                    .any(|blocker| !blocker["prior_blocker_id"].is_null()))
+        {
+            blockers.push(serde_json::json!({
+                "id": prior["blocker_id"],
+                "prior_blocker_id": prior["blocker_id"],
+                "blocker_key": "explicitly-resolved-prior",
+                "requirement_ref": "prior blocker",
+                "evidence": "Current bounded implementation evidence demonstrates resolution.",
+                "severity": "unspecified",
+                "acceptance_condition": prior["acceptance_condition"],
+                "status": "resolved",
+                "finding": "The prior concern is resolved in current evidence."
+            }));
+        }
+    }
+    let actionable = value["blockers"].as_array().is_some_and(|blockers| {
+        blockers
+            .iter()
+            .any(|blocker| blocker["status"] != "resolved")
+    });
+    value["criterion_results"] = serde_json::Value::Array(
+        packet["task_contract"]["acceptance_criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|criterion| serde_json::json!({
+                "criterion_id": criterion["criterion_id"],
+                "status": if actionable { "violated" } else { "satisfied" },
+                "evidence":[{"kind":"diff","reference":"current_changes.diff","explanation":"The bounded diff contains concrete semantic implementation evidence."}],
+                "rationale": if actionable { "The semantic requirement remains violated." } else { "Current implementation evidence satisfies the semantic requirement." }
+            }))
+            .collect(),
+    );
+    value.to_string()
 }
 
 impl Worker for NonResolvingRevisionWorker {
@@ -3704,7 +3774,7 @@ impl ActionBackend for CapturingReviewBackend {
         assert_eq!(action, AgentAction::Review);
         self.prompts.lock().unwrap().push(input.to_owned());
         Ok(ActionExecution {
-            output: r#"{"verdict":"PASS","findings":[],"blocking_findings":[],"non_blocking_findings":[],"severity":null,"revision_feedback":null}"#.into(),
+            output: add_review_criterion_results(input, r#"{"verdict":"PASS","findings":[],"blocking_findings":[],"non_blocking_findings":[],"severity":null,"revision_feedback":null}"#.into()),
             token_usage: None,
         })
     }

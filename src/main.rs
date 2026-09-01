@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use orc::adoption;
 use orc::agent;
 use orc::cli::agent::AgentCommand;
+use orc::cli::economy::EconomyCommand;
 use orc::cli::run::RunCommand;
 use orc::cli::task::TaskCommand;
 use orc::desktop;
@@ -185,6 +186,11 @@ enum Command {
     Template {
         #[command(subcommand)]
         command: TemplateCommand,
+    },
+    /// Configure model-cost tiers and inspect persisted economy outcomes.
+    Economy {
+        #[command(subcommand)]
+        command: EconomyCommand,
     },
     Lead {
         #[command(subcommand)]
@@ -843,6 +849,7 @@ fn run(cli: Cli) -> Result<()> {
                 TemplateCommand::Clear { class } => db.clear_execution_template(class)?,
             }
         }
+        Command::Economy { command } => orc::cli::economy::run(command, DB_PATH, ".")?,
         Command::Lead { command } => {
             let app = orc::app::OrcApp::open_global(DB_PATH, ".")?;
             match command {
@@ -1515,6 +1522,7 @@ mod cli_tests {
             Command::Cancel { .. } => "Cancel",
             Command::Queue { .. } => "Queue",
             Command::Template { .. } => "Template",
+            Command::Economy { .. } => "Economy",
             Command::Lead { .. } => "Lead",
             Command::Ask { .. } => "Ask",
             Command::NewProject { .. } => "NewProject",
@@ -1676,6 +1684,11 @@ mod cli_tests {
                 EntryRoute::OneShot,
                 Some("Template"),
             ),
+            (
+                &["orc", "economy", "show"],
+                EntryRoute::OneShot,
+                Some("Economy"),
+            ),
             (&["orc", "lead", "show"], EntryRoute::OneShot, Some("Lead")),
             (&["orc", "ask", "help"], EntryRoute::OneShot, Some("Ask")),
             (
@@ -1736,7 +1749,7 @@ mod cli_tests {
             .iter()
             .filter_map(|(_, _, command)| *command)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(covered_commands.len(), 27);
+        assert_eq!(covered_commands.len(), 28);
 
         for &(arguments, expected_route, expected_command) in cases {
             let cli = Cli::try_parse_from(arguments).unwrap_or_else(|error| {

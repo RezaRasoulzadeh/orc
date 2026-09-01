@@ -218,7 +218,15 @@ fn codex_workers_and_factory_support_isolated_profiles() {
     let second_worker = WorkerFactory::build(&second).unwrap();
     assert_eq!(
         CodexWorker::command_args("inspect"),
-        vec!["exec", "--json", "--sandbox", "workspace-write", "-"]
+        vec![
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--sandbox",
+            "workspace-write",
+            "-"
+        ]
     );
     assert_eq!(
         first_worker.configured_environment().map(|(_, path)| path),
@@ -241,6 +249,8 @@ fn codex_worker_uses_optional_model_and_reasoning_effort_configuration() {
         vec![
             "exec",
             "--json",
+            "--ephemeral",
+            "--ignore-user-config",
             "--sandbox",
             "workspace-write",
             "--model",

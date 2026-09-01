@@ -185,6 +185,63 @@ pub struct TaskProposal {
 /// Compatibility name for callers of the v1 planning API.
 pub type PlannedTask = TaskProposal;
 
+/// Orc-owned identity and text for one acceptance criterion. IDs are derived
+/// from the immutable order in the persisted task contract; providers evaluate
+/// these values but never name criteria authoritatively.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptanceCriterion {
+    pub criterion_id: String,
+    pub text: String,
+}
+
+impl AcceptanceCriterion {
+    pub fn from_contract(values: &[String]) -> Vec<Self> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Self {
+                criterion_id: format!("acceptance-criterion-{}", index + 1),
+                text: text.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCriterionStatus {
+    Satisfied,
+    Violated,
+    InsufficientEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewEvidenceKind {
+    Diff,
+    ChangedFile,
+    Validation,
+    TaskContract,
+    ImplementationFact,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewEvidenceRef {
+    pub kind: ReviewEvidenceKind,
+    pub reference: String,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewCriterionResult {
+    pub criterion_id: String,
+    pub status: ReviewCriterionStatus,
+    pub evidence: Vec<ReviewEvidenceRef>,
+    pub rationale: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionHints {
     #[serde(default, skip_serializing_if = "Option::is_none")]

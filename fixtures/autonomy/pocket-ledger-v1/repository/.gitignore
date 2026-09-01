@@ -1,0 +1,6 @@
+/target/
+.orc/orc.db
+.orc/orc.db-shm
+.orc/orc.db-wal
+.orc/worktrees/
+.trial-runs/

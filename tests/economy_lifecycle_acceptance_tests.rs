@@ -346,11 +346,81 @@ impl ActionBackend for ScriptedBackend {
             .unwrap()
             .pop_front()
             .expect("backend script exhausted");
+        let output = if action == AgentAction::Review {
+            add_criterion_results(input, output)
+        } else {
+            output
+        };
         Ok(ActionExecution {
             output,
             token_usage,
         })
     }
+}
+
+fn add_criterion_results(input: &str, output: String) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return output;
+    };
+    if value.get("criterion_results").is_some() {
+        return output;
+    }
+    let packet_json = input
+        .split("## Authoritative Orc packet")
+        .nth(1)
+        .and_then(|text| text.find('{').map(|index| &text[index..]))
+        .expect("review packet JSON");
+    let packet: serde_json::Value = serde_json::from_str(packet_json).unwrap();
+    let blockers = value
+        .as_object_mut()
+        .unwrap()
+        .entry("blockers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .unwrap();
+    for prior in packet["prior_blockers"].as_array().into_iter().flatten() {
+        if prior["status"] != "resolved"
+            && !blockers
+                .iter()
+                .any(|blocker| blocker["prior_blocker_id"] == prior["blocker_id"])
+        {
+            blockers.push(serde_json::json!({
+                "id":prior["blocker_id"],"prior_blocker_id":prior["blocker_id"],
+                "blocker_key":"explicitly-resolved-prior","requirement_ref":"prior blocker",
+                "evidence":"Current bounded implementation evidence demonstrates resolution.",
+                "severity":"unspecified","acceptance_condition":prior["acceptance_condition"],
+                "status":"resolved","finding":"The prior concern is resolved in current evidence."
+            }));
+        }
+    }
+    let actionable = value["blockers"].as_array().is_some_and(|blockers| {
+        blockers
+            .iter()
+            .any(|blocker| blocker["status"] != "resolved")
+    }) || value["blocking_findings"]
+        .as_array()
+        .is_some_and(|findings| !findings.is_empty());
+    value["criterion_results"] = serde_json::Value::Array(
+        packet["task_contract"]["acceptance_criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|criterion| serde_json::json!({
+                "criterion_id": criterion["criterion_id"],
+                "status": if actionable { "violated" } else { "satisfied" },
+                "evidence": [{
+                    "kind":"diff", "reference":"current_changes.diff",
+                    "explanation":"The bounded current diff supplies concrete implementation evidence."
+                }],
+                "rationale": if actionable {
+                    "The current implementation violates this required criterion."
+                } else {
+                    "The current implementation evidence satisfies this required criterion."
+                }
+            }))
+            .collect(),
+    );
+    value.to_string()
 }
 
 fn pass_review() -> String {

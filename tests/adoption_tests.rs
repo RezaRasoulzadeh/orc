@@ -1,5 +1,5 @@
 use orc::adoption;
-use orc::contract::DEFAULT_ENGINEERING_CONTRACT;
+use orc::contract::DEFAULT_ADOPTED_PROJECT_ENGINEERING_CONTRACT;
 use orc::discovery;
 use orc::lead::{LeadBackend, LeadBackendResponse, LeadContext, LeadDecision, LeadDecisionKind};
 use orc::protocol::{
@@ -220,8 +220,30 @@ fn adopt_writes_the_maintained_engineering_contract_when_missing() {
 
     assert_eq!(
         std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap(),
-        DEFAULT_ENGINEERING_CONTRACT
+        DEFAULT_ADOPTED_PROJECT_ENGINEERING_CONTRACT
     );
+}
+
+#[test]
+fn adopted_contract_is_provider_neutral_and_not_orc_self_context() {
+    let (_dir, repo) = git_repo();
+
+    adopt_isolated(&repo).unwrap();
+
+    let contract = std::fs::read_to_string(repo.join(".orc/engineering.md")).unwrap();
+    assert!(contract.contains("existing repository's architecture"));
+    assert!(contract.contains("Orc runs configured deterministic validation"));
+    for self_specific_rule in [
+        "SQLite access and SQL belong in the storage layer",
+        "Provider-specific behavior belongs behind worker/backend abstractions",
+        "Orc targets Linux, macOS, and Windows",
+        "existing Orc application, orchestration, and shared core APIs",
+    ] {
+        assert!(
+            !contract.contains(self_specific_rule),
+            "adopted contract leaked Orc self-hosting rule: {self_specific_rule}"
+        );
+    }
 }
 
 #[test]
@@ -460,7 +482,8 @@ fn adopt_cli_discovers_invokes_lead_from_nested_directory_and_only_persists_deci
     fs::write(
         &codex,
         r##"#!/bin/sh
-printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT_TASKS","details":{"tasks":[]}}}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"message\":\"assessment\",\"proposals\":[],\"decision\":{\"kind\":\"DIRECT_TASKS\",\"details\":{\"tasks\":[]}}}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":20}}'
 "##,
     )
     .unwrap();
@@ -492,7 +515,12 @@ printf '%s\n' '{"message":"assessment","proposals":[],"decision":{"kind":"DIRECT
     );
     assert!(decisions[0].snapshot.is_some());
     assert!(db.list_tasks().unwrap().is_empty());
-    assert!(db.list_agent_runs(project, usize::MAX).unwrap().is_empty());
+    let runs = db.list_agent_runs(project, usize::MAX).unwrap();
+    assert_eq!(runs.len(), 1);
+    let invocations = db.provider_invocations(runs[0].id).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert!(invocations[0].context.is_some());
+    assert_eq!(invocations[0].input_tokens, Some(120));
     assert_eq!(
         persisted_registry_path(&repo.join(".orc/orc.db")),
         global_registry

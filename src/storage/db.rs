@@ -66,6 +66,7 @@ pub struct ProviderInvocation {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub context: Option<crate::provider_context::ProviderInvocationContext>,
     pub tier: EconomyTier,
     pub escalation: Option<EscalationLineage>,
 }
@@ -1032,6 +1033,18 @@ pub struct ReviewBlockerRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewCriterionRecord {
+    pub task_id: String,
+    pub run_id: i64,
+    pub criterion_id: String,
+    pub criterion: String,
+    pub status: crate::protocol::ReviewCriterionStatus,
+    pub evidence: Vec<crate::protocol::ReviewEvidenceRef>,
+    pub rationale: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleEvent {
     pub id: i64,
     pub timestamp: String,
@@ -1928,6 +1941,7 @@ impl Database {
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
         Self::ensure_review_blockers_table(&conn)?;
+        Self::ensure_review_criteria_table(&conn)?;
         Self::ensure_revision_contracts_table(&conn)?;
         Self::ensure_lead_tables(&conn)?;
         Self::ensure_lead_provider_config_table(&conn)?;
@@ -1975,6 +1989,7 @@ impl Database {
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_plan_tables(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
+        Self::ensure_review_criteria_table(&conn)?;
         let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('agent_registry_path', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2879,6 +2894,7 @@ impl Database {
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
             ("cached_input_tokens", "INTEGER"),
+            ("context_metadata", "TEXT"),
         ] {
             let exists: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('provider_invocations') WHERE name='{column}'"), [], |row| row.get(0))?;
             if exists == 0 {
@@ -3548,12 +3564,26 @@ impl Database {
         )? != 0)
     }
 
+    /// Attach immutable, size-only context attribution before transport. The
+    /// full prompt is deliberately not duplicated in SQLite.
+    pub fn set_provider_invocation_context(
+        &self,
+        id: i64,
+        context: &crate::provider_context::ProviderInvocationContext,
+    ) -> Result<bool, DbError> {
+        let serialized = serde_json::to_string(context)?;
+        Ok(self.conn.execute(
+            "UPDATE provider_invocations SET context_metadata=?1 WHERE id=?2 AND context_metadata IS NULL",
+            params![serialized, id],
+        )? != 0)
+    }
+
     pub fn provider_invocations(
         &self,
         parent_run_id: i64,
     ) -> Result<Vec<ProviderInvocation>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens, tier FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
+            "SELECT id, parent_run_id, workflow_id, workflow_stage, workflow_version, purpose, lineage, attempt, started_at, finished_at, outcome, effort, selected_agent, selected_model, escalation_reason, total_tokens, input_tokens, output_tokens, cached_input_tokens, context_metadata, tier FROM provider_invocations WHERE parent_run_id=?1 ORDER BY id",
         )?;
         let mut invocations = statement
             .query_map([parent_run_id], |row| {
@@ -3579,7 +3609,10 @@ impl Database {
                     input_tokens: row.get(16)?,
                     output_tokens: row.get(17)?,
                     cached_input_tokens: row.get(18)?,
-                    tier: match row.get::<_, String>(19)?.as_str() {
+                    context: row
+                        .get::<_, Option<String>>(19)?
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                    tier: match row.get::<_, String>(20)?.as_str() {
                         "default" => EconomyTier::Default,
                         "escalation" => EconomyTier::Escalation,
                         "exceptional" => EconomyTier::Exceptional,
@@ -3626,6 +3659,7 @@ impl Database {
             input_tokens: Option<i64>,
             output_tokens: Option<i64>,
             cached_input_tokens: Option<i64>,
+            context_metadata: Option<String>,
             invocation_tier: String,
             resolution_agent: Option<String>,
             resolution_model: Option<String>,
@@ -3652,7 +3686,7 @@ impl Database {
                     p.started_at, p.finished_at, p.outcome, p.effort,
                     p.selected_agent, p.selected_model, p.escalation_reason,
                     p.total_tokens, p.input_tokens, p.output_tokens,
-                    p.cached_input_tokens, p.tier,
+                    p.cached_input_tokens, p.context_metadata, p.tier,
                     r.selected_agent, r.selected_model, r.effort, r.tier,
                     r.source, r.escalation_reason, r.input_lineage,
                     e.id, e.trigger, e.previous_provider_invocation_id,
@@ -3689,23 +3723,24 @@ impl Database {
                     input_tokens: row.get(17)?,
                     output_tokens: row.get(18)?,
                     cached_input_tokens: row.get(19)?,
-                    invocation_tier: row.get(20)?,
-                    resolution_agent: row.get(21)?,
-                    resolution_model: row.get(22)?,
-                    resolution_effort: row.get(23)?,
-                    resolution_tier: row.get(24)?,
-                    resolution_source: row.get(25)?,
-                    resolution_escalation_reason: row.get(26)?,
-                    resolution_lineage: row.get(27)?,
-                    escalation_id: row.get(28)?,
-                    escalation_trigger: row.get(29)?,
-                    previous_invocation_id: row.get(30)?,
-                    previous_tier: row.get(31)?,
-                    previous_model: row.get(32)?,
-                    previous_effort: row.get(33)?,
-                    previous_attempt: row.get(34)?,
-                    requested_tier: row.get(35)?,
-                    policy_attempt: row.get(36)?,
+                    context_metadata: row.get(20)?,
+                    invocation_tier: row.get(21)?,
+                    resolution_agent: row.get(22)?,
+                    resolution_model: row.get(23)?,
+                    resolution_effort: row.get(24)?,
+                    resolution_tier: row.get(25)?,
+                    resolution_source: row.get(26)?,
+                    resolution_escalation_reason: row.get(27)?,
+                    resolution_lineage: row.get(28)?,
+                    escalation_id: row.get(29)?,
+                    escalation_trigger: row.get(30)?,
+                    previous_invocation_id: row.get(31)?,
+                    previous_tier: row.get(32)?,
+                    previous_model: row.get(33)?,
+                    previous_effort: row.get(34)?,
+                    previous_attempt: row.get(35)?,
+                    requested_tier: row.get(36)?,
+                    policy_attempt: row.get(37)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3797,6 +3832,10 @@ impl Database {
                         input_tokens: row.input_tokens,
                         output_tokens: row.output_tokens,
                         cached_input_tokens: row.cached_input_tokens,
+                        context: row
+                            .context_metadata
+                            .as_deref()
+                            .and_then(|value| serde_json::from_str(value).ok()),
                         tier: EconomyTier::parse(&row.invocation_tier)
                             .unwrap_or(EconomyTier::Unknown),
                         escalation,
@@ -4136,6 +4175,25 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_review_criteria_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS review_criterion_results (
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                criterion_id TEXT NOT NULL,
+                criterion_text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY(run_id, criterion_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_criterion_task_run
+                ON review_criterion_results(task_id, run_id);",
+        )?;
+        Ok(())
+    }
+
     fn ensure_revision_contracts_table(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS revision_contracts (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, source_review_run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE, contract TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'actionable', created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), consumed_at TEXT, UNIQUE(source_review_run_id)); CREATE INDEX IF NOT EXISTS idx_revision_contracts_actionable ON revision_contracts(task_id, status, id);")?;
         Ok(())
@@ -4284,6 +4342,105 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn review_criterion_observations(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<ReviewCriterionRecord>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT task_id, run_id, criterion_id, criterion_text, status, evidence, rationale, created_at
+             FROM review_criterion_results WHERE run_id=?1 ORDER BY criterion_id",
+        )?;
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    task_id,
+                    run_id,
+                    criterion_id,
+                    criterion,
+                    status,
+                    evidence,
+                    rationale,
+                    created_at,
+                )| {
+                    Ok(ReviewCriterionRecord {
+                        task_id,
+                        run_id,
+                        criterion_id,
+                        criterion,
+                        status: serde_json::from_value(serde_json::Value::String(status))?,
+                        evidence: serde_json::from_str(&evidence)?,
+                        rationale,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn project_review_criterion_observations(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ReviewCriterionRecord>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT c.task_id, c.run_id, c.criterion_id, c.criterion_text, c.status, c.evidence, c.rationale, c.created_at
+             FROM review_criterion_results c JOIN tasks t ON t.id=c.task_id
+             WHERE t.project_id=?1 ORDER BY c.run_id, c.criterion_id",
+        )?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    task_id,
+                    run_id,
+                    criterion_id,
+                    criterion,
+                    status,
+                    evidence,
+                    rationale,
+                    created_at,
+                )| {
+                    Ok(ReviewCriterionRecord {
+                        task_id,
+                        run_id,
+                        criterion_id,
+                        criterion,
+                        status: serde_json::from_value(serde_json::Value::String(status))?,
+                        evidence: serde_json::from_str(&evidence)?,
+                        rationale,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
     pub fn store_review_blockers(
         &self,
         task_id: &str,
@@ -4304,11 +4461,13 @@ impl Database {
         clippy::too_many_arguments,
         reason = "the transaction boundary needs the complete validated review payload"
     )]
-    pub fn commit_task_review_result(
+    pub fn commit_task_review_result_with_criteria(
         &self,
         task_id: &str,
         run_id: i64,
         blockers: &[crate::automated::ReviewBlocker],
+        criteria: &[crate::protocol::AcceptanceCriterion],
+        criterion_results: &[crate::protocol::ReviewCriterionResult],
         revision_contract: Option<&str>,
         supersedes_with_pass: bool,
         output: &str,
@@ -4322,6 +4481,30 @@ impl Database {
         } else {
             "review"
         };
+        for result in criterion_results {
+            let criterion = criteria
+                .iter()
+                .find(|criterion| criterion.criterion_id == result.criterion_id)
+                .ok_or_else(|| {
+                    DbError::Scheduler(format!(
+                        "review result references unknown criterion '{}'",
+                        result.criterion_id
+                    ))
+                })?;
+            tx.execute(
+                "INSERT INTO review_criterion_results (task_id, run_id, criterion_id, criterion_text, status, evidence, rationale)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    task_id,
+                    run_id,
+                    result.criterion_id,
+                    criterion.text,
+                    serde_json::to_value(result.status)?.as_str().unwrap_or_default(),
+                    serde_json::to_string(&result.evidence)?,
+                    result.rationale,
+                ],
+            )?;
+        }
         for blocker in blockers {
             tx.execute("INSERT OR IGNORE INTO review_blocker_observations (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
             tx.execute("INSERT INTO review_blocker_ledger (task_id, blocker_id, run_id, blocker_key, requirement_ref, evidence, severity, acceptance_condition, status, finding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(task_id, blocker_id) DO UPDATE SET run_id=excluded.run_id, blocker_key=excluded.blocker_key, status=excluded.status, evidence=excluded.evidence, requirement_ref=excluded.requirement_ref, acceptance_condition=excluded.acceptance_condition, finding=excluded.finding, last_seen=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP", params![task_id, blocker.id, run_id, blocker.blocker_key, blocker.requirement_ref, blocker.evidence, blocker.severity, blocker.acceptance_condition, blocker.status, blocker.finding])?;
@@ -4361,6 +4544,36 @@ impl Database {
             sink(event);
         }
         Ok(())
+    }
+
+    /// Compatibility transaction for historical/imported reviews that
+    /// predate criterion-level evidence. New semantic Review uses
+    /// `commit_task_review_result_with_criteria`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "compatibility wrapper retains the published storage seam"
+    )]
+    pub fn commit_task_review_result(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        blockers: &[crate::automated::ReviewBlocker],
+        revision_contract: Option<&str>,
+        supersedes_with_pass: bool,
+        output: &str,
+        token_usage: Option<crate::worker::TokenUsage>,
+    ) -> Result<(), DbError> {
+        self.commit_task_review_result_with_criteria(
+            task_id,
+            run_id,
+            blockers,
+            &[],
+            &[],
+            revision_contract,
+            supersedes_with_pass,
+            output,
+            token_usage,
+        )
     }
 
     pub fn store_change_evidence(

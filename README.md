@@ -176,6 +176,9 @@ The tables below cover every `orc` command. Flags are summarized; see the [compl
 | `orc template list` | List the model/effort template for every execution class. |
 | `orc template set <CLASS> [--model] [--effort]` | Set the persistent template for a class (`coder`, `reviewer`, `architect`, `researcher`, `general`). |
 | `orc template clear <CLASS>` | Clear the persistent template for a class. |
+| `orc economy configure [--model-cost MODEL=COST]... [--unknown-tier TIER]` | Persist model-cost tiers used by the authoritative economy resolver. |
+| `orc economy show` | Emit model-cost configuration and project economy metrics as JSON. |
+| `orc economy context [INVOCATION_ID]` | Inspect persisted packet/context sizes beside provider token usage without dumping prompts. |
 
 ### Approvals
 
@@ -202,7 +205,7 @@ Dispatch a selected task with `orc dispatch TASK_ID`, or dispatch ready automate
 
 ## Runs, review, acceptance, and recovery
 
-Automated and manual implementation runs use task-specific Git worktrees. Manual runs print the worktree and a task packet, then wait for `orc run submit RUN_ID`, `orc run submit-patch RUN_ID PATCH_FILE`, or `orc run fail RUN_ID`. A manual completion report is descriptive: the actual worktree is authoritative for changed files, and Orc runs configured deterministic validation before publishing Review-ready state. Ordinary manual validation failures block the run for operator correction; automated runs retain their bounded same-worker repair loop. Inspect runs with `orc runs`; inspect changes with `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`.
+Automated and manual implementation runs use task-specific Git worktrees. Codex mutation processes start from an isolated launcher directory, but their logical working directory and explicit writable directory are the task worktree so relative edits stay inside it; the bounded packet carries the exact mutation root. Manual runs print the worktree and a task packet, then wait for `orc run submit RUN_ID`, `orc run submit-patch RUN_ID PATCH_FILE`, or `orc run fail RUN_ID`. A manual completion report is descriptive: the actual worktree is authoritative for changed files, and Orc runs configured deterministic validation before publishing Review-ready state. Ordinary manual validation failures block the run for operator correction; automated runs retain their bounded same-worker repair loop. Inspect runs with `orc runs`; inspect changes with `orc review TASK_ID`, `orc task diff TASK_ID`, and `orc task worktree TASK_ID`.
 
 Review is semantic-only, consumes fresh passing Orc validation evidence for the exact current worktree, and does not execute validation, accept, or merge work. Missing, failing, infrastructure-failed, or stale evidence is rejected before a reviewer provider is invoked. Send feedback with `orc revise TASK_ID "feedback"`; integrate satisfactory work with `orc task accept TASK_ID`; reject it with `orc task reject TASK_ID "reason"` while preserving the worktree; or cancel unfinished work with `orc task cancel TASK_ID "reason"`. An interrupted active task or failed blocked task can return to the queue with `orc task requeue TASK_ID`. After inspecting a `REPLAN_REQUIRED` non-convergence gate, acknowledge it explicitly with `orc task unblock TASK_ID`; this records the intervention but does not dispatch, revise, or review the task.
 
@@ -221,6 +224,12 @@ The Tauri desktop application shares the CLI's SQLite project state and provides
 The v0.3.0 desktop workspace supports the complete normal operator lifecycle through controls and forms, with raw protocol JSON limited to advanced disclosures. Desktop development requires Node.js/npm and the platform prerequisites for Tauri.
 
 ## Development
+
+The versioned external autonomy benchmark lives at
+[`fixtures/autonomy/pocket-ledger-v1`](fixtures/autonomy/pocket-ledger-v1/README.md).
+Its setup creates a deterministic dependency-free repository, a fresh trial
+registry, the five canonical task contracts, and a run manifest without making
+a provider invocation. Provider authentication remains external.
 
 ```bash
 cargo fmt --check

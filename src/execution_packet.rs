@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::automated::{RevisionContract, RevisionTaskRequirements};
 use crate::git::WorktreeChanges;
-use crate::protocol::{PlanningProjectState, TaskRiskGuard};
+use crate::protocol::{AcceptanceCriterion, PlanningProjectState, TaskRiskGuard};
 use crate::storage::db::ReviewBlockerRecord;
 use crate::task::{Task, TaskContract, TaskScopeMode};
 use crate::validation::{ValidationCategory, ValidationReport};
@@ -112,7 +112,7 @@ pub struct TaskContractPacket {
     pub objective: String,
     pub role: String,
     pub scope_mode: Option<TaskScopeMode>,
-    pub acceptance_criteria: Vec<String>,
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
     pub required_tests: Vec<String>,
     pub unchanged: Vec<String>,
     pub expected_changes: Vec<String>,
@@ -146,7 +146,9 @@ impl TaskContractPacket {
             }
             bounded
         };
-        let acceptance_criteria = list("acceptance_criteria", &contract.acceptance_criteria);
+        // Task proposals cap criteria below MAX_LIST_ITEMS, so Review always
+        // receives every criterion and its stable contract-order identity.
+        let acceptance_criteria = AcceptanceCriterion::from_contract(&contract.acceptance_criteria);
         let required_tests = list("required_tests", &contract.required_tests);
         let unchanged = list("unchanged", &contract.unchanged);
         let expected_changes = list("expected_changes", &task.expected_changes);
@@ -232,6 +234,9 @@ impl ChangeEvidence {
 pub struct DispatchPacket {
     pub metadata: PacketMetadata,
     pub project: String,
+    /// Explicit mutation root. Provider mutation tools are anchored here even
+    /// when Orc launches the provider process from an isolated directory.
+    pub workspace_root: String,
     pub engineering_contract: BoundedText,
     pub task_contract: TaskContractPacket,
     pub risk_guards: Vec<TaskRiskGuard>,
@@ -294,6 +299,7 @@ impl DispatchPacket {
         Ok(Self {
             metadata,
             project: project.to_owned(),
+            workspace_root: explicit_workspace_root(root),
             engineering_contract,
             task_contract: TaskContractPacket::from_task(task, contract),
             risk_guards: task.risk_policy().required_guards,
@@ -308,6 +314,7 @@ impl DispatchPacket {
 pub struct RevisionPacket {
     pub metadata: PacketMetadata,
     pub project: String,
+    pub workspace_root: String,
     pub engineering_contract: BoundedText,
     pub task_contract: TaskContractPacket,
     pub risk_guards: Vec<TaskRiskGuard>,
@@ -434,6 +441,7 @@ impl RevisionPacket {
         Ok(Self {
             metadata,
             project: project.to_owned(),
+            workspace_root: explicit_workspace_root(root),
             engineering_contract,
             task_contract: TaskContractPacket::from_revision(
                 task,
@@ -527,7 +535,28 @@ impl ReviewPacket {
         if !validation.is_success() {
             bail!("review packet requires fresh passing deterministic validation evidence");
         }
+        if contract.acceptance_criteria.is_empty() {
+            bail!("review packet requires at least one acceptance criterion");
+        }
+        if contract.acceptance_criteria.len() > MAX_LIST_ITEMS {
+            bail!(
+                "review packet cannot omit acceptance criteria: contract has {} but bounded protocol permits {}",
+                contract.acceptance_criteria.len(),
+                MAX_LIST_ITEMS
+            );
+        }
         let current_changes = ChangeEvidence::from_worktree(changes);
+        let active_blocker_count = ledger
+            .iter()
+            .filter(|blocker| blocker.status != "resolved")
+            .count();
+        if active_blocker_count > MAX_BLOCKERS {
+            bail!(
+                "review packet cannot omit unresolved blockers: ledger has {} but bounded protocol permits {}",
+                active_blocker_count,
+                MAX_BLOCKERS
+            );
+        }
         let mut prior_blockers = ledger
             .iter()
             .map(|blocker| ReviewBlockerContext {
@@ -536,7 +565,11 @@ impl ReviewPacket {
                 acceptance_condition: BoundedText::new(&blocker.acceptance_condition, 2_000).text,
             })
             .collect::<Vec<_>>();
-        prior_blockers.sort_by(|left, right| left.blocker_id.cmp(&right.blocker_id));
+        prior_blockers.sort_by(|left, right| {
+            (left.status == "resolved")
+                .cmp(&(right.status == "resolved"))
+                .then_with(|| left.blocker_id.cmp(&right.blocker_id))
+        });
         let omitted = prior_blockers.len().saturating_sub(MAX_BLOCKERS);
         prior_blockers.truncate(MAX_BLOCKERS);
         let mut truncations = Vec::new();
@@ -584,6 +617,44 @@ impl ReviewPacket {
             prior_blockers,
         })
     }
+
+    /// Deterministically confirm that a provider citation names evidence that
+    /// was actually visible in this bounded packet. This does not attempt to
+    /// prove the provider's semantic inference.
+    pub fn contains_evidence_ref(&self, evidence: &crate::protocol::ReviewEvidenceRef) -> bool {
+        use crate::protocol::ReviewEvidenceKind;
+        match evidence.kind {
+            ReviewEvidenceKind::Diff | ReviewEvidenceKind::ImplementationFact => {
+                evidence.reference == "current_changes.diff"
+                    && !self.current_changes.diff.text.trim().is_empty()
+            }
+            ReviewEvidenceKind::ChangedFile => self
+                .current_changes
+                .files
+                .iter()
+                .any(|file| file.path == evidence.reference),
+            ReviewEvidenceKind::Validation => self
+                .passing_validation
+                .iter()
+                .any(|step| step.command == evidence.reference),
+            ReviewEvidenceKind::TaskContract => {
+                evidence.reference == "task_contract.objective"
+                    || self
+                        .task_contract
+                        .acceptance_criteria
+                        .iter()
+                        .any(|criterion| criterion.criterion_id == evidence.reference)
+                    || self
+                        .task_contract
+                        .unchanged
+                        .iter()
+                        .enumerate()
+                        .any(|(index, _)| {
+                            evidence.reference == format!("task_contract.unchanged.{}", index + 1)
+                        })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +669,7 @@ pub struct FailedDiagnostic {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationRepairPacket {
     pub metadata: PacketMetadata,
+    pub workspace_root: String,
     pub task_id: String,
     pub objective: BoundedText,
     pub repair_attempt: usize,
@@ -677,6 +749,7 @@ impl ValidationRepairPacket {
                 blocker_count: 0,
                 truncations,
             },
+            workspace_root: explicit_workspace_root(root),
             task_id: task.id.clone(),
             objective: BoundedText::new(&task.objective, 2_000),
             repair_attempt: attempt,
@@ -741,6 +814,17 @@ pub fn render_packet<T: Serialize>(role_instructions: &str, packet: &T) -> Resul
     ))
 }
 
+/// Render a transport packet together with deterministic byte/section
+/// accounting. New provider invocation paths should use this form so the
+/// accounting can be persisted with the invocation.
+pub fn render_packet_accounted<T: Serialize>(
+    role_instructions: &str,
+    packet_metadata: &PacketMetadata,
+    packet: &T,
+) -> Result<crate::provider_context::RenderedPacket> {
+    crate::provider_context::render_accounted(role_instructions, packet_metadata, packet)
+}
+
 fn note_text(truncations: &mut Vec<Truncation>, field: &str, value: &BoundedText) {
     if value.truncated() {
         truncations.push(Truncation {
@@ -749,6 +833,13 @@ fn note_text(truncations: &mut Vec<Truncation>, field: &str, value: &BoundedText
             omitted_bytes: value.omitted_bytes,
         });
     }
+}
+
+fn explicit_workspace_root(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn bound_plan_snapshot(
@@ -1035,6 +1126,17 @@ mod tests {
         assert!(rendered.contains("persistence_reopen_coverage"));
         assert!(!rendered.contains("reviewer_feedback"));
         assert!(!rendered.contains("escalation"));
+        let accounted =
+            render_packet_accounted("stable instructions", &packet.metadata, &packet).unwrap();
+        assert!(accounted.packet.bytes > 0);
+        assert_eq!(accounted.packet.packet_type, "dispatch");
+        assert!(
+            accounted
+                .packet
+                .sections
+                .iter()
+                .any(|section| { section.name == "task_contract" && section.bytes > 0 })
+        );
     }
 
     #[test]
@@ -1085,13 +1187,34 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "src/blocker.rs")
         );
+        let accounted = render_packet_accounted("revision", &packet.metadata, &packet).unwrap();
+        assert!(
+            accounted
+                .packet
+                .sections
+                .iter()
+                .any(|section| section.name == "active_blockers" && section.bytes > 0)
+        );
+        assert!(
+            accounted
+                .packet
+                .sections
+                .iter()
+                .any(|section| section.name == "current_changes" && section.bytes > 0)
+        );
     }
 
     #[test]
     fn review_contains_compact_current_evidence_and_refuses_failure() {
+        let mut task_contract = contract();
+        task_contract.acceptance_criteria = vec![
+            "first semantic behavior".into(),
+            "second semantic behavior".into(),
+            "third semantic behavior".into(),
+        ];
         let packet = ReviewPacket::build(
             &task(),
-            &contract(),
+            &task_contract,
             Some(9),
             &changes("authoritative diff".into()),
             &validation(true, String::new()),
@@ -1109,7 +1232,33 @@ mod tests {
                 .contains("authoritative diff")
         );
         assert_eq!(packet.passing_validation[0].command, "cargo test");
-        assert_eq!(packet.prior_blockers[0].blocker_id, "BLK-a");
+        assert_eq!(
+            packet
+                .task_contract
+                .acceptance_criteria
+                .iter()
+                .map(|criterion| (criterion.criterion_id.as_str(), criterion.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("acceptance-criterion-1", "first semantic behavior"),
+                ("acceptance-criterion-2", "second semantic behavior"),
+                ("acceptance-criterion-3", "third semantic behavior"),
+            ]
+        );
+        assert_eq!(packet.prior_blockers[0].blocker_id, "BLK-b");
+        assert_eq!(packet.prior_blockers[1].blocker_id, "BLK-a");
+        let structured_bytes = serde_json::to_vec(&packet).unwrap().len();
+        let mut legacy_shape = serde_json::to_value(&packet).unwrap();
+        legacy_shape["task_contract"]["acceptance_criteria"] = serde_json::json!([
+            "first semantic behavior",
+            "second semantic behavior",
+            "third semantic behavior"
+        ]);
+        let legacy_bytes = serde_json::to_vec(&legacy_shape).unwrap().len();
+        assert!(
+            structured_bytes - legacy_bytes <= 256,
+            "stable criterion identity made the bounded Review packet unexpectedly large"
+        );
         let rendered = render_packet("Do not execute validation commands", &packet).unwrap();
         assert!(!rendered.contains("old passed output"));
         assert!(
@@ -1122,6 +1271,20 @@ mod tests {
                 &[],
             )
             .is_err()
+        );
+        let accounted = render_packet_accounted(
+            "Do not execute validation commands",
+            &packet.metadata,
+            &packet,
+        )
+        .unwrap();
+        assert_eq!(accounted.packet.packet_type, "semantic_review");
+        assert!(
+            accounted
+                .packet
+                .sections
+                .iter()
+                .any(|section| section.name == "passing_validation" && section.bytes > 0)
         );
     }
 
@@ -1162,6 +1325,16 @@ mod tests {
         let rendered = render_packet("repair", &packet).unwrap();
         assert!(!rendered.contains("passed output must not enter repair"));
         assert!(!rendered.contains("huge diff is not needed"));
+        let accounted = render_packet_accounted("repair", &packet.metadata, &packet).unwrap();
+        assert_eq!(accounted.packet.packet_type, "validation_repair");
+        assert!(accounted.packet.truncated);
+        assert!(
+            accounted
+                .packet
+                .sections
+                .iter()
+                .any(|section| section.name == "failures" && section.bytes > 0)
+        );
     }
 
     #[test]
@@ -1234,6 +1407,14 @@ mod tests {
         assert_eq!(
             render_packet("stable", &packet).unwrap(),
             render_packet("stable", &packet).unwrap()
+        );
+        assert_eq!(
+            render_packet_accounted("stable", &packet.metadata, &packet)
+                .unwrap()
+                .packet,
+            render_packet_accounted("stable", &packet.metadata, &packet)
+                .unwrap()
+                .packet
         );
     }
 }

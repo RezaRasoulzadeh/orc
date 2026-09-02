@@ -18,6 +18,7 @@ Only current/near-term milestones are decomposed here.
 | [M04-003](M04-003.md) | Done | M04 | Execute explicitly authorized recovery recommendations |
 | [M04-004](M04-004.md) | Done | M04 | Route validation-repair exhaustion into supervised Controller recovery |
 | [M04-005](M04-005.md) | Done | M04 | Route semantic revision non-convergence into supervised Controller recovery |
+| [M05-001](M05-001.md) | Planned | M05 | Add read-only Controller planning capability |
 
 ## Task format
 

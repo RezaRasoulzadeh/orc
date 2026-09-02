@@ -2,11 +2,11 @@
 
 **Architecture:** Orc Next / local Controller + deterministic kernel
 
-**Current milestone:** M02 — Read-only Controller
+**Current milestone:** M03 — Typed Controller tools
 
-**Current task:** M02-003 — Enforce reliable structured Controller output (In progress; implementation complete, real-model evaluation pending)
+**Current task:** M03-001 — Define typed Controller action intents and legality boundary (Planned)
 
-**Last completed:** M02-002 — Read-only Controller decision quality evaluation
+**Last completed:** M02-003 — Enforce reliable structured Controller output
 
 **Blocked by:** Nothing
 
@@ -18,10 +18,9 @@
 - `ProjectOperations` is the primary existing provider-independent observation seam.
 - `OrcApp` is the existing canonical application/mutation seam.
 - `src/local_runtime.rs` is the replaceable, read-only local inference seam; native backend details remain outside Controller/domain types. The optional `llama-cpp` feature implements the first adapter in `src/local_runtime/llama_cpp.rs`.
-- Controller recommendations use a model-independent JSON Schema request; the
-  llama.cpp adapter applies native grammar-constrained sampling and strict
-  full-value parsing, retaining raw output on structured parse failure.
-- M01-002 was source-reviewed as PASS. The supplied `Qwen3-8B-Q4_K_M.gguf` smoke passed end-to-end through `LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU; Vulkan/GPU optimization remains separate from M01-002.
+- Controller recommendations use a model-independent JSON Schema request; the llama.cpp adapter applies native grammar-constrained sampling and strict full-value parsing, retaining raw output on structured parse failure.
+- Controller state now carries an explicit canonical operational-consistency observation so derived next-step data cannot silently override contradictory lifecycle facts.
+- M02 is complete: the final unchanged seven-scenario Qwen3 evaluation achieved `7/7` semantic decisions and `7/7` strict structured-contract compliance.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -29,25 +28,18 @@
 
 ## Immediate next action
 
-M02-002 remains recorded with strict structured compliance `4/7` and semantic
-action selection `7/7`; the strict result was not reinterpreted as contract
-compliance. M02-003 addresses that protocol gap without stripping trailing
-model output.
+Implement M03-001 exactly against `docs/orc-next/tasks/M03-001.md`.
 
-Run the opt-in Qwen3 evaluation to verify that all seven unchanged M02-002
-scenarios satisfy both semantic expectations and the strict JSON contract:
+M03-001 introduces the first typed, model-independent Controller action-intent boundary for dispatch, semantic review, revise, and accept. The kernel must inspect whether an intent is legal using canonical Orc rules and return a bounded typed result without executing or persisting any mutation.
 
-```text
-ORC_QWEN3_GGUF=~/models/qwen3/Qwen3-8B-Q4_K_M.gguf \
-  cargo test --features llama-cpp --test controller_evaluation_smoke -- --ignored --nocapture
-```
+Keep this as a legality/contract slice only. Reuse `ProjectOperations`, selected `OrcApp` APIs, and canonical lifecycle/read rules; do not create a parallel Controller state machine. Do not add Controller execution, recovery, planning/Lead migration, memory, autonomy, model changes, Python, or GPU work.
 
-M02-003's implementation now uses native JSON Schema → llama.cpp grammar
-constrained decoding and retains structured-output diagnostics. The required
-real-model run is intentionally still pending and no model weights are part
-of the repository. A focused native smoke also confirmed and fixed the
-sampler-contract crash caused by accepting each token twice; the final
-seven-scenario evaluation remains pending while the local model choice is
-being replaced.
+M02-003 final acceptance evidence:
+
+- final Luna + High source review: `PASS`;
+- semantic decision quality: `7/7`;
+- strict structured-contract compliance: `7/7`;
+- real-model evaluation: `1 passed, 0 failed`, `189.80s`;
+- latest deterministic validation: 293 normal lib tests and 299 llama-cpp-feature lib tests passed, with normal/feature clippy, fmt, and diff check passing.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.

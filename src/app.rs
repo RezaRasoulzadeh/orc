@@ -967,6 +967,17 @@ impl OrcApp {
     pub fn review_history(&self, task_id: &str) -> Result<Vec<PriorReview>> {
         Ok(self.review(task_id)?.automated_reviews)
     }
+
+    /// Return the newest unconsumed REVISE review evidence for a canonical
+    /// revision execution. Controller callers receive only the application
+    /// fact they need; storage remains behind OrcApp.
+    pub(crate) fn actionable_revision_feedback(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .actionable_revision_review(task_id)?
+            .map(|(_, feedback)| feedback))
+    }
+
     pub fn review_for_run(&self, task_id: &str, run_id: i64) -> Result<ReviewSummary> {
         crate::review::build_review_for_task_run(&self.db, task_id, run_id, &self.repo_path)
     }

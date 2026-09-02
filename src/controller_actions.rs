@@ -5,10 +5,17 @@
 //! Legality is delegated to [`ProjectOperations`], which owns the canonical
 //! queue, lifecycle and evidence projections.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::agent;
+use crate::app::OrcApp;
+use crate::automated::{ActionBackend, ActionOverrides};
 use crate::operations::{OperationalAction, ProjectOperations};
+use crate::registry::ReasoningEffort;
+use crate::validation::ValidationRunner;
+use crate::worker::Worker;
 
 pub use crate::operations::{
     OperationalAction as ControllerActionKind,
@@ -37,6 +44,179 @@ pub enum ControllerActionError {
     InvalidTaskId,
     #[error("controller action legality read failed: {0}")]
     Read(#[source] anyhow::Error),
+}
+
+/// A one-shot authorization minted by trusted Orc/application code.
+///
+/// This deliberately has no serde implementation, no public constructor and
+/// is consumed by the execution boundary. The intent fingerprint prevents a
+/// token authorized for one action from being replayed for another action.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ControllerActionAuthorization {
+    action: OperationalAction,
+    task_id: String,
+}
+
+/// Native execution dependencies and operator/application configuration. This
+/// type is intentionally not serializable: it is not part of the
+/// model-owned Controller contract.
+pub enum ControllerActionExecutionContext<'a> {
+    Dispatch {
+        agent_id: Option<String>,
+        model_override: Option<String>,
+        effort_override: Option<ReasoningEffort>,
+        worker: Option<&'a dyn Worker>,
+        validation_runner: &'a dyn ValidationRunner,
+    },
+    SemanticReview {
+        overrides: ActionOverrides,
+        backend: &'a dyn ActionBackend,
+        validation_runner: &'a dyn ValidationRunner,
+    },
+    Revise {
+        agent_id: Option<String>,
+        overrides: agent::RevisionExecutionOverrides,
+        worker: Option<&'a dyn Worker>,
+        validation_runner: &'a dyn ValidationRunner,
+    },
+    Accept,
+}
+
+impl<'a> ControllerActionExecutionContext<'a> {
+    /// Use the configured Orc dispatch path. Optional agent/model/effort
+    /// values are trusted application/operator overrides, not model fields.
+    pub fn dispatch(
+        agent_id: Option<String>,
+        model_override: Option<String>,
+        effort_override: Option<ReasoningEffort>,
+    ) -> Self {
+        Self::Dispatch {
+            agent_id,
+            model_override,
+            effort_override,
+            worker: None,
+            validation_runner: &crate::validation::SystemValidationRunner,
+        }
+    }
+
+    /// Use the canonical worker-backed dispatch path with an injected worker
+    /// for deterministic tests or an explicitly trusted application seam.
+    pub fn dispatch_with_worker(
+        agent_id: impl Into<String>,
+        worker: &'a dyn Worker,
+        validation_runner: &'a dyn ValidationRunner,
+    ) -> Self {
+        Self::Dispatch {
+            agent_id: Some(agent_id.into()),
+            model_override: None,
+            effort_override: None,
+            worker: Some(worker),
+            validation_runner,
+        }
+    }
+
+    pub fn semantic_review(
+        overrides: ActionOverrides,
+        backend: &'a dyn ActionBackend,
+        validation_runner: &'a dyn ValidationRunner,
+    ) -> Self {
+        Self::SemanticReview {
+            overrides,
+            backend,
+            validation_runner,
+        }
+    }
+
+    /// Use Orc's configured previous implementation-agent selection.
+    pub fn revise() -> Self {
+        Self::Revise {
+            agent_id: None,
+            overrides: agent::RevisionExecutionOverrides::default(),
+            worker: None,
+            validation_runner: &crate::validation::SystemValidationRunner,
+        }
+    }
+
+    /// Use the canonical revision worker path with explicitly trusted agent,
+    /// worker, and validation seams.
+    pub fn revise_with_worker(
+        agent_id: impl Into<String>,
+        worker: &'a dyn Worker,
+        validation_runner: &'a dyn ValidationRunner,
+    ) -> Self {
+        Self::Revise {
+            agent_id: Some(agent_id.into()),
+            overrides: agent::RevisionExecutionOverrides::default(),
+            worker: Some(worker),
+            validation_runner,
+        }
+    }
+
+    pub const fn accept() -> Self {
+        Self::Accept
+    }
+
+    fn matches(&self, action: OperationalAction) -> bool {
+        matches!(
+            (self, action),
+            (Self::Dispatch { .. }, OperationalAction::Dispatch)
+                | (
+                    Self::SemanticReview { .. },
+                    OperationalAction::SemanticReview
+                )
+                | (Self::Revise { .. }, OperationalAction::Revise)
+                | (Self::Accept, OperationalAction::Accept)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerActionAuthorizationRejection {
+    Missing,
+    NotAuthorizedForIntent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerActionExecutionStage {
+    RequestValidation,
+    ExecutionContext,
+    LegalityInspection,
+    CanonicalMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerActionExecutionEvidence {
+    pub lifecycle: Option<crate::task::TaskStatus>,
+    pub run_id: Option<i64>,
+    pub review_run_id: Option<i64>,
+    pub validation_state: Option<crate::operations::ValidationState>,
+}
+
+/// Bounded result of one attempted Controller action execution. Provider
+/// output, filesystem paths, SQL, handles and runtime objects are excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ControllerActionExecutionResult {
+    AuthorizationRejected {
+        action: OperationalAction,
+        task_id: String,
+        reason: ControllerActionAuthorizationRejection,
+    },
+    FreshLegalityRejected {
+        legality: ControllerActionLegality,
+    },
+    Executed {
+        action: OperationalAction,
+        task_id: String,
+        evidence: ControllerActionExecutionEvidence,
+    },
+    ExecutionFailed {
+        action: OperationalAction,
+        task_id: String,
+        stage: ControllerActionExecutionStage,
+    },
 }
 
 impl ControllerActionIntent {
@@ -79,6 +259,236 @@ impl ControllerActionIntent {
     }
 }
 
+impl OrcApp {
+    /// Mint a one-shot authorization in trusted application code. This method
+    /// intentionally does not inspect or persist a grant; execution always
+    /// performs its own mutation-boundary legality check.
+    pub fn authorize_controller_action(
+        &self,
+        intent: &ControllerActionIntent,
+    ) -> std::result::Result<ControllerActionAuthorization, ControllerActionError> {
+        intent.validate()?;
+        Ok(ControllerActionAuthorization {
+            action: intent.action_kind(),
+            task_id: intent.task_id().to_owned(),
+        })
+    }
+
+    /// Execute one explicitly authorized Controller intent.
+    ///
+    /// Authorization is consumed, matched to the exact requested intent, and
+    /// followed by a fresh canonical legality inspection immediately before
+    /// delegating to the existing Orc mutation implementation. A missing or
+    /// mismatched authorization cannot reach the mutation path.
+    pub fn execute_authorized_controller_action(
+        &self,
+        intent: &ControllerActionIntent,
+        authorization: Option<ControllerActionAuthorization>,
+        context: ControllerActionExecutionContext<'_>,
+    ) -> ControllerActionExecutionResult {
+        let action = intent.action_kind();
+        let task_id = bounded_controller_task_id(intent.task_id());
+        if intent.validate().is_err() {
+            return ControllerActionExecutionResult::ExecutionFailed {
+                action,
+                task_id,
+                stage: ControllerActionExecutionStage::RequestValidation,
+            };
+        }
+        let Some(authorization) = authorization else {
+            return ControllerActionExecutionResult::AuthorizationRejected {
+                action,
+                task_id,
+                reason: ControllerActionAuthorizationRejection::Missing,
+            };
+        };
+        if authorization.action != action || authorization.task_id != intent.task_id() {
+            return ControllerActionExecutionResult::AuthorizationRejected {
+                action,
+                task_id,
+                reason: ControllerActionAuthorizationRejection::NotAuthorizedForIntent,
+            };
+        }
+        if !context.matches(action) {
+            return ControllerActionExecutionResult::ExecutionFailed {
+                action,
+                task_id,
+                stage: ControllerActionExecutionStage::ExecutionContext,
+            };
+        }
+
+        // This is deliberately the last read in the boundary before the
+        // canonical mutation call. Earlier Allowed observations are never
+        // consulted and never act as a capability.
+        let legality = match intent.inspect(&self.operations()) {
+            Ok(legality) => legality,
+            Err(_) => {
+                return ControllerActionExecutionResult::ExecutionFailed {
+                    action,
+                    task_id,
+                    stage: ControllerActionExecutionStage::LegalityInspection,
+                };
+            }
+        };
+        if matches!(legality, ControllerActionLegality::Rejected { .. }) {
+            return ControllerActionExecutionResult::FreshLegalityRejected { legality };
+        }
+
+        let run_id = match self.execute_controller_action_canonically(intent, context) {
+            Ok(run_id) => run_id,
+            Err(_) => {
+                return ControllerActionExecutionResult::ExecutionFailed {
+                    action,
+                    task_id,
+                    stage: ControllerActionExecutionStage::CanonicalMutation,
+                };
+            }
+        };
+
+        ControllerActionExecutionResult::Executed {
+            action,
+            task_id,
+            evidence: self.controller_execution_evidence(intent.task_id(), run_id),
+        }
+    }
+
+    fn execute_controller_action_canonically(
+        &self,
+        intent: &ControllerActionIntent,
+        context: ControllerActionExecutionContext<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        match (intent.action_kind(), context) {
+            (
+                OperationalAction::Dispatch,
+                ControllerActionExecutionContext::Dispatch {
+                    agent_id,
+                    model_override,
+                    effort_override,
+                    worker,
+                    validation_runner,
+                },
+            ) => {
+                let summary = match worker {
+                    Some(worker) => agent::dispatch_with_worker_on_db(
+                        intent.task_id(),
+                        worker,
+                        self.database(),
+                        self.repo_path(),
+                        agent_id
+                            .as_deref()
+                            .context("worker-backed dispatch requires an agent")?,
+                        validation_runner,
+                    )?,
+                    None => agent::dispatch_selected_with_db_and_repo(
+                        self.database(),
+                        self.repo_path(),
+                        intent.task_id(),
+                        agent_id.as_deref(),
+                        model_override,
+                        effort_override,
+                    )?,
+                };
+                Ok(Some(summary.run_id))
+            }
+            (
+                OperationalAction::SemanticReview,
+                ControllerActionExecutionContext::SemanticReview {
+                    overrides,
+                    backend,
+                    validation_runner,
+                },
+            ) => Ok(Some(
+                self.automated_review_with_backend(
+                    intent.task_id(),
+                    &overrides,
+                    backend,
+                    validation_runner,
+                )?
+                .0,
+            )),
+            (
+                OperationalAction::Revise,
+                ControllerActionExecutionContext::Revise {
+                    agent_id,
+                    overrides,
+                    worker,
+                    validation_runner,
+                },
+            ) => {
+                // The revision feedback is canonical persisted review
+                // evidence, not a model-owned execution argument.
+                let feedback = self
+                    .actionable_revision_feedback(intent.task_id())?
+                    .context("actionable revision review disappeared")?;
+                let summary = match worker {
+                    Some(worker) => agent::revise_with_worker_on_db_with_overrides(
+                        intent.task_id(),
+                        &feedback,
+                        worker,
+                        self.database(),
+                        self.repo_path(),
+                        agent_id
+                            .as_deref()
+                            .context("worker-backed revision requires an agent")?,
+                        validation_runner,
+                        &overrides,
+                    )?,
+                    None => {
+                        if overrides.model.is_some() || overrides.effort.is_some() {
+                            anyhow::bail!(
+                                "revision overrides require the worker-backed canonical seam"
+                            );
+                        }
+                        match agent_id {
+                            Some(agent_id) => {
+                                self.revise(intent.task_id(), &feedback, &agent_id)?;
+                            }
+                            None => {
+                                self.revise_with_previous_agent(intent.task_id(), &feedback)?;
+                            }
+                        }
+                        return Ok(None);
+                    }
+                };
+                Ok(Some(summary.run_id))
+            }
+            (OperationalAction::Accept, ControllerActionExecutionContext::Accept) => {
+                self.accept(intent.task_id())?;
+                Ok(None)
+            }
+            _ => anyhow::bail!("execution context does not match Controller action"),
+        }
+    }
+
+    fn controller_execution_evidence(
+        &self,
+        task_id: &str,
+        run_id: Option<i64>,
+    ) -> ControllerActionExecutionEvidence {
+        let Ok(Some(detail)) = self.task_operations(task_id) else {
+            return ControllerActionExecutionEvidence {
+                lifecycle: None,
+                run_id,
+                review_run_id: None,
+                validation_state: None,
+            };
+        };
+        ControllerActionExecutionEvidence {
+            lifecycle: Some(detail.summary.lifecycle),
+            run_id,
+            review_run_id: detail.summary.review.run_id,
+            validation_state: Some(detail.summary.validation.state),
+        }
+    }
+}
+
+fn bounded_controller_task_id(task_id: &str) -> String {
+    task_id
+        .chars()
+        .take(MAX_CONTROLLER_ACTION_TASK_ID_BYTES)
+        .collect()
+}
+
 /// Convenience function for callers that prefer a free inspection boundary.
 pub fn inspect_action(
     intent: &ControllerActionIntent,
@@ -94,11 +504,15 @@ mod tests {
     use std::process::Command;
 
     use crate::automated::ReviewResult;
+    use crate::automated::{ActionBackend, ActionExecution, ActionOverrides};
     use crate::operations::ProjectOperations;
     use crate::registry::{self, AgentAction, AgentDefinition, ReasoningEffort};
     use crate::storage::{AgentRunExecution, Database};
     use crate::task::{CreateTaskInput, TaskPriority, TaskStatus};
+    use crate::validation::test_helpers::FakeValidationRunner;
     use crate::validation::{ValidationCategory, ValidationReport, ValidationStepResult};
+    use crate::worker::TokenUsage;
+    use crate::worker::test_helpers::FakeWorker;
     use tempfile::TempDir;
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -570,5 +984,313 @@ mod tests {
         );
         assert_eq!(db.get_worktree_metadata(&task).unwrap(), before_worktree);
         assert_eq!(db.get_change_evidence(review).unwrap(), before_evidence);
+    }
+
+    #[test]
+    fn execution_requires_one_shot_trusted_authorization_and_does_not_self_authorize() {
+        let (repo, db, _project, task) = setup();
+        db.update_task_status(&task, TaskStatus::Ready).unwrap();
+        let intent = ControllerActionIntent::Dispatch {
+            task_id: task.clone(),
+        };
+        let before_runs = db.list_agent_runs_for_task(&task).unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+
+        let missing = app.execute_authorized_controller_action(
+            &intent,
+            None,
+            ControllerActionExecutionContext::dispatch_with_worker(
+                "agent-a",
+                &FakeWorker::new_success(None),
+                &FakeValidationRunner::success(),
+            ),
+        );
+        assert!(matches!(
+            missing,
+            ControllerActionExecutionResult::AuthorizationRejected {
+                reason: ControllerActionAuthorizationRejection::Missing,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(app.database().list_agent_runs_for_task(&task).unwrap()).unwrap(),
+            serde_json::to_value(before_runs).unwrap()
+        );
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Ready);
+
+        let authorization = app.authorize_controller_action(&intent).unwrap();
+        let different_intent = ControllerActionIntent::Accept {
+            task_id: task.clone(),
+        };
+        let replay = app.execute_authorized_controller_action(
+            &different_intent,
+            Some(authorization),
+            ControllerActionExecutionContext::accept(),
+        );
+        assert!(matches!(
+            replay,
+            ControllerActionExecutionResult::AuthorizationRejected {
+                reason: ControllerActionAuthorizationRejection::NotAuthorizedForIntent,
+                ..
+            }
+        ));
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Ready);
+    }
+
+    #[test]
+    fn previously_allowed_intent_is_rechecked_and_rejected_without_mutation() {
+        let (repo, db, _project, task) = setup();
+        db.update_task_status(&task, TaskStatus::Ready).unwrap();
+        let intent = ControllerActionIntent::Dispatch {
+            task_id: task.clone(),
+        };
+        assert!(matches!(
+            intent
+                .inspect(&ProjectOperations::new(&db, repo.path()))
+                .unwrap(),
+            ControllerActionLegality::Allowed { .. }
+        ));
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let authorization = app.authorize_controller_action(&intent).unwrap();
+        app.database()
+            .update_task_status(&task, TaskStatus::Active)
+            .unwrap();
+        let before_runs = app.database().list_agent_runs_for_task(&task).unwrap();
+        let result = app.execute_authorized_controller_action(
+            &intent,
+            Some(authorization),
+            ControllerActionExecutionContext::dispatch_with_worker(
+                "agent-a",
+                &FakeWorker::new_success(None),
+                &FakeValidationRunner::success(),
+            ),
+        );
+        assert!(matches!(
+            result,
+            ControllerActionExecutionResult::FreshLegalityRejected {
+                legality: ControllerActionLegality::Rejected {
+                    reason: ControllerActionRejection::WrongPhase { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(app.database().list_agent_runs_for_task(&task).unwrap()).unwrap(),
+            serde_json::to_value(before_runs).unwrap()
+        );
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Active);
+    }
+
+    struct ControllerReviewBackend {
+        output: String,
+    }
+
+    impl ActionBackend for ControllerReviewBackend {
+        fn invoke(
+            &self,
+            _agent: &AgentDefinition,
+            action: AgentAction,
+            _input: &str,
+            _model: Option<&str>,
+            _effort: Option<ReasoningEffort>,
+        ) -> anyhow::Result<ActionExecution> {
+            assert_eq!(action, AgentAction::Review);
+            Ok(ActionExecution {
+                output: self.output.clone(),
+                token_usage: Some(TokenUsage {
+                    total_tokens: 1,
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cached_input_tokens: None,
+                }),
+            })
+        }
+    }
+
+    fn revising_review_output() -> String {
+        serde_json::json!({
+            "verdict": "REVISE",
+            "criterion_results": [{
+                "criterion_id": "acceptance-criterion-1",
+                "status": "insufficient_evidence",
+                "evidence": [{
+                    "kind": "task_contract",
+                    "reference": "task_contract.objective",
+                    "explanation": "The objective needs implementation evidence."
+                }],
+                "rationale": "Implementation evidence is still required."
+            }],
+            "findings": ["implementation evidence is required"],
+            "blocking_findings": ["implementation evidence is required"],
+            "non_blocking_findings": [],
+            "severity": "medium",
+            "revision_feedback": "provide implementation evidence",
+            "blockers": []
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn all_authorized_actions_use_canonical_lifecycle_paths() {
+        // Dispatch: the injected Worker is only a trusted test seam; all
+        // lifecycle and persistence changes come from agent dispatch.
+        let (repo, db, _project, dispatch_task) = setup();
+        std::fs::write(repo.path().join(".orc/engineering.md"), "# contract\n").unwrap();
+        db.update_task_status(&dispatch_task, TaskStatus::Ready)
+            .unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let dispatch = ControllerActionIntent::Dispatch {
+            task_id: dispatch_task.clone(),
+        };
+        let dispatch_auth = app.authorize_controller_action(&dispatch).unwrap();
+        let dispatch_result = app.execute_authorized_controller_action(
+            &dispatch,
+            Some(dispatch_auth),
+            ControllerActionExecutionContext::dispatch_with_worker(
+                "agent-a",
+                &FakeWorker::new_success(None),
+                &FakeValidationRunner::success(),
+            ),
+        );
+        assert!(matches!(
+            dispatch_result,
+            ControllerActionExecutionResult::Executed {
+                evidence: ControllerActionExecutionEvidence {
+                    lifecycle: Some(TaskStatus::Review),
+                    run_id: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // Semantic Review: the backend is injected through the trusted
+        // application context and run_review owns the review transaction.
+        let (repo, db, _project, review_task) = setup();
+        db.update_task_status(&review_task, TaskStatus::Review)
+            .unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let review = ControllerActionIntent::SemanticReview {
+            task_id: review_task.clone(),
+        };
+        let review_auth = app.authorize_controller_action(&review).unwrap();
+        let review_result = app.execute_authorized_controller_action(
+            &review,
+            Some(review_auth),
+            ControllerActionExecutionContext::semantic_review(
+                ActionOverrides::default(),
+                &ControllerReviewBackend {
+                    output: revising_review_output(),
+                },
+                &FakeValidationRunner::success(),
+            ),
+        );
+        assert!(matches!(
+            review_result,
+            ControllerActionExecutionResult::Executed {
+                evidence: ControllerActionExecutionEvidence {
+                    lifecycle: Some(TaskStatus::RevisionRequired),
+                    review_run_id: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // Revise: create canonical actionable review evidence and let the
+        // existing worker-backed revision path consume it.
+        let (repo, db, project, revise_task) = setup();
+        std::fs::write(repo.path().join(".orc/engineering.md"), "# contract\n").unwrap();
+        let (branch, worktree) = crate::git::ensure_worktree(&revise_task, repo.path()).unwrap();
+        let implementation = create_run(&db, project, &revise_task, "coder");
+        db.store_worktree_metadata(
+            implementation,
+            &revise_task,
+            &branch,
+            &worktree.to_string_lossy(),
+        )
+        .unwrap();
+        db.update_agent_run_status(implementation, "completed", Some("implementation"))
+            .unwrap();
+        let review_run = create_run(&db, project, &revise_task, "review");
+        db.update_agent_run_status(review_run, "completed", Some(&review_output("REVISE")))
+            .unwrap();
+        db.update_task_status(&revise_task, TaskStatus::RevisionRequired)
+            .unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let revise = ControllerActionIntent::Revise {
+            task_id: revise_task.clone(),
+        };
+        let revise_auth = app.authorize_controller_action(&revise).unwrap();
+        let revise_result = app.execute_authorized_controller_action(
+            &revise,
+            Some(revise_auth),
+            ControllerActionExecutionContext::revise_with_worker(
+                "agent-a",
+                &FakeWorker::new_success(None),
+                &FakeValidationRunner::success(),
+            ),
+        );
+        assert!(matches!(
+            revise_result,
+            ControllerActionExecutionResult::Executed {
+                evidence: ControllerActionExecutionEvidence {
+                    lifecycle: Some(TaskStatus::Review),
+                    run_id: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // Accept: use the canonical worktree/evidence/merge path.
+        let (repo, db, project, accept_task) = setup();
+        let (branch, worktree) = crate::git::ensure_worktree(&accept_task, repo.path()).unwrap();
+        let worktree_absolute = repo.path().join(&worktree);
+        std::fs::write(worktree_absolute.join("accepted.txt"), "accepted\n").unwrap();
+        let changes = crate::git::inspect_worktree(&worktree_absolute, repo.path()).unwrap();
+        let implementation = create_run(&db, project, &accept_task, "coder");
+        db.store_worktree_metadata(
+            implementation,
+            &accept_task,
+            &branch,
+            &worktree.to_string_lossy(),
+        )
+        .unwrap();
+        db.update_agent_run_status(implementation, "completed", Some("implementation"))
+            .unwrap();
+        let review_run = create_run(&db, project, &accept_task, "review");
+        db.update_agent_run_status(review_run, "completed", Some(&review_output("PASS")))
+            .unwrap();
+        db.store_change_evidence(review_run, &changes).unwrap();
+        db.update_task_status(&accept_task, TaskStatus::AcceptanceReady)
+            .unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let accept = ControllerActionIntent::Accept {
+            task_id: accept_task.clone(),
+        };
+        let accept_auth = app.authorize_controller_action(&accept).unwrap();
+        let accept_result = app.execute_authorized_controller_action(
+            &accept,
+            Some(accept_auth),
+            ControllerActionExecutionContext::accept(),
+        );
+        assert!(matches!(
+            accept_result,
+            ControllerActionExecutionResult::Executed {
+                evidence: ControllerActionExecutionEvidence {
+                    lifecycle: Some(TaskStatus::Done),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(!worktree.exists());
     }
 }

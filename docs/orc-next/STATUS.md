@@ -4,9 +4,9 @@
 
 **Current milestone:** M03 — Typed Controller tools
 
-**Current task:** M03-002 — Execute explicitly authorized Controller intents (Planned)
+**Current task:** M03-002 — Execute explicitly authorized Controller intents (Done)
 
-**Last completed:** M03-001 — Define typed Controller action intents and legality boundary
+**Last completed:** M03-002 — Execute explicitly authorized Controller intents
 
 **Blocked by:** Nothing
 
@@ -31,7 +31,7 @@
 
 ## Immediate next action
 
-Implement M03-002 exactly against `docs/orc-next/tasks/M03-002.md`.
+M03-002 is complete against `docs/orc-next/tasks/M03-002.md`.
 
 M03-002 adds the first mutation-capable Controller boundary, but only for the
 four M03-001 intents. A trusted Orc caller must explicitly authorize one
@@ -47,6 +47,14 @@ trusted existing Orc configuration/override seams.
 This remains a supervised execution slice, not autonomy: no continuation loop,
 recovery actions, planning/Lead migration, memory, scheduler redesign, model
 changes, Python, GPU work, or new interface confirmation UX.
+
+The trusted boundary is implemented by an opaque one-shot
+`ControllerActionAuthorization`, native `ControllerActionExecutionContext`,
+and bounded `ControllerActionExecutionResult`. Execution reuses the fresh
+`ProjectOperations::inspect_action` result and the existing canonical Orc
+dispatch, review, revision, and acceptance APIs. No M03-003 architectural
+blocker was found; future Controller tools must preserve these host-side
+authorization and trusted-context seams.
 
 M03-001 completion evidence:
 

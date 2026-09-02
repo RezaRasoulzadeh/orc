@@ -2,9 +2,9 @@
 
 **Architecture:** Orc Next / local Controller + deterministic kernel
 
-**Current milestone:** M03 — Typed Controller tools
+**Current milestone:** M04 — Recovery intelligence
 
-**Current task:** M03-003 — Connect Controller recommendations to supervised typed actions
+**Current task:** M04-001 — Expose bounded recovery facts and legal recovery operations (Planned)
 
 **Last completed:** M03-003 — Connect Controller recommendations to supervised typed actions
 
@@ -17,18 +17,13 @@
 - Qwen/llama.cpp is an implementation choice, not a domain dependency; the runtime boundary must remain replaceable.
 - `ProjectOperations` is the primary existing provider-independent observation seam.
 - `OrcApp` is the existing canonical application/mutation seam.
-- `src/local_runtime.rs` is the replaceable local inference seam; native backend details remain outside Controller/domain types. The optional `llama-cpp` feature implements the first adapter in `src/local_runtime/llama_cpp.rs`.
-- Controller recommendations use a model-independent JSON Schema request; the llama.cpp adapter applies native grammar-constrained sampling and strict full-value parsing, retaining raw output on structured parse failure.
-- Controller state carries an explicit canonical operational-consistency observation so derived next-step data cannot silently override contradictory lifecycle facts.
-- M02 is complete: the final unchanged seven-scenario Qwen3 evaluation achieved `7/7` semantic decisions and `7/7` strict structured-contract compliance.
-- M03-001 is complete and source-reviewed `PASS`: typed Controller intents for dispatch/review/revise/accept can be inspected through canonical `ProjectOperations` legality without mutation.
-- M03-002 is complete and source-reviewed `PASS`: an opaque one-shot host authorization plus a fresh legality re-check gates canonical dispatch/review/revise/accept execution.
+- M02 is complete: the final seven-scenario Qwen3 evaluation achieved `7/7` semantic decisions and `7/7` strict structured-contract compliance.
+- M03 is complete: typed normal-action intents, deterministic legality inspection, opaque one-shot trusted authorization, fresh pre-mutation legality re-check, canonical execution, and the supervised recommendation-to-intent bridge are in place.
 - A legality inspection or Controller recommendation is not authorization and is not a durable grant.
 - Model-owned recommendation/intent must never carry or manufacture its own authorization/confirmation.
-- M03-003 is complete: `OrcApp::propose_controller_action` connects the
-  read-only typed recommendation path to a bounded proposed intent, while
-  trusted authorization and unchanged M03-002 execution remain separate.
-- M03-003 connects recommendation to typed intent under explicit supervision; it must not introduce an inference/action continuation loop.
+- Recovery follows the same architecture boundary: kernel exposes canonical facts and legal recovery operations; Controller judgment later chooses among them.
+- Recovery legality must preserve valid review/revision lineage and keep infrastructure, dependency, and economy/agent constraints distinct from semantic failure.
+- M04-001 is observation/legality only: no Controller recovery choice, execution, retry loop, or broad policy removal.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -36,30 +31,23 @@
 
 ## Immediate next action
 
-M03-003 is complete. The next milestone is M04 recovery intelligence; any
-recovery judgment or tooling remains out of scope until that task is defined.
+Implement M04-001 against `docs/orc-next/tasks/M04-001.md`.
 
-The task connects the existing bounded read-only Controller recommendation path
-to the M03 typed action boundary. Supported recommendations may become proposed
-`ControllerActionIntent` values, but proposal generation remains non-mutating
-and cannot mint authorization. Unsupported recommendations remain explicitly
-non-executable.
+Inventory current canonical recovery seams first. Then expose a bounded recovery observation and a small repository-grounded set of legal recovery operations. The deterministic kernel answers what is legal; it must not rank, select, or execute recovery choices.
 
-A trusted caller may explicitly authorize one proposed action and must reuse the
-M03-002 execution boundary, which performs a fresh
-`ProjectOperations::inspect_action` check immediately before canonical
-mutation. Do not add automatic authorization, inference/action loops, recovery,
-planning/Lead migration, memory, scheduler redesign, model changes, Python, GPU
-work, or interface confirmation UX.
+Required distinctions include blocked revision with valid REVISE lineage, infrastructure failure, dependency blocking, no-eligible-agent/economy exhaustion, and abnormal states where no safe automatic recovery operation exists.
 
-M03-002 completion evidence:
+Keep inspection side-effect free. Do not execute recovery, mint Controller authorization, add continuation/retry loops, migrate planning/Lead, add memory, change interfaces, or modify the production Controller recommendation prompt/schema/parser.
+
+M03-003 completion evidence:
 
 - Luna + High source review: `PASS`;
-- focused Controller action tests: 10 passed;
-- `cargo test --lib`: 303 passed;
-- `cargo test --features llama-cpp --lib`: 309 passed;
-- normal and feature clippy, fmt, and diff check: passed;
-- read-only recommendation code unchanged, so real Qwen evaluation was not rerun;
-- no M03-003 architectural blocker identified.
+- focused action tests: 16 passed;
+- Controller evaluation tests: 9 passed;
+- `cargo test --lib`: 309 passed;
+- `cargo test --features llama-cpp --lib`: 315 passed;
+- normal and feature clippy, fmt, and diff checks: passed;
+- production recommendation semantics unchanged, so Qwen was not rerun;
+- no M04 architectural blocker identified.
 
-See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.
+See `M00-REPOSITORY-MAP.md` for the repository-grounded recovery fact-versus-judgment classification.

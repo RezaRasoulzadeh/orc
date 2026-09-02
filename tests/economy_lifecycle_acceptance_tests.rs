@@ -19,7 +19,7 @@ use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, blocker_id
 use orc::operations::{OperationalNextStep, ProjectOperations, ValidationState};
 use orc::registry::{
     AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, EconomyCostConfiguration, EconomyTier,
-    EscalationTrigger, MANUAL, ReasoningEffort,
+    MANUAL, ReasoningEffort,
 };
 use orc::scheduler::{
     EconomyOverrides, QuotaRefresher, TransportEligibility,
@@ -1523,7 +1523,7 @@ fn quota_refresh_distinguishes_sufficient_insufficient_and_failed_observations()
 }
 
 #[test]
-fn validation_non_convergence_persists_and_consumes_one_escalation_after_restart() {
+fn validation_non_convergence_does_not_automatically_escalate_after_repair_exhaustion() {
     let project = TestProject::new(&["acceptance-check"]);
     project
         .db
@@ -1593,103 +1593,19 @@ fn validation_non_convergence_persists_and_consumes_one_escalation_after_restart
             .all(|run| run.execution_class != "review")
     );
 
-    let pending = project
-        .db
-        .pending_escalation_request(&project.task)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        pending.request.lineage.trigger,
-        EscalationTrigger::ValidationRepairNonConvergence
-    );
-    assert_eq!(
-        pending.request.lineage.requested_minimum_tier,
-        EconomyTier::Escalation
-    );
-    let request_id = pending.id;
-
-    let TestProject {
-        directory,
-        db,
-        task: task_id,
-    } = project;
-    drop(db);
-    let reopened = Database::open(directory.path().join(".orc/orc.db")).unwrap();
-    let pending = reopened
-        .pending_escalation_request(&task_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.id, request_id);
-    let task = reopened.get_task(&task_id).unwrap().unwrap();
-    let decision = resolve_task_economy_for_execution_with_refresher(
-        &reopened,
-        &task,
-        AgentAction::Code,
-        EconomyOverrides::default(),
-        Some(AUTOMATED),
-        None,
-        Some(ReasoningEffort::Low),
-        Some("task_contract".into()),
-        TransportEligibility::IgnoreUnsupportedBackend,
-        Some(pending.request.clone()),
-        "acceptance:restart-escalation",
-        &HashSet::new(),
-        &FakeQuotaRefresher {
-            observations: BTreeMap::new(),
-            calls: Mutex::new(Vec::new()),
-        },
-    )
-    .unwrap();
-    let resolution = decision.resolution.unwrap();
-    assert_eq!(resolution.agent.id, "escalation-agent");
-    assert_eq!(resolution.record.tier, EconomyTier::Escalation);
-    assert_eq!(resolution.record.source, "policy_escalation");
-    assert_eq!(
-        resolution
-            .record
-            .escalation
-            .as_ref()
-            .and_then(|lineage| lineage.request_id),
-        Some(request_id)
-    );
-
-    let run = reopened
-        .create_agent_run_with_execution(
-            reopened.get_project_id().unwrap().unwrap(),
-            &task_id,
-            &resolution.agent.id,
-            AUTOMATED,
-            AgentRunExecution {
-                class: "implementation",
-                model: resolution.execution.model.as_deref(),
-                effort: resolution.execution.reasoning_effort,
-                source: "acceptance-escalation",
-            },
-        )
-        .unwrap();
-    let invocation = reopened
-        .start_provider_invocation_with_resolution(run, "implementation", 1, &resolution.record)
-        .unwrap();
-    reopened
-        .finish_provider_invocation(invocation, "completed", None)
-        .unwrap();
-    reopened
-        .update_agent_run_status(run, "completed", None)
-        .unwrap();
     assert!(
-        reopened
-            .pending_escalation_request(&task_id)
+        project
+            .db
+            .pending_escalation_request(&project.task)
             .unwrap()
             .is_none()
     );
-    let detail = ProjectOperations::new(&reopened, directory.path())
-        .task_detail(&task_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(detail.escalations.len(), 1);
-    assert_eq!(
-        detail.escalations[0].resulting_invocation_id,
-        Some(invocation)
+    assert!(
+        project
+            .db
+            .get_task_execution_condition(&project.task)
+            .unwrap()
+            .is_none()
     );
 }
 

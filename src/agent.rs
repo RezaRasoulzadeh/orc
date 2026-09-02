@@ -769,7 +769,6 @@ fn run_task_validation_repair_loop(
     cancellation: Option<&crate::worker::CancellationControl>,
 ) -> Result<(ValidationReport, crate::validation::ValidationSelection)> {
     let mut repair_attempt = 0;
-    let mut last_repair_resolution = None;
     loop {
         let validation = run_post_implementation_validation(
             validation_runner,
@@ -789,15 +788,6 @@ fn run_task_validation_repair_loop(
             return Ok((report, selection));
         }
         if repair_attempt >= MAX_VALIDATION_REPAIRS {
-            if let Some(previous) = last_repair_resolution.as_ref() {
-                persist_escalation_decision(
-                    db,
-                    task_id,
-                    crate::scheduler::EscalationObservation::ValidationRepairNonConvergence,
-                    previous,
-                    1,
-                )?;
-            }
             return Ok((report, selection));
         }
         repair_attempt += 1;
@@ -866,7 +856,6 @@ fn run_task_validation_repair_loop(
                 .ok()
                 .and_then(|value| value.token_usage),
         )?;
-        last_repair_resolution = db.provider_resolution(invocation)?;
         let repair_execution = repair_execution
             .map_err(|error| anyhow::anyhow!("validation repair worker failed: {error}"))?;
         if let WorkerOutcome::Failure(error) = repair_execution.outcome {

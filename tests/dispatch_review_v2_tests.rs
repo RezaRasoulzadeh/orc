@@ -8,9 +8,13 @@ use orc::agent::{
 use orc::app::OrcApp;
 use orc::automated::{ActionBackend, ActionExecution, ActionOverrides, ReviewBlocker, blocker_id};
 use orc::git;
+use orc::recovery::{
+    RecoveryCondition, RecoveryObservationState, RecoveryOperation, RecoveryOperationLegality,
+    RecoveryOperationRejection, inspect_recovery,
+};
 use orc::registry::{
     AUTOMATED, AVAILABLE, AgentAction, AgentDefinition, EconomyCostConfiguration, EconomyTier,
-    EscalationTrigger, ReasoningEffort, ResolutionRecord,
+    ReasoningEffort, ResolutionRecord,
 };
 use orc::review;
 use orc::storage::{AgentRunExecution, Database};
@@ -3658,6 +3662,37 @@ fn dispatch_infrastructure_validation_failure_is_not_repair_non_convergence() {
             .unwrap_or_default()
             .contains("validation infrastructure failure")
     );
+    let inspection = inspect_recovery(
+        &orc::operations::ProjectOperations::new(&db, dir.path()),
+        &task,
+    )
+    .unwrap();
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::InfrastructureFailure)
+    );
+    assert!(
+        !inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::NonConvergenceReplanRequired)
+    );
+    assert!(
+        !inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::ValidationFailure)
+    );
+    assert!(inspection.operations.iter().all(|legality| {
+        !matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::ResumeRevision
+            }
+        )
+    }));
 }
 
 #[test]
@@ -3995,7 +4030,7 @@ commands = ["frontend-check"]
 }
 
 #[test]
-fn bounded_validation_non_convergence_persists_policy_request() {
+fn bounded_validation_non_convergence_enters_supervised_recovery_without_policy_continuation() {
     let (dir, db, task) = setup();
     db.set_agent_model("fake", "small").unwrap();
     db.set_economy_cost_configuration(&EconomyCostConfiguration {
@@ -4018,17 +4053,56 @@ fn bounded_validation_non_convergence_persists_policy_request() {
         )
         .is_err()
     );
-    let pending = db.pending_escalation_request(&task).unwrap().unwrap();
-    assert_eq!(
-        pending.request.lineage.trigger,
-        EscalationTrigger::ValidationRepairNonConvergence
+    assert!(db.pending_escalation_request(&task).unwrap().is_none());
+    assert!(db.get_task_execution_condition(&task).unwrap().is_none());
+    let failed_run = db
+        .list_agent_runs_for_task(&task)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.status == "failed")
+        .expect("repair exhaustion leaves a failed implementation run");
+    assert!(
+        db.latest_validation_result_for_run(failed_run.id)
+            .unwrap()
+            .is_some()
     );
-    assert_eq!(pending.request.lineage.previous_tier, EconomyTier::Default);
+    let inspection = inspect_recovery(
+        &orc::operations::ProjectOperations::new(&db, dir.path()),
+        &task,
+    )
+    .unwrap();
     assert_eq!(
-        pending.request.lineage.requested_minimum_tier,
-        EconomyTier::Escalation
+        inspection.observation.state,
+        RecoveryObservationState::Abnormal
     );
-    assert_eq!(pending.request.lineage.previous_attempt, 3);
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::ValidationFailure)
+    );
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::ExecutionFailure)
+    );
+    assert!(inspection.operations.iter().any(|legality| {
+        matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::Requeue
+            }
+        )
+    }));
+    assert!(inspection.operations.iter().all(|legality| {
+        !matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::ResumeRevision
+            }
+        )
+    }));
 }
 
 #[test]
@@ -4161,7 +4235,8 @@ fn revision_infrastructure_validation_failure_preserves_initial_usage() {
 
 #[test]
 fn failed_revision_keeps_initial_and_validation_repair_token_usage() {
-    let (dir, db, task, _) = revision_fixture();
+    let (dir, db, task, review_id) = revision_fixture();
+    persist_known_contract(&db, &task, review_id, "BLK-validation-exhausted");
     let worker = RevisionValidationUsageWorker {
         calls: Mutex::new(0),
     };
@@ -4200,6 +4275,73 @@ fn failed_revision_keeps_initial_and_validation_repair_token_usage() {
     assert_eq!(result.total_tokens, Some(31));
     assert_eq!(result.input_tokens, Some(27));
     assert_eq!(result.output_tokens, Some(4));
+
+    assert!(db.pending_escalation_request(&task).unwrap().is_none());
+    assert!(db.get_task_execution_condition(&task).unwrap().is_none());
+    assert!(
+        db.latest_validation_result_for_run(revision.id)
+            .unwrap()
+            .is_some()
+    );
+    let inspection = inspect_recovery(
+        &orc::operations::ProjectOperations::new(&db, dir.path()),
+        &task,
+    )
+    .unwrap();
+    assert_eq!(
+        inspection.observation.state,
+        RecoveryObservationState::Abnormal
+    );
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::BlockedRevision)
+    );
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::ValidationFailure)
+    );
+    assert!(
+        inspection
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::ExecutionFailure)
+    );
+    assert_eq!(
+        inspection.observation.validation.state,
+        orc::operations::ValidationState::Failing
+    );
+    assert_eq!(
+        inspection
+            .observation
+            .latest_execution
+            .map(|execution| execution.status),
+        Some(orc::recovery::RecoveryExecutionStatus::Failed)
+    );
+    assert!(inspection.operations.iter().any(|legality| {
+        matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::ResumeRevision
+            }
+        )
+    }));
+    assert!(inspection.operations.iter().any(|legality| {
+        matches!(
+            legality,
+            RecoveryOperationLegality::Rejected {
+                operation: RecoveryOperation::Requeue,
+                reason: RecoveryOperationRejection::RequeueWouldDiscardRevisionLineage
+            }
+        )
+    }));
+    assert_eq!(
+        db.actionable_revision_contract(&task).unwrap().unwrap().0,
+        review_id
+    );
 }
 
 #[test]

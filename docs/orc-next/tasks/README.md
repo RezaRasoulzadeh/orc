@@ -14,6 +14,7 @@ Only current/near-term milestones are decomposed here.
 | [M03-002](M03-002.md) | Done | M03 | Execute explicitly authorized Controller intents |
 | [M03-003](M03-003.md) | Done | M03 | Connect Controller recommendations to supervised typed actions |
 | [M04-001](M04-001.md) | Done | M04 | Expose bounded recovery facts and legal recovery operations |
+| [M04-002](M04-002.md) | Planned | M04 | Add read-only Controller recovery choice |
 
 ## Task format
 

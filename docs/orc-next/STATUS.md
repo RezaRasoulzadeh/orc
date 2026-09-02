@@ -2,11 +2,11 @@
 
 **Architecture:** Orc Next / local Controller + deterministic kernel
 
-**Current milestone:** M02 — Read-only Controller
+**Current milestone:** M03 — Typed Controller tools
 
-**Current task:** M02-003 — Enforce reliable structured Controller output (In progress; strict output 7/7, semantic decision quality 6/7)
+**Current task:** M03-001 — Define typed Controller action intents and legality boundary (Planned)
 
-**Last completed:** M02-002 — Read-only Controller decision quality evaluation
+**Last completed:** M02-003 — Enforce reliable structured Controller output
 
 **Blocked by:** Nothing
 
@@ -19,7 +19,8 @@
 - `OrcApp` is the existing canonical application/mutation seam.
 - `src/local_runtime.rs` is the replaceable, read-only local inference seam; native backend details remain outside Controller/domain types. The optional `llama-cpp` feature implements the first adapter in `src/local_runtime/llama_cpp.rs`.
 - Controller recommendations use a model-independent JSON Schema request; the llama.cpp adapter applies native grammar-constrained sampling and strict full-value parsing, retaining raw output on structured parse failure.
-- M01-002 was source-reviewed as PASS. The supplied `Qwen3-8B-Q4_K_M.gguf` smoke passed end-to-end through `LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU; Vulkan/GPU optimization remains separate from M01-002.
+- Controller state now carries an explicit canonical operational-consistency observation so derived next-step data cannot silently override contradictory lifecycle facts.
+- M02 is complete: the final unchanged seven-scenario Qwen3 evaluation achieved `7/7` semantic decisions and `7/7` strict structured-contract compliance.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -27,12 +28,18 @@
 
 ## Immediate next action
 
-M02-003's native grammar path is now proven reliable on the seven-scenario real-model evaluation: strict structured-contract compliance is `7/7`, and the sampler double-acceptance crash is fixed.
+Implement M03-001 exactly against `docs/orc-next/tasks/M03-001.md`.
 
-The same run produced semantic decision quality `6/7`. The sole failure is `review-revise`: a canonical `RevisionRequired` state with current `REVISE` evidence and `next_step=revise` was returned as `operator_decision`. The model's rationale itself said revision was necessary, so this is a decision-contract ambiguity rather than a structured-output failure.
+M03-001 introduces the first typed, model-independent Controller action-intent boundary for dispatch, semantic review, revise, and accept. The kernel must inspect whether an intent is legal using canonical Orc rules and return a bounded typed result without executing or persisting any mutation.
 
-Refine the generic Controller prompt/decision contract so clear canonical actionable state maps to an action while `operator_decision` remains reserved for genuinely ambiguous/inconsistent/non-actionable state. Do not hardcode the scenario, force-copy `next_step`, weaken expectations, or change the already-working grammar/schema path. After deterministic validation and source review, rerun the seven-scenario evaluation once. M02-003 acceptance still requires `7/7` semantic and `7/7` strict compliance.
+Keep this as a legality/contract slice only. Reuse `ProjectOperations`, selected `OrcApp` APIs, and canonical lifecycle/read rules; do not create a parallel Controller state machine. Do not add Controller execution, recovery, planning/Lead migration, memory, autonomy, model changes, Python, or GPU work.
 
-M03-001 is defined but must not start until M02-003 is accepted.
+M02-003 final acceptance evidence:
+
+- final Luna + High source review: `PASS`;
+- semantic decision quality: `7/7`;
+- strict structured-contract compliance: `7/7`;
+- real-model evaluation: `1 passed, 0 failed`, `189.80s`;
+- latest deterministic validation: 293 normal lib tests and 299 llama-cpp-feature lib tests passed, with normal/feature clippy, fmt, and diff check passing.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.

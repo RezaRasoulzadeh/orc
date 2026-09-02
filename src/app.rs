@@ -686,6 +686,24 @@ impl OrcApp {
         crate::recovery::inspect_recovery(&self.operations(), task_id)
     }
 
+    /// Produce one bounded, read-only recovery recommendation. This does not
+    /// authorize or execute recovery; a trusted caller must make that decision
+    /// separately at the M03 action boundary.
+    pub fn recommend_recovery(
+        &self,
+        task_id: &str,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::recovery_controller::RecoveryRecommendationResult,
+        crate::recovery_controller::RecoveryControllerError,
+    > {
+        crate::recovery_controller::RecoveryRecommendationBuilder::new().recommend(
+            &self.operations(),
+            task_id,
+            runtime,
+        )
+    }
+
     /// Build one read-only Controller recommendation and expose only its
     /// bounded typed action proposal. This seam does not authorize or execute
     /// the proposal; trusted callers must explicitly use the M03-002

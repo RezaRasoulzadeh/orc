@@ -7,6 +7,7 @@ pub mod backend;
 pub mod cli;
 pub mod codex_app_server;
 pub mod contract;
+pub mod controller;
 pub mod desktop;
 pub mod discovery;
 pub mod doctor;

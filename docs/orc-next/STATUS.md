@@ -4,9 +4,9 @@
 
 **Current milestone:** M02 — Read-only Controller
 
-**Current task:** M02-001 — Build the read-only Controller state/recommendation path (Ready)
+**Current task:** M02-001 — Build the read-only Controller state/recommendation path (Done)
 
-**Last completed:** M01-002 — Pinned native llama.cpp adapter and opt-in smoke path (source review PASS; Qwen3 GGUF smoke PASS)
+**Last completed:** M02-001 — Read-only Controller state/recommendation path
 
 **Blocked by:** Nothing
 
@@ -26,10 +26,10 @@
 
 ## Immediate next action
 
-Implement M02-001: build a bounded, model-independent Controller state packet
-from `ProjectOperations` / selected `OrcApp` read APIs and return a typed,
-read-only recommendation through `LocalInferenceRuntime`. Use a fake runtime
-for deterministic tests; do not grant mutation permission or connect the
-Controller to lifecycle, database mutation, planning, Lead, memory or tools.
+Review M02-001 and define the next bounded Controller slice. The current
+implementation builds a bounded, model-independent Controller state packet
+from `ProjectOperations` read APIs and returns a typed, read-only
+recommendation through `LocalInferenceRuntime`, with no mutation permission or
+connection to lifecycle execution, planning, Lead, memory or tools.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.

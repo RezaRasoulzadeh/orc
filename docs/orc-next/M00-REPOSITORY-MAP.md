@@ -117,6 +117,22 @@ Controller judgment:
 
 `economy_escalation_exhausted` should eventually be an observed condition/reason for Controller recovery, not a policy dead-end.
 
+## Repository-grounded behavioral evidence
+
+The classification above is supported by current deterministic behavior/tests, not only module names:
+
+- `src/operations.rs`: `ProjectOperations` is explicitly documented as a provider-independent, non-mutating read boundary; `TaskOperationsSummary` and `TaskOperationsDetail` already aggregate lifecycle, validation, review, blocker, execution-condition, economy and activity facts needed by a read-only Controller.
+- `src/app.rs`: `OrcApp::requeue`, `unblock_non_convergence`, workflow entry points and Lead/plan methods show that canonical mutations and current policy are already composed at the application boundary rather than in the TUI/desktop.
+- `src/scheduler.rs`: `schedule` and escalation-policy code demonstrate that deterministic eligibility and judgment-heavy escalation policy currently coexist and can be separated incrementally.
+- `src/validation.rs`: `run_validation_pipeline` is the deterministic validation execution boundary.
+- `src/lead.rs`: `PersistedLeadDecision` separates durable decision data from the Lead-specific reasoning role, which gives the migration a concrete persistence seam.
+- `tests/dispatch_review_v2_tests.rs::failed_revision_keeps_initial_and_validation_repair_token_usage` documents revision/validation-repair lineage and accounting across failed repair attempts.
+- `tests/dispatch_review_v2_tests.rs::dispatch_infrastructure_validation_failure_is_not_repair_non_convergence` documents the distinction between validation facts/infrastructure failure and semantic repair non-convergence.
+- `tests/workflow_engine_tests.rs::non_convergence_cancellation_and_supersession_are_explicit` documents explicit workflow stop/recovery behavior rather than silent mutation.
+- `src/agent.rs::non_convergence_recovery_rejects_invalid_attempts_without_mutation` documents that recovery legality is already guarded deterministically.
+
+These tests are useful migration guards: Controller introduction should change who chooses a legal recovery action, not weaken persistence, validation truth, lineage or transition legality.
+
 ## Proposed read-only Controller state packet
 
 M02 should build a bounded packet from existing read/storage surfaces rather than raw database access:

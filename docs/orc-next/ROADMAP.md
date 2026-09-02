@@ -2,24 +2,25 @@
 
 The roadmap defines direction, not a frozen implementation plan. Only the current and next milestone should be decomposed deeply.
 
-## M00 — Architecture and repository mapping — CURRENT
+## M00 — Architecture and repository mapping — COMPLETE
 
-Map the existing repository against the Controller/kernel target before changing architecture.
+Mapped the existing repository against the Controller/kernel target before changing architecture.
 
-Exit criteria:
-- deterministic kernel surfaces identified;
-- existing judgment/policy surfaces identified;
-- reusable `OrcApp` / `ProjectOperations` seams identified;
-- Lead/Planner data versus role-specific machinery mapped;
-- lifecycle invariants separated from policy;
-- economy constraints separated from judgment;
-- validation-repair/recovery policy mapped;
-- minimal read-only Controller integration seam proposed;
-- no broad rewrite introduced.
+Result: `M00-REPOSITORY-MAP.md` identifies deterministic kernel surfaces, judgment/policy migration targets, reusable `OrcApp` / `ProjectOperations` seams, Lead/Planner migration boundaries, and the minimal read-only Controller integration seam.
 
-## M01 — Native model runtime
+## M01 — Native model runtime — CURRENT
 
 Integrate the local Controller inference boundary. Initial target: Qwen3 8B + llama.cpp/GGUF, while keeping model-specific details replaceable.
+
+Exit criteria:
+- a small model-independent native runtime interface exists;
+- Qwen3/llama.cpp/GGUF-specific concerns stay behind the adapter;
+- model location/configuration and failure reporting are explicit;
+- Orc can perform a bounded local inference request and receive text/structured output;
+- no lifecycle/database mutation is granted to the model;
+- deterministic tests cover the runtime boundary without requiring the real model;
+- a real local smoke test is documented separately from normal deterministic tests;
+- no Python runtime dependency is introduced.
 
 ## M02 — Read-only Controller
 

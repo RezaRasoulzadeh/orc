@@ -12,9 +12,9 @@ use crate::local_runtime::{
 };
 use crate::operations::{
     BlockerState, EconomyResolutionSummary, ExecutionConditionSummary, ExecutionSummary,
-    OperationalEvent, OperationalNextStep, ProjectOperations, ReviewCriterionSummary,
-    ReviewOperationsSummary, TaskOperationsDetail, TaskOperationsSummary, ValidationCommandSummary,
-    ValidationSummary,
+    OperationalEvent, OperationalNextStep, OperationalStateConsistency, ProjectOperations,
+    ReviewCriterionSummary, ReviewOperationsSummary, TaskOperationsDetail, TaskOperationsSummary,
+    ValidationCommandSummary, ValidationSummary,
 };
 use crate::protocol::{ReviewCriterionStatus, ReviewEvidenceKind};
 use crate::queue::{DependencyInfo, QueueCategory};
@@ -59,6 +59,10 @@ pub enum ControllerError {
     },
     #[error("controller state packet exceeds its {field} bound")]
     PacketBounds { field: String },
+    #[error(
+        "controller state packet has stale operational consistency: expected {expected}, got {actual}"
+    )]
+    PacketConsistency { expected: String, actual: String },
     #[error("controller recommendation is invalid: {0}")]
     InvalidRecommendation(String),
     #[error("local inference failed: {0}")]
@@ -88,6 +92,18 @@ impl ControllerStatePacket {
             });
         }
         validate_packet_value(&value, "packet")?;
+        let expected_consistency = crate::operations::operational_state_consistency(
+            self.task.summary.lifecycle,
+            self.task.summary.phase,
+            self.task.summary.next_step,
+            !self.task.waiting_on.is_empty(),
+        );
+        if self.task.summary.state_consistency != expected_consistency {
+            return Err(ControllerError::PacketConsistency {
+                expected: expected_consistency.as_str().into(),
+                actual: self.task.summary.state_consistency.as_str().into(),
+            });
+        }
         Ok(())
     }
 }
@@ -190,9 +206,13 @@ impl ControllerTaskState {
             .take(MAX_ACTIVITY)
             .map(ControllerActivityEvent::from_event)
             .collect();
+        let has_waiting_dependencies = detail
+            .queue
+            .as_ref()
+            .is_some_and(|queue| !queue.waiting_on.is_empty());
 
         Self {
-            summary: ControllerTaskSummary::from_summary(&detail.summary),
+            summary: ControllerTaskSummary::from_summary(&detail.summary, has_waiting_dependencies),
             contract: ControllerContractSummary::from_contract(&detail.contract),
             dependencies,
             waiting_on,
@@ -213,7 +233,7 @@ impl ControllerTaskState {
     }
 }
 
-/// The bounded task identity and canonical next-step fact.
+/// Bounded task identity, operational evidence and consistency observation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerTaskSummary {
     pub task_id: String,
@@ -224,11 +244,12 @@ pub struct ControllerTaskSummary {
     pub lifecycle: TaskStatus,
     pub phase: QueueCategory,
     pub next_step: OperationalNextStep,
+    pub state_consistency: OperationalStateConsistency,
     pub cancellation_reason: Option<String>,
 }
 
 impl ControllerTaskSummary {
-    fn from_summary(summary: &TaskOperationsSummary) -> Self {
+    fn from_summary(summary: &TaskOperationsSummary, has_waiting_dependencies: bool) -> Self {
         Self {
             task_id: bounded_text(&summary.task_id),
             title: bounded_text(&summary.title),
@@ -238,6 +259,12 @@ impl ControllerTaskSummary {
             lifecycle: summary.lifecycle,
             phase: summary.phase,
             next_step: summary.next_step,
+            state_consistency: crate::operations::operational_state_consistency(
+                summary.lifecycle,
+                summary.phase,
+                summary.next_step,
+                has_waiting_dependencies,
+            ),
             cancellation_reason: summary.cancellation_reason.as_deref().map(bounded_text),
         }
     }
@@ -858,6 +885,7 @@ impl ControllerStateBuilder {
             .map_err(|error| ControllerError::Serialization(error.to_string()))?;
         let prompt = format!(
             "Return exactly one JSON object with `suggested_next_step` (a canonical next-step value or null), `decision_class` (action or operator_decision), and a short `rationale`; optionally include numeric `confidence` from 0 to 1. Do not include prose before or after the object.\n\
+The deterministic `summary.state_consistency` observation is authoritative: for `consistent_actionable`, use `decision_class` `action` with the appropriate `suggested_next_step`; for `consistent_non_actionable` or `inconsistent`, use `operator_decision` with a null `suggested_next_step`. When `inconsistent`, do not treat `summary.next_step` as authoritative.\n\
 Do not claim to have executed an action. Use the canonical state below:\n\n\
 {packet_json}"
         );
@@ -987,10 +1015,15 @@ mod tests {
         assert_eq!(packet.packet_version, CONTROLLER_STATE_PACKET_VERSION);
         assert_eq!(packet.task.summary.task_id, task_id);
         assert_eq!(packet.task.summary.title.len(), MAX_TEXT_BYTES);
+        assert_eq!(
+            packet.task.summary.state_consistency,
+            OperationalStateConsistency::ConsistentActionable
+        );
         assert!(packet.validate().is_ok());
         let serialized = serde_json::to_string(&packet).expect("packet serialization");
         assert!(!serialized.contains("llama"));
         assert!(!serialized.contains("gguf"));
+        assert!(serialized.contains("\"state_consistency\":\"consistent_actionable\""));
         assert!(!serialized.contains("\"output\""));
     }
 
@@ -1017,6 +1050,7 @@ mod tests {
                     lifecycle: TaskStatus::Backlog,
                     phase: QueueCategory::Backlog,
                     next_step: OperationalNextStep::ConfigureEligibleAgent,
+                    state_consistency: OperationalStateConsistency::ConsistentActionable,
                     cancellation_reason: None,
                 },
                 contract: ControllerContractSummary {
@@ -1105,6 +1139,22 @@ mod tests {
         assert_eq!(runtime.requests.len(), 1);
         assert!(runtime.requests[0].prompt.contains("recommend"));
         assert!(!runtime.requests[0].prompt.contains("llama"));
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("summary.state_consistency")
+        );
+        assert!(runtime.requests[0].prompt.contains("consistent_actionable"));
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("`consistent_non_actionable` or `inconsistent`")
+        );
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("summary.next_step` as authoritative")
+        );
         assert!(matches!(
             runtime.requests[0].parameters.response_format,
             LocalInferenceResponseFormat::JsonSchema { .. }

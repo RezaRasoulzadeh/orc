@@ -36,6 +36,47 @@ pub enum OperationalNextStep {
     None,
 }
 
+/// Deterministic observation of whether a task's derived operational step is
+/// internally consistent and actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalStateConsistency {
+    ConsistentActionable,
+    ConsistentNonActionable,
+    Inconsistent,
+}
+
+impl OperationalStateConsistency {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsistentActionable => "consistent_actionable",
+            Self::ConsistentNonActionable => "consistent_non_actionable",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+/// Compare the canonical lifecycle/queue/next-step projection without
+/// introducing a second lifecycle policy at the Controller boundary.
+pub(crate) fn operational_state_consistency(
+    lifecycle: TaskStatus,
+    phase: QueueCategory,
+    next_step: OperationalNextStep,
+    has_waiting_dependencies: bool,
+) -> OperationalStateConsistency {
+    let phase_matches_lifecycle =
+        crate::queue::phase_is_compatible(lifecycle, phase, has_waiting_dependencies);
+    let expected_next_step = operational_next_step_for_phase(phase, has_waiting_dependencies);
+    if !phase_matches_lifecycle || next_step != expected_next_step {
+        return OperationalStateConsistency::Inconsistent;
+    }
+    if next_step == OperationalNextStep::None {
+        OperationalStateConsistency::ConsistentNonActionable
+    } else {
+        OperationalStateConsistency::ConsistentActionable
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationState {
@@ -762,7 +803,7 @@ impl<'a> ProjectOperations<'a> {
         let queue = facts.queue.find_item(&task.id);
         let phase = queue
             .map(|entry| entry.category)
-            .unwrap_or_else(|| queue_category_for_status(task.status));
+            .unwrap_or_else(|| crate::queue::category_for_status(task.status, false));
         let resolutions = facts
             .invocations
             .iter()
@@ -1133,32 +1174,28 @@ fn is_active_run(status: &str) -> bool {
     matches!(status, "running" | "waiting_external")
 }
 
-fn queue_category_for_status(status: TaskStatus) -> QueueCategory {
-    match status {
-        TaskStatus::Backlog => QueueCategory::Backlog,
-        TaskStatus::Ready => QueueCategory::Ready,
-        TaskStatus::Active => QueueCategory::Active,
-        TaskStatus::Review => QueueCategory::Review,
-        TaskStatus::AcceptanceReady => QueueCategory::AcceptanceReady,
-        TaskStatus::RevisionRequired => QueueCategory::RevisionRequired,
-        TaskStatus::Blocked => QueueCategory::Blocked,
-        TaskStatus::Done => QueueCategory::Done,
-        TaskStatus::Cancelled => QueueCategory::Cancelled,
-    }
+fn next_step(phase: QueueCategory, entry: Option<&QueueEntry>) -> OperationalNextStep {
+    operational_next_step_for_phase(
+        phase,
+        entry.is_some_and(|entry| !entry.waiting_on.is_empty()),
+    )
 }
 
-fn next_step(phase: QueueCategory, entry: Option<&QueueEntry>) -> OperationalNextStep {
+fn operational_next_step_for_phase(
+    phase: QueueCategory,
+    has_waiting_dependencies: bool,
+) -> OperationalNextStep {
     match phase {
         QueueCategory::Ready => OperationalNextStep::Dispatch,
         QueueCategory::Active => OperationalNextStep::WaitForExecution,
         QueueCategory::Review => OperationalNextStep::RunSemanticReview,
         QueueCategory::AcceptanceReady => OperationalNextStep::Accept,
         QueueCategory::RevisionRequired => OperationalNextStep::Revise,
-        QueueCategory::Blocked if entry.is_some_and(|entry| !entry.waiting_on.is_empty()) => {
+        QueueCategory::Blocked if has_waiting_dependencies => {
             OperationalNextStep::SatisfyDependencies
         }
         QueueCategory::Blocked => OperationalNextStep::ResolveBlocker,
-        QueueCategory::Backlog if entry.is_some_and(|entry| !entry.waiting_on.is_empty()) => {
+        QueueCategory::Backlog if has_waiting_dependencies => {
             OperationalNextStep::SatisfyDependencies
         }
         QueueCategory::Backlog => OperationalNextStep::ConfigureEligibleAgent,

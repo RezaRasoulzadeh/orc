@@ -516,7 +516,7 @@ pub fn representative_scenarios()
         "eval-dependency",
         "Dependency-blocked task",
         TaskStatus::Backlog,
-        QueueCategory::Backlog,
+        QueueCategory::Blocked,
         OperationalNextStep::SatisfyDependencies,
     );
     packet.task.dependencies = vec![ControllerDependency {
@@ -525,6 +525,12 @@ pub fn representative_scenarios()
         is_done: false,
     }];
     packet.task.waiting_on = vec!["dependency-1".into()];
+    packet.task.summary.state_consistency = crate::operations::operational_state_consistency(
+        packet.task.summary.lifecycle,
+        packet.task.summary.phase,
+        packet.task.summary.next_step,
+        !packet.task.waiting_on.is_empty(),
+    );
     scenarios.push(ControllerEvaluationScenario::new(
         "dependency-blocked",
         "An incomplete dependency must prevent dispatch.",
@@ -588,6 +594,9 @@ fn base_packet(
                 lifecycle,
                 phase,
                 next_step,
+                state_consistency: crate::operations::operational_state_consistency(
+                    lifecycle, phase, next_step, false,
+                ),
                 cancellation_reason: None,
             },
             contract: ControllerContractSummary {
@@ -726,6 +735,7 @@ mod tests {
     use crate::local_runtime::{
         LocalInferenceError, LocalInferenceRequest, LocalInferenceResponse,
     };
+    use crate::operations::OperationalStateConsistency;
     use serde_json::Value;
     use std::collections::VecDeque;
 
@@ -786,6 +796,79 @@ mod tests {
             assert!(scenario.description.len() <= MAX_SCENARIO_TEXT_BYTES);
             assert!(scenario.acceptable_alternatives.len() <= MAX_ACCEPTABLE_ALTERNATIVES);
         }
+    }
+
+    #[test]
+    fn packet_consistency_observation_covers_actionable_and_conflicting_states() {
+        let scenarios = representative_scenarios().expect("scenario corpus");
+        assert_eq!(
+            scenarios[0].packet.task.summary.state_consistency,
+            OperationalStateConsistency::ConsistentActionable
+        );
+        assert_eq!(
+            scenarios[1].packet.task.summary.state_consistency,
+            OperationalStateConsistency::ConsistentActionable
+        );
+        assert_eq!(
+            scenarios[2].packet.task.summary.state_consistency,
+            OperationalStateConsistency::ConsistentActionable
+        );
+        for scenario in &scenarios[3..6] {
+            assert_eq!(
+                scenario.packet.task.summary.state_consistency,
+                OperationalStateConsistency::ConsistentActionable
+            );
+        }
+        assert_eq!(
+            scenarios[5].packet.task.summary.phase,
+            QueueCategory::Blocked
+        );
+        assert!(!scenarios[5].packet.task.waiting_on.is_empty());
+        assert_eq!(
+            scenarios[6].packet.task.summary.state_consistency,
+            OperationalStateConsistency::Inconsistent
+        );
+        let terminal = base_packet(
+            "eval-done",
+            "Completed task",
+            TaskStatus::Done,
+            QueueCategory::Done,
+            OperationalNextStep::None,
+        );
+        assert_eq!(
+            terminal.task.summary.state_consistency,
+            OperationalStateConsistency::ConsistentNonActionable
+        );
+        assert!(
+            scenarios
+                .iter()
+                .all(|scenario| scenario.packet.validate().is_ok())
+        );
+
+        let packet = scenarios[6].packet.clone();
+        assert!(
+            serde_json::to_string(&packet)
+                .expect("packet serialization")
+                .contains("\"state_consistency\":\"inconsistent\"")
+        );
+        let before = serde_json::to_string(&packet).expect("packet serialization");
+        assert!(packet.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&packet).expect("packet serialization"),
+            before
+        );
+
+        let mut stale = scenarios[0].packet.clone();
+        stale.task.summary.state_consistency = OperationalStateConsistency::Inconsistent;
+        let before = serde_json::to_string(&stale).expect("packet serialization");
+        assert!(matches!(
+            stale.validate(),
+            Err(ControllerError::PacketConsistency { .. })
+        ));
+        assert_eq!(
+            serde_json::to_string(&stale).expect("packet serialization"),
+            before
+        );
     }
 
     #[test]

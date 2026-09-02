@@ -21,6 +21,45 @@ pub enum QueueCategory {
     Backlog,
 }
 
+/// Return the queue category canonically implied by a task status and its
+/// dependency blocking facts.
+pub(crate) fn category_for_status(
+    status: TaskStatus,
+    has_incomplete_dependencies: bool,
+) -> QueueCategory {
+    match status {
+        TaskStatus::Backlog | TaskStatus::Ready if has_incomplete_dependencies => {
+            QueueCategory::Blocked
+        }
+        TaskStatus::Backlog => QueueCategory::Backlog,
+        TaskStatus::Ready => QueueCategory::Ready,
+        TaskStatus::Active => QueueCategory::Active,
+        TaskStatus::Review => QueueCategory::Review,
+        TaskStatus::AcceptanceReady => QueueCategory::AcceptanceReady,
+        TaskStatus::RevisionRequired => QueueCategory::RevisionRequired,
+        TaskStatus::Blocked => QueueCategory::Blocked,
+        TaskStatus::Done => QueueCategory::Done,
+        TaskStatus::Cancelled => QueueCategory::Cancelled,
+    }
+}
+
+/// Check whether a queue category is one the canonical queue can expose for a
+/// task status and its dependency facts. A Ready task without an eligible
+/// agent remains in the backlog until it can be dispatched.
+pub(crate) fn phase_is_compatible(
+    status: TaskStatus,
+    phase: QueueCategory,
+    has_incomplete_dependencies: bool,
+) -> bool {
+    if has_incomplete_dependencies && matches!(status, TaskStatus::Backlog | TaskStatus::Ready) {
+        return phase == QueueCategory::Blocked;
+    }
+    if phase == category_for_status(status, false) {
+        return true;
+    }
+    status == TaskStatus::Ready && phase == QueueCategory::Backlog
+}
+
 impl fmt::Display for QueueCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -610,4 +649,60 @@ pub fn ensure_dispatchable(db: &Database, task_id: &str) -> Result<(), DbError> 
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueueCategory, phase_is_compatible};
+    use crate::task::TaskStatus;
+
+    #[test]
+    fn phase_compatibility_respects_dependency_projection() {
+        let cases = [
+            (TaskStatus::Ready, QueueCategory::Blocked, true, true),
+            (TaskStatus::Ready, QueueCategory::Ready, true, false),
+            (TaskStatus::Ready, QueueCategory::Backlog, true, false),
+            (TaskStatus::Backlog, QueueCategory::Blocked, true, true),
+            (TaskStatus::Backlog, QueueCategory::Backlog, true, false),
+            (TaskStatus::Ready, QueueCategory::Backlog, false, true),
+            (TaskStatus::Active, QueueCategory::Active, true, true),
+            (TaskStatus::Review, QueueCategory::Review, true, true),
+            (
+                TaskStatus::AcceptanceReady,
+                QueueCategory::AcceptanceReady,
+                true,
+                true,
+            ),
+            (
+                TaskStatus::RevisionRequired,
+                QueueCategory::RevisionRequired,
+                true,
+                true,
+            ),
+            (TaskStatus::Done, QueueCategory::Done, true, true),
+            (TaskStatus::Cancelled, QueueCategory::Cancelled, true, true),
+        ];
+
+        for (status, phase, has_incomplete_dependencies, expected) in cases {
+            assert_eq!(
+                phase_is_compatible(status, phase, has_incomplete_dependencies),
+                expected,
+                "status={status:?}, phase={phase:?}, incomplete_dependencies={has_incomplete_dependencies}"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_free_ready_task_can_remain_in_backlog() {
+        assert!(phase_is_compatible(
+            TaskStatus::Ready,
+            QueueCategory::Backlog,
+            false
+        ));
+        assert!(phase_is_compatible(
+            TaskStatus::Ready,
+            QueueCategory::Ready,
+            false
+        ));
+    }
 }

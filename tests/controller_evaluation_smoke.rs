@@ -31,8 +31,11 @@ impl LocalInferenceRuntime for JsonEvaluationRuntime {
             "{}\n\nFor this evaluation, return only one JSON object with these fields: \
 `suggested_next_step` (one canonical next-step value or null), \
 `decision_class` (`action` or `operator_decision`), and `rationale` (short string). \
-Use `operator_decision` with a null next step when the facts are ambiguous or \
-inconsistent. Do not execute or claim to execute any action.",
+Use the deterministic `summary.state_consistency` observation: recommend an \
+action only for `consistent_actionable`; use `operator_decision` with a null \
+next step for `consistent_non_actionable` or `inconsistent`. Do not treat \
+`summary.next_step` as authoritative when the observation is `inconsistent`. \
+Do not execute or claim to execute any action.",
             request.prompt
         );
         let parameters = LocalInferenceParameters {

@@ -11,6 +11,7 @@ Only current/near-term milestones are decomposed here.
 | [M02-002](M02-002.md) | Done | M02 | Evaluate read-only Controller decision quality |
 | [M02-003](M02-003.md) | Done | M02 | Enforce reliable structured Controller output |
 | [M03-001](M03-001.md) | Done | M03 | Define typed Controller action intents and legality boundary |
+| [M03-002](M03-002.md) | Planned | M03 | Execute explicitly authorized Controller intents |
 
 ## Task format
 

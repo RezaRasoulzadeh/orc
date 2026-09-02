@@ -31,7 +31,7 @@ The Controller owns judgment: planning, next-action selection, failure interpret
 
 The Controller cannot mutate canonical state directly. It emits schema-constrained intents against a small high-level tool surface.
 
-Initial Controller direction: local Qwen3 8B through a native llama.cpp/GGUF runtime. Model-specific details must remain behind a replaceable runtime boundary so changing model size/family does not redesign Orc.
+Initial Controller direction: local Qwen3 8B through a native llama.cpp/GGUF runtime. Model-specific details must remain behind a replaceable runtime boundary so changing model size/family does not redesign Orc. `src/local_runtime.rs` now defines that boundary as `LocalInferenceRuntime`, with bounded model-independent request/response/error types and separate runtime configuration. A future native adapter consumes `LocalRuntimeConfig` and implements the trait; no Controller state or kernel mutation crosses it.
 
 ## Kernel
 

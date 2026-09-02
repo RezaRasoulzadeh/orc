@@ -17,6 +17,7 @@ pub mod format;
 pub mod git;
 pub mod interactive;
 pub mod lead;
+pub mod local_runtime;
 pub mod operations;
 pub mod protocol;
 pub mod provider_context;

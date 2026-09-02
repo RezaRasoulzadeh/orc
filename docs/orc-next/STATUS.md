@@ -6,7 +6,7 @@
 
 **Current task:** M01-001 — Introduce the model-independent local runtime boundary
 
-**Last completed:** M00-001 — Current repository mapped into kernel, judgment/policy, interface and migration surfaces
+**Last completed:** M01-001 — Model-independent local inference runtime boundary
 
 **Blocked by:** Nothing
 
@@ -17,6 +17,7 @@
 - Qwen/llama.cpp is an implementation choice, not a domain dependency; the runtime boundary must remain replaceable.
 - `ProjectOperations` is the primary existing provider-independent observation seam.
 - `OrcApp` is the existing canonical application/mutation seam.
+- `src/local_runtime.rs` is the replaceable, read-only local inference seam; native backend details remain outside Controller/domain types.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -24,6 +25,6 @@
 
 ## Immediate next action
 
-Execute M01-001. Inspect the current Rust build/dependency/runtime patterns and implement the smallest model-independent local inference boundary with deterministic fake-runtime tests. Do not connect the model to lifecycle/database mutation and do not build Controller state packets yet.
+The M01-001 boundary is ready for a separately reviewed native adapter. Do not connect it to lifecycle/database mutation or build Controller state packets until that adapter and its real-model smoke path are specified.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.

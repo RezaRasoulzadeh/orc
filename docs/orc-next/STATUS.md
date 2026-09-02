@@ -4,7 +4,7 @@
 
 **Current milestone:** M01 — Native model runtime
 
-**Current task:** M01-001 — Introduce the model-independent local runtime boundary
+**Current task:** M01-002 — Integrate llama.cpp behind the local runtime boundary
 
 **Last completed:** M01-001 — Model-independent local inference runtime boundary
 
@@ -25,6 +25,6 @@
 
 ## Immediate next action
 
-The M01-001 boundary is ready for a separately reviewed native adapter. Do not connect it to lifecycle/database mutation or build Controller state packets until that adapter and its real-model smoke path are specified.
+Execute M01-002. Integrate a pinned/reproducible native llama.cpp/GGUF adapter behind `LocalInferenceRuntime`, retain deterministic no-model tests, and add an opt-in real Qwen3 8B GGUF smoke path. Do not connect inference to Controller state, lifecycle or database mutation.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded migration map.

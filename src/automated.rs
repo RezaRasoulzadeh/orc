@@ -436,6 +436,15 @@ fn schema(action: AgentAction) -> String {
     value.to_string()
 }
 
+/// The canonical structured schema for a Planner `PlanResponse`.
+///
+/// Controller planning uses this existing schema without exposing the
+/// Planner's provider/backend machinery in its own request or result types.
+pub fn canonical_plan_response_schema() -> serde_json::Value {
+    serde_json::from_str(&schema(AgentAction::Plan))
+        .expect("canonical Planner response schema is valid JSON")
+}
+
 /// Native provider schema for the structured result returned by a revision worker.
 pub fn revision_handoff_schema() -> String {
     let completion: serde_json::Value =

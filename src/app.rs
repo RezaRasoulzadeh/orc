@@ -227,6 +227,25 @@ impl OrcApp {
         self.automated_plan_with_backend(request, overrides, &backend)
     }
 
+    /// Propose a bounded plan through the read-only Controller boundary.
+    ///
+    /// This deliberately does not use the application database or any of the
+    /// durable Planner/Lead APIs. The canonical request is projected into a
+    /// bounded Controller request, inferred once, and returned without plan,
+    /// task, workflow, or decision mutation.
+    pub fn propose_controller_plan(
+        &self,
+        request: &crate::protocol::PlanningRequest,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<
+        crate::controller_planning::ControllerPlanResult,
+        crate::controller_planning::ControllerPlanningError,
+    > {
+        let request =
+            crate::controller_planning::ControllerPlanningRequest::from_canonical(request)?;
+        crate::controller_planning::ControllerPlanningBuilder::new().propose(&request, runtime)
+    }
+
     /// Execute exactly one Planner run for the current actionable PLAN_REQUIRED decision.
     pub fn run_pending_plan(
         &self,

@@ -8,7 +8,8 @@ use crate::queue::{QueueCategory, QueueEntry, QueueReport};
 use crate::registry::{EconomyTier, EscalationTrigger, ReasoningEffort};
 use crate::storage::db::{
     LifecycleEvent, PersistedEscalationRequest, ProjectChangeEvidence, ProjectProviderInvocation,
-    ProjectWorktreeMetadata, ReviewBlockerRecord, ReviewCriterionRecord,
+    ProjectWorktreeMetadata, RequeueLegality, RequeueRejection, ReviewBlockerRecord,
+    ReviewCriterionRecord,
 };
 use crate::storage::{AgentRun, Database, WorkerResult};
 use crate::task::{Task, TaskContract, TaskPriority, TaskStatus};
@@ -126,6 +127,25 @@ pub enum OperationalActionLegality {
         observation: Option<OperationalActionObservation>,
         reason: OperationalActionRejection,
     },
+}
+
+/// Read-only legality facts for the existing `requeue_task` recovery API.
+/// This keeps recovery inspection aligned with the canonical application
+/// preconditions without executing or persisting a requeue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalRequeueRejection {
+    TaskNotFound,
+    TaskNotActive,
+    ActiveExecution,
+    NoRecoverableRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum OperationalRequeueLegality {
+    Allowed,
+    Rejected { reason: OperationalRequeueRejection },
 }
 
 const MAX_OPERATIONAL_ACTION_TEXT_BYTES: usize = 256;
@@ -397,6 +417,9 @@ pub struct TaskOperationsDetail {
     pub task: Task,
     pub contract: TaskContract,
     pub execution_condition: Option<ExecutionConditionSummary>,
+    /// Bounded identity of the actionable REVISE/revision-contract lineage;
+    /// contract contents remain outside the observation surface.
+    pub revision_lineage: Option<RevisionLineageSummary>,
     pub queue: Option<QueueEntry>,
     /// Newest run first; ties are broken by persisted run id descending.
     pub executions: Vec<ExecutionSummary>,
@@ -409,6 +432,13 @@ pub struct TaskOperationsDetail {
     /// Criterion judgments from the latest persisted semantic Review.
     pub review_criteria: Vec<ReviewCriterionSummary>,
     pub activity: Vec<OperationalEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionLineageSummary {
+    pub actionable_review_run_id: Option<i64>,
+    pub actionable_contract_id: Option<i64>,
+    pub contract_source_review_run_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,6 +644,17 @@ impl<'a> ProjectOperations<'a> {
             .filter(|criterion| Some(criterion.run_id) == latest_review_id)
             .map(review_criterion_summary)
             .collect();
+        let actionable_review_run_id = self
+            .db
+            .actionable_revision_review(task_id)?
+            .map(|(run_id, _)| run_id);
+        let contract_lineage = self.db.actionable_revision_contract(task_id)?;
+        let revision_lineage = (actionable_review_run_id.is_some() || contract_lineage.is_some())
+            .then(|| RevisionLineageSummary {
+                actionable_review_run_id,
+                actionable_contract_id: contract_lineage.as_ref().map(|(_, _, id)| *id),
+                contract_source_review_run_id: contract_lineage.map(|(source, _, _)| source),
+            });
         Ok(Some(TaskOperationsDetail {
             summary,
             task: task.clone(),
@@ -628,6 +669,7 @@ impl<'a> ProjectOperations<'a> {
                     created_at: value.created_at,
                 }
             }),
+            revision_lineage,
             queue: facts.queue.find_item(task_id).cloned(),
             executions,
             resolutions,
@@ -828,6 +870,27 @@ impl<'a> ProjectOperations<'a> {
                 action,
                 task_id: bounded_action_text(task_id),
                 observation,
+            },
+        })
+    }
+
+    /// Inspect whether the existing canonical requeue API can currently be
+    /// called. This reports only its deterministic preconditions; it never
+    /// changes task or run state.
+    pub fn inspect_requeue(&self, task_id: &str) -> Result<OperationalRequeueLegality> {
+        Ok(match self.db.requeue_legality(task_id)? {
+            RequeueLegality::Allowed { .. } => OperationalRequeueLegality::Allowed,
+            RequeueLegality::Rejected(reason) => OperationalRequeueLegality::Rejected {
+                reason: match reason {
+                    RequeueRejection::TaskNotFound => OperationalRequeueRejection::TaskNotFound,
+                    RequeueRejection::TaskNotActive => OperationalRequeueRejection::TaskNotActive,
+                    RequeueRejection::ActiveExecution => {
+                        OperationalRequeueRejection::ActiveExecution
+                    }
+                    RequeueRejection::NoRecoverableRun => {
+                        OperationalRequeueRejection::NoRecoverableRun
+                    }
+                },
             },
         })
     }

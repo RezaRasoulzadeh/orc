@@ -4,9 +4,9 @@
 
 **Current milestone:** M04 — Recovery intelligence
 
-**Current task:** M04-001 — Expose bounded recovery facts and legal recovery operations (Planned)
+**Current task:** M04-001 — Expose bounded recovery facts and legal recovery operations (Done)
 
-**Last completed:** M03-003 — Connect Controller recommendations to supervised typed actions
+**Last completed:** M04-001 — Expose bounded recovery facts and legal recovery operations
 
 **Blocked by:** Nothing
 
@@ -23,7 +23,7 @@
 - Model-owned recommendation/intent must never carry or manufacture its own authorization/confirmation.
 - Recovery follows the same architecture boundary: kernel exposes canonical facts and legal recovery operations; Controller judgment later chooses among them.
 - Recovery legality must preserve valid review/revision lineage and keep infrastructure, dependency, and economy/agent constraints distinct from semantic failure.
-- M04-001 is observation/legality only: no Controller recovery choice, execution, retry loop, or broad policy removal.
+- M04-001 is complete and remains observation/legality only: no Controller recovery choice, execution, retry loop, or broad policy removal.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -31,7 +31,10 @@
 
 ## Immediate next action
 
-Implement M04-001 against `docs/orc-next/tasks/M04-001.md`.
+Define the later M04-002 recovery-choice policy against the bounded observation
+and legal-operation seam. Keep recovery choice, retry/repair value, dependency
+resolution, escalation, and unusual infrastructure handling out of the kernel
+until that policy is explicitly scoped.
 
 Inventory current canonical recovery seams first. Then expose a bounded recovery observation and a small repository-grounded set of legal recovery operations. The deterministic kernel answers what is legal; it must not rank, select, or execute recovery choices.
 
@@ -49,5 +52,23 @@ M03-003 completion evidence:
 - normal and feature clippy, fmt, and diff checks: passed;
 - production recommendation semantics unchanged, so Qwen was not rerun;
 - no M04 architectural blocker identified.
+
+M04-001 completion evidence:
+
+- bounded serializable `RecoveryObservation` and typed `RecoveryInspection` are
+  derived from canonical `ProjectOperations` facts;
+- included operations are inspected `Requeue`, `ResumeRevision`, and exact
+  `AcknowledgeNonConvergence`; unsupported/speculative recovery actions expose
+  no unsafe default;
+- seven focused recovery tests passed, including all five required abnormal
+  scenarios and side-effect-free bounded serialization;
+- `cargo test --lib`: 316 passed; `cargo test --features llama-cpp --lib`: 322
+  passed;
+- relevant dispatch/revision regression tests: 87 passed; economy/lifecycle:
+  12 passed; app API: 26 passed; operations: 8 passed; queue: 25 passed;
+- normal and feature clippy, fmt, and diff checks passed;
+- Controller recommendation prompt/schema/parser semantics were unchanged, so
+  Qwen was not rerun;
+- no M04-002 architectural blocker identified.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded recovery fact-versus-judgment classification.

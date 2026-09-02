@@ -676,6 +676,16 @@ impl OrcApp {
         crate::operations::ProjectOperations::new(&self.db, &self.repo_path)
     }
 
+    /// Read canonical abnormal-state facts and legal recovery operations.
+    /// This seam performs no recovery, authorization or persistence mutation.
+    pub fn inspect_recovery(
+        &self,
+        task_id: &str,
+    ) -> std::result::Result<crate::recovery::RecoveryInspection, crate::recovery::RecoveryError>
+    {
+        crate::recovery::inspect_recovery(&self.operations(), task_id)
+    }
+
     /// Build one read-only Controller recommendation and expose only its
     /// bounded typed action proposal. This seam does not authorize or execute
     /// the proposal; trusted callers must explicitly use the M03-002

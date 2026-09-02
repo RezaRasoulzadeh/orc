@@ -45,6 +45,23 @@ pub struct TaskExecutionCondition {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequeueLegality {
+    Allowed {
+        task_is_active: bool,
+        active_run_id: Option<i64>,
+    },
+    Rejected(RequeueRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequeueRejection {
+    TaskNotFound,
+    TaskNotActive,
+    ActiveExecution,
+    NoRecoverableRun,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderInvocation {
     pub id: i64,
@@ -6647,54 +6664,76 @@ impl Database {
         Ok(changed != 0)
     }
 
+    pub(crate) fn requeue_legality(&self, id: &str) -> Result<RequeueLegality, DbError> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Ok(RequeueLegality::Rejected(RequeueRejection::TaskNotFound));
+        };
+        let task_is_active = match status.as_str() {
+            "active" => true,
+            "blocked" => false,
+            _ => return Ok(RequeueLegality::Rejected(RequeueRejection::TaskNotActive)),
+        };
+        let active_run_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM agent_runs WHERE task_id = ?1 AND status IN ('running', 'waiting_external') ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !task_is_active && active_run_id.is_some() {
+            return Ok(RequeueLegality::Rejected(RequeueRejection::ActiveExecution));
+        }
+        let recoverable_run_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('failed', 'cancelled'))",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if active_run_id.is_some() || recoverable_run_exists {
+            Ok(RequeueLegality::Allowed {
+                task_is_active,
+                active_run_id,
+            })
+        } else {
+            Ok(RequeueLegality::Rejected(
+                RequeueRejection::NoRecoverableRun,
+            ))
+        }
+    }
+
     pub fn requeue_task(&self, id: &str, reason: &str) -> Result<(), DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let status: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT status FROM tasks WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let status = match status.as_deref() {
-                Some(status @ ("active" | "blocked")) => status,
-                Some(_) => return Err(DbError::TaskNotActive(id.into())),
-                None => return Err(DbError::TaskNotFound(id.into())),
-            };
-            let active_run_id: Option<i64> = self.conn.query_row(
-                "SELECT id FROM agent_runs WHERE task_id = ?1 AND status IN ('running', 'waiting_external') ORDER BY started_at DESC, id DESC LIMIT 1",
-                params![id], |row| row.get(0),
-            ).optional()?;
-            if status == "active" {
-                if let Some(run_id) = active_run_id {
-                    self.conn.execute(
-                        "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
-                        params![reason, run_id],
-                    )?;
-                } else {
-                    let terminal_recovery_run_exists: bool = self.conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('failed', 'cancelled'))",
-                        params![id],
-                        |row| row.get(0),
-                    )?;
-                    if !terminal_recovery_run_exists {
-                        return Err(DbError::NoRecoverableRun(id.into()));
+            let legality = self.requeue_legality(id)?;
+            let RequeueLegality::Allowed {
+                task_is_active,
+                active_run_id,
+            } = legality
+            else {
+                let RequeueLegality::Rejected(rejection) = legality else {
+                    unreachable!("requeue legality was rejected after an allowed result")
+                };
+                return Err(match rejection {
+                    RequeueRejection::TaskNotFound => DbError::TaskNotFound(id.into()),
+                    RequeueRejection::TaskNotActive | RequeueRejection::ActiveExecution => {
+                        DbError::TaskNotActive(id.into())
                     }
-                }
-            } else {
-                if active_run_id.is_some() {
-                    return Err(DbError::TaskNotActive(id.into()));
-                }
-                let failed_run_exists: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE task_id = ?1 AND status IN ('failed', 'cancelled'))",
-                    params![id],
-                    |row| row.get(0),
+                    RequeueRejection::NoRecoverableRun => DbError::NoRecoverableRun(id.into()),
+                });
+            };
+            if task_is_active && let Some(run_id) = active_run_id {
+                self.conn.execute(
+                    "UPDATE agent_runs SET status = 'failed', output = ?1, finished_at = CURRENT_TIMESTAMP WHERE id = ?2 AND status IN ('running', 'waiting_external')",
+                    params![reason, run_id],
                 )?;
-                if !failed_run_exists {
-                    return Err(DbError::NoRecoverableRun(id.into()));
-                }
             }
             self.conn.execute(
                 "UPDATE tasks SET status = 'backlog', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('active', 'blocked')",

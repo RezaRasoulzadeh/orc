@@ -16,7 +16,8 @@ Only current/near-term milestones are decomposed here.
 | [M04-001](M04-001.md) | Done | M04 | Expose bounded recovery facts and legal recovery operations |
 | [M04-002](M04-002.md) | Done | M04 | Add read-only Controller recovery choice |
 | [M04-003](M04-003.md) | Done | M04 | Execute explicitly authorized recovery recommendations |
-| [M04-004](M04-004.md) | Planned | M04 | Route validation-repair exhaustion into supervised Controller recovery |
+| [M04-004](M04-004.md) | Done | M04 | Route validation-repair exhaustion into supervised Controller recovery |
+| [M04-005](M04-005.md) | Planned | M04 | Route semantic revision non-convergence into supervised Controller recovery |
 
 ## Task format
 

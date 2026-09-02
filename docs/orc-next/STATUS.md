@@ -4,9 +4,9 @@
 
 **Current milestone:** M03 — Typed Controller tools
 
-**Current task:** M03-001 — Define typed Controller action intents and legality boundary (Planned)
+**Current task:** M03-002 — Execute explicitly authorized Controller intents (not yet decomposed)
 
-**Last completed:** M02-003 — Enforce reliable structured Controller output
+**Last completed:** M03-001 — Define typed Controller action intents and legality boundary
 
 **Blocked by:** Nothing
 
@@ -28,11 +28,14 @@
 
 ## Immediate next action
 
-Implement M03-001 exactly against `docs/orc-next/tasks/M03-001.md`.
+Define M03-002 around explicit, re-checked execution of authorized intents.
 
-M03-001 introduces the first typed, model-independent Controller action-intent boundary for dispatch, semantic review, revise, and accept. The kernel must inspect whether an intent is legal using canonical Orc rules and return a bounded typed result without executing or persisting any mutation.
-
-Keep this as a legality/contract slice only. Reuse `ProjectOperations`, selected `OrcApp` APIs, and canonical lifecycle/read rules; do not create a parallel Controller state machine. Do not add Controller execution, recovery, planning/Lead migration, memory, autonomy, model changes, Python, or GPU work.
+M03-001 is complete. The read-only `ControllerActionIntent` boundary supports
+dispatch, semantic review, revise and accept; canonical `ProjectOperations`
+legality inspection returns bounded typed Allowed/Rejected facts without
+executing or persisting an action. M03-002 remains intentionally undefined;
+its first design concern is an explicit permission/confirmation and a
+mutation-boundary legality re-check, not treating inspection as authorization.
 
 M02-003 final acceptance evidence:
 

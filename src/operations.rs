@@ -46,6 +46,91 @@ pub enum OperationalStateConsistency {
     Inconsistent,
 }
 
+/// A supported high-level operation that the deterministic kernel can inspect
+/// without executing it. This is deliberately provider-independent: it is a
+/// kernel fact about the operation surface, not a model/tool/backend command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalAction {
+    Dispatch,
+    SemanticReview,
+    Revise,
+    Accept,
+}
+
+/// Bounded canonical facts used to explain an action-legality decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalActionObservation {
+    pub action: OperationalAction,
+    pub task_id: String,
+    pub lifecycle: TaskStatus,
+    pub phase: QueueCategory,
+    pub next_step: OperationalNextStep,
+    pub waiting_on: Vec<String>,
+    pub validation_state: ValidationState,
+    pub validation_required: bool,
+    pub validation_is_current: Option<bool>,
+    pub review_run_id: Option<i64>,
+    pub review_completed: bool,
+    pub review_verdict: Option<String>,
+    pub review_applies_to_current_change: Option<bool>,
+    pub actionable_revision_review: bool,
+    pub execution_condition_present: bool,
+}
+
+/// A bounded, inspectable reason an otherwise typed action is not currently
+/// legal. The variants intentionally report facts rather than prescribe a
+/// recovery strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OperationalActionRejection {
+    TaskNotFound,
+    WrongLifecycle {
+        expected: Vec<TaskStatus>,
+        actual: TaskStatus,
+    },
+    WrongPhase {
+        expected: QueueCategory,
+        actual: QueueCategory,
+    },
+    DependenciesIncomplete {
+        waiting_on: Vec<String>,
+    },
+    NoEligibleAgent,
+    ValidationMissing,
+    ValidationNotPassing {
+        state: ValidationState,
+    },
+    ValidationStale,
+    ReviewMissing,
+    ReviewNotPassing {
+        verdict: Option<String>,
+    },
+    ReviewStale,
+    RevisionEvidenceMissing,
+    ExecutionConditionPresent,
+}
+
+/// Result of deterministic, side-effect-free action inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum OperationalActionLegality {
+    Allowed {
+        action: OperationalAction,
+        task_id: String,
+        observation: OperationalActionObservation,
+    },
+    Rejected {
+        action: OperationalAction,
+        task_id: String,
+        observation: Option<OperationalActionObservation>,
+        reason: OperationalActionRejection,
+    },
+}
+
+const MAX_OPERATIONAL_ACTION_TEXT_BYTES: usize = 256;
+const MAX_OPERATIONAL_ACTION_WAITING: usize = 16;
+
 impl OperationalStateConsistency {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -551,6 +636,200 @@ impl<'a> ProjectOperations<'a> {
             review_criteria,
             activity,
         }))
+    }
+
+    /// Inspect whether a supported Controller action is currently legal.
+    ///
+    /// This is intentionally a read-only seam. It composes the same queue,
+    /// validation, review and revision evidence projections used by the
+    /// operator-facing operations views; no lifecycle transition or
+    /// persistence mutation is performed here.
+    pub fn inspect_action(
+        &self,
+        task_id: &str,
+        action: OperationalAction,
+    ) -> Result<OperationalActionLegality> {
+        let Some(detail) = self.task_detail(task_id)? else {
+            return Ok(OperationalActionLegality::Rejected {
+                action,
+                task_id: bounded_action_text(task_id),
+                observation: None,
+                reason: OperationalActionRejection::TaskNotFound,
+            });
+        };
+
+        let queue = detail.queue.as_ref();
+        let waiting_on = queue
+            .map(|entry| {
+                entry
+                    .waiting_on
+                    .iter()
+                    .take(MAX_OPERATIONAL_ACTION_WAITING)
+                    .map(|value| bounded_action_text(value))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let review_run_id = detail.summary.review.run_id;
+        let review_completed = review_run_id.is_some_and(|run_id| {
+            detail.executions.iter().any(|run| {
+                run.id == run_id && run.execution_class == "review" && run.status == "completed"
+            })
+        });
+        let validation_required = self
+            .db
+            .get_worktree_metadata(task_id)?
+            .is_some_and(|(_, path)| !path.is_empty());
+        let actionable_revision_review = self.db.actionable_revision_review(task_id)?.is_some();
+        let observation = OperationalActionObservation {
+            action,
+            task_id: bounded_action_text(task_id),
+            lifecycle: detail.summary.lifecycle,
+            phase: detail.summary.phase,
+            next_step: detail.summary.next_step,
+            waiting_on: waiting_on.clone(),
+            validation_state: detail.summary.validation.state,
+            validation_required,
+            validation_is_current: detail.summary.validation.is_current,
+            review_run_id,
+            review_completed,
+            review_verdict: detail
+                .summary
+                .review
+                .verdict
+                .as_deref()
+                .map(bounded_action_text),
+            review_applies_to_current_change: detail.summary.review.applies_to_current_change,
+            actionable_revision_review,
+            execution_condition_present: detail.execution_condition.is_some(),
+        };
+
+        let rejection = match action {
+            OperationalAction::Dispatch => {
+                if !waiting_on.is_empty()
+                    && matches!(
+                        detail.summary.lifecycle,
+                        TaskStatus::Backlog | TaskStatus::Ready | TaskStatus::Blocked
+                    )
+                {
+                    Some(OperationalActionRejection::DependenciesIncomplete { waiting_on })
+                } else {
+                    match detail.summary.phase {
+                        QueueCategory::Ready => None,
+                        QueueCategory::Backlog => Some(OperationalActionRejection::NoEligibleAgent),
+                        actual => Some(OperationalActionRejection::WrongPhase {
+                            expected: QueueCategory::Ready,
+                            actual,
+                        }),
+                    }
+                }
+            }
+            OperationalAction::SemanticReview => {
+                if detail.summary.lifecycle.is_terminal() {
+                    Some(OperationalActionRejection::WrongLifecycle {
+                        expected: vec![
+                            TaskStatus::Backlog,
+                            TaskStatus::Ready,
+                            TaskStatus::Active,
+                            TaskStatus::Review,
+                            TaskStatus::AcceptanceReady,
+                            TaskStatus::RevisionRequired,
+                            TaskStatus::Blocked,
+                        ],
+                        actual: detail.summary.lifecycle,
+                    })
+                } else if !validation_required {
+                    None
+                } else {
+                    match detail.summary.validation.state {
+                        ValidationState::None | ValidationState::Running => {
+                            Some(OperationalActionRejection::ValidationMissing)
+                        }
+                        ValidationState::Stale
+                            if detail.summary.validation.is_current == Some(false) =>
+                        {
+                            Some(OperationalActionRejection::ValidationStale)
+                        }
+                        ValidationState::Stale => Some(OperationalActionRejection::ValidationStale),
+                        ValidationState::Failing | ValidationState::InfrastructureFailure => {
+                            Some(OperationalActionRejection::ValidationNotPassing {
+                                state: detail.summary.validation.state,
+                            })
+                        }
+                        ValidationState::Passing
+                            if detail.summary.validation.is_current != Some(true) =>
+                        {
+                            Some(OperationalActionRejection::ValidationStale)
+                        }
+                        ValidationState::Passing => None,
+                    }
+                }
+            }
+            OperationalAction::Revise => {
+                if !matches!(
+                    detail.summary.lifecycle,
+                    TaskStatus::RevisionRequired | TaskStatus::Blocked
+                ) {
+                    Some(OperationalActionRejection::WrongLifecycle {
+                        expected: vec![TaskStatus::RevisionRequired, TaskStatus::Blocked],
+                        actual: detail.summary.lifecycle,
+                    })
+                } else if !actionable_revision_review {
+                    Some(OperationalActionRejection::RevisionEvidenceMissing)
+                } else if detail.execution_condition.is_some() {
+                    Some(OperationalActionRejection::ExecutionConditionPresent)
+                } else {
+                    None
+                }
+            }
+            OperationalAction::Accept => {
+                if detail.summary.lifecycle != TaskStatus::AcceptanceReady {
+                    Some(OperationalActionRejection::WrongLifecycle {
+                        expected: vec![TaskStatus::AcceptanceReady],
+                        actual: detail.summary.lifecycle,
+                    })
+                } else if detail.summary.phase != QueueCategory::AcceptanceReady {
+                    Some(OperationalActionRejection::WrongPhase {
+                        expected: QueueCategory::AcceptanceReady,
+                        actual: detail.summary.phase,
+                    })
+                } else if !review_completed || review_run_id.is_none() {
+                    Some(OperationalActionRejection::ReviewMissing)
+                } else if !detail
+                    .summary
+                    .review
+                    .verdict
+                    .as_deref()
+                    .is_some_and(|verdict| verdict.eq_ignore_ascii_case("pass"))
+                {
+                    Some(OperationalActionRejection::ReviewNotPassing {
+                        verdict: detail
+                            .summary
+                            .review
+                            .verdict
+                            .as_deref()
+                            .map(bounded_action_text),
+                    })
+                } else if detail.summary.review.applies_to_current_change != Some(true) {
+                    Some(OperationalActionRejection::ReviewStale)
+                } else {
+                    None
+                }
+            }
+        };
+
+        Ok(match rejection {
+            Some(reason) => OperationalActionLegality::Rejected {
+                action,
+                task_id: bounded_action_text(task_id),
+                observation: Some(observation),
+                reason,
+            },
+            None => OperationalActionLegality::Allowed {
+                action,
+                task_id: bounded_action_text(task_id),
+                observation,
+            },
+        })
     }
 
     pub fn execution_detail(&self, run_id: i64) -> Result<Option<ExecutionSummary>> {
@@ -1172,6 +1451,14 @@ impl<'a> ProjectOperations<'a> {
 
 fn is_active_run(status: &str) -> bool {
     matches!(status, "running" | "waiting_external")
+}
+
+fn bounded_action_text(value: &str) -> String {
+    let mut end = value.len().min(MAX_OPERATIONAL_ACTION_TEXT_BYTES);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn next_step(phase: QueueCategory, entry: Option<&QueueEntry>) -> OperationalNextStep {

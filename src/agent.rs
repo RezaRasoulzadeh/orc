@@ -504,60 +504,15 @@ fn effective_revision_effort(
     Ok(explicit_override.unwrap_or(base))
 }
 
-fn persist_escalation_decision(
-    db: &Database,
-    task_id: &str,
-    observation: crate::scheduler::EscalationObservation,
-    previous: &crate::storage::db::ProviderResolution,
-    policy_attempt: usize,
-) -> Result<Option<EscalationRequest>> {
-    let configuration = db.escalation_policy_configuration()?;
-    match crate::scheduler::evaluate_escalation_policy(crate::scheduler::EscalationPolicyInput {
-        observation,
-        previous_provider_invocation_id: Some(previous.invocation_id),
-        previous_resolution: Some(&previous.resolution),
-        previous_attempt: previous.attempt,
-        policy_attempt,
-        configuration: &configuration,
-    }) {
-        crate::scheduler::EscalationDecision::NoEscalation { .. } => Ok(None),
-        crate::scheduler::EscalationDecision::Escalate(request) => {
-            let persisted = db.persist_escalation_request(task_id, &request)?;
-            db.record_lifecycle_event(
-                "economy_escalation_requested",
-                Some(task_id),
-                None,
-                None,
-                Some(&serde_json::to_string(&persisted)?),
-            )?;
-            Ok(Some(persisted.request))
-        }
-        crate::scheduler::EscalationDecision::Exhausted { reason } => {
-            let details = serde_json::json!({
-                "previous_provider_invocation_id": previous.invocation_id,
-                "previous_tier": previous.resolution.tier.as_str(),
-                "reason": reason,
-            });
-            db.set_task_execution_condition(
-                task_id,
-                "economy_escalation_exhausted",
-                &details.to_string(),
-            )?;
-            Ok(None)
-        }
-    }
-}
-
-fn semantic_escalation_request(
+/// Detect a semantic blocker that survived a completed revision and persist
+/// that bounded kernel fact. The detection remains deterministic; choosing
+/// what recovery operation, if any, is worthwhile belongs to the supervised
+/// recovery boundary.
+fn record_semantic_revision_non_convergence(
     db: &Database,
     task: &Task,
     source_review_id: i64,
-    overrides: &RevisionExecutionOverrides,
-    operator_agent_override: bool,
-) -> Result<Option<EscalationRequest>> {
-    if operator_agent_override || overrides.model.is_some() || overrides.effort.is_some() {
-        return Ok(None);
-    }
+) -> Result<bool> {
     for blocker in db
         .review_blocker_observations(source_review_id)?
         .into_iter()
@@ -568,32 +523,23 @@ fn semantic_escalation_request(
             source_review_id,
             &blocker.blocker_id,
         )? {
-            let policy_attempt = previous
-                .resolution
-                .escalation
-                .as_ref()
-                .map_or(1, |lineage| lineage.policy_attempt + 1);
-            let escalation = persist_escalation_decision(
-                db,
-                &task.id,
-                crate::scheduler::EscalationObservation::SemanticRevisionNonConvergence,
-                &previous,
-                policy_attempt,
+            let details = serde_json::json!({
+                "source_review_run_id": source_review_id,
+                "blocker_id": blocker.blocker_id,
+                "previous_provider_invocation_id": previous.invocation_id,
+                "previous_attempt": previous.attempt,
+            });
+            db.record_lifecycle_event(
+                "semantic_revision_non_convergence_detected",
+                Some(&task.id),
+                None,
+                None,
+                Some(&details.to_string()),
             )?;
-            if escalation.is_none()
-                && db
-                    .get_task_execution_condition(&task.id)?
-                    .is_some_and(|condition| condition.kind == "economy_escalation_exhausted")
-            {
-                bail!(
-                    "NON_CONVERGENCE: no stronger eligible economy tier remains for task '{}'",
-                    task.id
-                );
-            }
-            return Ok(escalation);
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 fn validate_worker_step_completion(
@@ -2001,13 +1947,7 @@ where
         .map(|(id, _)| id)
         .context("task has no actionable revision review")?;
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
-    let escalation_request = semantic_escalation_request(
-        db,
-        &task,
-        source_review_id,
-        overrides,
-        operator_agent_override,
-    )?;
+    record_semantic_revision_non_convergence(db, &task, source_review_id)?;
     let resolution = resolve_revision_economy(
         db,
         &task,
@@ -2016,7 +1956,7 @@ where
         revision_effort,
         transport,
         operator_agent_override,
-        escalation_request,
+        None,
         &crate::scheduler::ProviderQuotaRefresher,
     )?;
     let resolved_agent_id = resolution.agent.id.clone();
@@ -2267,17 +2207,20 @@ fn revise_with_worker_on_db_with_overrides_resolved(
     let revision_effort = effective_revision_effort(db, &task, source_review_id, overrides.effort)?;
     let resolution = match provided_resolution {
         Some(resolution) => resolution,
-        None => resolve_revision_economy(
-            db,
-            &task,
-            agent_id,
-            overrides,
-            revision_effort,
-            crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
-            true,
-            semantic_escalation_request(db, &task, source_review_id, overrides, true)?,
-            &crate::scheduler::UnsupportedQuotaRefresher,
-        )?,
+        None => {
+            record_semantic_revision_non_convergence(db, &task, source_review_id)?;
+            resolve_revision_economy(
+                db,
+                &task,
+                agent_id,
+                overrides,
+                revision_effort,
+                crate::scheduler::TransportEligibility::IgnoreUnsupportedBackend,
+                true,
+                None,
+                &crate::scheduler::UnsupportedQuotaRefresher,
+            )?
+        }
     };
     let run_id = db.create_agent_run_with_execution(
         project_id,
@@ -3658,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn surviving_blockers_do_not_directly_promote_revision_effort() {
+    fn surviving_blockers_are_detected_without_automatic_escalation() {
         let (_dir, db, task) = setup();
         let project = db.get_project_id().unwrap().unwrap();
         let blocker = || crate::automated::ReviewBlocker {
@@ -3736,22 +3679,21 @@ mod tests {
         revision(&db, first_review, ReasoningEffort::Low);
         let second_review = review(&db);
         assert_eq!(effort(second_review), ReasoningEffort::Low);
-        let escalation = semantic_escalation_request(
-            &db,
-            &db.get_task(&task).unwrap().unwrap(),
-            second_review,
-            &RevisionExecutionOverrides::default(),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            escalation.lineage.trigger,
-            crate::registry::EscalationTrigger::SemanticRevisionNonConvergence
+        assert!(
+            record_semantic_revision_non_convergence(
+                &db,
+                &db.get_task(&task).unwrap().unwrap(),
+                second_review,
+            )
+            .unwrap()
         );
-        assert_eq!(
-            escalation.lineage.requested_minimum_tier,
-            crate::registry::EconomyTier::Escalation
+        assert!(db.pending_escalation_request(&task).unwrap().is_none());
+        assert!(db.get_task_execution_condition(&task).unwrap().is_none());
+        assert!(
+            db.list_lifecycle_events_for_task(&task, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "semantic_revision_non_convergence_detected")
         );
         assert_eq!(
             effort_with_override(&db, &task, second_review, ReasoningEffort::Low),

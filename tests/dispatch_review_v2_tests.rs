@@ -2947,6 +2947,52 @@ fn production_review_revision_loop_stops_at_task_revision_bound_after_restart() 
             .unwrap()
             .is_some()
     );
+    assert!(
+        reopened
+            .pending_escalation_request(&task)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .get_task_execution_condition(&task)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .list_lifecycle_events_for_task(&task, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "semantic_revision_non_convergence_detected")
+    );
+    let recovery = inspect_recovery(
+        &orc::operations::ProjectOperations::new(&reopened, dir.path()),
+        &task,
+    )
+    .unwrap();
+    assert!(
+        recovery
+            .observation
+            .conditions
+            .contains(&RecoveryCondition::SemanticRevision)
+    );
+    assert!(recovery.operations.iter().any(|legality| {
+        matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::ResumeRevision
+            }
+        )
+    }));
+    assert!(recovery.operations.iter().all(|legality| {
+        !matches!(
+            legality,
+            RecoveryOperationLegality::Allowed {
+                operation: RecoveryOperation::Requeue
+            }
+        )
+    }));
 
     let unchanged = engine.continue_run(workflow_id).unwrap();
     assert_eq!(unchanged.status, WorkflowStatus::NonConvergent);

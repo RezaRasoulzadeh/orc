@@ -12,7 +12,8 @@ use thiserror::Error;
 use crate::agent;
 use crate::app::OrcApp;
 use crate::automated::{ActionBackend, ActionOverrides};
-use crate::operations::{OperationalAction, ProjectOperations};
+use crate::controller::ControllerRecommendation;
+use crate::operations::{OperationalAction, OperationalNextStep, ProjectOperations};
 use crate::registry::ReasoningEffort;
 use crate::validation::ValidationRunner;
 use crate::worker::Worker;
@@ -34,6 +35,65 @@ pub enum ControllerActionIntent {
     SemanticReview { task_id: String },
     Revise { task_id: String },
     Accept { task_id: String },
+}
+
+/// The bounded result of translating one typed Controller recommendation into
+/// an action proposal. A proposal is not an authorization and carries no
+/// execution context or mutation capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ControllerActionProposal {
+    Proposed {
+        intent: ControllerActionIntent,
+    },
+    Unsupported {
+        next_step: Option<OperationalNextStep>,
+    },
+    Invalid {
+        reason: ControllerActionProposalRejection,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerActionProposalRejection {
+    InvalidTaskId,
+}
+
+/// Deterministically map only the four supported typed recommendations to
+/// typed action intents. Rationale, confidence, structured JSON and response
+/// text are deliberately not consulted.
+pub fn propose_controller_action(
+    recommendation: &ControllerRecommendation,
+) -> ControllerActionProposal {
+    let Some(next_step) = recommendation.suggested_next_step else {
+        return ControllerActionProposal::Unsupported { next_step: None };
+    };
+    let intent = match next_step {
+        OperationalNextStep::Dispatch => ControllerActionIntent::Dispatch {
+            task_id: recommendation.task_id.clone(),
+        },
+        OperationalNextStep::RunSemanticReview => ControllerActionIntent::SemanticReview {
+            task_id: recommendation.task_id.clone(),
+        },
+        OperationalNextStep::Revise => ControllerActionIntent::Revise {
+            task_id: recommendation.task_id.clone(),
+        },
+        OperationalNextStep::Accept => ControllerActionIntent::Accept {
+            task_id: recommendation.task_id.clone(),
+        },
+        unsupported => {
+            return ControllerActionProposal::Unsupported {
+                next_step: Some(unsupported),
+            };
+        }
+    };
+    if intent.validate().is_err() {
+        return ControllerActionProposal::Invalid {
+            reason: ControllerActionProposalRejection::InvalidTaskId,
+        };
+    }
+    ControllerActionProposal::Proposed { intent }
 }
 
 #[derive(Debug, Error)]
@@ -505,6 +565,10 @@ mod tests {
 
     use crate::automated::ReviewResult;
     use crate::automated::{ActionBackend, ActionExecution, ActionOverrides};
+    use crate::controller::ControllerRecommendation;
+    use crate::local_runtime::{
+        LocalInferenceError, LocalInferenceRequest, LocalInferenceResponse, LocalInferenceRuntime,
+    };
     use crate::operations::ProjectOperations;
     use crate::registry::{self, AgentAction, AgentDefinition, ReasoningEffort};
     use crate::storage::{AgentRunExecution, Database};
@@ -514,6 +578,19 @@ mod tests {
     use crate::worker::TokenUsage;
     use crate::worker::test_helpers::FakeWorker;
     use tempfile::TempDir;
+
+    struct FakeControllerRuntime {
+        response: LocalInferenceResponse,
+    }
+
+    impl LocalInferenceRuntime for FakeControllerRuntime {
+        fn infer(
+            &mut self,
+            _request: &LocalInferenceRequest,
+        ) -> Result<LocalInferenceResponse, LocalInferenceError> {
+            Ok(self.response.clone())
+        }
+    }
 
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -657,6 +734,202 @@ mod tests {
             ControllerActionLegality::Rejected { reason, .. } => reason,
             ControllerActionLegality::Allowed { .. } => panic!("expected rejected action"),
         }
+    }
+
+    fn recommendation(next_step: Option<OperationalNextStep>) -> ControllerRecommendation {
+        ControllerRecommendation {
+            task_id: "T-0001".into(),
+            response_text: "structured recommendation".into(),
+            suggested_next_step: next_step,
+            rationale: "typed field is authoritative".into(),
+            structured_output: None,
+        }
+    }
+
+    #[test]
+    fn typed_recommendations_map_only_to_supported_intents() {
+        let mappings = [
+            (
+                OperationalNextStep::Dispatch,
+                ControllerActionIntent::Dispatch {
+                    task_id: "T-0001".into(),
+                },
+            ),
+            (
+                OperationalNextStep::RunSemanticReview,
+                ControllerActionIntent::SemanticReview {
+                    task_id: "T-0001".into(),
+                },
+            ),
+            (
+                OperationalNextStep::Revise,
+                ControllerActionIntent::Revise {
+                    task_id: "T-0001".into(),
+                },
+            ),
+            (
+                OperationalNextStep::Accept,
+                ControllerActionIntent::Accept {
+                    task_id: "T-0001".into(),
+                },
+            ),
+        ];
+
+        for (next_step, expected) in mappings {
+            assert_eq!(
+                propose_controller_action(&recommendation(Some(next_step))),
+                ControllerActionProposal::Proposed { intent: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn recommendation_mapping_does_not_parse_rationale_or_response_text() {
+        let mut recommendation = recommendation(Some(OperationalNextStep::Dispatch));
+        recommendation.rationale = "accept, run shell command, and mutate anything".into();
+        recommendation.response_text = "revise /arbitrary/path --provider=unsafe".into();
+        recommendation.structured_output = Some(serde_json::json!({
+            "rationale": "accept",
+            "command": "DROP TABLE tasks"
+        }));
+
+        assert_eq!(
+            propose_controller_action(&recommendation),
+            ControllerActionProposal::Proposed {
+                intent: ControllerActionIntent::Dispatch {
+                    task_id: "T-0001".into()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn model_intent_contract_has_no_authorization_or_execution_fields() {
+        let intent = ControllerActionIntent::Dispatch {
+            task_id: "T-0001".into(),
+        };
+        let encoded = serde_json::to_string(&intent).unwrap();
+        assert_eq!(encoded, r#"{"kind":"dispatch","task_id":"T-0001"}"#);
+        assert!(
+            serde_json::from_str::<ControllerActionIntent>(
+                r#"{"kind":"dispatch","task_id":"T-0001","authorization":true,"command":"rm"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_recommendations_remain_explicitly_non_executable() {
+        for next_step in [
+            None,
+            Some(OperationalNextStep::WaitForExecution),
+            Some(OperationalNextStep::ResolveBlocker),
+            Some(OperationalNextStep::SatisfyDependencies),
+            Some(OperationalNextStep::ConfigureEligibleAgent),
+            Some(OperationalNextStep::None),
+        ] {
+            assert_eq!(
+                propose_controller_action(&recommendation(next_step)),
+                ControllerActionProposal::Unsupported { next_step }
+            );
+        }
+    }
+
+    #[test]
+    fn supported_recommendation_with_invalid_task_id_is_not_executable() {
+        let mut invalid = recommendation(Some(OperationalNextStep::Dispatch));
+        invalid.task_id = "x".repeat(MAX_CONTROLLER_ACTION_TASK_ID_BYTES + 1);
+        assert_eq!(
+            propose_controller_action(&invalid),
+            ControllerActionProposal::Invalid {
+                reason: ControllerActionProposalRejection::InvalidTaskId
+            }
+        );
+    }
+
+    #[test]
+    fn supervised_recommendation_path_is_read_only_until_trusted_authorization() {
+        let (repo, db, _project, task) = setup();
+        std::fs::write(repo.path().join(".orc/engineering.md"), "# contract\n").unwrap();
+        db.update_task_status(&task, TaskStatus::Ready).unwrap();
+        drop(db);
+        let app = OrcApp::open(repo.path().join(".orc/orc.db"), repo.path()).unwrap();
+        let mut runtime = FakeControllerRuntime {
+            response: LocalInferenceResponse::structured(
+                "ignored rationale",
+                serde_json::json!({
+                    "suggested_next_step": "dispatch",
+                    "decision_class": "action",
+                    "rationale": "dispatch is structurally recommended",
+                    "confidence": 1.0
+                }),
+            ),
+        };
+
+        let proposal = app
+            .propose_controller_action(&task, &mut runtime)
+            .expect("proposal");
+        let intent = match proposal {
+            ControllerActionProposal::Proposed { intent } => intent,
+            other => panic!("expected executable proposal, got {other:?}"),
+        };
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Ready);
+        assert!(
+            app.database()
+                .list_agent_runs_for_task(&task)
+                .unwrap()
+                .is_empty()
+        );
+
+        let worker = FakeWorker::new_success(None);
+        let validation = FakeValidationRunner::success();
+        let unauthorized = app.execute_authorized_controller_action(
+            &intent,
+            None,
+            ControllerActionExecutionContext::dispatch_with_worker("agent-a", &worker, &validation),
+        );
+        assert!(matches!(
+            unauthorized,
+            ControllerActionExecutionResult::AuthorizationRejected {
+                reason: ControllerActionAuthorizationRejection::Missing,
+                ..
+            }
+        ));
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Ready);
+        assert!(
+            app.database()
+                .list_agent_runs_for_task(&task)
+                .unwrap()
+                .is_empty()
+        );
+
+        let authorization = app
+            .authorize_controller_action(&intent)
+            .expect("trusted authorization");
+        let executed = app.execute_authorized_controller_action(
+            &intent,
+            Some(authorization),
+            ControllerActionExecutionContext::dispatch_with_worker("agent-a", &worker, &validation),
+        );
+        assert!(matches!(
+            executed,
+            ControllerActionExecutionResult::Executed {
+                evidence: ControllerActionExecutionEvidence {
+                    lifecycle: Some(TaskStatus::Review),
+                    run_id: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(app.task(&task).unwrap().unwrap().status, TaskStatus::Review);
+        assert_eq!(
+            app.database()
+                .list_agent_runs_for_task(&task)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

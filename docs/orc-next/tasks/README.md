@@ -12,7 +12,7 @@ Only current/near-term milestones are decomposed here.
 | [M02-003](M02-003.md) | Done | M02 | Enforce reliable structured Controller output |
 | [M03-001](M03-001.md) | Done | M03 | Define typed Controller action intents and legality boundary |
 | [M03-002](M03-002.md) | Done | M03 | Execute explicitly authorized Controller intents |
-| [M03-003](M03-003.md) | Planned | M03 | Connect Controller recommendations to supervised typed actions |
+| [M03-003](M03-003.md) | Done | M03 | Connect Controller recommendations to supervised typed actions |
 
 ## Task format
 

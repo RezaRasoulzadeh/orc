@@ -6,7 +6,7 @@
 
 **Current task:** M03-003 — Connect Controller recommendations to supervised typed actions
 
-**Last completed:** M03-002 — Execute explicitly authorized Controller intents
+**Last completed:** M03-003 — Connect Controller recommendations to supervised typed actions
 
 **Blocked by:** Nothing
 
@@ -25,6 +25,9 @@
 - M03-002 is complete and source-reviewed `PASS`: an opaque one-shot host authorization plus a fresh legality re-check gates canonical dispatch/review/revise/accept execution.
 - A legality inspection or Controller recommendation is not authorization and is not a durable grant.
 - Model-owned recommendation/intent must never carry or manufacture its own authorization/confirmation.
+- M03-003 is complete: `OrcApp::propose_controller_action` connects the
+  read-only typed recommendation path to a bounded proposed intent, while
+  trusted authorization and unchanged M03-002 execution remain separate.
 - M03-003 connects recommendation to typed intent under explicit supervision; it must not introduce an inference/action continuation loop.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
@@ -33,7 +36,8 @@
 
 ## Immediate next action
 
-Implement M03-003 against `docs/orc-next/tasks/M03-003.md`.
+M03-003 is complete. The next milestone is M04 recovery intelligence; any
+recovery judgment or tooling remains out of scope until that task is defined.
 
 The task connects the existing bounded read-only Controller recommendation path
 to the M03 typed action boundary. Supported recommendations may become proposed

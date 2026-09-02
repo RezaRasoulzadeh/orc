@@ -675,6 +675,29 @@ impl OrcApp {
     pub fn operations(&self) -> crate::operations::ProjectOperations<'_> {
         crate::operations::ProjectOperations::new(&self.db, &self.repo_path)
     }
+
+    /// Build one read-only Controller recommendation and expose only its
+    /// bounded typed action proposal. This seam does not authorize or execute
+    /// the proposal; trusted callers must explicitly use the M03-002
+    /// authorization and execution boundary afterward.
+    pub fn propose_controller_action(
+        &self,
+        task_id: &str,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::controller_actions::ControllerActionProposal,
+        crate::controller::ControllerError,
+    > {
+        let recommendation = crate::controller::ControllerStateBuilder::new().recommend(
+            &self.operations(),
+            task_id,
+            runtime,
+        )?;
+        Ok(crate::controller_actions::propose_controller_action(
+            &recommendation,
+        ))
+    }
+
     pub fn task_operations(
         &self,
         id: &str,

@@ -4,7 +4,7 @@
 
 **Current milestone:** M04 — Recovery intelligence
 
-**Current task:** M04-001 — Expose bounded recovery facts and legal recovery operations (Done)
+**Current task:** M04-002 — Add read-only Controller recovery choice
 
 **Last completed:** M04-001 — Expose bounded recovery facts and legal recovery operations
 
@@ -21,9 +21,11 @@
 - M03 is complete: typed normal-action intents, deterministic legality inspection, opaque one-shot trusted authorization, fresh pre-mutation legality re-check, canonical execution, and the supervised recommendation-to-intent bridge are in place.
 - A legality inspection or Controller recommendation is not authorization and is not a durable grant.
 - Model-owned recommendation/intent must never carry or manufacture its own authorization/confirmation.
-- Recovery follows the same architecture boundary: kernel exposes canonical facts and legal recovery operations; Controller judgment later chooses among them.
-- Recovery legality must preserve valid review/revision lineage and keep infrastructure, dependency, and economy/agent constraints distinct from semantic failure.
-- M04-001 is complete and remains observation/legality only: no Controller recovery choice, execution, retry loop, or broad policy removal.
+- Recovery follows the same architecture boundary: kernel exposes canonical facts and legal recovery operations; Controller judgment chooses among them.
+- M04-001 is complete and source-reviewed `PASS`: bounded recovery facts and deterministic legality are exposed through `RecoveryObservation` / `RecoveryInspection` with repository-grounded `Requeue`, `ResumeRevision`, and `AcknowledgeNonConvergence` operations.
+- Requeue inspection and mutation share canonical legality; recovery classification scans complete candidate/execution sets before bounded projection.
+- Recovery legality preserves valid review/revision lineage and keeps infrastructure, dependency, and economy/agent constraints distinct from semantic failure.
+- M04-002 adds read-only Controller recovery choice only; execution/authorization remains out of scope.
 - Memory is explicit Orc data, separate from model weights.
 - Lead/Planner reasoning will move into Controller after the Controller foundation is proven; durable useful Plan/decision data is preserved.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
@@ -31,44 +33,24 @@
 
 ## Immediate next action
 
-Define the later M04-002 recovery-choice policy against the bounded observation
-and legal-operation seam. Keep recovery choice, retry/repair value, dependency
-resolution, escalation, and unusual infrastructure handling out of the kernel
-until that policy is explicitly scoped.
+Implement M04-002 against `tasks/M04-002.md`: feed bounded M04-001 recovery observation and legal-operation facts through `LocalInferenceRuntime`, obtain a structured `RecoveryRecommendation`, and deterministically accept a recovery choice only when that exact operation is legal in the supplied inspection. `OperatorDecision` remains the non-mutating fallback.
 
-Inventory current canonical recovery seams first. Then expose a bounded recovery observation and a small repository-grounded set of legal recovery operations. The deterministic kernel answers what is legal; it must not rank, select, or execute recovery choices.
+M04-002 must not execute recovery, mint authorization, add continuation/retry loops, add new recovery operations, weaken validation/revision lineage, migrate planning/Lead, add memory, change interfaces, replace the model, add GPU work, or introduce Python.
 
-Required distinctions include blocked revision with valid REVISE lineage, infrastructure failure, dependency blocking, no-eligible-agent/economy exhaustion, and abnormal states where no safe automatic recovery operation exists.
+Because M04-002 introduces new production recovery prompt/schema semantics, deterministic validation must pass before running the real local Qwen recovery evaluation. Report strict structured-contract compliance and semantic decision quality separately.
 
-Keep inspection side-effect free. Do not execute recovery, mint Controller authorization, add continuation/retry loops, migrate planning/Lead, add memory, change interfaces, or modify the production Controller recommendation prompt/schema/parser.
+M04-001 final completion evidence:
 
-M03-003 completion evidence:
-
-- Luna + High source review: `PASS`;
-- focused action tests: 16 passed;
-- Controller evaluation tests: 9 passed;
-- `cargo test --lib`: 309 passed;
-- `cargo test --features llama-cpp --lib`: 315 passed;
-- normal and feature clippy, fmt, and diff checks: passed;
-- production recommendation semantics unchanged, so Qwen was not rerun;
-- no M04 architectural blocker identified.
-
-M04-001 completion evidence:
-
-- bounded serializable `RecoveryObservation` and typed `RecoveryInspection` are
-  derived from canonical `ProjectOperations` facts;
-- included operations are inspected `Requeue`, `ResumeRevision`, and exact
-  `AcknowledgeNonConvergence`; unsupported/speculative recovery actions expose
-  no unsafe default;
-- seven focused recovery tests passed, including all five required abnormal
-  scenarios and side-effect-free bounded serialization;
-- `cargo test --lib`: 316 passed; `cargo test --features llama-cpp --lib`: 322
-  passed;
-- relevant dispatch/revision regression tests: 87 passed; economy/lifecycle:
-  12 passed; app API: 26 passed; operations: 8 passed; queue: 25 passed;
+- Luna + High source review: `PASS` after three blockers were corrected;
+- shared canonical requeue legality drives inspection and mutation;
+- economy classification examines the complete candidate set before bounded projection;
+- latest relevant failed/cancelled execution is selected from complete history before bounded projection;
+- focused recovery tests: 9 passed;
+- `cargo test --lib`: 318 passed;
+- `cargo test --features llama-cpp --lib`: 324 passed;
+- dispatch/revision: 87 passed; economy/lifecycle: 12 passed; app API: 26 passed; operations: 8 passed; queue: 25 passed;
 - normal and feature clippy, fmt, and diff checks passed;
-- Controller recommendation prompt/schema/parser semantics were unchanged, so
-  Qwen was not rerun;
+- production Controller semantics were unchanged, so Qwen was not rerun;
 - no M04-002 architectural blocker identified.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded recovery fact-versus-judgment classification.

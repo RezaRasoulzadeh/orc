@@ -1,9 +1,10 @@
 //! Model-independent boundary for local Controller inference.
 //!
 //! This module intentionally contains no Controller state, lifecycle, storage,
-//! provider, model-family, tokenizer, or native-backend types. A future native
-//! adapter (initially planned for llama.cpp/GGUF) accepts [`LocalRuntimeConfig`]
-//! and implements [`LocalInferenceRuntime`]. It translates its native request,
+//! provider, model-family, tokenizer, or native-backend types. The optional
+//! native adapter (initially implemented with llama.cpp/GGUF) accepts
+//! [`LocalRuntimeConfig`] and implements [`LocalInferenceRuntime`]. It
+//! translates its native request,
 //! output, and failure details at that boundary, leaving Controller-facing
 //! types replaceable when the model or runtime changes.
 
@@ -230,6 +231,13 @@ pub trait LocalInferenceRuntime: Send {
         request: &LocalInferenceRequest,
     ) -> Result<LocalInferenceResponse, LocalInferenceError>;
 }
+
+#[cfg(feature = "llama-cpp")]
+mod llama_cpp;
+
+/// Native llama.cpp implementation of the model-independent local runtime.
+#[cfg(feature = "llama-cpp")]
+pub use llama_cpp::LlamaCppRuntime;
 
 #[cfg(test)]
 mod tests {

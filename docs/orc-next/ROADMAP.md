@@ -8,7 +8,7 @@ Mapped the existing repository against the Controller/kernel target before chang
 
 Result: `M00-REPOSITORY-MAP.md` identifies deterministic kernel surfaces, judgment/policy migration targets, reusable `OrcApp` / `ProjectOperations` seams, Lead/Planner migration boundaries, and the minimal read-only Controller integration seam.
 
-## M01 — Native model runtime — CURRENT
+## M01 — Native model runtime — COMPLETE
 
 Integrate the local Controller inference boundary. Initial target: Qwen3 8B + llama.cpp/GGUF, while keeping model-specific details replaceable.
 
@@ -22,7 +22,12 @@ Exit criteria:
 - a real local smoke test is documented separately from normal deterministic tests;
 - no Python runtime dependency is introduced.
 
-## M02 — Read-only Controller
+Result: M01-002 received source review **PASS**. The opt-in
+`Qwen3-8B-Q4_K_M.gguf` smoke passed in `15.26s` (`1 passed; 0 failed`) through
+`LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU. Vulkan/GPU
+optimization remains a separate concern.
+
+## M02 — Read-only Controller — CURRENT
 
 Give the Controller bounded project/task/validation/review/agent state. It recommends next actions but cannot mutate state.
 

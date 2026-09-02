@@ -205,7 +205,7 @@ M01 should introduce only the runtime seam required by the Controller. Model-spe
 
 ## Concrete M01/M02 direction
 
-1. M01: add a native local-model runtime seam with Qwen3 8B/llama.cpp behind it. Do not connect it to lifecycle mutation.
+1. M01: add a native local-model runtime seam, then the feature-gated Qwen3 8B/llama.cpp adapter behind it. Do not connect it to lifecycle mutation.
 2. M02: add `ControllerStatePacket` + builder from existing read surfaces and obtain a structured read-only recommendation from the local model.
 3. Evaluate recommendations on known abnormal cases before granting typed mutation tools.
 

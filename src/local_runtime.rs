@@ -16,8 +16,24 @@ use thiserror::Error;
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 /// Maximum output budget accepted by one local inference request.
 pub const MAX_OUTPUT_TOKENS: u32 = 16 * 1024;
+/// Maximum serialized size of a structured-output JSON schema.
+pub const MAX_RESPONSE_SCHEMA_BYTES: usize = 16 * 1024;
 const MAX_STOP_SEQUENCES: usize = 32;
 const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
+
+/// Model-independent output contract requested from a local runtime.
+///
+/// The schema is data at this boundary. Runtime adapters decide how (or if)
+/// they can enforce it; no grammar, tokenizer or backend handle is exposed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LocalInferenceResponseFormat {
+    #[default]
+    Text,
+    JsonSchema {
+        schema: serde_json::Value,
+    },
+}
 
 /// Runtime-owned sampling and output controls.
 ///
@@ -31,6 +47,8 @@ pub struct LocalInferenceParameters {
     pub top_p: f32,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    #[serde(default)]
+    pub response_format: LocalInferenceResponseFormat,
 }
 
 impl Default for LocalInferenceParameters {
@@ -40,6 +58,7 @@ impl Default for LocalInferenceParameters {
             temperature: 0.2,
             top_p: 0.95,
             stop_sequences: Vec::new(),
+            response_format: LocalInferenceResponseFormat::Text,
         }
     }
 }
@@ -74,6 +93,23 @@ impl LocalInferenceParameters {
             return Err(LocalInferenceError::InvalidRequest(format!(
                 "stop sequences must be non-empty and at most {MAX_STOP_SEQUENCE_BYTES} bytes"
             )));
+        }
+        if let LocalInferenceResponseFormat::JsonSchema { schema } = &self.response_format {
+            if !schema.is_object() {
+                return Err(LocalInferenceError::InvalidRequest(
+                    "response schema must be a JSON object".into(),
+                ));
+            }
+            let schema_size = serde_json::to_vec(schema).map_err(|error| {
+                LocalInferenceError::InvalidRequest(format!(
+                    "response schema could not be serialized: {error}"
+                ))
+            })?;
+            if schema_size.len() > MAX_RESPONSE_SCHEMA_BYTES {
+                return Err(LocalInferenceError::InvalidRequest(format!(
+                    "response schema exceeds the {MAX_RESPONSE_SCHEMA_BYTES}-byte limit"
+                )));
+            }
         }
         Ok(())
     }
@@ -140,6 +176,8 @@ impl LocalInferenceResponse {
 }
 
 /// Runtime and request failures exposed to the future Controller boundary.
+/// Structured-output adapters use [`Self::InvalidStructuredOutput`] when the
+/// complete response does not satisfy the requested JSON contract.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum LocalInferenceError {
@@ -151,6 +189,11 @@ pub enum LocalInferenceError {
     ModelUnavailable(String),
     #[error("local inference backend failed: {0}")]
     Backend(String),
+    #[error("local inference produced invalid structured output: {parse_error}")]
+    InvalidStructuredOutput {
+        raw_output: String,
+        parse_error: String,
+    },
     #[error("local inference was cancelled")]
     Cancelled,
 }
@@ -305,6 +348,50 @@ mod tests {
         let oversized = "x".repeat(MAX_PROMPT_BYTES + 1);
         let error = LocalInferenceRequest::new(oversized, Default::default()).unwrap_err();
         assert!(matches!(error, LocalInferenceError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn structured_response_schema_is_generic_and_bounded() {
+        let parameters = LocalInferenceParameters {
+            response_format: LocalInferenceResponseFormat::JsonSchema {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}}
+                }),
+            },
+            ..Default::default()
+        };
+        let request = LocalInferenceRequest::new("prompt", parameters).unwrap();
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            serialized["parameters"]["response_format"]["kind"],
+            "json_schema"
+        );
+        assert!(serialized["parameters"]["response_format"]["schema"].is_object());
+
+        let invalid = LocalInferenceParameters {
+            response_format: LocalInferenceResponseFormat::JsonSchema {
+                schema: serde_json::json!("not an object"),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            LocalInferenceRequest::new("prompt", invalid),
+            Err(LocalInferenceError::InvalidRequest(_))
+        ));
+
+        let oversized = LocalInferenceParameters {
+            response_format: LocalInferenceResponseFormat::JsonSchema {
+                schema: serde_json::json!({
+                    "description": "x".repeat(MAX_RESPONSE_SCHEMA_BYTES)
+                }),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            LocalInferenceRequest::new("prompt", oversized),
+            Err(LocalInferenceError::InvalidRequest(_))
+        ));
     }
 
     #[test]

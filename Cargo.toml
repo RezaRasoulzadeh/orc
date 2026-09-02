@@ -22,7 +22,7 @@ dialoguer = "0.11"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = "0.29.0"
 encoding_rs = { version = "=0.8.35", optional = true }
-llama-cpp-2 = { version = "=0.1.155", default-features = false, optional = true }
+llama-cpp-2 = { version = "=0.1.155", default-features = false, features = ["common"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -5,12 +5,13 @@
 //! local-runtime request or response types.
 
 use super::{
-    LocalInferenceError, LocalInferenceRequest, LocalInferenceResponse, LocalInferenceRuntime,
-    LocalRuntimeConfig,
+    LocalInferenceError, LocalInferenceRequest, LocalInferenceResponse,
+    LocalInferenceResponseFormat, LocalInferenceRuntime, LocalRuntimeConfig,
 };
 use encoding_rs::UTF_8;
 use llama_cpp_2::{
     context::params::LlamaContextParams,
+    json_schema_to_grammar,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaModel, params::LlamaModelParams},
@@ -99,20 +100,52 @@ impl LlamaCppRuntime {
         Ok(params)
     }
 
-    fn sampler(request: &LocalInferenceRequest) -> LlamaSampler {
+    fn sampler(
+        &self,
+        request: &LocalInferenceRequest,
+    ) -> Result<LlamaSampler, LocalInferenceError> {
         let parameters = &request.parameters;
-        if parameters.temperature == 0.0 {
-            LlamaSampler::greedy()
-        } else {
-            LlamaSampler::chain_simple([
-                LlamaSampler::temp(parameters.temperature),
-                LlamaSampler::top_p(parameters.top_p, 1),
-                // A fixed seed keeps this boundary deterministic when callers
-                // choose the same request and model; seed policy can evolve
-                // without changing the model-independent API.
-                LlamaSampler::dist(0x0AC0_0001),
-            ])
+        let mut samplers = Vec::with_capacity(4);
+        if let LocalInferenceResponseFormat::JsonSchema { schema } = &parameters.response_format {
+            let schema_json = serde_json::to_string(schema).map_err(|error| {
+                LocalInferenceError::InvalidRequest(format!(
+                    "response schema could not be serialized: {error}"
+                ))
+            })?;
+            let grammar = json_schema_to_grammar(&schema_json).map_err(|error| {
+                LocalInferenceError::InvalidRequest(format!(
+                    "response schema could not be converted to a grammar: {error}"
+                ))
+            })?;
+            let grammar_sampler =
+                LlamaSampler::grammar(&self.model, &grammar, "root").map_err(|error| {
+                    LocalInferenceError::InvalidRequest(format!(
+                        "response grammar could not be initialized: {error}"
+                    ))
+                })?;
+            // Grammar runs before the final sampling operation so invalid
+            // tokens are masked regardless of temperature/top-p settings.
+            samplers.push(grammar_sampler);
         }
+        if parameters.temperature == 0.0 {
+            samplers.push(LlamaSampler::greedy());
+        } else {
+            samplers.push(LlamaSampler::temp(parameters.temperature));
+            samplers.push(LlamaSampler::top_p(parameters.top_p, 1));
+            // A fixed seed keeps this boundary deterministic when callers
+            // choose the same request and model; seed policy can evolve
+            // without changing the model-independent API.
+            samplers.push(LlamaSampler::dist(0x0AC0_0001));
+        }
+        Ok(LlamaSampler::chain_simple(samplers))
+    }
+
+    fn parse_structured_output(output: &str) -> Result<serde_json::Value, String> {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return Err("model output was empty".into());
+        }
+        serde_json::from_str(trimmed).map_err(|error| format!("invalid JSON: {error}"))
     }
 
     fn truncate_at_stop(output: &mut String, stop_sequences: &[String]) -> bool {
@@ -176,7 +209,7 @@ impl LocalInferenceRuntime for LlamaCppRuntime {
             LocalInferenceError::Backend(format!("llama.cpp prompt evaluation failed: {error}"))
         })?;
 
-        let mut sampler = Self::sampler(request);
+        let mut sampler = self.sampler(request)?;
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
         for index in 0..request.parameters.max_output_tokens {
@@ -193,7 +226,9 @@ impl LocalInferenceRuntime for LlamaCppRuntime {
                     ))
                 })?;
             output.push_str(&piece);
-            sampler.accept(token);
+            // `LlamaSampler::sample` already accepts the selected token in
+            // llama-cpp-2; accepting it again corrupts stateful samplers such
+            // as the native grammar sampler.
             if Self::truncate_at_stop(&mut output, &request.parameters.stop_sequences) {
                 break;
             }
@@ -219,7 +254,21 @@ impl LocalInferenceRuntime for LlamaCppRuntime {
             })?;
         }
 
-        Ok(LocalInferenceResponse::text(output))
+        let structured_output = match &request.parameters.response_format {
+            LocalInferenceResponseFormat::Text => None,
+            LocalInferenceResponseFormat::JsonSchema { .. } => Some(
+                Self::parse_structured_output(&output).map_err(|parse_error| {
+                    LocalInferenceError::InvalidStructuredOutput {
+                        raw_output: output.clone(),
+                        parse_error,
+                    }
+                })?,
+            ),
+        };
+        Ok(LocalInferenceResponse {
+            text: output,
+            structured_output,
+        })
     }
 }
 
@@ -264,5 +313,29 @@ mod tests {
             &["<stop>".to_owned(), "other".to_owned()]
         ));
         assert_eq!(output, "answer");
+    }
+
+    #[test]
+    fn strict_structured_parser_rejects_trailing_output() {
+        assert_eq!(
+            LlamaCppRuntime::parse_structured_output(r#"{"answer":"ok"}"#)
+                .expect("one JSON value should parse")["answer"],
+            "ok"
+        );
+        assert!(
+            LlamaCppRuntime::parse_structured_output(r#"{"answer":"ok"} trailing prose"#).is_err()
+        );
+        assert!(
+            LlamaCppRuntime::parse_structured_output(r#"{"answer":"ok"}{"repeat":true}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn native_json_schema_conversion_produces_root_grammar() {
+        let grammar = json_schema_to_grammar(
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
+        )
+        .expect("pinned llama.cpp should convert JSON schema");
+        assert!(grammar.contains("root ::="));
     }
 }

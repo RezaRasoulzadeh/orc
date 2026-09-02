@@ -8,6 +8,8 @@ Only current/near-term milestones are decomposed here.
 | [M01-001](M01-001.md) | Done | M01 | Introduce the model-independent local runtime boundary |
 | [M01-002](M01-002.md) | Done | M01 | Integrate llama.cpp behind the local runtime boundary |
 | [M02-001](M02-001.md) | Done | M02 | Build the read-only Controller state/recommendation path |
+| [M02-002](M02-002.md) | Done | M02 | Evaluate read-only Controller decision quality |
+| [M02-003](M02-003.md) | In progress | M02 | Enforce reliable structured Controller output |
 
 ## Task format
 

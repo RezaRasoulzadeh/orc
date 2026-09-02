@@ -8,7 +8,7 @@
 
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
-    LocalInferenceRuntime,
+    LocalInferenceResponseFormat, LocalInferenceRuntime,
 };
 use crate::operations::{
     BlockerState, EconomyResolutionSummary, ExecutionConditionSummary, ExecutionSummary,
@@ -39,6 +39,7 @@ const MAX_BLOCKERS: usize = 16;
 const MAX_EVIDENCE_PER_CRITERION: usize = 8;
 const MAX_RECOMMENDATION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_RECOMMENDATION_STRUCTURED_BYTES: usize = 16 * 1024;
+const MAX_RECOMMENDATION_RATIONALE_BYTES: usize = 1024;
 
 /// Failures at the read-only Controller boundary.
 #[derive(Debug, Error)]
@@ -651,34 +652,20 @@ impl ControllerRecommendation {
                 "response text exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
             )));
         }
-        let mut suggested_next_step = None;
-        let mut rationale = response.text.clone();
-        if let Some(value) = response.structured_output.as_ref() {
-            let size = serde_json::to_vec(value)
-                .map_err(|error| ControllerError::InvalidRecommendation(error.to_string()))?
-                .len();
-            if size > MAX_RECOMMENDATION_STRUCTURED_BYTES {
-                return Err(ControllerError::InvalidRecommendation(format!(
-                    "structured output exceeds the {MAX_RECOMMENDATION_STRUCTURED_BYTES}-byte limit"
-                )));
-            }
-            if let Some(object) = value.as_object() {
-                if let Some(step) = object.get("suggested_next_step") {
-                    suggested_next_step =
-                        Some(serde_json::from_value(step.clone()).map_err(|error| {
-                            ControllerError::InvalidRecommendation(format!(
-                                "suggested_next_step is invalid: {error}"
-                            ))
-                        })?);
-                }
-                if let Some(value) = object.get("rationale") {
-                    let value = value.as_str().ok_or_else(|| {
-                        ControllerError::InvalidRecommendation("rationale must be a string".into())
-                    })?;
-                    rationale = value.to_owned();
-                }
-            }
+        let value = response.structured_output.as_ref().ok_or_else(|| {
+            ControllerError::InvalidRecommendation(
+                "structured response is missing its JSON object".into(),
+            )
+        })?;
+        let size = serde_json::to_vec(value)
+            .map_err(|error| ControllerError::InvalidRecommendation(error.to_string()))?
+            .len();
+        if size > MAX_RECOMMENDATION_STRUCTURED_BYTES {
+            return Err(ControllerError::InvalidRecommendation(format!(
+                "structured output exceeds the {MAX_RECOMMENDATION_STRUCTURED_BYTES}-byte limit"
+            )));
         }
+        let (suggested_next_step, rationale) = validate_recommendation_value(value)?;
         if rationale.len() > MAX_RECOMMENDATION_TEXT_BYTES {
             return Err(ControllerError::InvalidRecommendation(format!(
                 "rationale exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
@@ -697,6 +684,115 @@ impl ControllerRecommendation {
             structured_output: response.structured_output,
         })
     }
+}
+
+fn validate_recommendation_value(
+    value: &Value,
+) -> Result<(Option<OperationalNextStep>, String), ControllerError> {
+    let object = value.as_object().ok_or_else(|| {
+        ControllerError::InvalidRecommendation("structured response must be a JSON object".into())
+    })?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "suggested_next_step" | "decision_class" | "rationale" | "confidence"
+        ) {
+            return Err(ControllerError::InvalidRecommendation(format!(
+                "structured response contains unsupported field `{key}`"
+            )));
+        }
+    }
+    let step_value = object.get("suggested_next_step").ok_or_else(|| {
+        ControllerError::InvalidRecommendation("suggested_next_step is required".into())
+    })?;
+    let suggested_next_step = if step_value.is_null() {
+        None
+    } else {
+        Some(serde_json::from_value(step_value.clone()).map_err(|error| {
+            ControllerError::InvalidRecommendation(format!(
+                "suggested_next_step is invalid: {error}"
+            ))
+        })?)
+    };
+    let decision_class = object
+        .get("decision_class")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ControllerError::InvalidRecommendation(
+                "decision_class must be `action` or `operator_decision`".into(),
+            )
+        })?;
+    match decision_class {
+        "action" if suggested_next_step.is_some() => {}
+        "operator_decision" if suggested_next_step.is_none() => {}
+        "action" => {
+            return Err(ControllerError::InvalidRecommendation(
+                "action recommendations require suggested_next_step".into(),
+            ));
+        }
+        "operator_decision" => {
+            return Err(ControllerError::InvalidRecommendation(
+                "operator_decision recommendations require a null suggested_next_step".into(),
+            ));
+        }
+        _ => {
+            return Err(ControllerError::InvalidRecommendation(
+                "decision_class must be `action` or `operator_decision`".into(),
+            ));
+        }
+    }
+    let rationale = object
+        .get("rationale")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ControllerError::InvalidRecommendation("rationale must be a string".into())
+        })?;
+    if rationale.is_empty() || rationale.len() > MAX_RECOMMENDATION_RATIONALE_BYTES {
+        return Err(ControllerError::InvalidRecommendation(format!(
+            "rationale must be non-empty and at most {MAX_RECOMMENDATION_RATIONALE_BYTES} bytes"
+        )));
+    }
+    if let Some(confidence) = object.get("confidence") {
+        let confidence = confidence.as_f64().ok_or_else(|| {
+            ControllerError::InvalidRecommendation("confidence must be a number from 0 to 1".into())
+        })?;
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(ControllerError::InvalidRecommendation(
+                "confidence must be a number from 0 to 1".into(),
+            ));
+        }
+    }
+    Ok((suggested_next_step, rationale.to_owned()))
+}
+
+/// The model-independent JSON contract requested for Controller advice.
+///
+/// The local runtime adapter may translate this schema into a native grammar,
+/// but Controller types never depend on that representation.
+fn recommendation_response_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "suggested_next_step": {
+                "anyOf": [
+                    {"type": "string", "enum": [
+                        "dispatch", "wait_for_execution", "run_semantic_review",
+                        "revise", "accept", "resolve_blocker", "satisfy_dependencies",
+                        "configure_eligible_agent", "none"
+                    ]},
+                    {"type": "null"}
+                ]
+            },
+            "decision_class": {
+                "type": "string",
+                "enum": ["action", "operator_decision"]
+            },
+            "rationale": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "required": ["suggested_next_step", "decision_class", "rationale"],
+        "additionalProperties": false
+    })
 }
 
 /// Builds bounded Controller state and obtains advisory recommendations.
@@ -743,15 +839,36 @@ impl ControllerStateBuilder {
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerRecommendation, ControllerError> {
         let packet = self.build(operations, task_id)?;
+        self.recommend_packet(&packet, runtime)
+    }
+
+    /// Obtain an advisory recommendation from an already-built packet.
+    ///
+    /// This packet-level entry point lets deterministic evaluation and later
+    /// read-only callers reuse the exact recommendation path without gaining
+    /// access to `OrcApp`, storage or lifecycle mutation.
+    pub fn recommend_packet(
+        &self,
+        packet: &ControllerStatePacket,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerRecommendation, ControllerError> {
+        packet.validate()?;
+        let task_id = &packet.task.summary.task_id;
         let packet_json = serde_json::to_string(&packet)
             .map_err(|error| ControllerError::Serialization(error.to_string()))?;
         let prompt = format!(
-            "Return a concise advisory recommendation for the selected Orc task.\n\
+            "Return exactly one JSON object with `suggested_next_step` (a canonical next-step value or null), `decision_class` (action or operator_decision), and a short `rationale`; optionally include numeric `confidence` from 0 to 1. Do not include prose before or after the object.\n\
 Do not claim to have executed an action. Use the canonical state below:\n\n\
 {packet_json}"
         );
-        let request = LocalInferenceRequest::new(prompt, LocalInferenceParameters::default())
-            .map_err(ControllerError::Inference)?;
+        let parameters = LocalInferenceParameters {
+            response_format: LocalInferenceResponseFormat::JsonSchema {
+                schema: recommendation_response_schema(),
+            },
+            ..Default::default()
+        };
+        let request =
+            LocalInferenceRequest::new(prompt, parameters).map_err(ControllerError::Inference)?;
         let response = runtime
             .infer(&request)
             .map_err(ControllerError::Inference)?;
@@ -967,6 +1084,7 @@ mod tests {
             text: "Inspect the task before dispatch.".into(),
             structured_output: Some(serde_json::json!({
                 "suggested_next_step": "dispatch",
+                "decision_class": "action",
                 "rationale": "The task is ready for an eligible worker."
             })),
         };
@@ -987,6 +1105,10 @@ mod tests {
         assert_eq!(runtime.requests.len(), 1);
         assert!(runtime.requests[0].prompt.contains("recommend"));
         assert!(!runtime.requests[0].prompt.contains("llama"));
+        assert!(matches!(
+            runtime.requests[0].parameters.response_format,
+            LocalInferenceResponseFormat::JsonSchema { .. }
+        ));
         let after = operations
             .task_detail(&task_id)
             .expect("task detail after")
@@ -1005,6 +1127,28 @@ mod tests {
             ControllerStateBuilder::new().recommend(&operations, &task_id, &mut runtime),
             Err(ControllerError::Inference(LocalInferenceError::Backend(message)))
                 if message == "fake failure"
+        ));
+    }
+
+    #[test]
+    fn recommendation_rejects_unknown_structured_fields() {
+        let (directory, database, task_id) = project_with_task("invalid-structured");
+        let operations = ProjectOperations::new(&database, directory.path());
+        let response = LocalInferenceResponse::structured(
+            "unused",
+            serde_json::json!({
+                "suggested_next_step": "dispatch",
+                "decision_class": "action",
+                "rationale": "The task is ready.",
+                "unexpected": true
+            }),
+        );
+        let mut runtime = FakeRuntime::responding(response);
+
+        assert!(matches!(
+            ControllerStateBuilder::new().recommend(&operations, &task_id, &mut runtime),
+            Err(ControllerError::InvalidRecommendation(message))
+                if message.contains("unsupported field")
         ));
     }
 

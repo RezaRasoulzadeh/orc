@@ -520,6 +520,20 @@ impl OrcApp {
         }
     }
 
+    /// Shared trusted canonical revision seam for M03 normal actions and M04
+    /// recovery. Recovery keeps its own intent and authorization boundary;
+    /// revision lifecycle logic remains centralized here.
+    pub(crate) fn execute_canonical_revision(
+        &self,
+        task_id: &str,
+        context: ControllerActionExecutionContext<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        let intent = ControllerActionIntent::Revise {
+            task_id: task_id.to_owned(),
+        };
+        self.execute_controller_action_canonically(&intent, context)
+    }
+
     fn controller_execution_evidence(
         &self,
         task_id: &str,

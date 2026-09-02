@@ -28,6 +28,7 @@ pub mod queue;
 pub mod read_model;
 pub mod recovery;
 pub mod recovery_controller;
+pub mod recovery_execution;
 pub mod registry;
 pub mod review;
 pub mod runtime;

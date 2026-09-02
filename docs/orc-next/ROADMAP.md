@@ -27,19 +27,21 @@ Result: M01-002 received source review **PASS**. The opt-in
 `LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU. Vulkan/GPU
 optimization remains a separate concern.
 
-## M02 — Read-only Controller — CURRENT
+## M02 — Read-only Controller — COMPLETE
 
 Give the Controller bounded project/task/validation/review/agent state. It recommends next actions but cannot mutate state.
 
-## M03 — Typed Controller tools
+## M03 — Typed Controller tools — COMPLETE
 
 Expose a small high-level tool/action surface over canonical Orc APIs. Kernel validates every intent.
 
-## M04 — Recovery intelligence
+## M04 — Recovery intelligence — COMPLETE
 
 Move retry, validation-failure response, unusual recovery and escalation judgment into Controller reasoning. Remove superseded rigid policy rather than layering intelligence on top of it.
 
-## M05 — Planning and Lead unification
+Result: bounded recovery observation/legality, read-only Controller recovery choice, one-shot supervised authorization/execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are complete. Deterministic validation/review/revision/economy facts remain kernel-owned; migrated post-failure recovery choices no longer automatically invoke economy escalation.
+
+## M05 — Planning and Lead unification — CURRENT
 
 Move planning and Lead-like judgment into Controller. Preserve useful Plan/approval data while simplifying obsolete role/handoff machinery.
 

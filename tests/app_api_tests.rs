@@ -612,8 +612,10 @@ fn pending_plan_run_invokes_once_persists_lineage_and_is_visible_after_reopen() 
     assert_eq!(result.lead_decision_id, decision);
     let reopened = Database::open(&db_path).unwrap();
     let plan = reopened.get_plan(result.plan_id).unwrap().unwrap();
-    assert_eq!(plan.source_lead_decision_id, decision);
-    assert_eq!(plan.source_planner_run_id, result.planner_run_id);
+    assert_eq!(
+        plan.provenance,
+        orc::storage::db::PlanProvenance::legacy(decision, result.planner_run_id)
+    );
     assert!(reopened.pending_lead_decision(project).unwrap().is_none());
     assert_eq!(reopened.list_tasks().unwrap().len(), 0);
 }

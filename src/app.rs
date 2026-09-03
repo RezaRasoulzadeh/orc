@@ -369,8 +369,8 @@ impl OrcApp {
             .get_plan(plan_id)?
             .ok_or_else(|| anyhow::anyhow!("plan {plan_id} not found"))?;
         let project_id = self.lead().project_id()?;
-        if !self.db.is_current_valid_planner_plan(project_id, &plan)? {
-            anyhow::bail!("plan {plan_id} is not the current valid Planner plan");
+        if !self.db.is_current_valid_plan(project_id, &plan)? {
+            anyhow::bail!("plan {plan_id} is not the current valid plan");
         }
         let resolution = user_resolution
             .map(|value| format!(" Persisted user response to your prior question: {value}."))

@@ -15,14 +15,82 @@ pub struct LeadDecisionMetadata<'a> {
     pub summary: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanOrigin {
+    LegacyPlanner,
+    Controller,
+}
+
+impl PlanOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyPlanner => "legacy_planner",
+            Self::Controller => "controller",
+        }
+    }
+
+    fn parse(value: String) -> rusqlite::Result<Self> {
+        match value.as_str() {
+            "legacy_planner" => Ok(Self::LegacyPlanner),
+            "controller" => Ok(Self::Controller),
+            _ => Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid plan origin: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanProvenance {
+    pub origin: PlanOrigin,
+    pub source_lead_decision_id: Option<i64>,
+    pub source_planner_run_id: Option<i64>,
+}
+
+impl PlanProvenance {
+    pub fn legacy(source_lead_decision_id: i64, source_planner_run_id: i64) -> Self {
+        Self {
+            origin: PlanOrigin::LegacyPlanner,
+            source_lead_decision_id: Some(source_lead_decision_id),
+            source_planner_run_id: Some(source_planner_run_id),
+        }
+    }
+
+    pub const fn controller() -> Self {
+        Self {
+            origin: PlanOrigin::Controller,
+            source_lead_decision_id: None,
+            source_planner_run_id: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), DbError> {
+        let valid = match self.origin {
+            PlanOrigin::LegacyPlanner => {
+                self.source_lead_decision_id.is_some() && self.source_planner_run_id.is_some()
+            }
+            PlanOrigin::Controller => {
+                self.source_lead_decision_id.is_none() && self.source_planner_run_id.is_none()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(DbError::Scheduler(
+                "plan provenance does not match its origin".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedPlan {
     pub id: i64,
     pub project_id: i64,
     pub version: i64,
     pub parent_plan_id: Option<i64>,
-    pub source_lead_decision_id: i64,
-    pub source_planner_run_id: i64,
+    pub provenance: PlanProvenance,
     pub status: PlanStatus,
     pub response: crate::protocol::PlanResponse,
     pub created_at: String,
@@ -33,6 +101,7 @@ pub struct PersistedPlan {
 pub struct PlanHistoryEntry {
     pub plan_id: i64,
     pub version: i64,
+    pub provenance: PlanProvenance,
     pub status: PlanStatus,
     pub created_at: String,
 }
@@ -178,6 +247,34 @@ impl PlanStatus {
             ))),
         }
     }
+}
+
+fn decode_persisted_plan(row: &Row<'_>) -> rusqlite::Result<PersistedPlan> {
+    let provenance = PlanProvenance {
+        origin: PlanOrigin::parse(row.get(4)?)?,
+        source_lead_decision_id: row.get(5)?,
+        source_planner_run_id: row.get(6)?,
+    };
+    if let Err(error) = provenance.validate() {
+        return Err(rusqlite::Error::InvalidParameterName(error.to_string()));
+    }
+    Ok(PersistedPlan {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        version: row.get(2)?,
+        parent_plan_id: row.get(3)?,
+        provenance,
+        status: PlanStatus::parse(row.get(7)?)?,
+        response: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: row.get(9)?,
+        superseded_by_plan_id: row.get(10)?,
+    })
 }
 
 fn priority_string(priority: TaskPriority) -> &'static str {
@@ -1236,33 +1333,61 @@ impl Database {
         source_planner_run_id: i64,
         response: &crate::protocol::PlanResponse,
     ) -> Result<i64, DbError> {
+        self.store_plan_with_provenance(
+            project_id,
+            PlanProvenance::legacy(source_lead_decision_id, source_planner_run_id),
+            response,
+        )
+    }
+
+    /// Persist a Controller-origin proposal without inventing or consuming
+    /// legacy Lead/Planner provenance. This is a canonical storage seam for a
+    /// later trusted Controller persistence task; it does not create tasks,
+    /// approve the plan, or invoke review.
+    pub fn store_controller_plan(
+        &self,
+        project_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<i64, DbError> {
+        self.store_plan_with_provenance(project_id, PlanProvenance::controller(), response)
+    }
+
+    fn store_plan_with_provenance(
+        &self,
+        project_id: i64,
+        provenance: PlanProvenance,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<i64, DbError> {
         response
             .validate()
             .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
+        provenance.validate()?;
         let transaction = self.conn.unchecked_transaction()?;
-        let lead_project: Option<i64> = transaction
-            .query_row(
-                "SELECT project_id FROM lead_decisions WHERE id = ?1 AND kind = 'PLAN_REQUIRED'",
-                [source_lead_decision_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if lead_project != Some(project_id) {
-            return Err(DbError::Scheduler(
-                "invalid source Lead decision linkage".into(),
-            ));
-        }
-        let run_project: Option<i64> = transaction
-            .query_row(
-                "SELECT project_id FROM agent_runs WHERE id = ?1 AND execution_class = 'plan'",
-                [source_planner_run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if run_project != Some(project_id) {
-            return Err(DbError::Scheduler(
-                "invalid source Planner run linkage".into(),
-            ));
+        if provenance.origin == PlanOrigin::LegacyPlanner {
+            let lead_project: Option<i64> = transaction
+                .query_row(
+                    "SELECT project_id FROM lead_decisions WHERE id = ?1 AND kind = 'PLAN_REQUIRED'",
+                    [provenance.source_lead_decision_id.unwrap()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if lead_project != Some(project_id) {
+                return Err(DbError::Scheduler(
+                    "invalid source Lead decision linkage".into(),
+                ));
+            }
+            let run_project: Option<i64> = transaction
+                .query_row(
+                    "SELECT project_id FROM agent_runs WHERE id = ?1 AND execution_class = 'plan'",
+                    [provenance.source_planner_run_id.unwrap()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if run_project != Some(project_id) {
+                return Err(DbError::Scheduler(
+                    "invalid source Planner run linkage".into(),
+                ));
+            }
         }
         let (parent_plan_id, version): (Option<i64>, i64) = transaction.query_row(
             "SELECT id, version FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
@@ -1271,8 +1396,8 @@ impl Database {
         ).optional()?.unwrap_or((None, 1));
         let canonical = serde_json::to_string(response)?;
         transaction.execute(
-            "INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
+            "INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![project_id, version, parent_plan_id, provenance.origin.as_str(), provenance.source_lead_decision_id, provenance.source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
         )?;
         let id = transaction.last_insert_rowid();
         if let Some(parent_plan_id) = parent_plan_id {
@@ -1331,7 +1456,7 @@ impl Database {
             "SELECT id, version FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id],
             |row| Ok((Some(row.get(0)?), row.get::<_, i64>(1)? + 1))).optional()?.unwrap_or((None, 1));
         let canonical = serde_json::to_string(response)?;
-        transaction.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical])?;
+        transaction.execute("INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, 'legacy_planner', ?4, ?5, ?6, ?7)", params![project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, PlanStatus::Proposed.as_str(), canonical])?;
         let id = transaction.last_insert_rowid();
         if let Some(parent_plan_id) = parent_plan_id {
             transaction.execute(
@@ -1356,15 +1481,15 @@ impl Database {
 
     pub fn get_plan(&self, id: i64) -> Result<Option<PersistedPlan>, DbError> {
         Ok(self.conn.query_row(
-            "SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
+            "SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
             [id],
-            |row| Ok(PersistedPlan { id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, parent_plan_id: row.get(3)?, source_lead_decision_id: row.get(4)?, source_planner_run_id: row.get(5)?, status: PlanStatus::parse(row.get(6)?)?, response: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?, created_at: row.get(8)?, superseded_by_plan_id: row.get(9)? }))
-        .optional()?)
+            decode_persisted_plan,
+        ).optional()?)
     }
 
     /// Checks that a plan is the project's current, actionable Planner output.
     /// This is deliberately performed before any Lead run is created.
-    pub fn is_current_valid_planner_plan(
+    pub fn is_current_valid_plan(
         &self,
         project_id: i64,
         plan: &PersistedPlan,
@@ -1386,6 +1511,18 @@ impl Database {
         if current != Some(plan.id) {
             return Ok(false);
         }
+        let Some(persisted) = self.get_plan(plan.id)? else {
+            return Ok(false);
+        };
+        if persisted.project_id != project_id
+            || persisted.status != plan.status
+            || persisted.provenance != plan.provenance
+        {
+            return Ok(false);
+        }
+        if plan.provenance.origin == PlanOrigin::Controller {
+            return Ok(plan.provenance == PlanProvenance::controller());
+        }
         let valid: Option<i64> = self
             .conn
             .query_row(
@@ -1404,15 +1541,30 @@ impl Database {
         Ok(valid == Some(plan.id))
     }
 
+    /// Compatibility name for callers that specifically consume the legacy
+    /// Planner workflow. Validation itself is origin-aware.
+    pub fn is_current_valid_planner_plan(
+        &self,
+        project_id: i64,
+        plan: &PersistedPlan,
+    ) -> Result<bool, DbError> {
+        self.is_current_valid_plan(project_id, plan)
+    }
+
     pub fn list_plan_history(&self, project_id: i64) -> Result<Vec<PlanHistoryEntry>, DbError> {
-        let mut statement = self.conn.prepare("SELECT id, version, status, created_at FROM plans WHERE project_id = ?1 ORDER BY version, id")?;
+        let mut statement = self.conn.prepare("SELECT id, version, origin, source_lead_decision_id, source_planner_run_id, status, created_at FROM plans WHERE project_id = ?1 ORDER BY version, id")?;
         Ok(statement
             .query_map([project_id], |row| {
                 Ok(PlanHistoryEntry {
                     plan_id: row.get(0)?,
                     version: row.get(1)?,
-                    status: PlanStatus::parse(row.get(2)?)?,
-                    created_at: row.get(3)?,
+                    provenance: PlanProvenance {
+                        origin: PlanOrigin::parse(row.get(2)?)?,
+                        source_lead_decision_id: row.get(3)?,
+                        source_planner_run_id: row.get(4)?,
+                    },
+                    status: PlanStatus::parse(row.get(5)?)?,
+                    created_at: row.get(6)?,
                 })
             })?
             .collect::<Result<_, _>>()?)
@@ -1712,7 +1864,7 @@ impl Database {
     ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let plan = self.conn.query_row("SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE project_id=?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id], |r| Ok(PersistedPlan { id:r.get(0)?, project_id:r.get(1)?, version:r.get(2)?, parent_plan_id:r.get(3)?, source_lead_decision_id:r.get(4)?, source_planner_run_id:r.get(5)?, status:PlanStatus::parse(r.get(6)?)?, response:serde_json::from_str(&r.get::<_,String>(7)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?, created_at:r.get(8)?, superseded_by_plan_id:r.get(9)? })).optional()?.ok_or_else(|| DbError::Scheduler("no Planner plan found".into()))?;
+            let plan = self.conn.query_row("SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE project_id=?1 ORDER BY version DESC, id DESC LIMIT 1", [project_id], decode_persisted_plan).optional()?.ok_or_else(|| DbError::Scheduler("no Planner plan found".into()))?;
             if plan.status != PlanStatus::Approved {
                 return Err(DbError::Scheduler(
                     "current Planner plan is not approved".into(),
@@ -1889,12 +2041,14 @@ impl Database {
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 version INTEGER NOT NULL,
                 parent_plan_id INTEGER REFERENCES plans(id),
-                source_lead_decision_id INTEGER NOT NULL,
-                source_planner_run_id INTEGER NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')),
+                source_lead_decision_id INTEGER REFERENCES lead_decisions(id),
+                source_planner_run_id INTEGER REFERENCES agent_runs(id),
                 status TEXT NOT NULL DEFAULT 'proposed',
                 response TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 superseded_by_plan_id INTEGER REFERENCES plans(id),
+                CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL)),
                 UNIQUE(project_id, version)
             );
             CREATE TABLE IF NOT EXISTS plan_dependencies (
@@ -4731,7 +4885,7 @@ impl Database {
 
     fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), source_lead_decision_id INTEGER NOT NULL, source_planner_run_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id)); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id));",
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')), source_lead_decision_id INTEGER REFERENCES lead_decisions(id), source_planner_run_id INTEGER REFERENCES agent_runs(id), status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id), CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id));",
         )?;
         for (table, column, definition) in [
             (
@@ -4760,6 +4914,40 @@ impl Database {
                     [],
                 )?;
             }
+        }
+        let has_origin: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plans') WHERE name='origin'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_origin == 0 {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let migration = conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE plans_new (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    parent_plan_id INTEGER REFERENCES plans_new(id),
+                    origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')),
+                    source_lead_decision_id INTEGER REFERENCES lead_decisions(id),
+                    source_planner_run_id INTEGER REFERENCES agent_runs(id),
+                    status TEXT NOT NULL DEFAULT 'proposed',
+                    response TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    superseded_by_plan_id INTEGER REFERENCES plans_new(id),
+                    UNIQUE(project_id, version),
+                    CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))
+                 );
+                 INSERT INTO plans_new (id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id)
+                    SELECT id, project_id, version, parent_plan_id, 'legacy_planner', source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans;
+                 DROP TABLE plans;
+                 ALTER TABLE plans_new RENAME TO plans;
+                 CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version);
+                 COMMIT;",
+            );
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
         }
         Ok(())
     }
@@ -4843,7 +5031,7 @@ impl Database {
             "UPDATE plans SET status = 'revision_requested' WHERE id = ?1 AND status = 'proposed'",
             [parent_id],
         )?;
-        tx.execute("INSERT INTO plans (project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,'proposed',?6)", params![project_id, parent_version + 1, parent_id, decision_id, planner_run_id, serde_json::to_string(response)?])?;
+        tx.execute("INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,'legacy_planner',?4,?5,'proposed',?6)", params![project_id, parent_version + 1, parent_id, decision_id, planner_run_id, serde_json::to_string(response)?])?;
         let id = tx.last_insert_rowid();
         tx.execute(
             "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND superseded_by_plan_id IS NULL",

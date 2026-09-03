@@ -6,7 +6,7 @@ use orc::storage::db::LeadDecisionMetadata;
 use orc::storage::{AgentRunExecution, Database, WorkerResult};
 use orc::task::TaskScopeMode;
 use orc::task::{TaskPriority, TaskStatus};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tempfile::tempdir;
 
 fn plan_response() -> PlanResponse {
@@ -142,8 +142,10 @@ fn plan_persistence_round_trip_lineage_and_atomic_provenance_validation() {
         response
     );
     let reopened = db.get_plan(history[1].plan_id).unwrap().unwrap();
-    assert_eq!(reopened.source_lead_decision_id, decision);
-    assert_eq!(reopened.source_planner_run_id, run);
+    assert_eq!(
+        reopened.provenance,
+        orc::storage::db::PlanProvenance::legacy(decision, run)
+    );
     assert_eq!(db.list_tasks().unwrap(), task_snapshot);
     let repository_after = std::fs::read(&repository_file).unwrap();
     assert_eq!(repository_after, repository_snapshot);
@@ -1128,4 +1130,170 @@ fn exact_resolution_is_persisted_once_and_survives_reopen() {
     assert_eq!(records[0].source, "operator_override");
     assert_eq!(records[0].tier, EconomyTier::Default);
     assert_eq!(records[0].selected_model.as_deref(), Some("small-model"));
+}
+
+#[test]
+fn controller_origin_plan_is_proposed_without_legacy_lineage_or_tasks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let db = Database::init(&path).unwrap();
+    let project = db.create_project("controller plan").unwrap();
+    let pending_decision = db
+        .record_lead_decision(
+            project,
+            &LeadDecisionKind::PlanRequired,
+            &serde_json::json!({"plan": "still pending"}),
+            LeadDecisionMetadata {
+                snapshot: "snapshot",
+                run_id: None,
+                source_request: "request",
+                summary: "summary",
+            },
+        )
+        .unwrap();
+    let response = plan_response();
+
+    let plan_id = db.store_controller_plan(project, &response).unwrap();
+    let plan = db.get_plan(plan_id).unwrap().unwrap();
+    assert_eq!(
+        plan.provenance,
+        orc::storage::db::PlanProvenance::controller()
+    );
+    assert_eq!(plan.status, orc::storage::db::PlanStatus::Proposed);
+    assert_eq!(plan.version, 1);
+    assert_eq!(plan.parent_plan_id, None);
+    assert!(db.is_current_valid_plan(project, &plan).unwrap());
+    assert_eq!(
+        db.pending_lead_decision(project).unwrap().unwrap().id,
+        pending_decision
+    );
+    assert!(db.list_tasks().unwrap().is_empty());
+    assert_eq!(
+        db.list_plan_history(project).unwrap()[0].provenance,
+        orc::storage::db::PlanProvenance::controller()
+    );
+
+    let connection = Connection::open(&path).unwrap();
+    let row = connection
+        .query_row(
+            "SELECT origin, source_lead_decision_id, source_planner_run_id FROM plans WHERE id = ?1",
+            [plan_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("controller".into(), None, None));
+}
+
+#[test]
+fn legacy_plan_schema_migrates_and_reopens_with_truthful_lineage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let (project, decision, run, plan_id) = {
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("legacy migration").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "existing",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let decision = db
+            .record_lead_decision(
+                project,
+                &LeadDecisionKind::PlanRequired,
+                &serde_json::json!({"plan": "needed"}),
+                LeadDecisionMetadata {
+                    snapshot: "snapshot",
+                    run_id: None,
+                    source_request: "request",
+                    summary: "summary",
+                },
+            )
+            .unwrap();
+        let run = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "planner",
+                AUTOMATED,
+                AgentRunExecution {
+                    class: "plan",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        let plan_id = db
+            .store_plan(project, decision, run, &plan_response())
+            .unwrap();
+        (project, decision, run, plan_id)
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE plans_legacy (
+                 id INTEGER PRIMARY KEY,
+                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 version INTEGER NOT NULL,
+                 parent_plan_id INTEGER REFERENCES plans(id),
+                 source_lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id),
+                 source_planner_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+                 status TEXT NOT NULL DEFAULT 'proposed',
+                 response TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                 superseded_by_plan_id INTEGER REFERENCES plans(id)
+             );
+             INSERT INTO plans_legacy (id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id)
+                 SELECT id, project_id, version, parent_plan_id, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans;
+             UPDATE lead_decisions SET status='consumed' WHERE id=(SELECT source_lead_decision_id FROM plans_legacy LIMIT 1);
+             UPDATE agent_runs SET status='completed' WHERE id=(SELECT source_planner_run_id FROM plans_legacy LIMIT 1);
+             DROP TABLE plans;
+             ALTER TABLE plans_legacy RENAME TO plans;
+             CREATE UNIQUE INDEX plans_project_version ON plans(project_id, version);
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Database::open(&path).unwrap();
+    let plan = reopened.get_plan(plan_id).unwrap().unwrap();
+    assert_eq!(
+        plan.provenance,
+        orc::storage::db::PlanProvenance::legacy(decision, run)
+    );
+    assert!(reopened.is_current_valid_plan(project, &plan).unwrap());
+    assert_eq!(reopened.list_plan_dependencies(plan_id).unwrap().len(), 1);
+    let history = reopened.list_plan_history(project).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].provenance, plan.provenance);
+    let second_reopen = Database::open(&path).unwrap();
+    assert_eq!(
+        second_reopen.get_plan(plan_id).unwrap().unwrap().provenance,
+        orc::storage::db::PlanProvenance::legacy(decision, run)
+    );
+    let connection = Connection::open(&path).unwrap();
+    let origin: String = connection
+        .query_row("SELECT origin FROM plans WHERE id = ?1", [plan_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(origin, "legacy_planner");
+    let foreign_keys: i64 = connection
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(0))
+        .optional()
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(foreign_keys, 0);
 }

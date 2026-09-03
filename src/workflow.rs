@@ -1115,7 +1115,8 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             .rev()
         {
             if let Some(plan) = self.app.database().get_plan(entry.plan_id)?
-                && plan.source_planner_run_id == run.id
+                && plan.provenance.origin == crate::storage::db::PlanOrigin::LegacyPlanner
+                && plan.provenance.source_planner_run_id == Some(run.id)
             {
                 recovered_plan = Some(plan);
                 break;

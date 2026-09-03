@@ -4,9 +4,9 @@
 
 **Current milestone:** M05 — Planning and Lead unification
 
-**Current task:** M05-004 — Add read-only Controller Plan review judgment
+**Current task:** M05-005 — Persist Controller Plan review decisions through explicit authorization
 
-**Last completed:** M05-003 — Persist Controller Plan proposals through explicit authorization
+**Last completed:** M05-004 — Add read-only Controller Plan review judgment
 
 **Blocked by:** Nothing
 
@@ -22,9 +22,10 @@
 - M04 is complete: bounded recovery facts/legality, Controller recovery choice, supervised recovery execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are in place.
 - M05-001 is complete: bounded read-only Controller planning returns a validated typed plan proposal through `LocalInferenceRuntime`; real Qwen strict-contract evaluation passed.
 - M05-002 is complete: persisted Plan provenance distinguishes legacy Planner and Controller origins without fabricated lineage.
-- M05-003 is complete: validated Controller Plan proposals can be persisted as Controller-origin `Proposed` Plans only through trusted one-shot authorization, fresh deterministic validation, and the canonical storage seam.
-- Existing Plan review still performs semantic judgment through the legacy Lead backend, then persists a Lead decision and `PlanReview` through canonical storage/status transitions.
-- M05-004 migrates only that semantic review judgment to a bounded read-only Controller capability. Review persistence/status transitions remain unchanged until a later task.
+- M05-003 is complete: validated Controller Plan proposals persist as Controller-origin `Proposed` Plans only through trusted one-shot authorization and fresh deterministic validation.
+- M05-004 is complete: Plan review semantic judgment can run through the local Controller as a bounded read-only three-way decision; Qwen strict and semantic evaluation passed 3/3.
+- Durable Plan review persistence/status transitions still use the legacy Lead-lineage schema and canonical `Database::record_plan_review` path.
+- M05-005 makes durable Plan review provenance Controller-compatible and connects validated Controller review decisions through trusted one-shot authorization, while preserving deterministic status semantics and legacy compatibility.
 - Deterministic validation, lifecycle legality, authorization, persistence, review/application state, and mutation remain kernel-owned.
 - Existing Lead/Planner compatibility machinery remains until later M05 tasks migrate its judgment/routing safely.
 - Memory is explicit Orc data, separate from model weights.
@@ -33,6 +34,6 @@
 
 ## Immediate next action
 
-Implement `tasks/M05-004.md`: add bounded read-only Controller Plan review judgment for approve/revise/operator-decision outcomes. Reject missing/non-current Plans before inference and create no Lead decision, PlanReview, Plan status change, task, workflow transition, approval/application, or revision execution.
+Implement `tasks/M05-005.md`: persist a validated Controller Plan review decision through truthful Controller review provenance, trusted one-shot authorization, a fresh current-valid-plan check, and canonical deterministic Plan status transitions. Do not fabricate Lead lineage, generate revisions, apply Plans, create tasks, or continue workflows.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and Lead/Planner migration map.

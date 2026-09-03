@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fs;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -9,9 +10,9 @@ use orc::storage::Database;
 use orc::storage::db::AgentRunExecution;
 use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
 use orc::workflow::{
-    AcceptancePolicy, AppWorkflowActions, LeadOutcome, PlanOutcome, PlanReviewOutcome,
-    ProviderOutcome, ReviewOutcome, WorkflowActions, WorkflowEngine, WorkflowPolicy, WorkflowStage,
-    WorkflowStatus,
+    AcceptancePolicy, AppWorkflowActions, ControllerPlanOutcome, ControllerPlanReviewDecision,
+    ControllerPlanReviewOutcome, LeadOutcome, PlanOutcome, PlanReviewOutcome, ProviderOutcome,
+    ReviewOutcome, WorkflowActions, WorkflowEngine, WorkflowPolicy, WorkflowStage, WorkflowStatus,
 };
 use tempfile::TempDir;
 
@@ -49,6 +50,13 @@ struct FakeActions<'a> {
     dispatch_error: Option<&'static str>,
     leave_dispatch_active: bool,
     scheduling_block: Option<&'static str>,
+    controller_plan_calls: Mutex<usize>,
+    controller_revision_calls: Mutex<usize>,
+    controller_review_calls: Mutex<usize>,
+    controller_plan_persisted: Mutex<bool>,
+    controller_revision_persisted: Mutex<bool>,
+    controller_review_persisted: Mutex<bool>,
+    controller_review_plan_id: Mutex<Option<i64>>,
 }
 
 impl<'a> FakeActions<'a> {
@@ -67,6 +75,13 @@ impl<'a> FakeActions<'a> {
             dispatch_error: None,
             leave_dispatch_active: false,
             scheduling_block: None,
+            controller_plan_calls: Mutex::new(0),
+            controller_revision_calls: Mutex::new(0),
+            controller_review_calls: Mutex::new(0),
+            controller_plan_persisted: Mutex::new(false),
+            controller_revision_persisted: Mutex::new(false),
+            controller_review_persisted: Mutex::new(false),
+            controller_review_plan_id: Mutex::new(None),
         }
     }
 
@@ -175,6 +190,86 @@ impl WorkflowActions for FakeActions<'_> {
         self.create_tasks()
     }
 
+    fn controller_plan(
+        &self,
+        _: &orc::workflow::WorkflowRun,
+        _: &mut dyn orc::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        *self.controller_plan_calls.lock().unwrap() += 1;
+        *self.controller_plan_persisted.lock().unwrap() = true;
+        Ok(Some(ControllerPlanOutcome { plan_id: 10 }))
+    }
+
+    fn controller_plan_revision(
+        &self,
+        _: &orc::workflow::WorkflowRun,
+        _: &mut dyn orc::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        *self.controller_revision_calls.lock().unwrap() += 1;
+        *self.controller_revision_persisted.lock().unwrap() = true;
+        Ok(Some(ControllerPlanOutcome { plan_id: 11 }))
+    }
+
+    fn controller_plan_review(
+        &self,
+        _: &orc::workflow::WorkflowRun,
+        plan_id: i64,
+        _: &mut dyn orc::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        *self.controller_review_calls.lock().unwrap() += 1;
+        *self.controller_review_persisted.lock().unwrap() = true;
+        *self.controller_review_plan_id.lock().unwrap() = Some(plan_id);
+        let decision = self
+            .plan_reviews
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(LeadDecisionKind::Approve);
+        Ok(Some(ControllerPlanReviewOutcome {
+            decision: match decision {
+                LeadDecisionKind::Approve => ControllerPlanReviewDecision::Approve,
+                LeadDecisionKind::RevisePlan => ControllerPlanReviewDecision::RevisePlan,
+                LeadDecisionKind::UserDecisionRequired => {
+                    ControllerPlanReviewDecision::UserDecisionRequired
+                }
+                other => anyhow::bail!("unsupported controller test decision {other:?}"),
+            },
+        }))
+    }
+
+    fn recover_controller_plan(
+        &self,
+        workflow: &orc::workflow::WorkflowRun,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        let persisted = match workflow.stage {
+            WorkflowStage::Planner => *self.controller_plan_persisted.lock().unwrap(),
+            WorkflowStage::PlannerRevision => *self.controller_revision_persisted.lock().unwrap(),
+            _ => false,
+        };
+        Ok(persisted.then_some(ControllerPlanOutcome {
+            plan_id: if workflow.stage == WorkflowStage::Planner {
+                10
+            } else {
+                11
+            },
+        }))
+    }
+
+    fn recover_controller_plan_review(
+        &self,
+        workflow: &orc::workflow::WorkflowRun,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        if workflow.user_resolution.is_some()
+            || !*self.controller_review_persisted.lock().unwrap()
+            || *self.controller_review_plan_id.lock().unwrap() != workflow.plan_id
+        {
+            return Ok(None);
+        }
+        Ok(Some(ControllerPlanReviewOutcome {
+            decision: ControllerPlanReviewDecision::Approve,
+        }))
+    }
+
     fn plan(&self) -> Result<PlanOutcome> {
         Ok(PlanOutcome {
             plan_id: 10,
@@ -272,6 +367,157 @@ impl WorkflowActions for FakeActions<'_> {
     }
 }
 
+struct NoopControllerRuntime;
+
+impl orc::local_runtime::LocalInferenceRuntime for NoopControllerRuntime {
+    fn infer(
+        &mut self,
+        _: &orc::local_runtime::LocalInferenceRequest,
+    ) -> Result<orc::local_runtime::LocalInferenceResponse, orc::local_runtime::LocalInferenceError>
+    {
+        Err(orc::local_runtime::LocalInferenceError::Backend(
+            "test action consumes the Controller boundary without direct runtime inference".into(),
+        ))
+    }
+}
+
+struct AppControllerRuntime {
+    responses: VecDeque<orc::local_runtime::LocalInferenceResponse>,
+    calls: usize,
+}
+
+impl orc::local_runtime::LocalInferenceRuntime for AppControllerRuntime {
+    fn infer(
+        &mut self,
+        _: &orc::local_runtime::LocalInferenceRequest,
+    ) -> Result<orc::local_runtime::LocalInferenceResponse, orc::local_runtime::LocalInferenceError>
+    {
+        self.calls += 1;
+        self.responses.pop_front().ok_or_else(|| {
+            orc::local_runtime::LocalInferenceError::Backend(
+                "no Controller fixture response".into(),
+            )
+        })
+    }
+}
+
+fn controller_plan_response(objective: &str) -> orc::local_runtime::LocalInferenceResponse {
+    orc::local_runtime::LocalInferenceResponse::structured(
+        "controller fixture",
+        serde_json::json!({
+            "plan": {
+                "protocol_version": orc::protocol::PROTOCOL_VERSION,
+                "objective": objective,
+                "assumptions": [],
+                "risks": [],
+                "questions": [],
+                "tasks": []
+            },
+            "rationale": "bounded fixture plan",
+            "uncertainty": null
+        }),
+    )
+}
+
+fn controller_plan_result(objective: &str) -> orc::controller_planning::ControllerPlanResult {
+    orc::controller_planning::ControllerPlanResult {
+        plan: orc::protocol::PlanResponse {
+            protocol_version: orc::protocol::PROTOCOL_VERSION,
+            objective: objective.into(),
+            assumptions: vec![],
+            risks: vec![],
+            questions: vec![],
+            tasks: vec![],
+        },
+        rationale: "workflow-bound fixture plan".into(),
+        uncertainty: None,
+    }
+}
+
+fn persist_workflow_plan(app: &OrcApp, workflow_id: i64, objective: &str) -> i64 {
+    let proposal = app
+        .propose_controller_plan_persistence_for_workflow(
+            workflow_id,
+            &controller_plan_result(objective),
+        )
+        .unwrap();
+    let authorization = app.authorize_controller_plan_persistence(&proposal);
+    match app.execute_authorized_controller_plan_persistence(&proposal, Some(authorization)) {
+        orc::controller_plan_persistence::ControllerPlanPersistenceResult::Persisted {
+            plan_id,
+            ..
+        } => plan_id,
+        other => panic!("unexpected Controller Plan persistence result: {other:?}"),
+    }
+}
+
+fn persist_workflow_review(
+    app: &OrcApp,
+    workflow_id: i64,
+    plan_id: i64,
+    resolution: Option<&str>,
+    decision: orc::controller_plan_review::ControllerPlanReviewDecision,
+) -> i64 {
+    let result = orc::controller_plan_review::ControllerPlanReviewResult {
+        decision,
+        details: "workflow-bound fixture review".into(),
+        revision_feedback: (decision
+            == orc::controller_plan_review::ControllerPlanReviewDecision::RevisePlan)
+            .then_some("workflow-bound fixture feedback".into()),
+    };
+    let proposal = app
+        .propose_controller_plan_review_persistence_for_workflow(
+            workflow_id,
+            plan_id,
+            resolution,
+            &result,
+        )
+        .unwrap();
+    let authorization = app.authorize_controller_plan_review_persistence(&proposal);
+    match app.execute_authorized_controller_plan_review_persistence(&proposal, Some(authorization))
+    {
+        orc::controller_plan_review_persistence::ControllerPlanReviewPersistenceResult::Persisted {
+            review_id,
+            ..
+        } => review_id,
+        other => panic!("unexpected Controller review persistence result: {other:?}"),
+    }
+}
+
+fn persist_workflow_revision(
+    app: &OrcApp,
+    workflow_id: i64,
+    parent: &orc::storage::db::PersistedPlan,
+    review_id: i64,
+    objective: &str,
+) -> i64 {
+    let result = orc::controller_plan_revision::ControllerPlanRevisionResult {
+        parent_plan_id: parent.id,
+        parent_plan_version: parent.version,
+        review_id,
+        plan: orc::protocol::PlanResponse {
+            protocol_version: orc::protocol::PROTOCOL_VERSION,
+            objective: objective.into(),
+            assumptions: vec![],
+            risks: vec![],
+            questions: vec![],
+            tasks: vec![],
+        },
+    };
+    let proposal = app
+        .propose_controller_plan_revision_persistence_for_workflow(workflow_id, &result)
+        .unwrap();
+    let authorization = app.authorize_controller_plan_revision_persistence(&proposal);
+    match app.execute_authorized_controller_plan_revision_persistence(&proposal, Some(authorization))
+    {
+        orc::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceResult::Persisted {
+            plan_id,
+            ..
+        } => plan_id,
+        other => panic!("unexpected Controller revision persistence result: {other:?}"),
+    }
+}
+
 fn setup() -> (TempDir, Database, i64) {
     let directory = tempfile::tempdir().unwrap();
     let db = Database::init(directory.path().join("orc.db")).unwrap();
@@ -311,6 +557,504 @@ fn automatic_policy() -> WorkflowPolicy {
         acceptance: AcceptancePolicy::Automatic,
         ..WorkflowPolicy::default()
     }
+}
+
+#[test]
+fn app_controller_adapter_persists_plan_and_review_before_canonical_apply() {
+    let (directory, db, project) = setup();
+    fs::create_dir_all(directory.path().join(".orc")).unwrap();
+    fs::write(
+        directory.path().join(".orc/engineering.md"),
+        "Controller workflow test contract",
+    )
+    .unwrap();
+    let workflow = db
+        .start_controller_workflow(project, "app controller path", &automatic_policy())
+        .unwrap();
+    let mut planning = workflow.clone();
+    planning.stage = WorkflowStage::Planner;
+    let planning = db
+        .commit_workflow_transition(
+            &workflow,
+            &planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut runtime = AppControllerRuntime {
+        responses: VecDeque::from([
+            controller_plan_response("app controller path"),
+            orc::local_runtime::LocalInferenceResponse::structured(
+                "controller fixture",
+                serde_json::json!({
+                    "decision": "approve",
+                    "details": "the bounded fixture plan is coherent",
+                    "revision_feedback": null
+                }),
+            ),
+        ]),
+        calls: 0,
+    };
+    let completed = app
+        .continue_workflow_with_controller_runtime(planning.id, &mut runtime)
+        .unwrap();
+    assert_eq!(
+        completed.status,
+        WorkflowStatus::Completed,
+        "{}",
+        completed.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(runtime.calls, 2);
+
+    let state = app.workflow_state().unwrap();
+    assert_eq!(state.plans.len(), 1);
+    assert_eq!(
+        state.plans[0].provenance,
+        orc::storage::db::PlanProvenance::controller()
+    );
+    assert_eq!(state.plan_reviews.len(), 1);
+    assert_eq!(
+        state.plan_reviews[0].origin,
+        orc::storage::db::PlanReviewOrigin::Controller
+    );
+    assert!(
+        app.workflow_transitions(completed.id)
+            .unwrap()
+            .iter()
+            .filter(|edge| { edge.edge == "plan_proposed" || edge.edge == "plan_reviewed" })
+            .all(|edge| edge.provider_run_id.is_none())
+    );
+}
+
+#[test]
+fn app_controller_user_decision_persists_wait_and_resumes_review_after_reopen() {
+    let (directory, db, project) = setup();
+    fs::create_dir_all(directory.path().join(".orc")).unwrap();
+    fs::write(
+        directory.path().join(".orc/engineering.md"),
+        "Controller user-decision workflow test contract",
+    )
+    .unwrap();
+    let workflow = db
+        .start_controller_workflow(project, "app controller question", &automatic_policy())
+        .unwrap();
+    let mut planning = workflow.clone();
+    planning.stage = WorkflowStage::Planner;
+    let planning = db
+        .commit_workflow_transition(
+            &workflow,
+            &planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut first_runtime = AppControllerRuntime {
+        responses: VecDeque::from([
+            controller_plan_response("app controller question"),
+            orc::local_runtime::LocalInferenceResponse::structured(
+                "controller fixture",
+                serde_json::json!({
+                    "decision": "operator_decision_required",
+                    "details": "choose the deployment boundary",
+                    "revision_feedback": null
+                }),
+            ),
+        ]),
+        calls: 0,
+    };
+    let waiting = app
+        .continue_workflow_with_controller_runtime(planning.id, &mut first_runtime)
+        .unwrap();
+    assert_eq!(waiting.status, WorkflowStatus::WaitingUser);
+    assert_eq!(waiting.stage, WorkflowStage::PlanReview);
+    let plan_id = waiting.plan_id.unwrap();
+    assert_eq!(
+        app.workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == plan_id)
+            .unwrap()
+            .status,
+        orc::storage::db::PlanStatus::UnderReview
+    );
+    assert_eq!(app.workflow_state().unwrap().plan_reviews.len(), 1);
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut second_runtime = AppControllerRuntime {
+        responses: VecDeque::from([orc::local_runtime::LocalInferenceResponse::structured(
+            "controller fixture",
+            serde_json::json!({
+                "decision": "approve",
+                "details": "the operator resolution is sufficient",
+                "revision_feedback": null
+            }),
+        )]),
+        calls: 0,
+    };
+    let completed = reopened
+        .resolve_workflow_with_controller_runtime(
+            waiting.id,
+            "use the bounded deployment boundary",
+            &mut second_runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        completed.status,
+        WorkflowStatus::Completed,
+        "{}",
+        completed.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(second_runtime.calls, 1);
+    assert_eq!(reopened.workflow_state().unwrap().plan_reviews.len(), 2);
+    assert_eq!(
+        reopened
+            .workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == plan_id)
+            .unwrap()
+            .status,
+        orc::storage::db::PlanStatus::Applied
+    );
+}
+
+#[test]
+fn controller_boundaries_recover_through_normal_continuation_without_runtime() {
+    let (directory, db, project) = setup();
+    let workflow = db
+        .start_controller_workflow(
+            project,
+            "durable Controller boundaries",
+            &automatic_policy(),
+        )
+        .unwrap();
+    let mut planning = workflow.clone();
+    planning.stage = WorkflowStage::Planner;
+    let planning = db
+        .commit_workflow_transition(
+            &workflow,
+            &planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let plan_id = persist_workflow_plan(&app, planning.id, "durable Controller boundaries");
+    persist_workflow_review(
+        &app,
+        planning.id,
+        plan_id,
+        None,
+        orc::controller_plan_review::ControllerPlanReviewDecision::Approve,
+    );
+    let observer = Database::open(&db_path).unwrap();
+    assert!(
+        observer
+            .controller_plan_for_workflow(planning.id, project, None)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        observer
+            .controller_plan_review_for_workflow(planning.id, project, plan_id)
+            .unwrap(),
+        Some(orc::storage::db::PlanReviewDecision::Approve)
+    );
+    drop(observer);
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let completed = reopened.continue_workflow(planning.id).unwrap();
+    assert_eq!(
+        completed.status,
+        WorkflowStatus::Completed,
+        "{}",
+        completed.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(reopened.workflow_state().unwrap().plans.len(), 1);
+    assert_eq!(reopened.workflow_state().unwrap().plan_reviews.len(), 1);
+    assert_eq!(
+        reopened
+            .workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == plan_id)
+            .unwrap()
+            .status,
+        orc::storage::db::PlanStatus::Applied
+    );
+}
+
+#[test]
+fn controller_recovery_is_workflow_bound_and_does_not_adopt_another_workflow_plan() {
+    let (directory, db, project) = setup();
+    let first = db
+        .start_controller_workflow(project, "same objective", &automatic_policy())
+        .unwrap();
+    let mut first_planning = first.clone();
+    first_planning.stage = WorkflowStage::Planner;
+    let first_planning = db
+        .commit_workflow_transition(
+            &first,
+            &first_planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let first_plan_id = persist_workflow_plan(&app, first_planning.id, "same objective");
+    drop(app);
+    let db = Database::open(&db_path).unwrap();
+    let second = db
+        .start_controller_workflow(project, "same objective", &automatic_policy())
+        .unwrap();
+    let mut second_planning = second.clone();
+    second_planning.stage = WorkflowStage::Planner;
+    let second_planning = db
+        .commit_workflow_transition(
+            &second,
+            &second_planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(db);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let stopped = reopened.continue_workflow(second_planning.id).unwrap();
+    assert_eq!(stopped.status, WorkflowStatus::Blocked);
+    assert_eq!(stopped.stage, WorkflowStage::Planner);
+    assert_eq!(stopped.plan_id, None);
+    assert_eq!(reopened.workflow_state().unwrap().plans.len(), 1);
+    assert!(
+        reopened
+            .workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .any(|plan| plan.plan_id == first_plan_id)
+    );
+    assert_eq!(reopened.workflow_state().unwrap().plan_reviews.len(), 0);
+    assert_eq!(
+        reopened
+            .workflow_run(first_planning.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Superseded
+    );
+}
+
+#[test]
+fn controller_revision_boundary_recovers_after_reopen_without_runtime() {
+    let (directory, db, project) = setup();
+    let workflow = db
+        .start_controller_workflow(project, "revision boundary", &automatic_policy())
+        .unwrap();
+    let mut planning = workflow.clone();
+    planning.stage = WorkflowStage::Planner;
+    let planning = db
+        .commit_workflow_transition(
+            &workflow,
+            &planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let parent_id = persist_workflow_plan(&app, planning.id, "revision boundary");
+    let review_id = persist_workflow_review(
+        &app,
+        planning.id,
+        parent_id,
+        None,
+        orc::controller_plan_review::ControllerPlanReviewDecision::RevisePlan,
+    );
+    let mut review_stage = app.workflow_run(planning.id).unwrap().unwrap();
+    review_stage.stage = WorkflowStage::PlanReview;
+    review_stage.plan_id = Some(parent_id);
+    let observer = Database::open(&db_path).unwrap();
+    let review_stage = observer
+        .commit_workflow_transition(
+            &app.workflow_run(planning.id).unwrap().unwrap(),
+            &review_stage,
+            "test_controller_review_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let actions = AppWorkflowActions::new(&app);
+    let after_review = WorkflowEngine::new(&observer, &actions)
+        .continue_one(review_stage.id)
+        .unwrap();
+    assert_eq!(after_review.stage, WorkflowStage::PlannerRevision);
+    assert_eq!(after_review.plan_id, Some(parent_id));
+
+    let parent = observer.get_plan(parent_id).unwrap().unwrap();
+    let child_id =
+        persist_workflow_revision(&app, planning.id, &parent, review_id, "revised boundary");
+    persist_workflow_review(
+        &app,
+        planning.id,
+        child_id,
+        None,
+        orc::controller_plan_review::ControllerPlanReviewDecision::Approve,
+    );
+    drop(observer);
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let completed = reopened.continue_workflow(planning.id).unwrap();
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert_eq!(reopened.workflow_state().unwrap().plans.len(), 2);
+    assert_eq!(reopened.workflow_state().unwrap().plan_reviews.len(), 2);
+    assert_eq!(
+        reopened
+            .workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == child_id)
+            .unwrap()
+            .status,
+        orc::storage::db::PlanStatus::Applied
+    );
+}
+
+#[test]
+fn controller_plan_path_routes_all_plan_boundaries_without_provider_lineage() {
+    let (_directory, db, project) = setup();
+    let actions = FakeActions::new(&db, project, Intake::Plan);
+    *actions.plan_reviews.lock().unwrap() =
+        VecDeque::from([LeadDecisionKind::RevisePlan, LeadDecisionKind::Approve]);
+    let mut runtime = NoopControllerRuntime;
+    let run = WorkflowEngine::new(&db, &actions)
+        .start_with_controller_runtime(project, "controller plan", automatic_policy(), &mut runtime)
+        .unwrap();
+
+    assert_eq!(run.status, WorkflowStatus::Completed);
+    assert_eq!(*actions.controller_plan_calls.lock().unwrap(), 1);
+    assert_eq!(*actions.controller_revision_calls.lock().unwrap(), 1);
+    assert_eq!(*actions.controller_review_calls.lock().unwrap(), 2);
+    assert_eq!(run.plan_revision_count, 1);
+    let transitions = db.workflow_transitions(run.id).unwrap();
+    for edge in transitions.iter().filter(|edge| {
+        edge.edge == "plan_proposed" || edge.edge == "plan_revised" || edge.edge == "plan_reviewed"
+    }) {
+        assert!(!edge.deterministic);
+        assert_eq!(edge.provider_run_id, None);
+    }
+    assert_eq!(
+        transitions
+            .iter()
+            .filter(|edge| edge.edge == "plan_proposed" || edge.edge == "plan_revised")
+            .count(),
+        2
+    );
+    assert_eq!(
+        transitions
+            .iter()
+            .filter(|edge| edge.edge == "plan_reviewed")
+            .count(),
+        2
+    );
+    assert!(
+        db.list_agent_runs(project, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|run| db.provider_invocations(run.id).unwrap())
+            .all(|invocation| invocation.purpose != "plan"
+                && invocation.workflow_stage.as_deref() != Some("plan_review"))
+    );
+}
+
+#[test]
+fn controller_plan_path_preserves_configured_user_approval_gate() {
+    let (_directory, db, project) = setup();
+    let actions = FakeActions::new(&db, project, Intake::Plan);
+    let policy = WorkflowPolicy {
+        plan_approval: orc::workflow::ApprovalPolicy::User,
+        acceptance: AcceptancePolicy::Automatic,
+        ..WorkflowPolicy::default()
+    };
+    let mut runtime = NoopControllerRuntime;
+    let waiting = WorkflowEngine::new(&db, &actions)
+        .start_with_controller_runtime(project, "approval gate", policy, &mut runtime)
+        .unwrap();
+    assert_eq!(waiting.status, WorkflowStatus::WaitingUser);
+    assert_eq!(waiting.stage, WorkflowStage::ApplyPlan);
+    assert_eq!(db.list_tasks_for_project(project).unwrap().len(), 0);
+
+    let completed = WorkflowEngine::new(&db, &actions)
+        .resolve_user_gate_with_controller_runtime(waiting.id, "approve", &mut runtime)
+        .unwrap();
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert!(!db.list_tasks_for_project(project).unwrap().is_empty());
+}
+
+#[test]
+fn controller_plan_review_user_decision_reenters_controller_with_resolution() {
+    let (_directory, db, project) = setup();
+    let actions = FakeActions::new(&db, project, Intake::Plan);
+    *actions.plan_reviews.lock().unwrap() = VecDeque::from([
+        LeadDecisionKind::UserDecisionRequired,
+        LeadDecisionKind::Approve,
+    ]);
+    let mut runtime = NoopControllerRuntime;
+    let waiting = WorkflowEngine::new(&db, &actions)
+        .start_with_controller_runtime(
+            project,
+            "controller question",
+            automatic_policy(),
+            &mut runtime,
+        )
+        .unwrap();
+    assert_eq!(waiting.status, WorkflowStatus::WaitingUser);
+    assert_eq!(waiting.stage, WorkflowStage::PlanReview);
+    assert_eq!(*actions.controller_review_calls.lock().unwrap(), 1);
+
+    let completed = WorkflowEngine::new(&db, &actions)
+        .resolve_user_gate_with_controller_runtime(
+            waiting.id,
+            "use the bounded option",
+            &mut runtime,
+        )
+        .unwrap();
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert_eq!(*actions.controller_review_calls.lock().unwrap(), 2);
 }
 
 #[test]

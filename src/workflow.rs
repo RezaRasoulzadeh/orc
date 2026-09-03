@@ -92,6 +92,14 @@ impl WorkflowStage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPlanPath {
+    #[default]
+    Legacy,
+    Controller,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
@@ -134,6 +142,8 @@ pub struct WorkflowRun {
     pub objective: String,
     pub status: WorkflowStatus,
     pub stage: WorkflowStage,
+    #[serde(default)]
+    pub plan_path: WorkflowPlanPath,
     pub version: i64,
     pub policy: WorkflowPolicy,
     pub transition_count: usize,
@@ -186,6 +196,29 @@ pub struct PlanReviewOutcome {
     pub decision: LeadDecisionKind,
 }
 
+/// Result of one Controller Plan persistence boundary. Controller inference
+/// has no provider-run identity in the workflow journal, so this outcome only
+/// carries the canonical Plan identity returned by trusted storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControllerPlanOutcome {
+    pub plan_id: i64,
+}
+
+/// Result of one Controller Plan-review persistence boundary. The workflow
+/// kernel owns the transition mapping; Controller output cannot supply any
+/// workflow or persistence metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerPlanReviewDecision {
+    Approve,
+    RevisePlan,
+    UserDecisionRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerPlanReviewOutcome {
+    pub decision: ControllerPlanReviewDecision,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewOutcome {
     pub provider_run_id: i64,
@@ -232,6 +265,46 @@ pub trait WorkflowActions {
     fn recover_revision(&self, _: &WorkflowRun) -> Result<Option<ProviderOutcome>> {
         Ok(None)
     }
+
+    /// Optional Controller-routed Plan boundaries. The default keeps custom
+    /// and legacy action implementations source-compatible; the production
+    /// Controller adapter opts in explicitly when a runtime is supplied to
+    /// the engine.
+    fn controller_plan(
+        &self,
+        _: &WorkflowRun,
+        _: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        Ok(None)
+    }
+
+    fn controller_plan_revision(
+        &self,
+        _: &WorkflowRun,
+        _: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        Ok(None)
+    }
+
+    fn controller_plan_review(
+        &self,
+        _: &WorkflowRun,
+        _: i64,
+        _: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        Ok(None)
+    }
+
+    fn recover_controller_plan(&self, _: &WorkflowRun) -> Result<Option<ControllerPlanOutcome>> {
+        Ok(None)
+    }
+
+    fn recover_controller_plan_review(
+        &self,
+        _: &WorkflowRun,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        Ok(None)
+    }
 }
 
 pub struct WorkflowEngine<'a, A: WorkflowActions> {
@@ -257,7 +330,42 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
         self.continue_run(run.id)
     }
 
+    /// Start a workflow with an explicitly supplied local Controller runtime.
+    /// The runtime is used only by the Controller Plan boundaries; all stage,
+    /// status, approval, and application decisions remain in this engine.
+    pub fn start_with_controller_runtime(
+        &self,
+        project_id: i64,
+        objective: &str,
+        policy: WorkflowPolicy,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<WorkflowRun> {
+        if objective.trim().is_empty() {
+            anyhow::bail!("workflow objective must not be empty")
+        }
+        let run = self
+            .db
+            .start_controller_workflow(project_id, objective, &policy)?;
+        self.continue_run_with_controller_runtime(run.id, runtime)
+    }
+
     pub fn continue_run(&self, workflow_id: i64) -> Result<WorkflowRun> {
+        self.continue_run_inner(workflow_id, None)
+    }
+
+    pub fn continue_run_with_controller_runtime(
+        &self,
+        workflow_id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<WorkflowRun> {
+        self.continue_run_inner(workflow_id, Some(runtime))
+    }
+
+    fn continue_run_inner(
+        &self,
+        workflow_id: i64,
+        mut runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+    ) -> Result<WorkflowRun> {
         let mut initial = self
             .db
             .get_workflow(workflow_id)?
@@ -273,7 +381,10 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             .max_transitions
             .saturating_sub(initial.transition_count);
         for _ in 0..remaining {
-            let committed = self.continue_one(workflow_id)?;
+            let committed = match runtime.as_mut() {
+                Some(runtime) => self.continue_one_inner(workflow_id, Some(&mut **runtime))?,
+                None => self.continue_one_inner(workflow_id, None)?,
+            };
             if committed.status != WorkflowStatus::Running {
                 return Ok(committed);
             }
@@ -369,6 +480,24 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
     }
 
     pub fn resolve_user_gate(&self, workflow_id: i64, resolution: &str) -> Result<WorkflowRun> {
+        self.resolve_user_gate_inner(workflow_id, resolution, None)
+    }
+
+    pub fn resolve_user_gate_with_controller_runtime(
+        &self,
+        workflow_id: i64,
+        resolution: &str,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<WorkflowRun> {
+        self.resolve_user_gate_inner(workflow_id, resolution, Some(runtime))
+    }
+
+    fn resolve_user_gate_inner(
+        &self,
+        workflow_id: i64,
+        resolution: &str,
+        runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+    ) -> Result<WorkflowRun> {
         let current = self
             .db
             .get_workflow(workflow_id)?
@@ -430,7 +559,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             None,
             Some(resolution),
         )?;
-        self.continue_run(resumed.id)
+        self.continue_run_inner(resumed.id, runtime)
     }
 
     pub fn cancel(&self, workflow_id: i64, reason: Option<&str>) -> Result<WorkflowRun> {
@@ -460,6 +589,14 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
     /// and makes restart tests exercise the exact same production transition
     /// code as continuous orchestration.
     pub fn continue_one(&self, workflow_id: i64) -> Result<WorkflowRun> {
+        self.continue_one_inner(workflow_id, None)
+    }
+
+    fn continue_one_inner(
+        &self,
+        workflow_id: i64,
+        runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+    ) -> Result<WorkflowRun> {
         let current = self
             .db
             .get_workflow(workflow_id)?
@@ -467,7 +604,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
         if current.status != WorkflowStatus::Running {
             return Ok(current);
         }
-        let next = match self.advance(&current) {
+        let next = match self.advance(&current, runtime) {
             Ok(next) => next,
             Err(error) => self.stop_for_error(&current, &error)?,
         };
@@ -483,7 +620,11 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             .map_err(Into::into)
     }
 
-    fn advance(&self, current: &WorkflowRun) -> Result<NextTransition> {
+    fn advance(
+        &self,
+        current: &WorkflowRun,
+        mut runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+    ) -> Result<NextTransition> {
         match current.stage {
             WorkflowStage::Discovery => {
                 let fingerprint = self.actions.discover()?;
@@ -532,6 +673,23 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 ))
             }
             WorkflowStage::Planner => {
+                if current.plan_path == WorkflowPlanPath::Controller {
+                    let outcome =
+                        if let Some(outcome) = self.actions.recover_controller_plan(current)? {
+                            outcome
+                        } else {
+                            let runtime = runtime
+                                .as_deref_mut()
+                                .context("Controller runtime is required for this workflow")?;
+                            self.actions
+                                .controller_plan(current, runtime)?
+                                .context("Controller Plan adapter returned no outcome")?
+                        };
+                    let mut next = current.clone();
+                    next.stage = WorkflowStage::PlanReview;
+                    next.plan_id = Some(outcome.plan_id);
+                    return Ok(NextTransition::semantic(next, "plan_proposed"));
+                }
                 let outcome = self
                     .actions
                     .recover_plan(current)?
@@ -550,6 +708,24 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 if current.plan_revision_count >= current.policy.max_plan_revisions {
                     return Ok(self.non_convergent(current, "plan revision limit exhausted"));
                 }
+                if current.plan_path == WorkflowPlanPath::Controller {
+                    let outcome =
+                        if let Some(outcome) = self.actions.recover_controller_plan(current)? {
+                            outcome
+                        } else {
+                            let runtime = runtime
+                                .as_deref_mut()
+                                .context("Controller runtime is required for this workflow")?;
+                            self.actions
+                                .controller_plan_revision(current, runtime)?
+                                .context("Controller Plan revision adapter returned no outcome")?
+                        };
+                    let mut next = current.clone();
+                    next.stage = WorkflowStage::PlanReview;
+                    next.plan_id = Some(outcome.plan_id);
+                    next.plan_revision_count += 1;
+                    return Ok(NextTransition::semantic(next, "plan_revised"));
+                }
                 let outcome = self
                     .actions
                     .recover_plan(current)?
@@ -567,6 +743,42 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             }
             WorkflowStage::PlanReview => {
                 let plan_id = current.plan_id.context("workflow has no current plan")?;
+                if current.plan_path == WorkflowPlanPath::Controller {
+                    let outcome = if let Some(outcome) =
+                        self.actions.recover_controller_plan_review(current)?
+                    {
+                        outcome
+                    } else {
+                        let runtime =
+                            runtime.context("Controller runtime is required for this workflow")?;
+                        self.actions
+                            .controller_plan_review(current, plan_id, runtime)?
+                            .context("Controller Plan review adapter returned no outcome")?
+                    };
+                    let mut next = current.clone();
+                    next.user_resolution = None;
+                    match outcome.decision {
+                        ControllerPlanReviewDecision::Approve => {
+                            next.stage = WorkflowStage::ApplyPlan;
+                            if current.policy.plan_approval == ApprovalPolicy::User {
+                                next.status = WorkflowStatus::WaitingUser;
+                                next.resume_stage = Some(WorkflowStage::ApplyPlan);
+                                next.stop_reason =
+                                    Some("configured user plan approval required".into());
+                            }
+                        }
+                        ControllerPlanReviewDecision::RevisePlan => {
+                            next.stage = WorkflowStage::PlannerRevision
+                        }
+                        ControllerPlanReviewDecision::UserDecisionRequired => {
+                            next.status = WorkflowStatus::WaitingUser;
+                            next.resume_stage = Some(WorkflowStage::PlanReview);
+                            next.stop_reason =
+                                Some("Controller plan review requires a user decision".into());
+                        }
+                    }
+                    return Ok(NextTransition::semantic(next, "plan_reviewed"));
+                }
                 let outcome = self
                     .actions
                     .recover_plan_review(current)?
@@ -911,6 +1123,16 @@ impl NextTransition {
             details: None,
         }
     }
+
+    fn semantic(run: WorkflowRun, edge: &str) -> Self {
+        Self {
+            run,
+            edge: edge.into(),
+            deterministic: false,
+            provider_run_id: None,
+            details: None,
+        }
+    }
 }
 
 /// Production adapter. It composes existing one-shot APIs; none of those APIs
@@ -960,6 +1182,16 @@ impl<'a> AppWorkflowActions<'a> {
         }
         Ok(())
     }
+
+    fn controller_planning_request(
+        &self,
+        workflow: &WorkflowRun,
+    ) -> Result<crate::protocol::PlanningRequest> {
+        let mut request = self.app.planning_request()?;
+        request.objective = workflow.objective.clone();
+        request.kind = "project_plan".into();
+        Ok(request)
+    }
 }
 
 impl WorkflowActions for AppWorkflowActions<'_> {
@@ -1002,6 +1234,160 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             .apply_pending_lead_decision()?
             .context("no actionable DIRECT_TASKS decision")?;
         Ok(())
+    }
+
+    fn controller_plan(
+        &self,
+        workflow: &WorkflowRun,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        let request = self.controller_planning_request(workflow)?;
+        let result = self
+            .app
+            .propose_controller_plan(&request, runtime)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if result.plan.objective != workflow.objective {
+            anyhow::bail!("Controller Plan objective does not match workflow objective")
+        }
+        let proposal = self
+            .app
+            .propose_controller_plan_persistence_for_workflow(workflow.id, &result)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let authorization = self.app.authorize_controller_plan_persistence(&proposal);
+        match self
+            .app
+            .execute_authorized_controller_plan_persistence(&proposal, Some(authorization))
+        {
+            crate::controller_plan_persistence::ControllerPlanPersistenceResult::Persisted {
+                plan_id,
+                ..
+            } => Ok(Some(ControllerPlanOutcome { plan_id })),
+            result => anyhow::bail!("Controller Plan persistence failed: {result:?}"),
+        }
+    }
+
+    fn controller_plan_revision(
+        &self,
+        workflow: &WorkflowRun,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        let plan_id = workflow
+            .plan_id
+            .context("workflow has no Controller Plan to revise")?;
+        let result = self
+            .app
+            .revise_controller_plan(plan_id, runtime)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let proposal = self
+            .app
+            .propose_controller_plan_revision_persistence_for_workflow(workflow.id, &result)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let authorization = self
+            .app
+            .authorize_controller_plan_revision_persistence(&proposal);
+        match self.app.execute_authorized_controller_plan_revision_persistence(
+            &proposal,
+            Some(authorization),
+        ) {
+            crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceResult::Persisted {
+                plan_id,
+                ..
+            } => Ok(Some(ControllerPlanOutcome { plan_id })),
+            result => anyhow::bail!("Controller Plan revision persistence failed: {result:?}"),
+        }
+    }
+
+    fn controller_plan_review(
+        &self,
+        workflow: &WorkflowRun,
+        plan_id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        let result = self
+            .app
+            .review_controller_plan(plan_id, workflow.user_resolution.as_deref(), runtime)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let proposal = self
+            .app
+            .propose_controller_plan_review_persistence_for_workflow(
+                workflow.id,
+                plan_id,
+                workflow.user_resolution.as_deref(),
+                &result,
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let authorization = self
+            .app
+            .authorize_controller_plan_review_persistence(&proposal);
+        match self.app.execute_authorized_controller_plan_review_persistence(
+            &proposal,
+            Some(authorization),
+        ) {
+            crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceResult::Persisted {
+                decision,
+                ..
+            } => Ok(Some(ControllerPlanReviewOutcome {
+                decision: match decision {
+                    crate::controller_plan_review::ControllerPlanReviewDecision::Approve =>
+                        ControllerPlanReviewDecision::Approve,
+                    crate::controller_plan_review::ControllerPlanReviewDecision::RevisePlan =>
+                        ControllerPlanReviewDecision::RevisePlan,
+                    crate::controller_plan_review::ControllerPlanReviewDecision::OperatorDecisionRequired =>
+                        ControllerPlanReviewDecision::UserDecisionRequired,
+                },
+            })),
+            result => anyhow::bail!("Controller Plan review persistence failed: {result:?}"),
+        }
+    }
+
+    fn recover_controller_plan(
+        &self,
+        workflow: &WorkflowRun,
+    ) -> Result<Option<ControllerPlanOutcome>> {
+        let parent_plan_id = match workflow.stage {
+            WorkflowStage::Planner => None,
+            WorkflowStage::PlannerRevision => workflow.plan_id,
+            _ => return Ok(None),
+        };
+        let plan = self.app.database().controller_plan_for_workflow(
+            workflow.id,
+            workflow.project_id,
+            parent_plan_id,
+        )?;
+        Ok(plan.map(|plan| ControllerPlanOutcome { plan_id: plan.id }))
+    }
+
+    fn recover_controller_plan_review(
+        &self,
+        workflow: &WorkflowRun,
+    ) -> Result<Option<ControllerPlanReviewOutcome>> {
+        // A resolution means the prior operator-decision review has already
+        // been consumed by the workflow edge; the resumed review must infer
+        // once with that resolution as context.
+        if workflow.user_resolution.is_some() {
+            return Ok(None);
+        }
+        let Some(plan_id) = workflow.plan_id else {
+            return Ok(None);
+        };
+        let review = self.app.database().controller_plan_review_for_workflow(
+            workflow.id,
+            workflow.project_id,
+            plan_id,
+        )?;
+        Ok(review.map(|decision| ControllerPlanReviewOutcome {
+            decision: match decision {
+                crate::storage::db::PlanReviewDecision::Approve => {
+                    ControllerPlanReviewDecision::Approve
+                }
+                crate::storage::db::PlanReviewDecision::RevisePlan => {
+                    ControllerPlanReviewDecision::RevisePlan
+                }
+                crate::storage::db::PlanReviewDecision::UserDecisionRequired => {
+                    ControllerPlanReviewDecision::UserDecisionRequired
+                }
+            },
+        }))
     }
 
     fn plan(&self) -> Result<PlanOutcome> {

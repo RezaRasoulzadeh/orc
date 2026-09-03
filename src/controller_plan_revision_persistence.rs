@@ -35,6 +35,7 @@ pub enum ControllerPlanRevisionPersistenceProposalError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControllerPlanRevisionPersistenceProposal {
     project_id: i64,
+    workflow_id: Option<i64>,
     parent_plan_id: i64,
     parent_plan_version: i64,
     parent_plan: PlanResponse,
@@ -51,7 +52,20 @@ impl ControllerPlanRevisionPersistenceProposal {
         source_review: &PlanReview,
         result: &ControllerPlanRevisionResult,
     ) -> Result<Self, ControllerPlanRevisionPersistenceProposalError> {
+        Self::from_controller_result_for_workflow(project_id, None, parent, source_review, result)
+    }
+
+    pub fn from_controller_result_for_workflow(
+        project_id: i64,
+        workflow_id: Option<i64>,
+        parent: &PersistedPlan,
+        source_review: &PlanReview,
+        result: &ControllerPlanRevisionResult,
+    ) -> Result<Self, ControllerPlanRevisionPersistenceProposalError> {
         if project_id <= 0 || parent.project_id != project_id {
+            return Err(ControllerPlanRevisionPersistenceProposalError::InvalidProject);
+        }
+        if workflow_id.is_some_and(|id| id <= 0) {
             return Err(ControllerPlanRevisionPersistenceProposalError::InvalidProject);
         }
         result
@@ -80,6 +94,7 @@ impl ControllerPlanRevisionPersistenceProposal {
             .map_err(|_| ControllerPlanRevisionPersistenceProposalError::InvalidSourceReview)?;
         let proposal = Self {
             project_id,
+            workflow_id,
             parent_plan_id: parent.id,
             parent_plan_version: parent.version,
             parent_plan: parent.response.clone(),
@@ -94,6 +109,10 @@ impl ControllerPlanRevisionPersistenceProposal {
 
     pub const fn project_id(&self) -> i64 {
         self.project_id
+    }
+
+    pub const fn workflow_id(&self) -> Option<i64> {
+        self.workflow_id
     }
 
     pub const fn parent_plan_id(&self) -> i64 {
@@ -127,6 +146,9 @@ impl ControllerPlanRevisionPersistenceProposal {
             || self.source_review_id <= 0
         {
             return Err(ControllerPlanRevisionPersistenceProposalError::InvalidRevisionResult);
+        }
+        if self.workflow_id.is_some_and(|id| id <= 0) {
+            return Err(ControllerPlanRevisionPersistenceProposalError::InvalidProject);
         }
         self.parent_plan
             .validate()
@@ -177,6 +199,7 @@ struct PersistedRevisionSnapshot<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ControllerPlanRevisionPersistenceAuthorization {
     project_id: i64,
+    workflow_id: Option<i64>,
     parent_plan_id: i64,
     parent_plan_version: i64,
     parent_plan: PlanResponse,
@@ -225,6 +248,7 @@ pub(crate) fn authorization_for(
 ) -> ControllerPlanRevisionPersistenceAuthorization {
     ControllerPlanRevisionPersistenceAuthorization {
         project_id: proposal.project_id,
+        workflow_id: proposal.workflow_id,
         parent_plan_id: proposal.parent_plan_id,
         parent_plan_version: proposal.parent_plan_version,
         parent_plan: proposal.parent_plan.clone(),
@@ -240,6 +264,7 @@ pub(crate) fn matches_authorization(
     authorization: &ControllerPlanRevisionPersistenceAuthorization,
 ) -> bool {
     authorization.project_id == proposal.project_id
+        && authorization.workflow_id == proposal.workflow_id
         && authorization.parent_plan_id == proposal.parent_plan_id
         && authorization.parent_plan_version == proposal.parent_plan_version
         && authorization.parent_plan == proposal.parent_plan

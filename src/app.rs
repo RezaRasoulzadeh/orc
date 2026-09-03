@@ -70,9 +70,53 @@ impl OrcApp {
             .start(project_id, objective, policy)
     }
 
+    /// Start the persisted workflow with an explicitly supplied Controller
+    /// runtime. This is the opt-in supervised path for Controller Plan
+    /// generation/review/revision; legacy entry points remain available.
+    pub fn start_workflow_with_controller_runtime(
+        &self,
+        objective: &str,
+        policy: crate::workflow::WorkflowPolicy,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let project_id = self.lead().project_id()?;
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions)
+            .start_with_controller_runtime(project_id, objective, policy, runtime)
+    }
+
+    /// Alias emphasizing that the runtime is supplied by the caller rather
+    /// than selected by workflow policy.
+    pub fn start_workflow_with_runtime(
+        &self,
+        objective: &str,
+        policy: crate::workflow::WorkflowPolicy,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        self.start_workflow_with_controller_runtime(objective, policy, runtime)
+    }
+
     pub fn continue_workflow(&self, id: i64) -> Result<crate::workflow::WorkflowRun> {
         let actions = crate::workflow::AppWorkflowActions::new(self);
         crate::workflow::WorkflowEngine::new(&self.db, &actions).continue_run(id)
+    }
+
+    pub fn continue_workflow_with_controller_runtime(
+        &self,
+        id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions)
+            .continue_run_with_controller_runtime(id, runtime)
+    }
+
+    pub fn continue_workflow_with_runtime(
+        &self,
+        id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        self.continue_workflow_with_controller_runtime(id, runtime)
     }
 
     pub fn resolve_workflow(
@@ -82,6 +126,26 @@ impl OrcApp {
     ) -> Result<crate::workflow::WorkflowRun> {
         let actions = crate::workflow::AppWorkflowActions::new(self);
         crate::workflow::WorkflowEngine::new(&self.db, &actions).resolve_user_gate(id, resolution)
+    }
+
+    pub fn resolve_workflow_with_controller_runtime(
+        &self,
+        id: i64,
+        resolution: &str,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        let actions = crate::workflow::AppWorkflowActions::new(self);
+        crate::workflow::WorkflowEngine::new(&self.db, &actions)
+            .resolve_user_gate_with_controller_runtime(id, resolution, runtime)
+    }
+
+    pub fn resolve_workflow_with_runtime(
+        &self,
+        id: i64,
+        resolution: &str,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<crate::workflow::WorkflowRun> {
+        self.resolve_workflow_with_controller_runtime(id, resolution, runtime)
     }
 
     pub fn cancel_workflow(
@@ -269,7 +333,7 @@ impl OrcApp {
             )?;
         if !self
             .db
-            .is_current_valid_plan(project_id, &plan)
+            .is_current_valid_controller_review_plan(project_id, &plan, operator_resolution)
             .map_err(crate::controller_plan_review::ControllerPlanReviewError::Storage)?
         {
             return Err(
@@ -391,6 +455,43 @@ impl OrcApp {
         Proposal::from_controller_result(project_id, &parent, &review, result)
     }
 
+    pub fn propose_controller_plan_revision_persistence_for_workflow(
+        &self,
+        workflow_id: i64,
+        result: &crate::controller_plan_revision::ControllerPlanRevisionResult,
+    ) -> Result<
+        crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal,
+        crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError,
+    > {
+        use crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal as Proposal;
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidProject
+        })?;
+        let parent = self
+            .db
+            .get_plan(result.parent_plan_id)
+            .map_err(|_| {
+                crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidParent
+            })?
+            .ok_or(crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidParent)?;
+        let review = self
+            .db
+            .list_plan_reviews(project_id)
+            .map_err(|_| {
+                crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidSourceReview
+            })?
+            .into_iter()
+            .find(|review| review.id == result.review_id)
+            .ok_or(crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidSourceReview)?;
+        Proposal::from_controller_result_for_workflow(
+            project_id,
+            Some(workflow_id),
+            &parent,
+            &review,
+            result,
+        )
+    }
+
     /// Mint trusted authorization for one exact Controller revision
     /// persistence proposal.
     pub fn authorize_controller_plan_revision_persistence(
@@ -434,15 +535,28 @@ impl OrcApp {
         let Ok(project_id) = self.lead().project_id() else {
             return Result::FreshValidationRejected;
         };
-        let (plan_id, parent_id) = match self.db.store_controller_plan_revision(
-            project_id,
-            proposal.parent_plan_id(),
-            proposal.parent_plan_version(),
-            proposal.parent_plan(),
-            proposal.source_review_id(),
-            proposal.source_review_details(),
-            proposal.revised_plan(),
-        ) {
+        let stored = match proposal.workflow_id() {
+            Some(workflow_id) => self.db.store_controller_plan_revision_for_workflow(
+                project_id,
+                Some(workflow_id),
+                proposal.parent_plan_id(),
+                proposal.parent_plan_version(),
+                proposal.parent_plan(),
+                proposal.source_review_id(),
+                proposal.source_review_details(),
+                proposal.revised_plan(),
+            ),
+            None => self.db.store_controller_plan_revision(
+                project_id,
+                proposal.parent_plan_id(),
+                proposal.parent_plan_version(),
+                proposal.parent_plan(),
+                proposal.source_review_id(),
+                proposal.source_review_details(),
+                proposal.revised_plan(),
+            ),
+        };
+        let (plan_id, parent_id) = match stored {
             Ok(ids) => ids,
             Err(crate::storage::db::DbError::Scheduler(_)) => {
                 return Result::FreshValidationRejected;
@@ -485,6 +599,35 @@ impl OrcApp {
             .ok_or(crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity)?;
         crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal::from_controller_result(
             project_id,
+            &plan,
+            result,
+        )
+    }
+
+    pub fn propose_controller_plan_review_persistence_for_workflow(
+        &self,
+        workflow_id: i64,
+        plan_id: i64,
+        operator_resolution: Option<&str>,
+        result: &crate::controller_plan_review::ControllerPlanReviewResult,
+    ) -> Result<
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal,
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidProject
+        })?;
+        let plan = self
+            .db
+            .get_plan(plan_id)
+            .map_err(|_| {
+                crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity
+            })?
+            .ok_or(crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity)?;
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal::from_controller_result_for_workflow(
+            project_id,
+            Some(workflow_id),
+            operator_resolution,
             &plan,
             result,
         )
@@ -545,7 +688,11 @@ impl OrcApp {
             || plan.provenance.origin != crate::storage::db::PlanOrigin::Controller
             || !self
                 .db
-                .is_current_valid_plan(project_id, &plan)
+                .is_current_valid_controller_review_plan(
+                    project_id,
+                    &plan,
+                    proposal.operator_resolution(),
+                )
                 .unwrap_or(false)
         {
             return Result::FreshValidationRejected;
@@ -555,14 +702,26 @@ impl OrcApp {
                 reason: Failure::InvalidProposal,
             };
         };
-        let Ok(review_id) = self.db.store_controller_plan_review(
-            project_id,
-            proposal.plan_id(),
-            proposal.plan_version(),
-            proposal.plan(),
-            crate::controller_plan_review_persistence::database_decision(proposal),
-            &details,
-        ) else {
+        let stored = match proposal.workflow_id() {
+            Some(workflow_id) => self.db.store_controller_plan_review_for_workflow(
+                project_id,
+                workflow_id,
+                proposal.plan_id(),
+                proposal.plan_version(),
+                proposal.plan(),
+                crate::controller_plan_review_persistence::database_decision(proposal),
+                &details,
+            ),
+            None => self.db.store_controller_plan_review(
+                project_id,
+                proposal.plan_id(),
+                proposal.plan_version(),
+                proposal.plan(),
+                crate::controller_plan_review_persistence::database_decision(proposal),
+                &details,
+            ),
+        };
+        let Ok(review_id) = stored else {
             return Result::PersistenceFailed {
                 reason: Failure::CanonicalStorage,
             };
@@ -596,6 +755,24 @@ impl OrcApp {
         crate::controller_plan_persistence::authorization_for(proposal)
     }
 
+    pub fn propose_controller_plan_persistence_for_workflow(
+        &self,
+        workflow_id: i64,
+        result: &crate::controller_planning::ControllerPlanResult,
+    ) -> Result<
+        crate::controller_plan_persistence::ControllerPlanPersistenceProposal,
+        crate::controller_plan_persistence::ControllerPlanPersistenceProposalError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_persistence::ControllerPlanPersistenceProposalError::InvalidProject
+        })?;
+        crate::controller_plan_persistence::ControllerPlanPersistenceProposal::from_controller_result_for_workflow(
+            project_id,
+            Some(workflow_id),
+            result,
+        )
+    }
+
     /// Persist one explicitly authorized Controller-origin Proposed Plan.
     /// Validation is repeated immediately before the canonical storage call;
     /// the authorization is consumed regardless of the execution outcome.
@@ -619,10 +796,17 @@ impl OrcApp {
         if proposal.validate().is_err() {
             return crate::controller_plan_persistence::ControllerPlanPersistenceResult::FreshValidationRejected;
         }
-        match self
-            .db
-            .store_controller_plan(proposal.project_id(), proposal.plan())
-        {
+        let stored = match proposal.workflow_id() {
+            Some(workflow_id) => self.db.store_controller_plan_for_workflow(
+                proposal.project_id(),
+                workflow_id,
+                proposal.plan(),
+            ),
+            None => self
+                .db
+                .store_controller_plan(proposal.project_id(), proposal.plan()),
+        };
+        match stored {
             Ok(plan_id) => {
                 crate::controller_plan_persistence::ControllerPlanPersistenceResult::persisted(
                     plan_id,

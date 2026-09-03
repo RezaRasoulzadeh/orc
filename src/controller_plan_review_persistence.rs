@@ -32,6 +32,8 @@ pub enum ControllerPlanReviewPersistenceProposalError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControllerPlanReviewPersistenceProposal {
     project_id: i64,
+    workflow_id: Option<i64>,
+    operator_resolution: Option<String>,
     plan_id: i64,
     plan_version: i64,
     plan: PlanResponse,
@@ -48,9 +50,23 @@ impl ControllerPlanReviewPersistenceProposal {
         plan: &PersistedPlan,
         result: &ControllerPlanReviewResult,
     ) -> Result<Self, ControllerPlanReviewPersistenceProposalError> {
+        Self::from_controller_result_for_workflow(project_id, None, None, plan, result)
+    }
+
+    pub fn from_controller_result_for_workflow(
+        project_id: i64,
+        workflow_id: Option<i64>,
+        operator_resolution: Option<&str>,
+        plan: &PersistedPlan,
+        result: &ControllerPlanReviewResult,
+    ) -> Result<Self, ControllerPlanReviewPersistenceProposalError> {
         if project_id <= 0 || project_id != plan.project_id {
             return Err(ControllerPlanReviewPersistenceProposalError::InvalidProject);
         }
+        if workflow_id.is_some_and(|id| id <= 0) {
+            return Err(ControllerPlanReviewPersistenceProposalError::InvalidProject);
+        }
+        let operator_resolution = operator_resolution.map(str::to_owned);
         if plan.provenance.origin != PlanOrigin::Controller {
             return Err(ControllerPlanReviewPersistenceProposalError::InvalidPlanOrigin);
         }
@@ -62,6 +78,8 @@ impl ControllerPlanReviewPersistenceProposal {
             .map_err(|_| ControllerPlanReviewPersistenceProposalError::InvalidControllerResult)?;
         let proposal = Self {
             project_id,
+            workflow_id,
+            operator_resolution,
             plan_id: plan.id,
             plan_version: plan.version,
             plan: plan.response.clone(),
@@ -75,6 +93,14 @@ impl ControllerPlanReviewPersistenceProposal {
 
     pub const fn project_id(&self) -> i64 {
         self.project_id
+    }
+
+    pub const fn workflow_id(&self) -> Option<i64> {
+        self.workflow_id
+    }
+
+    pub fn operator_resolution(&self) -> Option<&str> {
+        self.operator_resolution.as_deref()
     }
 
     pub const fn plan_id(&self) -> i64 {
@@ -95,6 +121,16 @@ impl ControllerPlanReviewPersistenceProposal {
             || self.plan_id <= 0
             || self.plan_version <= 0
             || self.plan.protocol_version == 0
+        {
+            return Err(ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity);
+        }
+        if self.workflow_id.is_some_and(|id| id <= 0) {
+            return Err(ControllerPlanReviewPersistenceProposalError::InvalidProject);
+        }
+        if self
+            .operator_resolution
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
         {
             return Err(ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity);
         }
@@ -154,6 +190,8 @@ fn validate_details(value: &str) -> Result<(), ControllerPlanReviewPersistencePr
 #[derive(Debug, PartialEq, Eq)]
 pub struct ControllerPlanReviewPersistenceAuthorization {
     project_id: i64,
+    workflow_id: Option<i64>,
+    operator_resolution: Option<String>,
     plan_id: i64,
     plan_version: i64,
     plan: PlanResponse,
@@ -200,6 +238,8 @@ pub(crate) fn authorization_for(
 ) -> ControllerPlanReviewPersistenceAuthorization {
     ControllerPlanReviewPersistenceAuthorization {
         project_id: proposal.project_id,
+        workflow_id: proposal.workflow_id,
+        operator_resolution: proposal.operator_resolution.clone(),
         plan_id: proposal.plan_id,
         plan_version: proposal.plan_version,
         plan: proposal.plan.clone(),
@@ -214,6 +254,8 @@ pub(crate) fn matches_authorization(
     authorization: &ControllerPlanReviewPersistenceAuthorization,
 ) -> bool {
     authorization.project_id == proposal.project_id
+        && authorization.workflow_id == proposal.workflow_id
+        && authorization.operator_resolution == proposal.operator_resolution
         && authorization.plan_id == proposal.plan_id
         && authorization.plan_version == proposal.plan_version
         && authorization.plan == proposal.plan

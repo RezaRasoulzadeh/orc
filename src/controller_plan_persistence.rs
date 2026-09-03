@@ -32,6 +32,7 @@ pub enum ControllerPlanPersistenceProposalError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControllerPlanPersistenceProposal {
     project_id: i64,
+    workflow_id: Option<i64>,
     plan: PlanResponse,
 }
 
@@ -40,7 +41,18 @@ impl ControllerPlanPersistenceProposal {
         project_id: i64,
         result: &ControllerPlanResult,
     ) -> Result<Self, ControllerPlanPersistenceProposalError> {
+        Self::from_controller_result_for_workflow(project_id, None, result)
+    }
+
+    pub fn from_controller_result_for_workflow(
+        project_id: i64,
+        workflow_id: Option<i64>,
+        result: &ControllerPlanResult,
+    ) -> Result<Self, ControllerPlanPersistenceProposalError> {
         if project_id <= 0 {
+            return Err(ControllerPlanPersistenceProposalError::InvalidProject);
+        }
+        if workflow_id.is_some_and(|id| id <= 0) {
             return Err(ControllerPlanPersistenceProposalError::InvalidProject);
         }
         result
@@ -48,6 +60,7 @@ impl ControllerPlanPersistenceProposal {
             .map_err(|_| ControllerPlanPersistenceProposalError::InvalidControllerResult)?;
         let proposal = Self {
             project_id,
+            workflow_id,
             plan: result.plan.clone(),
         };
         proposal.validate()?;
@@ -58,6 +71,10 @@ impl ControllerPlanPersistenceProposal {
         self.project_id
     }
 
+    pub const fn workflow_id(&self) -> Option<i64> {
+        self.workflow_id
+    }
+
     pub const fn plan(&self) -> &PlanResponse {
         &self.plan
     }
@@ -66,6 +83,9 @@ impl ControllerPlanPersistenceProposal {
     /// immediately before the canonical storage mutation.
     pub fn validate(&self) -> Result<(), ControllerPlanPersistenceProposalError> {
         if self.project_id <= 0 {
+            return Err(ControllerPlanPersistenceProposalError::InvalidProject);
+        }
+        if self.workflow_id.is_some_and(|id| id <= 0) {
             return Err(ControllerPlanPersistenceProposalError::InvalidProject);
         }
         self.plan
@@ -88,6 +108,7 @@ impl ControllerPlanPersistenceProposal {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ControllerPlanPersistenceAuthorization {
     project_id: i64,
+    workflow_id: Option<i64>,
     plan: PlanResponse,
 }
 
@@ -138,6 +159,7 @@ pub(crate) fn authorization_for(
 ) -> ControllerPlanPersistenceAuthorization {
     ControllerPlanPersistenceAuthorization {
         project_id: proposal.project_id,
+        workflow_id: proposal.workflow_id,
         plan: proposal.plan.clone(),
     }
 }
@@ -146,7 +168,9 @@ pub(crate) fn matches_authorization(
     proposal: &ControllerPlanPersistenceProposal,
     authorization: &ControllerPlanPersistenceAuthorization,
 ) -> bool {
-    authorization.project_id == proposal.project_id && authorization.plan == proposal.plan
+    authorization.project_id == proposal.project_id
+        && authorization.workflow_id == proposal.workflow_id
+        && authorization.plan == proposal.plan
 }
 
 #[cfg(test)]

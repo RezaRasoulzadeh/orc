@@ -309,12 +309,14 @@ fn record_plan_review_tx(
     provenance: PlanReviewProvenance,
     decision: PlanReviewDecision,
     details: &str,
+    workflow_id: Option<i64>,
 ) -> Result<i64, DbError> {
     provenance.validate()?;
     tx.execute(
-        "INSERT INTO plan_reviews (plan_id, origin, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO plan_reviews (plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             plan_id,
+            workflow_id,
             provenance.origin.storage_str(),
             provenance.lead_run_id,
             provenance.lead_decision_id,
@@ -332,10 +334,17 @@ fn record_plan_review_tx(
         PlanReviewDecision::RevisePlan => "revision_requested",
         PlanReviewDecision::UserDecisionRequired => "under_review",
     };
-    tx.execute(
-        "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
-        params![status, plan_id],
-    )?;
+    if provenance.origin == PlanReviewOrigin::Controller {
+        tx.execute(
+            "UPDATE plans SET status=?1 WHERE id=?2 AND status IN ('proposed', 'under_review')",
+            params![status, plan_id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
+            params![status, plan_id],
+        )?;
+    }
     Ok(review_id)
 }
 
@@ -1493,6 +1502,7 @@ impl Database {
             project_id,
             PlanProvenance::legacy(source_lead_decision_id, source_planner_run_id),
             response,
+            None,
         )
     }
 
@@ -1505,7 +1515,24 @@ impl Database {
         project_id: i64,
         response: &crate::protocol::PlanResponse,
     ) -> Result<i64, DbError> {
-        self.store_plan_with_provenance(project_id, PlanProvenance::controller(), response)
+        self.store_plan_with_provenance(project_id, PlanProvenance::controller(), response, None)
+    }
+
+    /// Persist a Controller-origin proposal bound to one workflow. The
+    /// workflow binding is written in the same transaction as the Plan so a
+    /// restart cannot adopt a Plan produced for another workflow.
+    pub fn store_controller_plan_for_workflow(
+        &self,
+        project_id: i64,
+        workflow_id: i64,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<i64, DbError> {
+        self.store_plan_with_provenance(
+            project_id,
+            PlanProvenance::controller(),
+            response,
+            Some(workflow_id),
+        )
     }
 
     fn store_plan_with_provenance(
@@ -1513,12 +1540,27 @@ impl Database {
         project_id: i64,
         provenance: PlanProvenance,
         response: &crate::protocol::PlanResponse,
+        workflow_id: Option<i64>,
     ) -> Result<i64, DbError> {
         response
             .validate()
             .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
         provenance.validate()?;
         let transaction = self.conn.unchecked_transaction()?;
+        if let Some(workflow_id) = workflow_id {
+            let workflow_project: Option<i64> = transaction
+                .query_row(
+                    "SELECT project_id FROM workflow_runs WHERE id = ?1",
+                    [workflow_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if workflow_project != Some(project_id) || provenance.origin != PlanOrigin::Controller {
+                return Err(DbError::Scheduler(
+                    "invalid Controller workflow Plan linkage".into(),
+                ));
+            }
+        }
         if provenance.origin == PlanOrigin::LegacyPlanner {
             let lead_project: Option<i64> = transaction
                 .query_row(
@@ -1552,8 +1594,8 @@ impl Database {
         ).optional()?.unwrap_or((None, 1));
         let canonical = serde_json::to_string(response)?;
         transaction.execute(
-            "INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![project_id, version, parent_plan_id, provenance.origin.as_str(), provenance.source_lead_decision_id, provenance.source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
+            "INSERT INTO plans (project_id, workflow_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![project_id, workflow_id, version, parent_plan_id, provenance.origin.as_str(), provenance.source_lead_decision_id, provenance.source_planner_run_id, PlanStatus::Proposed.as_str(), canonical],
         )?;
         let id = transaction.last_insert_rowid();
         if let Some(parent_plan_id) = parent_plan_id {
@@ -1707,6 +1749,62 @@ impl Database {
         self.is_current_valid_plan(project_id, plan)
     }
 
+    /// Checks whether a Controller Plan may be reviewed now or may be
+    /// re-reviewed after the operator answered its persisted question.
+    /// UnderReview is eligible only for that exact current Controller review
+    /// and a non-empty operator resolution; the Plan remains UnderReview until
+    /// the next canonical review decision is persisted.
+    pub fn is_current_valid_controller_review_plan(
+        &self,
+        project_id: i64,
+        plan: &PersistedPlan,
+        operator_resolution: Option<&str>,
+    ) -> Result<bool, DbError> {
+        if plan.project_id != project_id
+            || plan.provenance != PlanProvenance::controller()
+            || plan.response.validate().is_err()
+        {
+            return Ok(false);
+        }
+        let current: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(plan.id) {
+            return Ok(false);
+        }
+        let Some(persisted) = self.get_plan(plan.id)? else {
+            return Ok(false);
+        };
+        if persisted != *plan {
+            return Ok(false);
+        }
+        if plan.status == PlanStatus::Proposed {
+            return Ok(true);
+        }
+        if plan.status != PlanStatus::UnderReview
+            || operator_resolution.is_none_or(|value| value.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        let prior_question: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT decision FROM plan_reviews
+                 WHERE plan_id = ?1 AND origin = 'controller'
+                   AND superseded_by_review_id IS NULL
+                 ORDER BY id DESC LIMIT 1",
+                [plan.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(prior_question.as_deref() == Some("USER_DECISION_REQUIRED"))
+    }
+
     /// Checks that a Controller Plan remains the current Plan whose
     /// Controller review requested revision. This is intentionally separate
     /// from [`Self::is_current_valid_plan`], whose Proposed-only semantics
@@ -1761,6 +1859,57 @@ impl Database {
                 })
             })?
             .collect::<Result<_, _>>()?)
+    }
+
+    /// Return the one current Controller Plan persisted for this workflow
+    /// boundary. The workflow id is the recovery key; no semantic fields are
+    /// used to guess ownership.
+    pub fn controller_plan_for_workflow(
+        &self,
+        workflow_id: i64,
+        project_id: i64,
+        parent_plan_id: Option<i64>,
+    ) -> Result<Option<PersistedPlan>, DbError> {
+        let plan_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT p.id FROM plans p
+                 WHERE p.workflow_id = ?1 AND p.project_id = ?2
+                   AND p.origin = 'controller'
+                   AND p.status IN ('proposed', 'under_review', 'revision_requested', 'approved')
+                   AND (?3 IS NULL OR p.parent_plan_id = ?3)
+                 ORDER BY p.version DESC, p.id DESC LIMIT 1",
+                params![workflow_id, project_id, parent_plan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match plan_id {
+            Some(id) => self.get_plan(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the current Controller review persisted for this workflow and
+    /// Plan. Review recovery is likewise keyed by durable workflow identity.
+    pub fn controller_plan_review_for_workflow(
+        &self,
+        workflow_id: i64,
+        project_id: i64,
+        plan_id: i64,
+    ) -> Result<Option<PlanReviewDecision>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT r.decision FROM plan_reviews r
+                 JOIN plans p ON p.id = r.plan_id
+                 WHERE r.workflow_id = ?1 AND r.plan_id = ?2
+                   AND p.workflow_id = ?1 AND p.project_id = ?3
+                   AND r.origin = 'controller' AND r.superseded_by_review_id IS NULL
+                 ORDER BY r.id DESC LIMIT 1",
+                params![workflow_id, plan_id, project_id],
+                |row| parse_plan_review_decision(&row.get::<_, String>(0)?),
+            )
+            .optional()
+            .map_err(DbError::from)
     }
 
     pub fn list_plan_reviews(&self, project_id: i64) -> Result<Vec<PlanReview>, DbError> {
@@ -4245,6 +4394,38 @@ impl Database {
         objective: &str,
         policy: &crate::workflow::WorkflowPolicy,
     ) -> Result<crate::workflow::WorkflowRun, DbError> {
+        self.start_workflow_with_plan_path(
+            project_id,
+            objective,
+            policy,
+            crate::workflow::WorkflowPlanPath::Legacy,
+        )
+    }
+
+    /// Start a workflow whose persisted Plan stages are routed through the
+    /// Controller adapter. The route is durable so a later continuation cannot
+    /// accidentally fall back to legacy Planner/Lead semantics.
+    pub fn start_controller_workflow(
+        &self,
+        project_id: i64,
+        objective: &str,
+        policy: &crate::workflow::WorkflowPolicy,
+    ) -> Result<crate::workflow::WorkflowRun, DbError> {
+        self.start_workflow_with_plan_path(
+            project_id,
+            objective,
+            policy,
+            crate::workflow::WorkflowPlanPath::Controller,
+        )
+    }
+
+    fn start_workflow_with_plan_path(
+        &self,
+        project_id: i64,
+        objective: &str,
+        policy: &crate::workflow::WorkflowPolicy,
+        plan_path: crate::workflow::WorkflowPlanPath,
+    ) -> Result<crate::workflow::WorkflowRun, DbError> {
         let tx = self.conn.unchecked_transaction()?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
@@ -4296,6 +4477,7 @@ impl Database {
             objective: objective.trim().to_owned(),
             status: crate::workflow::WorkflowStatus::Running,
             stage: crate::workflow::WorkflowStage::Discovery,
+            plan_path,
             version: 0,
             policy: policy.clone(),
             transition_count: 0,
@@ -5087,7 +5269,7 @@ impl Database {
 
     fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')), source_lead_decision_id INTEGER REFERENCES lead_decisions(id), source_planner_run_id INTEGER REFERENCES agent_runs(id), status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id), CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, origin TEXT NOT NULL DEFAULT 'legacy_lead' CHECK (origin IN ('legacy_lead', 'controller')), lead_run_id INTEGER REFERENCES agent_runs(id), lead_decision_id INTEGER REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id), CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL)));",
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, workflow_id INTEGER REFERENCES workflow_runs(id), version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')), source_lead_decision_id INTEGER REFERENCES lead_decisions(id), source_planner_run_id INTEGER REFERENCES agent_runs(id), status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id), CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, workflow_id INTEGER REFERENCES workflow_runs(id), origin TEXT NOT NULL DEFAULT 'legacy_lead' CHECK (origin IN ('legacy_lead', 'controller')), lead_run_id INTEGER REFERENCES agent_runs(id), lead_decision_id INTEGER REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id), CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL)));",
         )?;
         for (table, column, definition) in [
             (
@@ -5099,6 +5281,16 @@ impl Database {
                 "plan_reviews",
                 "superseded_by_review_id",
                 "INTEGER REFERENCES plan_reviews(id)",
+            ),
+            (
+                "plans",
+                "workflow_id",
+                "INTEGER REFERENCES workflow_runs(id)",
+            ),
+            (
+                "plan_reviews",
+                "workflow_id",
+                "INTEGER REFERENCES workflow_runs(id)",
             ),
         ] {
             let exists: i64 = conn
@@ -5129,6 +5321,7 @@ impl Database {
                  CREATE TABLE plans_new (
                     id INTEGER PRIMARY KEY,
                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    workflow_id INTEGER REFERENCES workflow_runs(id),
                     version INTEGER NOT NULL,
                     parent_plan_id INTEGER REFERENCES plans_new(id),
                     origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')),
@@ -5141,8 +5334,8 @@ impl Database {
                     UNIQUE(project_id, version),
                     CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))
                  );
-                 INSERT INTO plans_new (id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id)
-                    SELECT id, project_id, version, parent_plan_id, 'legacy_planner', source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans;
+                 INSERT INTO plans_new (id, project_id, workflow_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id)
+                    SELECT id, project_id, workflow_id, version, parent_plan_id, 'legacy_planner', source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans;
                  DROP TABLE plans;
                  ALTER TABLE plans_new RENAME TO plans;
                  CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version);
@@ -5163,6 +5356,7 @@ impl Database {
                  CREATE TABLE plan_reviews_new (
                     id INTEGER PRIMARY KEY,
                     plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                    workflow_id INTEGER REFERENCES workflow_runs(id),
                     origin TEXT NOT NULL DEFAULT 'legacy_lead' CHECK (origin IN ('legacy_lead', 'controller')),
                     lead_run_id INTEGER REFERENCES agent_runs(id),
                     lead_decision_id INTEGER REFERENCES lead_decisions(id),
@@ -5172,8 +5366,8 @@ impl Database {
                     superseded_by_review_id INTEGER REFERENCES plan_reviews_new(id),
                     CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL))
                  );
-                 INSERT INTO plan_reviews_new (id, plan_id, origin, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id)
-                    SELECT id, plan_id, 'legacy_lead', lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id FROM plan_reviews;
+                 INSERT INTO plan_reviews_new (id, plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id)
+                    SELECT id, plan_id, workflow_id, 'legacy_lead', lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id FROM plan_reviews;
                  DROP TABLE plan_reviews;
                  ALTER TABLE plan_reviews_new RENAME TO plan_reviews;
                  COMMIT;",
@@ -5181,6 +5375,10 @@ impl Database {
             conn.pragma_update(None, "foreign_keys", "ON")?;
             migration?;
         }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS plans_workflow ON plans(workflow_id, id)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -5209,6 +5407,7 @@ impl Database {
             PlanReviewProvenance::legacy(lead_run_id, decision_id),
             decision,
             details,
+            None,
         )?;
         tx.commit()?;
         Ok(review_id)
@@ -5263,6 +5462,82 @@ impl Database {
             PlanReviewProvenance::controller(),
             decision,
             details,
+            None,
+        )?;
+        tx.commit()?;
+        Ok(review_id)
+    }
+
+    /// Persist a Controller-origin review bound to one workflow in the same
+    /// transaction as the canonical Plan status update.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_controller_plan_review_for_workflow(
+        &self,
+        project_id: i64,
+        workflow_id: i64,
+        plan_id: i64,
+        expected_version: i64,
+        expected_plan: &crate::protocol::PlanResponse,
+        decision: PlanReviewDecision,
+        details: &str,
+    ) -> Result<i64, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let workflow_project: Option<i64> = tx
+            .query_row(
+                "SELECT project_id FROM workflow_runs WHERE id = ?1",
+                [workflow_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if workflow_project != Some(project_id) {
+            return Err(DbError::Scheduler(
+                "invalid Controller workflow review linkage".into(),
+            ));
+        }
+        let plan = tx
+            .query_row(
+                "SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
+                [plan_id],
+                decode_persisted_plan,
+            )
+            .optional()?;
+        let Some(plan) = plan else {
+            return Err(DbError::Scheduler(
+                "Controller Plan review target is missing".into(),
+            ));
+        };
+        let plan_workflow_id: Option<i64> = tx.query_row(
+            "SELECT workflow_id FROM plans WHERE id = ?1",
+            [plan_id],
+            |row| row.get(0),
+        )?;
+        let latest: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if plan_workflow_id != Some(workflow_id)
+            || plan.project_id != project_id
+            || latest != Some(plan_id)
+            || plan.version != expected_version
+            || !matches!(plan.status, PlanStatus::Proposed | PlanStatus::UnderReview)
+            || plan.provenance != PlanProvenance::controller()
+            || plan.response != *expected_plan
+            || plan.response.validate().is_err()
+        {
+            return Err(DbError::Scheduler(
+                "Controller Plan review target is not the current valid Plan".into(),
+            ));
+        }
+        let review_id = record_plan_review_tx(
+            &tx,
+            plan_id,
+            PlanReviewProvenance::controller(),
+            decision,
+            details,
+            Some(workflow_id),
         )?;
         tx.commit()?;
         Ok(review_id)
@@ -5284,15 +5559,17 @@ impl Database {
         parent_version: i64,
         provenance: PlanProvenance,
         response: &crate::protocol::PlanResponse,
+        workflow_id: Option<i64>,
     ) -> Result<(i64, i64), DbError> {
         provenance.validate()?;
         response
             .validate()
             .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
         tx.execute(
-            "INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,?6,'proposed',?7)",
+            "INSERT INTO plans (project_id, workflow_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,?6,?7,'proposed',?8)",
             params![
                 project_id,
+                workflow_id,
                 parent_version + 1,
                 parent_id,
                 provenance.origin.as_str(),
@@ -5365,6 +5642,7 @@ impl Database {
             parent_version,
             PlanProvenance::legacy(decision_id, planner_run_id),
             response,
+            None,
         )?;
         let changed = tx.execute("UPDATE lead_decisions SET status='consumed', resolved_at=CURRENT_TIMESTAMP WHERE id=?1 AND project_id=?2 AND kind='REVISE_PLAN' AND status='pending'", params![decision_id, project_id])?;
         if changed != 1 {
@@ -5392,10 +5670,51 @@ impl Database {
         expected_review_details: &str,
         response: &crate::protocol::PlanResponse,
     ) -> Result<(i64, i64), DbError> {
+        self.store_controller_plan_revision_for_workflow(
+            project_id,
+            None,
+            parent_id,
+            expected_parent_version,
+            expected_parent,
+            source_review_id,
+            expected_review_details,
+            response,
+        )
+    }
+
+    /// Persist a Controller-origin revision bound to one workflow. The child
+    /// Plan and parent supersession are committed atomically with this exact
+    /// workflow identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_controller_plan_revision_for_workflow(
+        &self,
+        project_id: i64,
+        workflow_id: Option<i64>,
+        parent_id: i64,
+        expected_parent_version: i64,
+        expected_parent: &crate::protocol::PlanResponse,
+        source_review_id: i64,
+        expected_review_details: &str,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<(i64, i64), DbError> {
         response
             .validate()
             .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
         let tx = self.conn.unchecked_transaction()?;
+        if let Some(workflow_id) = workflow_id {
+            let workflow_project: Option<i64> = tx
+                .query_row(
+                    "SELECT project_id FROM workflow_runs WHERE id = ?1",
+                    [workflow_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if workflow_project != Some(project_id) {
+                return Err(DbError::Scheduler(
+                    "invalid Controller workflow revision linkage".into(),
+                ));
+            }
+        }
         let parent = tx
             .query_row(
                 "SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
@@ -5408,6 +5727,11 @@ impl Database {
                 "Controller revision parent Plan is missing".into(),
             ));
         };
+        let parent_workflow_id: Option<i64> = tx.query_row(
+            "SELECT workflow_id FROM plans WHERE id = ?1",
+            [parent_id],
+            |row| row.get(0),
+        )?;
         let latest_plan: Option<i64> = tx
             .query_row(
                 "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
@@ -5417,24 +5741,35 @@ impl Database {
             .optional()?;
         let latest_review = tx
             .query_row(
-                "SELECT id, origin, lead_run_id, lead_decision_id, decision, details, superseded_by_review_id FROM plan_reviews WHERE plan_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details, superseded_by_review_id FROM plan_reviews WHERE plan_id = ?1 ORDER BY id DESC LIMIT 1",
                 [parent_id],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        PlanReviewOrigin::parse(row.get(1)?)?,
-                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        PlanReviewOrigin::parse(row.get(2)?)?,
                         row.get::<_, Option<i64>>(3)?,
-                        parse_plan_review_decision(&row.get::<_, String>(4)?)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        parse_plan_review_decision(&row.get::<_, String>(5)?)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
                     ))
                 },
             )
             .optional()?;
         let review_is_current = latest_review.is_some_and(
-            |(id, origin, lead_run_id, lead_decision_id, decision, details, superseded_by)| {
+            |(
+                id,
+                review_workflow_id,
+                origin,
+                lead_run_id,
+                lead_decision_id,
+                decision,
+                details,
+                superseded_by,
+            )| {
                 id == source_review_id
+                    && workflow_id.is_none_or(|workflow_id| review_workflow_id == Some(workflow_id))
                     && origin == PlanReviewOrigin::Controller
                     && lead_run_id.is_none()
                     && lead_decision_id.is_none()
@@ -5443,7 +5778,10 @@ impl Database {
                     && superseded_by.is_none()
             },
         );
-        if parent.project_id != project_id
+        let parent_workflow_matches =
+            workflow_id.is_none_or(|workflow_id| parent_workflow_id == Some(workflow_id));
+        if !parent_workflow_matches
+            || parent.project_id != project_id
             || latest_plan != Some(parent_id)
             || parent.version != expected_parent_version
             || parent.status != PlanStatus::RevisionRequested
@@ -5464,6 +5802,7 @@ impl Database {
             expected_parent_version,
             PlanProvenance::controller(),
             response,
+            workflow_id,
         )?;
         tx.commit()?;
         Ok(result)

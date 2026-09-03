@@ -246,6 +246,53 @@ impl OrcApp {
         crate::controller_planning::ControllerPlanningBuilder::new().propose(&request, runtime)
     }
 
+    /// Mint trusted authorization for one exact validated Controller plan
+    /// persistence proposal. This is a read-only application boundary.
+    pub fn authorize_controller_plan_persistence(
+        &self,
+        proposal: &crate::controller_plan_persistence::ControllerPlanPersistenceProposal,
+    ) -> crate::controller_plan_persistence::ControllerPlanPersistenceAuthorization {
+        crate::controller_plan_persistence::authorization_for(proposal)
+    }
+
+    /// Persist one explicitly authorized Controller-origin Proposed Plan.
+    /// Validation is repeated immediately before the canonical storage call;
+    /// the authorization is consumed regardless of the execution outcome.
+    pub fn execute_authorized_controller_plan_persistence(
+        &self,
+        proposal: &crate::controller_plan_persistence::ControllerPlanPersistenceProposal,
+        authorization: Option<
+            crate::controller_plan_persistence::ControllerPlanPersistenceAuthorization,
+        >,
+    ) -> crate::controller_plan_persistence::ControllerPlanPersistenceResult {
+        let Some(authorization) = authorization else {
+            return crate::controller_plan_persistence::ControllerPlanPersistenceResult::AuthorizationRejected {
+                reason: crate::controller_plan_persistence::ControllerPlanPersistenceAuthorizationRejection::Missing,
+            };
+        };
+        if !crate::controller_plan_persistence::matches_authorization(proposal, &authorization) {
+            return crate::controller_plan_persistence::ControllerPlanPersistenceResult::AuthorizationRejected {
+                reason: crate::controller_plan_persistence::ControllerPlanPersistenceAuthorizationRejection::NotAuthorizedForProposal,
+            };
+        }
+        if proposal.validate().is_err() {
+            return crate::controller_plan_persistence::ControllerPlanPersistenceResult::FreshValidationRejected;
+        }
+        match self
+            .db
+            .store_controller_plan(proposal.project_id(), proposal.plan())
+        {
+            Ok(plan_id) => {
+                crate::controller_plan_persistence::ControllerPlanPersistenceResult::persisted(
+                    plan_id,
+                )
+            }
+            Err(_) => crate::controller_plan_persistence::ControllerPlanPersistenceResult::PersistenceFailed {
+                reason: crate::controller_plan_persistence::ControllerPlanPersistenceFailure::CanonicalStorage,
+            },
+        }
+    }
+
     /// Execute exactly one Planner run for the current actionable PLAN_REQUIRED decision.
     pub fn run_pending_plan(
         &self,

@@ -1707,6 +1707,43 @@ impl Database {
         self.is_current_valid_plan(project_id, plan)
     }
 
+    /// Checks that a Controller Plan remains the current Plan whose
+    /// Controller review requested revision. This is intentionally separate
+    /// from [`Self::is_current_valid_plan`], whose Proposed-only semantics
+    /// gate initial review.
+    pub fn is_current_controller_revision_plan(
+        &self,
+        project_id: i64,
+        plan: &PersistedPlan,
+    ) -> Result<bool, DbError> {
+        if plan.project_id != project_id
+            || plan.status != PlanStatus::RevisionRequested
+            || plan.provenance != PlanProvenance::controller()
+            || plan.response.validate().is_err()
+        {
+            return Ok(false);
+        }
+        let current: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(plan.id) {
+            return Ok(false);
+        }
+        let Some(persisted) = self.get_plan(plan.id)? else {
+            return Ok(false);
+        };
+        Ok(persisted.project_id == project_id
+            && persisted.version == plan.version
+            && persisted.status == plan.status
+            && persisted.provenance == plan.provenance
+            && persisted.response == plan.response)
+    }
+
     pub fn list_plan_history(&self, project_id: i64) -> Result<Vec<PlanHistoryEntry>, DbError> {
         let mut statement = self.conn.prepare("SELECT id, version, origin, source_lead_decision_id, source_planner_run_id, status, created_at FROM plans WHERE project_id = ?1 ORDER BY version, id")?;
         Ok(statement

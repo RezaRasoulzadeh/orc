@@ -303,40 +303,7 @@ pub struct ControllerPlanResult {
 
 impl ControllerPlanResult {
     pub fn validate(&self) -> Result<(), ControllerPlanningError> {
-        self.plan
-            .validate()
-            .map_err(|error| ControllerPlanningError::InvalidPlan(error.to_string()))?;
-        if self.plan.tasks.len() > MAX_PLAN_TASKS {
-            return Err(ControllerPlanningError::InvalidPlan(
-                "too many proposed tasks".into(),
-            ));
-        }
-        output_check(validate_strings(
-            &self.plan.assumptions,
-            "plan.assumptions",
-            MAX_LIST_ITEMS,
-            MAX_TEXT_BYTES,
-        ))?;
-        output_check(validate_strings(
-            &self.plan.risks,
-            "plan.risks",
-            MAX_LIST_ITEMS,
-            MAX_TEXT_BYTES,
-        ))?;
-        output_check(validate_strings(
-            &self.plan.questions,
-            "plan.questions",
-            MAX_LIST_ITEMS,
-            MAX_TEXT_BYTES,
-        ))?;
-        output_check(validate_text(
-            &self.plan.objective,
-            MAX_TEXT_BYTES,
-            "plan.objective",
-        ))?;
-        for task in &self.plan.tasks {
-            output_check(validate_task(task))?;
-        }
+        validate_controller_plan(&self.plan)?;
         output_check(validate_text(
             &self.rationale,
             MAX_RATIONALE_BYTES,
@@ -364,6 +331,43 @@ impl ControllerPlanResult {
         }
         Ok(())
     }
+}
+
+fn validate_controller_plan(plan: &PlanResponse) -> Result<(), ControllerPlanningError> {
+    plan.validate()
+        .map_err(|error| ControllerPlanningError::InvalidPlan(error.to_string()))?;
+    if plan.tasks.len() > MAX_PLAN_TASKS {
+        return Err(ControllerPlanningError::InvalidPlan(
+            "too many proposed tasks".into(),
+        ));
+    }
+    output_check(validate_strings(
+        &plan.assumptions,
+        "plan.assumptions",
+        MAX_LIST_ITEMS,
+        MAX_TEXT_BYTES,
+    ))?;
+    output_check(validate_strings(
+        &plan.risks,
+        "plan.risks",
+        MAX_LIST_ITEMS,
+        MAX_TEXT_BYTES,
+    ))?;
+    output_check(validate_strings(
+        &plan.questions,
+        "plan.questions",
+        MAX_LIST_ITEMS,
+        MAX_TEXT_BYTES,
+    ))?;
+    output_check(validate_text(
+        &plan.objective,
+        MAX_TEXT_BYTES,
+        "plan.objective",
+    ))?;
+    for task in &plan.tasks {
+        output_check(validate_task(task))?;
+    }
+    Ok(())
 }
 
 fn output_check(
@@ -509,13 +513,37 @@ fn parse_result(
     Ok(result)
 }
 
+/// Parse one strict canonical PlanResponse object for Controller capabilities
+/// that return a plan directly rather than the planning-result wrapper.
+pub(crate) fn parse_canonical_plan_response(
+    value: Value,
+) -> Result<PlanResponse, ControllerPlanningError> {
+    reject_plan_unknown_fields(&value)?;
+    let plan = serde_json::from_value::<PlanResponse>(value)
+        .map_err(|error| ControllerPlanningError::InvalidStructuredOutput(error.to_string()))?;
+    validate_controller_plan(&plan).map_err(|error| match error {
+        ControllerPlanningError::InvalidPlan(message) => {
+            ControllerPlanningError::InvalidPlan(message)
+        }
+        ControllerPlanningError::InvalidStructuredOutput(message) => {
+            ControllerPlanningError::InvalidStructuredOutput(message)
+        }
+        other => ControllerPlanningError::InvalidStructuredOutput(other.to_string()),
+    })?;
+    Ok(plan)
+}
+
 fn reject_unknown_fields(value: &Value) -> Result<(), ControllerPlanningError> {
     expect_keys(value, &["plan", "rationale", "uncertainty"], "result")?;
     let plan = value
         .get("plan")
         .ok_or_else(|| ControllerPlanningError::InvalidStructuredOutput("missing plan".into()))?;
+    reject_plan_unknown_fields(plan)
+}
+
+fn reject_plan_unknown_fields(value: &Value) -> Result<(), ControllerPlanningError> {
     expect_keys(
-        plan,
+        value,
         &[
             "protocol_version",
             "objective",
@@ -526,9 +554,12 @@ fn reject_unknown_fields(value: &Value) -> Result<(), ControllerPlanningError> {
         ],
         "plan",
     )?;
-    let tasks = plan.get("tasks").and_then(Value::as_array).ok_or_else(|| {
-        ControllerPlanningError::InvalidStructuredOutput("tasks must be an array".into())
-    })?;
+    let tasks = value
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ControllerPlanningError::InvalidStructuredOutput("tasks must be an array".into())
+        })?;
     for task in tasks {
         expect_keys(
             task,

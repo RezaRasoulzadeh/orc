@@ -293,6 +293,71 @@ impl OrcApp {
         crate::controller_plan_review::ControllerPlanReviewBuilder::new().review(&request, runtime)
     }
 
+    /// Generate one read-only Controller revision for the current
+    /// Controller-origin Plan and its latest actionable Controller review.
+    /// Durable Plan/review mutation remains a later explicitly authorized
+    /// boundary.
+    pub fn revise_controller_plan(
+        &self,
+        plan_id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::controller_plan_revision::ControllerPlanRevisionResult,
+        crate::controller_plan_revision::ControllerPlanRevisionError,
+    > {
+        use crate::controller_plan_revision::{
+            ControllerPlanRevisionBuilder, ControllerPlanRevisionError as RevisionError,
+            ControllerPlanRevisionRequest, ControllerPlanRevisionResult,
+            persisted_revision_feedback,
+        };
+        let project_id = self
+            .lead()
+            .project_id()
+            .map_err(|_| RevisionError::NoActiveProject)?;
+        let plan = self
+            .db
+            .get_plan(plan_id)
+            .map_err(RevisionError::Storage)?
+            .ok_or(RevisionError::PlanNotFound(plan_id))?;
+        if plan.provenance.origin != crate::storage::db::PlanOrigin::Controller {
+            return Err(RevisionError::InvalidPlanOrigin(plan_id));
+        }
+        if !self
+            .db
+            .is_current_controller_revision_plan(project_id, &plan)
+            .map_err(RevisionError::Storage)?
+        {
+            return Err(RevisionError::PlanNotCurrent(plan_id));
+        }
+        let latest_review = self
+            .db
+            .list_plan_reviews(project_id)
+            .map_err(RevisionError::Storage)?
+            .into_iter()
+            .filter(|review| review.plan_id == plan_id)
+            .max_by_key(|review| review.id)
+            .ok_or(RevisionError::ReviewNotFound(plan_id))?;
+        if latest_review.origin != crate::storage::db::PlanReviewOrigin::Controller
+            || latest_review.decision != crate::storage::db::PlanReviewDecision::RevisePlan
+            || latest_review.superseded_by_review_id.is_some()
+        {
+            return Err(RevisionError::ReviewNotActionable(latest_review.id));
+        }
+        let feedback = persisted_revision_feedback(&latest_review)?;
+        let planning_request = self
+            .planning_request()
+            .map_err(|error| RevisionError::PlanningContext(error.to_string()))?;
+        let request =
+            ControllerPlanRevisionRequest::from_canonical(&plan, &feedback, &planning_request)?;
+        let revised_plan = ControllerPlanRevisionBuilder::new().revise(&request, runtime)?;
+        ControllerPlanRevisionResult::from_generated(
+            plan.id,
+            plan.version,
+            latest_review.id,
+            revised_plan,
+        )
+    }
+
     /// Derive a read-only trusted-context proposal for persisting one
     /// Controller review. The result itself never carries authority.
     pub fn propose_controller_plan_review_persistence(

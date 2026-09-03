@@ -21,7 +21,8 @@ Only current/near-term milestones are decomposed here.
 | [M05-001](M05-001.md) | Done | M05 | Add read-only Controller planning capability |
 | [M05-002](M05-002.md) | Done | M05 | Make persisted Plan provenance Controller-compatible |
 | [M05-003](M05-003.md) | Done | M05 | Persist Controller Plan proposals through explicit authorization |
-| [M05-004](M05-004.md) | Planned | M05 | Add read-only Controller Plan review judgment |
+| [M05-004](M05-004.md) | Done | M05 | Add read-only Controller Plan review judgment |
+| [M05-005](M05-005.md) | Planned | M05 | Persist Controller Plan review decisions through explicit authorization |
 
 ## Task format
 

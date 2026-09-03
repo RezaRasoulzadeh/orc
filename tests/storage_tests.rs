@@ -1297,3 +1297,133 @@ fn legacy_plan_schema_migrates_and_reopens_with_truthful_lineage() {
         .unwrap_or(0);
     assert_eq!(foreign_keys, 0);
 }
+
+#[test]
+fn legacy_plan_review_schema_migrates_without_losing_lead_lineage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orc.db");
+    let (project, plan_id, run_id, decision_id, second_review_id) = {
+        let db = Database::init(&path).unwrap();
+        let project = db.create_project("legacy review migration").unwrap();
+        let task = db
+            .insert_task(
+                project,
+                "existing",
+                "objective",
+                "developer",
+                TaskPriority::Normal,
+            )
+            .unwrap();
+        let decision = db
+            .record_lead_decision(
+                project,
+                &LeadDecisionKind::PlanRequired,
+                &serde_json::json!({"plan":"needed"}),
+                LeadDecisionMetadata {
+                    snapshot: "snapshot",
+                    run_id: None,
+                    source_request: "request",
+                    summary: "summary",
+                },
+            )
+            .unwrap();
+        let run = db
+            .create_agent_run_with_execution(
+                project,
+                &task,
+                "planner",
+                AUTOMATED,
+                AgentRunExecution {
+                    class: "plan",
+                    model: None,
+                    effort: None,
+                    source: "test",
+                },
+            )
+            .unwrap();
+        let plan_id = db
+            .store_plan(project, decision, run, &plan_response())
+            .unwrap();
+        let first_review_id = db
+            .record_plan_review(
+                plan_id,
+                run,
+                decision,
+                &LeadDecisionKind::Approve,
+                "legacy review",
+            )
+            .unwrap();
+        let second_decision = db
+            .record_lead_decision(
+                project,
+                &LeadDecisionKind::Approve,
+                &serde_json::json!({"plan":"review again"}),
+                LeadDecisionMetadata {
+                    snapshot: "snapshot",
+                    run_id: Some(run),
+                    source_request: "request",
+                    summary: "summary",
+                },
+            )
+            .unwrap();
+        let second_review_id = db
+            .record_plan_review(
+                plan_id,
+                run,
+                second_decision,
+                &LeadDecisionKind::Approve,
+                "second legacy review",
+            )
+            .unwrap();
+        assert_ne!(first_review_id, second_review_id);
+        (project, plan_id, run, decision, second_review_id)
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE plan_reviews_legacy (
+                 id INTEGER PRIMARY KEY,
+                 plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                 lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+                 lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id),
+                 decision TEXT NOT NULL,
+                 details TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                 superseded_by_review_id INTEGER REFERENCES plan_reviews(id)
+             );
+             INSERT INTO plan_reviews_legacy (id, plan_id, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id)
+                 SELECT id, plan_id, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id FROM plan_reviews;
+             DROP TABLE plan_reviews;
+             ALTER TABLE plan_reviews_legacy RENAME TO plan_reviews;
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Database::open(&path).unwrap();
+    let reviews = reopened.list_plan_reviews(project).unwrap();
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(reviews[0].plan_id, plan_id);
+    assert_eq!(reviews[0].lead_run_id, Some(run_id));
+    assert_eq!(reviews[0].lead_decision_id, Some(decision_id));
+    assert_eq!(reviews[0].superseded_by_review_id, Some(second_review_id));
+    assert_eq!(
+        reviews[0].origin,
+        orc::storage::db::PlanReviewOrigin::LegacyLead
+    );
+    assert_eq!(
+        reviews[0].decision,
+        orc::storage::db::PlanReviewDecision::Approve
+    );
+    assert_eq!(reviews[1].id, second_review_id);
+    assert!(reviews[1].superseded_by_review_id.is_none());
+    let connection = Connection::open(&path).unwrap();
+    let foreign_keys: i64 = connection
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(0))
+        .optional()
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(foreign_keys, 0);
+}

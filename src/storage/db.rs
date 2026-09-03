@@ -200,12 +200,153 @@ pub struct ProjectWorktreeMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReviewOrigin {
+    LegacyLead,
+    Controller,
+}
+
+impl PlanReviewOrigin {
+    fn storage_str(&self) -> &'static str {
+        match self {
+            Self::LegacyLead => "legacy_lead",
+            Self::Controller => "controller",
+        }
+    }
+
+    fn parse(value: String) -> rusqlite::Result<Self> {
+        match value.as_str() {
+            "legacy_lead" => Ok(Self::LegacyLead),
+            "controller" => Ok(Self::Controller),
+            _ => Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid plan review origin: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanReviewProvenance {
+    pub origin: PlanReviewOrigin,
+    pub lead_run_id: Option<i64>,
+    pub lead_decision_id: Option<i64>,
+}
+
+impl PlanReviewProvenance {
+    pub fn legacy(lead_run_id: i64, lead_decision_id: i64) -> Self {
+        Self {
+            origin: PlanReviewOrigin::LegacyLead,
+            lead_run_id: Some(lead_run_id),
+            lead_decision_id: Some(lead_decision_id),
+        }
+    }
+
+    pub const fn controller() -> Self {
+        Self {
+            origin: PlanReviewOrigin::Controller,
+            lead_run_id: None,
+            lead_decision_id: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), DbError> {
+        let valid = match self.origin {
+            PlanReviewOrigin::LegacyLead => {
+                self.lead_run_id.is_some() && self.lead_decision_id.is_some()
+            }
+            PlanReviewOrigin::Controller => {
+                self.lead_run_id.is_none() && self.lead_decision_id.is_none()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(DbError::Scheduler(
+                "plan review provenance does not match its origin".into(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PlanReviewDecision {
+    Approve,
+    RevisePlan,
+    UserDecisionRequired,
+}
+
+impl PlanReviewDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVE",
+            Self::RevisePlan => "REVISE_PLAN",
+            Self::UserDecisionRequired => "USER_DECISION_REQUIRED",
+        }
+    }
+
+    pub(crate) fn from_lead(decision: crate::lead::LeadDecisionKind) -> Option<Self> {
+        match decision {
+            crate::lead::LeadDecisionKind::Approve => Some(Self::Approve),
+            crate::lead::LeadDecisionKind::RevisePlan => Some(Self::RevisePlan),
+            crate::lead::LeadDecisionKind::UserDecisionRequired => Some(Self::UserDecisionRequired),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_lead(self) -> crate::lead::LeadDecisionKind {
+        match self {
+            Self::Approve => crate::lead::LeadDecisionKind::Approve,
+            Self::RevisePlan => crate::lead::LeadDecisionKind::RevisePlan,
+            Self::UserDecisionRequired => crate::lead::LeadDecisionKind::UserDecisionRequired,
+        }
+    }
+}
+
+fn record_plan_review_tx(
+    tx: &rusqlite::Transaction<'_>,
+    plan_id: i64,
+    provenance: PlanReviewProvenance,
+    decision: PlanReviewDecision,
+    details: &str,
+) -> Result<i64, DbError> {
+    provenance.validate()?;
+    tx.execute(
+        "INSERT INTO plan_reviews (plan_id, origin, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            plan_id,
+            provenance.origin.storage_str(),
+            provenance.lead_run_id,
+            provenance.lead_decision_id,
+            decision.as_str(),
+            details
+        ],
+    )?;
+    let review_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE plan_reviews SET superseded_by_review_id = ?1 WHERE plan_id = ?2 AND id <> ?1 AND superseded_by_review_id IS NULL",
+        params![review_id, plan_id],
+    )?;
+    let status = match decision {
+        PlanReviewDecision::Approve => "approved",
+        PlanReviewDecision::RevisePlan => "revision_requested",
+        PlanReviewDecision::UserDecisionRequired => "under_review",
+    };
+    tx.execute(
+        "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
+        params![status, plan_id],
+    )?;
+    Ok(review_id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanReview {
     pub id: i64,
     pub plan_id: i64,
-    pub lead_run_id: i64,
-    pub lead_decision_id: i64,
-    pub decision: crate::lead::LeadDecisionKind,
+    pub origin: PlanReviewOrigin,
+    pub lead_run_id: Option<i64>,
+    pub lead_decision_id: Option<i64>,
+    pub decision: PlanReviewDecision,
     pub details: String,
     pub created_at: String,
     pub superseded_by_review_id: Option<i64>,
@@ -1228,6 +1369,21 @@ fn parse_lead_decision_kind(value: &str) -> Result<crate::lead::LeadDecisionKind
     }
 }
 
+fn parse_plan_review_decision(value: &str) -> Result<PlanReviewDecision, rusqlite::Error> {
+    match value {
+        "APPROVE" | "approve" => Ok(PlanReviewDecision::Approve),
+        "REVISE_PLAN" | "revise_plan" => Ok(PlanReviewDecision::RevisePlan),
+        "USER_DECISION_REQUIRED" | "user_decision_required" => {
+            Ok(PlanReviewDecision::UserDecisionRequired)
+        }
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            1,
+            "decision".into(),
+            rusqlite::types::Type::Text,
+        )),
+    }
+}
+
 fn lead_proposal_from_row(row: &Row<'_>) -> rusqlite::Result<crate::lead::LeadProposal> {
     let proposal = serde_json::from_str(&row.get::<_, String>(1)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
@@ -1571,18 +1727,27 @@ impl Database {
     }
 
     pub fn list_plan_reviews(&self, project_id: i64) -> Result<Vec<PlanReview>, DbError> {
-        let mut statement = self.conn.prepare("SELECT r.id, r.plan_id, r.lead_run_id, r.lead_decision_id, r.decision, r.details, r.created_at, r.superseded_by_review_id FROM plan_reviews r JOIN plans p ON p.id = r.plan_id WHERE p.project_id = ?1 ORDER BY r.id")?;
+        let mut statement = self.conn.prepare("SELECT r.id, r.plan_id, r.origin, r.lead_run_id, r.lead_decision_id, r.decision, r.details, r.created_at, r.superseded_by_review_id FROM plan_reviews r JOIN plans p ON p.id = r.plan_id WHERE p.project_id = ?1 ORDER BY r.id")?;
         Ok(statement
             .query_map([project_id], |row| {
+                let provenance = PlanReviewProvenance {
+                    origin: PlanReviewOrigin::parse(row.get(2)?)?,
+                    lead_run_id: row.get(3)?,
+                    lead_decision_id: row.get(4)?,
+                };
+                if let Err(error) = provenance.validate() {
+                    return Err(rusqlite::Error::InvalidParameterName(error.to_string()));
+                }
                 Ok(PlanReview {
                     id: row.get(0)?,
                     plan_id: row.get(1)?,
-                    lead_run_id: row.get(2)?,
-                    lead_decision_id: row.get(3)?,
-                    decision: parse_lead_decision_kind(&row.get::<_, String>(4)?)?,
-                    details: row.get(5)?,
-                    created_at: row.get(6)?,
-                    superseded_by_review_id: row.get(7)?,
+                    origin: provenance.origin,
+                    lead_run_id: provenance.lead_run_id,
+                    lead_decision_id: provenance.lead_decision_id,
+                    decision: parse_plan_review_decision(&row.get::<_, String>(5)?)?,
+                    details: row.get(6)?,
+                    created_at: row.get(7)?,
+                    superseded_by_review_id: row.get(8)?,
                 })
             })?
             .collect::<Result<_, _>>()?)
@@ -4885,7 +5050,7 @@ impl Database {
 
     fn ensure_plan_tables(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')), source_lead_decision_id INTEGER REFERENCES lead_decisions(id), source_planner_run_id INTEGER REFERENCES agent_runs(id), status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id), CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, lead_run_id INTEGER NOT NULL REFERENCES agent_runs(id), lead_decision_id INTEGER NOT NULL REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id));",
+            "CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, version INTEGER NOT NULL, parent_plan_id INTEGER REFERENCES plans(id), origin TEXT NOT NULL DEFAULT 'legacy_planner' CHECK (origin IN ('legacy_planner', 'controller')), source_lead_decision_id INTEGER REFERENCES lead_decisions(id), source_planner_run_id INTEGER REFERENCES agent_runs(id), status TEXT NOT NULL DEFAULT 'proposed', response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_plan_id INTEGER REFERENCES plans(id), CHECK ((origin = 'legacy_planner' AND source_lead_decision_id IS NOT NULL AND source_planner_run_id IS NOT NULL) OR (origin = 'controller' AND source_lead_decision_id IS NULL AND source_planner_run_id IS NULL))); CREATE UNIQUE INDEX IF NOT EXISTS plans_project_version ON plans(project_id, version); CREATE TABLE IF NOT EXISTS plan_dependencies (plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, task_local_id TEXT NOT NULL, depends_on_local_id TEXT NOT NULL, PRIMARY KEY(plan_id, task_local_id, depends_on_local_id)); CREATE TABLE IF NOT EXISTS plan_reviews (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, origin TEXT NOT NULL DEFAULT 'legacy_lead' CHECK (origin IN ('legacy_lead', 'controller')), lead_run_id INTEGER REFERENCES agent_runs(id), lead_decision_id INTEGER REFERENCES lead_decisions(id), decision TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), superseded_by_review_id INTEGER REFERENCES plan_reviews(id), CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL)));",
         )?;
         for (table, column, definition) in [
             (
@@ -4949,6 +5114,36 @@ impl Database {
             conn.pragma_update(None, "foreign_keys", "ON")?;
             migration?;
         }
+        let has_review_origin: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plan_reviews') WHERE name='origin'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_review_origin == 0 {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let migration = conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE plan_reviews_new (
+                    id INTEGER PRIMARY KEY,
+                    plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                    origin TEXT NOT NULL DEFAULT 'legacy_lead' CHECK (origin IN ('legacy_lead', 'controller')),
+                    lead_run_id INTEGER REFERENCES agent_runs(id),
+                    lead_decision_id INTEGER REFERENCES lead_decisions(id),
+                    decision TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    superseded_by_review_id INTEGER REFERENCES plan_reviews_new(id),
+                    CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL))
+                 );
+                 INSERT INTO plan_reviews_new (id, plan_id, origin, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id)
+                    SELECT id, plan_id, 'legacy_lead', lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id FROM plan_reviews;
+                 DROP TABLE plan_reviews;
+                 ALTER TABLE plan_reviews_new RENAME TO plan_reviews;
+                 COMMIT;",
+            );
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
+        }
         Ok(())
     }
 
@@ -4968,18 +5163,69 @@ impl Database {
         ) {
             return Err(DbError::Scheduler("invalid plan review decision".into()));
         }
+        let decision = PlanReviewDecision::from_lead(*decision)
+            .expect("validated legacy plan review decision must map");
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("INSERT INTO plan_reviews (plan_id, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan_id, lead_run_id, decision_id, lead_decision_kind(*decision), details])?;
-        let review_id = tx.last_insert_rowid();
-        tx.execute("UPDATE plan_reviews SET superseded_by_review_id = ?1 WHERE plan_id = ?2 AND id <> ?1 AND superseded_by_review_id IS NULL", params![review_id, plan_id])?;
-        let status = match decision {
-            crate::lead::LeadDecisionKind::Approve => "approved",
-            crate::lead::LeadDecisionKind::RevisePlan => "revision_requested",
-            _ => "under_review",
+        let review_id = record_plan_review_tx(
+            &tx,
+            plan_id,
+            PlanReviewProvenance::legacy(lead_run_id, decision_id),
+            decision,
+            details,
+        )?;
+        tx.commit()?;
+        Ok(review_id)
+    }
+
+    /// Persist a Controller-origin review after rechecking the exact current
+    /// Controller Plan in the same transaction as the canonical status edge.
+    pub fn store_controller_plan_review(
+        &self,
+        project_id: i64,
+        plan_id: i64,
+        expected_version: i64,
+        expected_plan: &crate::protocol::PlanResponse,
+        decision: PlanReviewDecision,
+        details: &str,
+    ) -> Result<i64, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let plan = tx
+            .query_row(
+                "SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
+                [plan_id],
+                decode_persisted_plan,
+            )
+            .optional()?;
+        let Some(plan) = plan else {
+            return Err(DbError::Scheduler(
+                "Controller Plan review target is missing".into(),
+            ));
         };
-        tx.execute(
-            "UPDATE plans SET status=?1 WHERE id=?2 AND status='proposed'",
-            params![status, plan_id],
+        let latest: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if plan.project_id != project_id
+            || latest != Some(plan_id)
+            || plan.version != expected_version
+            || plan.status != PlanStatus::Proposed
+            || plan.provenance != PlanProvenance::controller()
+            || plan.response != *expected_plan
+            || plan.response.validate().is_err()
+        {
+            return Err(DbError::Scheduler(
+                "Controller Plan review target is not the current valid Plan".into(),
+            ));
+        }
+        let review_id = record_plan_review_tx(
+            &tx,
+            plan_id,
+            PlanReviewProvenance::controller(),
+            decision,
+            details,
         )?;
         tx.commit()?;
         Ok(review_id)

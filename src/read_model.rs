@@ -78,7 +78,7 @@ pub fn workflow_history(db: &crate::storage::Database) -> Result<Vec<WorkflowHis
             kind: "plan_review".into(),
             summary: format!("plan review: {:?}", review.decision),
             task_id: None,
-            run_id: Some(review.lead_run_id),
+            run_id: review.lead_run_id,
             details: serde_json::to_value(review)?,
         });
         sequence += 1;

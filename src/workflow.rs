@@ -1032,8 +1032,10 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             workflow.user_resolution.as_deref(),
         )?;
         Ok(PlanReviewOutcome {
-            provider_run_id: outcome.lead_run_id,
-            decision: outcome.decision,
+            provider_run_id: outcome
+                .lead_run_id
+                .context("legacy Plan review has no Lead run provenance")?,
+            decision: outcome.decision.as_lead(),
         })
     }
 
@@ -1141,11 +1143,13 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             .list_plan_reviews(workflow.project_id)?
             .into_iter()
             .rev()
-            .find(|review| review.lead_run_id == run.id && Some(review.plan_id) == workflow.plan_id)
+            .find(|review| {
+                review.lead_run_id == Some(run.id) && Some(review.plan_id) == workflow.plan_id
+            })
             .context("completed workflow plan-review run has no persisted review")?;
         Ok(Some(PlanReviewOutcome {
             provider_run_id: run.id,
-            decision: review.decision,
+            decision: review.decision.as_lead(),
         }))
     }
 

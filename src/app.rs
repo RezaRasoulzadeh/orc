@@ -293,6 +293,130 @@ impl OrcApp {
         crate::controller_plan_review::ControllerPlanReviewBuilder::new().review(&request, runtime)
     }
 
+    /// Derive a read-only trusted-context proposal for persisting one
+    /// Controller review. The result itself never carries authority.
+    pub fn propose_controller_plan_review_persistence(
+        &self,
+        plan_id: i64,
+        result: &crate::controller_plan_review::ControllerPlanReviewResult,
+    ) -> Result<
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal,
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidProject
+        })?;
+        let plan = self
+            .db
+            .get_plan(plan_id)
+            .map_err(|_| {
+                crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity
+            })?
+            .ok_or(crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposalError::InvalidPlanIdentity)?;
+        crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal::from_controller_result(
+            project_id,
+            &plan,
+            result,
+        )
+    }
+
+    /// Mint trusted authorization for one exact Controller review proposal.
+    pub fn authorize_controller_plan_review_persistence(
+        &self,
+        proposal: &crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal,
+    ) -> crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceAuthorization
+    {
+        crate::controller_plan_review_persistence::authorization_for(proposal)
+    }
+
+    /// Consume one authorization after a fresh current-Plan check and persist
+    /// exactly one Controller-origin review through the canonical DB seam.
+    pub fn execute_authorized_controller_plan_review_persistence(
+        &self,
+        proposal: &crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceProposal,
+        authorization: Option<
+            crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceAuthorization,
+        >,
+    ) -> crate::controller_plan_review_persistence::ControllerPlanReviewPersistenceResult {
+        use crate::controller_plan_review_persistence::{
+            ControllerPlanReviewPersistenceAuthorizationRejection as Rejection,
+            ControllerPlanReviewPersistenceFailure as Failure,
+            ControllerPlanReviewPersistenceResult as Result,
+        };
+        let Some(authorization) = authorization else {
+            return Result::AuthorizationRejected {
+                reason: Rejection::Missing,
+            };
+        };
+        if !crate::controller_plan_review_persistence::matches_authorization(
+            proposal,
+            &authorization,
+        ) {
+            return Result::AuthorizationRejected {
+                reason: Rejection::NotAuthorizedForProposal,
+            };
+        }
+        if proposal.validate().is_err() {
+            return Result::PersistenceFailed {
+                reason: Failure::InvalidProposal,
+            };
+        }
+        let Ok(project_id) = self.lead().project_id() else {
+            return Result::PersistenceFailed {
+                reason: Failure::InvalidProposal,
+            };
+        };
+        let Ok(Some(plan)) = self.db.get_plan(proposal.plan_id()) else {
+            return Result::FreshValidationRejected;
+        };
+        if plan.project_id != project_id
+            || plan.version != proposal.plan_version()
+            || plan.response != *proposal.plan()
+            || plan.provenance.origin != crate::storage::db::PlanOrigin::Controller
+            || !self
+                .db
+                .is_current_valid_plan(project_id, &plan)
+                .unwrap_or(false)
+        {
+            return Result::FreshValidationRejected;
+        }
+        let Ok(details) = proposal.persisted_details() else {
+            return Result::PersistenceFailed {
+                reason: Failure::InvalidProposal,
+            };
+        };
+        let Ok(review_id) = self.db.store_controller_plan_review(
+            project_id,
+            proposal.plan_id(),
+            proposal.plan_version(),
+            proposal.plan(),
+            crate::controller_plan_review_persistence::database_decision(proposal),
+            &details,
+        ) else {
+            return Result::PersistenceFailed {
+                reason: Failure::CanonicalStorage,
+            };
+        };
+        let plan_status = match proposal.decision() {
+            crate::controller_plan_review::ControllerPlanReviewDecision::Approve => {
+                crate::storage::db::PlanStatus::Approved
+            }
+            crate::controller_plan_review::ControllerPlanReviewDecision::RevisePlan => {
+                crate::storage::db::PlanStatus::RevisionRequested
+            }
+            crate::controller_plan_review::ControllerPlanReviewDecision::OperatorDecisionRequired => {
+                crate::storage::db::PlanStatus::UnderReview
+            }
+        };
+        Result::Persisted {
+            review_id,
+            plan_id: proposal.plan_id(),
+            origin: crate::storage::db::PlanReviewOrigin::Controller,
+            decision: proposal.decision(),
+            plan_status,
+        }
+    }
+
     /// Mint trusted authorization for one exact validated Controller plan
     /// persistence proposal. This is a read-only application boundary.
     pub fn authorize_controller_plan_persistence(
@@ -501,9 +625,11 @@ impl OrcApp {
         Ok(crate::storage::db::PlanReview {
             id: review_id,
             plan_id,
-            lead_run_id: run_id,
-            lead_decision_id: decision_id,
-            decision: decision.kind,
+            origin: crate::storage::db::PlanReviewOrigin::LegacyLead,
+            lead_run_id: Some(run_id),
+            lead_decision_id: Some(decision_id),
+            decision: crate::storage::db::PlanReviewDecision::from_lead(decision.kind)
+                .expect("validated legacy review decision must map"),
             details: decision.details.to_string(),
             created_at: String::new(),
             superseded_by_review_id: None,

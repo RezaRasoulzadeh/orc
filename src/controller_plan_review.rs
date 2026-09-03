@@ -198,7 +198,7 @@ pub struct ControllerPlanReviewResult {
 }
 
 impl ControllerPlanReviewResult {
-    fn validate(&self) -> Result<(), ControllerPlanReviewError> {
+    pub fn validate(&self) -> Result<(), ControllerPlanReviewError> {
         validate_text(&self.details, "details")?;
         if self.details.trim().is_empty() {
             return Err(ControllerPlanReviewError::MalformedStructuredOutput(

@@ -20,7 +20,8 @@ Only current/near-term milestones are decomposed here.
 | [M04-005](M04-005.md) | Done | M04 | Route semantic revision non-convergence into supervised Controller recovery |
 | [M05-001](M05-001.md) | Done | M05 | Add read-only Controller planning capability |
 | [M05-002](M05-002.md) | Done | M05 | Make persisted Plan provenance Controller-compatible |
-| [M05-003](M05-003.md) | Planned | M05 | Persist Controller Plan proposals through explicit authorization |
+| [M05-003](M05-003.md) | Done | M05 | Persist Controller Plan proposals through explicit authorization |
+| [M05-004](M05-004.md) | Planned | M05 | Add read-only Controller Plan review judgment |
 
 ## Task format
 

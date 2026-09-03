@@ -4,11 +4,11 @@
 
 **Current milestone:** M05 — Planning and Lead unification
 
-**Current task:** M05-002 — Make persisted Plan provenance Controller-compatible
+**Current task:** M05-003 — Persist Controller Plan proposals through explicit authorization
 
-**Last completed:** M05-001 — Add read-only Controller planning capability
+**Last completed:** M05-002 — Make persisted Plan provenance Controller-compatible
 
-**Blocked by:** Nothing; M05-002 was refocused after repository inspection exposed a legacy provenance constraint.
+**Blocked by:** Nothing
 
 ## Current decisions
 
@@ -21,10 +21,9 @@
 - M03 is complete: typed normal-action intents, deterministic legality, trusted one-shot authorization, fresh legality re-check, canonical execution, and supervised recommendation-to-intent bridge are in place.
 - M04 is complete: bounded recovery facts/legality, Controller recovery choice, supervised recovery execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are in place.
 - M05-001 is complete: bounded read-only Controller planning returns a validated typed plan proposal through `LocalInferenceRuntime`; real Qwen strict-contract evaluation passed.
-- Repository inspection for the original M05-002 scope found that persisted Plans universally require non-null Lead-decision and Planner-run foreign keys, and storage/review validation assumes that legacy lineage.
-- Those fields are legacy workflow provenance, not intrinsic Plan invariants. Controller-origin Plans must be representable without fabricated or consumed Lead/Planner state.
-- M05-002 now migrates durable Plan provenance to an explicit source-neutral representation while preserving strict legacy-origin validation and existing Plan status/version/parent/application semantics.
-- Authorized Controller Plan persistence moves to the next task after M05-002 establishes truthful provenance.
+- M05-002 is complete: persisted Plan provenance explicitly distinguishes legacy Planner origin from Controller origin; legacy lineage remains strict and truthful, while Controller-origin Proposed Plans require no fabricated Lead/Planner IDs.
+- `Database::store_controller_plan` is the canonical deterministic storage seam for Controller-origin Proposed Plans; production Controller authorization/persistence has not yet been connected.
+- M05-003 connects validated Controller plan proposals to that storage seam through trusted one-shot authorization and fresh deterministic validation only.
 - Deterministic validation, lifecycle legality, authorization, persistence, review/application state, and mutation remain kernel-owned.
 - Existing Lead/Planner compatibility machinery remains until later M05 tasks migrate its judgment/routing safely.
 - Memory is explicit Orc data, separate from model weights.
@@ -33,6 +32,6 @@
 
 ## Immediate next action
 
-Implement `tasks/M05-002.md`: make persisted Plan provenance explicitly distinguish legacy Planner-origin from Controller-origin Plans. Preserve real legacy Lead/Planner lineage and validation; do not fabricate IDs, persist a production Controller proposal, create/apply tasks, approve plans, or remove legacy machinery.
+Implement `tasks/M05-003.md`: authorize and persist a validated Controller plan proposal as exactly one canonical Controller-origin `Proposed` Plan through the M05-002 storage seam. Do not review, revise, approve, apply, create tasks, consume Lead state, invoke Planner, or remove legacy machinery.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and Lead/Planner migration map.

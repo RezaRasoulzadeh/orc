@@ -5277,6 +5277,50 @@ impl Database {
             [decision_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
+    fn insert_plan_revision_tx(
+        tx: &rusqlite::Transaction<'_>,
+        project_id: i64,
+        parent_id: i64,
+        parent_version: i64,
+        provenance: PlanProvenance,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<(i64, i64), DbError> {
+        provenance.validate()?;
+        response
+            .validate()
+            .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
+        tx.execute(
+            "INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,?4,?5,?6,'proposed',?7)",
+            params![
+                project_id,
+                parent_version + 1,
+                parent_id,
+                provenance.origin.as_str(),
+                provenance.source_lead_decision_id,
+                provenance.source_planner_run_id,
+                serde_json::to_string(response)?
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        if tx.execute(
+            "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND project_id = ?3 AND superseded_by_plan_id IS NULL",
+            params![id, parent_id, project_id],
+        )? != 1 {
+            return Err(DbError::Scheduler(
+                "parent Plan changed while revision was being persisted".into(),
+            ));
+        }
+        for task in &response.tasks {
+            for dependency in &task.depends_on {
+                tx.execute(
+                    "INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1,?2,?3)",
+                    params![id, task.local_id, dependency],
+                )?;
+            }
+        }
+        Ok((id, parent_id))
+    }
+
     /// Persist a revision as the next immutable plan version and consume the
     /// exact actionable review decision in one transaction.
     pub fn store_plan_revision(
@@ -5314,17 +5358,14 @@ impl Database {
             "UPDATE plans SET status = 'revision_requested' WHERE id = ?1 AND status = 'proposed'",
             [parent_id],
         )?;
-        tx.execute("INSERT INTO plans (project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response) VALUES (?1,?2,?3,'legacy_planner',?4,?5,'proposed',?6)", params![project_id, parent_version + 1, parent_id, decision_id, planner_run_id, serde_json::to_string(response)?])?;
-        let id = tx.last_insert_rowid();
-        tx.execute(
-            "UPDATE plans SET status = 'cancelled', superseded_by_plan_id = ?1 WHERE id = ?2 AND superseded_by_plan_id IS NULL",
-            params![id, parent_id],
+        let (id, parent_id) = Self::insert_plan_revision_tx(
+            &tx,
+            project_id,
+            parent_id,
+            parent_version,
+            PlanProvenance::legacy(decision_id, planner_run_id),
+            response,
         )?;
-        for task in &response.tasks {
-            for dependency in &task.depends_on {
-                tx.execute("INSERT INTO plan_dependencies (plan_id, task_local_id, depends_on_local_id) VALUES (?1,?2,?3)", params![id, task.local_id, dependency])?;
-            }
-        }
         let changed = tx.execute("UPDATE lead_decisions SET status='consumed', resolved_at=CURRENT_TIMESTAMP WHERE id=?1 AND project_id=?2 AND kind='REVISE_PLAN' AND status='pending'", params![decision_id, project_id])?;
         if changed != 1 {
             return Err(DbError::Scheduler(
@@ -5333,6 +5374,99 @@ impl Database {
         }
         tx.commit()?;
         Ok((id, parent_id))
+    }
+
+    /// Persist one Controller-origin revision after atomically rechecking its
+    /// exact current parent and source Controller review. Controller reviews
+    /// are historical rows without a consumed state; superseding their parent
+    /// Plan makes the source review non-actionable through canonical current
+    /// Plan selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_controller_plan_revision(
+        &self,
+        project_id: i64,
+        parent_id: i64,
+        expected_parent_version: i64,
+        expected_parent: &crate::protocol::PlanResponse,
+        source_review_id: i64,
+        expected_review_details: &str,
+        response: &crate::protocol::PlanResponse,
+    ) -> Result<(i64, i64), DbError> {
+        response
+            .validate()
+            .map_err(|error| DbError::Scheduler(format!("invalid plan: {error}")))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let parent = tx
+            .query_row(
+                "SELECT id, project_id, version, parent_plan_id, origin, source_lead_decision_id, source_planner_run_id, status, response, created_at, superseded_by_plan_id FROM plans WHERE id = ?1",
+                [parent_id],
+                decode_persisted_plan,
+            )
+            .optional()?;
+        let Some(parent) = parent else {
+            return Err(DbError::Scheduler(
+                "Controller revision parent Plan is missing".into(),
+            ));
+        };
+        let latest_plan: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM plans WHERE project_id = ?1 ORDER BY version DESC, id DESC LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let latest_review = tx
+            .query_row(
+                "SELECT id, origin, lead_run_id, lead_decision_id, decision, details, superseded_by_review_id FROM plan_reviews WHERE plan_id = ?1 ORDER BY id DESC LIMIT 1",
+                [parent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        PlanReviewOrigin::parse(row.get(1)?)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        parse_plan_review_decision(&row.get::<_, String>(4)?)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let review_is_current = latest_review.is_some_and(
+            |(id, origin, lead_run_id, lead_decision_id, decision, details, superseded_by)| {
+                id == source_review_id
+                    && origin == PlanReviewOrigin::Controller
+                    && lead_run_id.is_none()
+                    && lead_decision_id.is_none()
+                    && decision == PlanReviewDecision::RevisePlan
+                    && details == expected_review_details
+                    && superseded_by.is_none()
+            },
+        );
+        if parent.project_id != project_id
+            || latest_plan != Some(parent_id)
+            || parent.version != expected_parent_version
+            || parent.status != PlanStatus::RevisionRequested
+            || parent.provenance != PlanProvenance::controller()
+            || parent.superseded_by_plan_id.is_some()
+            || parent.response != *expected_parent
+            || parent.response.validate().is_err()
+            || !review_is_current
+        {
+            return Err(DbError::Scheduler(
+                "Controller revision parent or source review is no longer actionable".into(),
+            ));
+        }
+        let result = Self::insert_plan_revision_tx(
+            &tx,
+            project_id,
+            parent_id,
+            expected_parent_version,
+            PlanProvenance::controller(),
+            response,
+        )?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn record_lead_decision(

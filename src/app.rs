@@ -359,6 +359,111 @@ impl OrcApp {
     }
 
     /// Derive a read-only trusted-context proposal for persisting one
+    /// Controller revision. The result carries no authority or storage
+    /// capability.
+    pub fn propose_controller_plan_revision_persistence(
+        &self,
+        result: &crate::controller_plan_revision::ControllerPlanRevisionResult,
+    ) -> Result<
+        crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal,
+        crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError,
+    > {
+        use crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal as Proposal;
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidProject
+        })?;
+        let parent = self
+            .db
+            .get_plan(result.parent_plan_id)
+            .map_err(|_| {
+                crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidParent
+            })?
+            .ok_or(crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidParent)?;
+        let review = self
+            .db
+            .list_plan_reviews(project_id)
+            .map_err(|_| {
+                crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidSourceReview
+            })?
+            .into_iter()
+            .find(|review| review.id == result.review_id)
+            .ok_or(crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposalError::InvalidSourceReview)?;
+        Proposal::from_controller_result(project_id, &parent, &review, result)
+    }
+
+    /// Mint trusted authorization for one exact Controller revision
+    /// persistence proposal.
+    pub fn authorize_controller_plan_revision_persistence(
+        &self,
+        proposal: &crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal,
+    ) -> crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceAuthorization
+    {
+        crate::controller_plan_revision_persistence::authorization_for(proposal)
+    }
+
+    /// Consume one authorization and atomically persist the Controller
+    /// revision after the canonical parent/review eligibility re-check.
+    pub fn execute_authorized_controller_plan_revision_persistence(
+        &self,
+        proposal: &crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceProposal,
+        authorization: Option<crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceAuthorization>,
+    ) -> crate::controller_plan_revision_persistence::ControllerPlanRevisionPersistenceResult {
+        use crate::controller_plan_revision_persistence::{
+            ControllerPlanRevisionPersistenceAuthorizationRejection as Rejection,
+            ControllerPlanRevisionPersistenceFailure as Failure,
+            ControllerPlanRevisionPersistenceResult as Result,
+        };
+        let Some(authorization) = authorization else {
+            return Result::AuthorizationRejected {
+                reason: Rejection::Missing,
+            };
+        };
+        if !crate::controller_plan_revision_persistence::matches_authorization(
+            proposal,
+            &authorization,
+        ) {
+            return Result::AuthorizationRejected {
+                reason: Rejection::NotAuthorizedForProposal,
+            };
+        }
+        if proposal.validate().is_err() {
+            return Result::PersistenceFailed {
+                reason: Failure::InvalidProposal,
+            };
+        }
+        let Ok(project_id) = self.lead().project_id() else {
+            return Result::FreshValidationRejected;
+        };
+        let (plan_id, parent_id) = match self.db.store_controller_plan_revision(
+            project_id,
+            proposal.parent_plan_id(),
+            proposal.parent_plan_version(),
+            proposal.parent_plan(),
+            proposal.source_review_id(),
+            proposal.source_review_details(),
+            proposal.revised_plan(),
+        ) {
+            Ok(ids) => ids,
+            Err(crate::storage::db::DbError::Scheduler(_)) => {
+                return Result::FreshValidationRejected;
+            }
+            Err(_) => {
+                return Result::PersistenceFailed {
+                    reason: Failure::CanonicalStorage,
+                };
+            }
+        };
+        Result::Persisted {
+            plan_id,
+            version: proposal.parent_plan_version() + 1,
+            status: crate::storage::db::PlanStatus::Proposed,
+            origin: crate::storage::db::PlanOrigin::Controller,
+            parent_plan_id: parent_id,
+            source_review_id: proposal.source_review_id(),
+        }
+    }
+
+    /// Derive a read-only trusted-context proposal for persisting one
     /// Controller review. The result itself never carries authority.
     pub fn propose_controller_plan_review_persistence(
         &self,

@@ -4,9 +4,9 @@
 
 **Current milestone:** M05 — Planning and Lead unification
 
-**Current task:** M05-007 — Persist Controller Plan revisions through explicit authorization
+**Current task:** M05 follow-up — migrate the next supervised legacy planning/routing seam
 
-**Last completed:** M05-006 — Add read-only Controller Plan revision generation
+**Last completed:** M05-007 — Persist Controller Plan revisions through explicit authorization
 
 **Blocked by:** Nothing
 
@@ -32,6 +32,6 @@
 
 ## Immediate next action
 
-Implement `tasks/M05-007.md`: persist a validated Controller Plan revision through exact trusted one-shot authorization, fresh parent/review eligibility checks, and atomic canonical version/parent/review supersession. Do not invoke Lead/Planner, approve/apply the new Plan, create tasks, automatically review it, or continue workflow execution.
+Select the next separately scoped supervised migration of the remaining legacy Lead/Planner routing boundary. Preserve plan application gates and do not remove compatibility machinery until its replacement is validated.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and Lead/Planner migration map.

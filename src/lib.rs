@@ -14,6 +14,7 @@ pub mod controller_plan_persistence;
 pub mod controller_plan_review;
 pub mod controller_plan_review_persistence;
 pub mod controller_plan_revision;
+pub mod controller_plan_revision_persistence;
 pub mod controller_planning;
 pub mod desktop;
 pub mod discovery;

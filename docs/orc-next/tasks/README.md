@@ -24,7 +24,7 @@ Only current/near-term milestones are decomposed here.
 | [M05-004](M05-004.md) | Done | M05 | Add read-only Controller Plan review judgment |
 | [M05-005](M05-005.md) | Done | M05 | Persist Controller Plan review decisions through explicit authorization |
 | [M05-006](M05-006.md) | Done | M05 | Add read-only Controller Plan revision generation |
-| [M05-007](M05-007.md) | Planned | M05 | Persist Controller Plan revisions through explicit authorization |
+| [M05-007](M05-007.md) | Done | M05 | Persist Controller Plan revisions through explicit authorization |
 
 ## Task format
 

@@ -246,6 +246,53 @@ impl OrcApp {
         crate::controller_planning::ControllerPlanningBuilder::new().propose(&request, runtime)
     }
 
+    /// Review a current valid persisted Plan through the read-only Controller
+    /// judgment boundary. This never persists the returned decision.
+    pub fn review_controller_plan(
+        &self,
+        plan_id: i64,
+        operator_resolution: Option<&str>,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<
+        crate::controller_plan_review::ControllerPlanReviewResult,
+        crate::controller_plan_review::ControllerPlanReviewError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_plan_review::ControllerPlanReviewError::NoActiveProject
+        })?;
+        let plan = self
+            .db
+            .get_plan(plan_id)
+            .map_err(crate::controller_plan_review::ControllerPlanReviewError::Storage)?
+            .ok_or(
+                crate::controller_plan_review::ControllerPlanReviewError::PlanNotFound(plan_id),
+            )?;
+        if !self
+            .db
+            .is_current_valid_plan(project_id, &plan)
+            .map_err(crate::controller_plan_review::ControllerPlanReviewError::Storage)?
+        {
+            return Err(
+                crate::controller_plan_review::ControllerPlanReviewError::PlanNotCurrent(plan_id),
+            );
+        }
+        let state = self
+            .db
+            .planning_project_state()
+            .map_err(crate::controller_plan_review::ControllerPlanReviewError::Storage)?;
+        let project_name = self
+            .db
+            .get_project_name()
+            .map_err(crate::controller_plan_review::ControllerPlanReviewError::Storage)?;
+        let request = crate::controller_plan_review::ControllerPlanReviewRequest::from_persisted(
+            &plan,
+            project_name.as_deref(),
+            &state,
+            operator_resolution,
+        )?;
+        crate::controller_plan_review::ControllerPlanReviewBuilder::new().review(&request, runtime)
+    }
+
     /// Mint trusted authorization for one exact validated Controller plan
     /// persistence proposal. This is a read-only application boundary.
     pub fn authorize_controller_plan_persistence(

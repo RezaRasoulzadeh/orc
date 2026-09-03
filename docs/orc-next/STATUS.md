@@ -4,7 +4,7 @@
 
 **Current milestone:** M05 — Planning and Lead unification
 
-**Current task:** M05 follow-up — migrate the next supervised legacy planning/routing seam
+**Current task:** M05-008 — Route supervised Plan workflow through Controller capabilities
 
 **Last completed:** M05-007 — Persist Controller Plan revisions through explicit authorization
 
@@ -22,16 +22,16 @@
 - M04 is complete: bounded recovery facts/legality, Controller recovery choice, supervised recovery execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are in place.
 - M05-001 through M05-003 provide bounded Controller Plan generation and explicitly authorized Controller-origin Plan persistence with truthful provenance.
 - M05-004 and M05-005 provide bounded Controller Plan review judgment and explicitly authorized durable Controller-origin Plan review/status persistence.
-- M05-006 is complete: Controller revision generation requires a current Controller-origin `RevisionRequested` Plan and its latest unsuperseded Controller-origin `RevisePlan` review; generation is read-only and Qwen strict/semantic evaluation passed 1/1.
-- M05-007 connects validated Controller revisions to atomic canonical Plan version/parent/review supersession through trusted one-shot authorization.
+- M05-006 and M05-007 provide bounded Controller Plan revision generation and explicitly authorized atomic Controller-origin revision persistence/supersession.
+- M05-008 integrates those completed Controller capabilities into the persisted supervised Plan workflow while keeping workflow transitions, approval gates, application, and restart safety deterministic.
 - Deterministic validation, lifecycle legality, authorization, persistence, review/application state, and mutation remain kernel-owned.
-- Existing Lead/Planner compatibility machinery remains until later M05 tasks migrate its judgment/routing safely.
+- Existing Lead/Planner compatibility machinery remains until later M05 cleanup validates its replacement.
 - Memory is explicit Orc data, separate from model weights.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Select the next separately scoped supervised migration of the remaining legacy Lead/Planner routing boundary. Preserve plan application gates and do not remove compatibility machinery until its replacement is validated.
+Implement `tasks/M05-008.md`: route workflow Plan generation, review, and revision through the completed Controller semantic + authorized persistence boundaries without fabricating legacy lineage. Preserve restart recovery, user Plan approval, canonical ApplyPlan, and legacy compatibility paths.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and Lead/Planner migration map.

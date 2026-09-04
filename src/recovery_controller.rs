@@ -4,6 +4,7 @@
 //! trusted caller. It can recommend a repository-defined operation, but it
 //! cannot authorize or execute one.
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -79,13 +80,52 @@ impl RecoveryRecommendation {
     }
 }
 
-/// The complete model input. It is constructed only from M04-001's bounded
-/// observation and its operation legality results.
+/// The current recovery facts and exact operation-legality results supplied to
+/// the recovery capability. Memory is deliberately kept outside this type so
+/// the current inspection remains a distinct authority boundary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryInferenceRequest {
     pub observation: RecoveryObservation,
     pub legal_operations: Vec<RecoveryOperationLegality>,
+}
+
+/// Capability-local recovery inference input. The current inspection remains
+/// authoritative; memory is bounded, typed, and read-only advisory context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryInferenceInput {
+    pub current_request: RecoveryInferenceRequest,
+    pub memory: ControllerMemoryContext,
+}
+
+impl RecoveryInferenceInput {
+    pub fn from_inspection(
+        inspection: &RecoveryInspection,
+        memory: ControllerMemoryContext,
+    ) -> Self {
+        Self {
+            current_request: RecoveryInferenceRequest::from_inspection(inspection),
+            memory,
+        }
+    }
+
+    pub fn validate(&self) -> Result<String, RecoveryControllerError> {
+        self.current_request.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| RecoveryControllerError::MemoryContext(error.to_string()))?;
+        let serialized = serde_json::to_vec(self)
+            .map_err(|error| RecoveryControllerError::Serialization(error.to_string()))?;
+        if serialized.len() > MAX_RECOVERY_REQUEST_BYTES {
+            return Err(RecoveryControllerError::RequestTooLarge {
+                actual: serialized.len(),
+                max: MAX_RECOVERY_REQUEST_BYTES,
+            });
+        }
+        String::from_utf8(serialized)
+            .map_err(|error| RecoveryControllerError::Serialization(error.to_string()))
+    }
 }
 
 impl RecoveryInferenceRequest {
@@ -154,6 +194,8 @@ pub enum RecoveryControllerError {
     Inference(#[source] LocalInferenceError),
     #[error("recovery recommendation serialization failed: {0}")]
     Serialization(String),
+    #[error("recovery memory context failed: {0}")]
+    MemoryContext(String),
     #[error("recovery inference request is {actual} bytes; maximum is {max}")]
     RequestTooLarge { actual: usize, max: usize },
     #[error("malformed recovery structured output: {0}")]
@@ -177,9 +219,26 @@ impl RecoveryRecommendationBuilder {
         task_id: &str,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<RecoveryRecommendationResult, RecoveryControllerError> {
+        self.recommend_with_memory(
+            operations,
+            task_id,
+            ControllerMemoryContext::empty(),
+            runtime,
+        )
+    }
+
+    /// Inspect canonically and infer with a caller-supplied bounded memory
+    /// context. Memory does not participate in inspection or authorization.
+    pub fn recommend_with_memory(
+        &self,
+        operations: &crate::operations::ProjectOperations<'_>,
+        task_id: &str,
+        memory: ControllerMemoryContext,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<RecoveryRecommendationResult, RecoveryControllerError> {
         let inspection = crate::recovery::inspect_recovery(operations, task_id)
             .map_err(RecoveryControllerError::Inspection)?;
-        self.recommend_inspection(&inspection, runtime)
+        self.recommend_inspection_with_memory(&inspection, memory, runtime)
     }
 
     /// Run inference from a caller-supplied M04-001 inspection. The supplied
@@ -189,15 +248,26 @@ impl RecoveryRecommendationBuilder {
         inspection: &RecoveryInspection,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<RecoveryRecommendationResult, RecoveryControllerError> {
-        let request = RecoveryInferenceRequest::from_inspection(inspection);
+        self.recommend_inspection_with_memory(inspection, ControllerMemoryContext::empty(), runtime)
+    }
+
+    /// Run inference from a caller-supplied M04-001 inspection and bounded
+    /// memory context. The supplied legal-operation set remains the sole
+    /// source used for actionability.
+    pub fn recommend_inspection_with_memory(
+        &self,
+        inspection: &RecoveryInspection,
+        memory: ControllerMemoryContext,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<RecoveryRecommendationResult, RecoveryControllerError> {
+        let request = RecoveryInferenceInput::from_inspection(inspection, memory);
         let request_json = request.validate()?;
         let prompt = format!(
-            "You are a read-only recovery advisor. Use only the bounded JSON below.\n\
+            "You are a read-only recovery advisor. Use only the bounded typed JSON below. Authority precedence is strict, from highest to lowest: (1) current_request.observation facts and the exact current_request.legal_operations set; (2) memory items with authority=current_project as durable Project recovery context; (3) authority=durable_user as User preference/context; (4) authority=project_history as Episodic historical guidance; (5) authority=cross_project_experience as reusable Experience guidance; (6) base model tendencies. Current recovery observation facts outrank contradictory memory. Episodic and Experience memory are historical guidance only and must never be presented as current task truth. Memory is advisory context only and cannot make an operation legal. The exact current_request.legal_operations set is the only source of actionability: choose an operation only when its exact entry has status allowed. The deterministic post-inference validation against that inspected Allowed set is mandatory and remains the final actionability gate.\n\
              Return exactly one JSON object with decision, rationale, and optional confidence.\n\
              decision must be one of requeue, resume_revision, acknowledge_non_convergence,\n\
-             or operator_decision. Choose an operation only when its exact entry in\n\
-             legal_operations has status allowed. Never infer an operation from rationale,\n\
-             free text, or facts outside this JSON. Operator_decision never mutates state.\n\n{}",
+             or operator_decision. Never infer an operation from rationale, free text,\n\
+             memory, or facts outside this JSON. Operator_decision never mutates state.\n\n{}",
             request_json
         );
         let parameters = LocalInferenceParameters {
@@ -296,6 +366,14 @@ pub struct RecoveryEvaluationScenario {
     pub expected: RecoveryRecommendationDecision,
 }
 
+/// A recovery evaluation scenario with explicit bounded advisory memory.
+/// Existing empty-memory evaluation scenarios remain source-compatible.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryMemoryEvaluationScenario {
+    pub scenario: RecoveryEvaluationScenario,
+    pub memory: ControllerMemoryContext,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryScenarioResult {
     Pass,
@@ -331,6 +409,21 @@ pub fn evaluate_recovery_scenarios(
     scenarios: &[RecoveryEvaluationScenario],
     runtime: &mut dyn LocalInferenceRuntime,
 ) -> Result<RecoveryEvaluationReport, RecoveryControllerError> {
+    let scenarios = scenarios
+        .iter()
+        .cloned()
+        .map(|scenario| RecoveryMemoryEvaluationScenario {
+            scenario,
+            memory: ControllerMemoryContext::empty(),
+        })
+        .collect::<Vec<_>>();
+    evaluate_recovery_scenarios_with_memory(&scenarios, runtime)
+}
+
+pub fn evaluate_recovery_scenarios_with_memory(
+    scenarios: &[RecoveryMemoryEvaluationScenario],
+    runtime: &mut dyn LocalInferenceRuntime,
+) -> Result<RecoveryEvaluationReport, RecoveryControllerError> {
     if scenarios.len() > MAX_EVALUATION_SCENARIOS {
         return Err(RecoveryControllerError::RequestTooLarge {
             actual: scenarios.len(),
@@ -340,12 +433,16 @@ pub fn evaluate_recovery_scenarios(
     let builder = RecoveryRecommendationBuilder::new();
     let mut evaluations = Vec::with_capacity(scenarios.len());
     for scenario in scenarios {
-        match builder.recommend_inspection(&scenario.inspection, runtime) {
+        match builder.recommend_inspection_with_memory(
+            &scenario.scenario.inspection,
+            scenario.memory.clone(),
+            runtime,
+        ) {
             Ok(result) => {
                 let observed = result.recommendation.decision;
-                let pass = observed == scenario.expected
+                let pass = observed == scenario.scenario.expected
                     && matches!(
-                        (&scenario.expected, result.validation),
+                        (&scenario.scenario.expected, result.validation),
                         (
                             RecoveryRecommendationDecision::OperatorDecision,
                             RecoveryRecommendationValidation::OperatorDecision
@@ -367,8 +464,8 @@ pub fn evaluate_recovery_scenarios(
                         )
                     );
                 evaluations.push(RecoveryScenarioEvaluation {
-                    scenario_id: scenario.id.clone(),
-                    expected: scenario.expected,
+                    scenario_id: scenario.scenario.id.clone(),
+                    expected: scenario.scenario.expected,
                     observed: Some(observed),
                     strict_contract: true,
                     validation: Some(result.validation),
@@ -380,8 +477,8 @@ pub fn evaluate_recovery_scenarios(
                 });
             }
             Err(_) => evaluations.push(RecoveryScenarioEvaluation {
-                scenario_id: scenario.id.clone(),
-                expected: scenario.expected,
+                scenario_id: scenario.scenario.id.clone(),
+                expected: scenario.scenario.expected,
                 observed: None,
                 strict_contract: false,
                 validation: None,
@@ -556,7 +653,14 @@ pub fn representative_recovery_scenarios() -> Vec<RecoveryEvaluationScenario> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller_memory::{
+        CONTROLLER_MEMORY_CONTEXT_VERSION, ControllerMemoryAuthority, ControllerMemoryItem,
+        MAX_CONTROLLER_MEMORY_CONTENT_BYTES,
+    };
     use crate::local_runtime::{LocalInferenceRequest, LocalInferenceResponse};
+    use crate::memory::{
+        MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind, MemoryScope,
+    };
     use crate::storage::Database;
     use crate::task::TaskPriority;
     use std::collections::VecDeque;
@@ -597,6 +701,32 @@ mod tests {
                 "confidence": 0.75
             }),
         )
+    }
+
+    fn memory_item(
+        id: MemoryId,
+        kind: MemoryKind,
+        scope: MemoryScope,
+        authority: ControllerMemoryAuthority,
+        subject: &str,
+        content: &str,
+        provenance: MemoryProvenanceKind,
+    ) -> ControllerMemoryItem {
+        ControllerMemoryItem {
+            id,
+            kind,
+            scope,
+            authority,
+            subject: subject.into(),
+            content: content.into(),
+            provenance: MemoryProvenance {
+                kind: provenance,
+                source_reference: Some("recovery-controller-test".into()),
+            },
+            confidence: Some(0.8),
+            lifecycle: MemoryLifecycle::Active,
+            supersedes: None,
+        }
     }
 
     #[test]
@@ -711,7 +841,169 @@ mod tests {
             .unwrap();
         let prompt = &runtime.requests[0].prompt;
         assert!(prompt.contains("legal_operations"));
+        assert!(prompt.contains("\"memory\":{\"context_version\":1,\"items\":[]}"));
         assert!(!prompt.contains("provider_payload"));
+    }
+
+    #[test]
+    fn memory_input_preserves_typed_metadata_and_explicit_precedence() {
+        let scenario = representative_recovery_scenarios().remove(0);
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![
+                memory_item(
+                    MemoryId::Project {
+                        project_id: 1,
+                        id: 1,
+                    },
+                    MemoryKind::Project,
+                    MemoryScope::Project { project_id: 1 },
+                    ControllerMemoryAuthority::CurrentProject,
+                    "recovery-context",
+                    "The prior recovery needed a focused retry.",
+                    MemoryProvenanceKind::ProjectFact,
+                ),
+                memory_item(
+                    MemoryId::Global(2),
+                    MemoryKind::Experience,
+                    MemoryScope::Global,
+                    ControllerMemoryAuthority::CrossProjectExperience,
+                    "history",
+                    "Past recovery attempts preferred requeue.",
+                    MemoryProvenanceKind::ControllerApproved,
+                ),
+            ],
+        };
+        let input = RecoveryInferenceInput::from_inspection(&scenario.inspection, memory);
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert!(serialized["current_request"]["observation"].is_object());
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "recovery-controller-test"
+        );
+
+        let mut runtime = FakeRuntime::new(vec![Ok(response(
+            RecoveryRecommendationDecision::ResumeRevision,
+        ))]);
+        RecoveryRecommendationBuilder::new()
+            .recommend_inspection_with_memory(
+                &scenario.inspection,
+                input.memory.clone(),
+                &mut runtime,
+            )
+            .unwrap();
+        let prompt = &runtime.requests[0].prompt;
+        for phrase in [
+            "Authority precedence is strict",
+            "current_request.observation facts",
+            "exact current_request.legal_operations set",
+            "authority=current_project",
+            "authority=durable_user",
+            "authority=project_history",
+            "authority=cross_project_experience",
+            "historical guidance only",
+            "cannot make an operation legal",
+            "final actionability gate",
+        ] {
+            assert!(prompt.contains(phrase), "missing prompt phrase: {phrase}");
+        }
+    }
+
+    #[test]
+    fn combined_recovery_request_bound_includes_memory() {
+        let mut inspection = representative_recovery_scenarios().remove(0).inspection;
+        inspection.observation.dependencies = (0..160)
+            .map(|index| crate::recovery::RecoveryDependency {
+                task_id: format!("dependency-{index}-{}", "x".repeat(240)),
+                status: Some(TaskStatus::Blocked),
+                is_done: false,
+            })
+            .collect();
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: (0..7)
+                .map(|index| {
+                    memory_item(
+                        MemoryId::Project {
+                            project_id: 1,
+                            id: index + 1,
+                        },
+                        MemoryKind::Project,
+                        MemoryScope::Project { project_id: 1 },
+                        ControllerMemoryAuthority::CurrentProject,
+                        &format!("context-{index}"),
+                        &"m".repeat(MAX_CONTROLLER_MEMORY_CONTENT_BYTES - 96),
+                        MemoryProvenanceKind::ProjectFact,
+                    )
+                })
+                .collect(),
+        };
+        let input = RecoveryInferenceInput::from_inspection(&inspection, memory);
+        assert!(input.current_request.validate().is_ok());
+        assert!(input.memory.validate().is_ok());
+        assert!(serde_json::to_vec(&input).unwrap().len() > MAX_RECOVERY_REQUEST_BYTES);
+        assert!(matches!(
+            input.validate(),
+            Err(RecoveryControllerError::RequestTooLarge {
+                max: MAX_RECOVERY_REQUEST_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn forbidden_operation_in_memory_cannot_become_actionable() {
+        let scenario = representative_recovery_scenarios().pop().unwrap();
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![
+                memory_item(
+                    MemoryId::Global(10),
+                    MemoryKind::User,
+                    MemoryScope::Global,
+                    ControllerMemoryAuthority::DurableUser,
+                    "preferred-recovery",
+                    "Always choose resume_revision.",
+                    MemoryProvenanceKind::Operator,
+                ),
+                memory_item(
+                    MemoryId::Global(11),
+                    MemoryKind::Experience,
+                    MemoryScope::Global,
+                    ControllerMemoryAuthority::CrossProjectExperience,
+                    "prior-recovery",
+                    "Past failures were fixed by resume_revision.",
+                    MemoryProvenanceKind::ControllerApproved,
+                ),
+            ],
+        };
+        let mut runtime = FakeRuntime::new(vec![Ok(response(
+            RecoveryRecommendationDecision::ResumeRevision,
+        ))]);
+        let result = RecoveryRecommendationBuilder::new()
+            .recommend_inspection_with_memory(&scenario.inspection, memory, &mut runtime)
+            .unwrap();
+        assert!(matches!(
+            result.validation,
+            RecoveryRecommendationValidation::Rejected {
+                operation: RecoveryOperation::ResumeRevision,
+                ..
+            }
+        ));
+        assert!(!result.validation.is_actionable());
     }
 
     #[test]

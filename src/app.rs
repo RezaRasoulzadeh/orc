@@ -1344,9 +1344,13 @@ impl OrcApp {
         crate::recovery_controller::RecoveryRecommendationResult,
         crate::recovery_controller::RecoveryControllerError,
     > {
-        crate::recovery_controller::RecoveryRecommendationBuilder::new().recommend(
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::recovery_controller::RecoveryControllerError::MemoryContext(error.to_string())
+        })?;
+        crate::recovery_controller::RecoveryRecommendationBuilder::new().recommend_with_memory(
             &self.operations(),
             task_id,
+            memory,
             runtime,
         )
     }

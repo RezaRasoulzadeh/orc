@@ -22,10 +22,7 @@ Exit criteria:
 - a real local smoke test is documented separately from normal deterministic tests;
 - no Python runtime dependency is introduced.
 
-Result: M01-002 received source review **PASS**. The opt-in
-`Qwen3-8B-Q4_K_M.gguf` smoke passed in `15.26s` (`1 passed; 0 failed`) through
-`LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU. Vulkan/GPU
-optimization remains a separate concern.
+Result: M01-002 received source review **PASS**. The opt-in `Qwen3-8B-Q4_K_M.gguf` smoke passed in `15.26s` (`1 passed; 0 failed`) through `LocalInferenceRuntime` → `LlamaCppRuntime` → llama.cpp on CPU. Vulkan/GPU optimization remains a separate concern.
 
 ## M02 — Read-only Controller — COMPLETE
 
@@ -51,11 +48,11 @@ Result: supervised Controller workflow now owns Plan generation/review/revision 
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 integrated it into Plan generation, M06-004 into recovery recommendation, M06-005 into normal task recommendation, and M06-006 into workflow intake through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
+M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 through M06-008 integrated it into Plan generation, recovery recommendation, normal task recommendation, workflow intake, Plan review, and Plan revision through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
 
-Current work integrates the same bounded read-only memory context into Controller Plan review through `ControllerPlanReviewRequest` / `ControllerPlanReviewBuilder::review` / `OrcApp::review_controller_plan`. The current persisted Plan, current project/task state, and explicit operator resolution remain authoritative; valid outcomes remain Approve, RevisePlan, and OperatorDecisionRequired. Review persistence and all approval/revision/application workflow mutation remain kernel-owned downstream.
+The currently identified Controller read/judgment seams now consume bounded typed memory. The next smallest seam is the write boundary: M06-009 establishes typed memory mutation intents, deterministic legality, trusted one-shot authorization, fresh-state revalidation, and execution through existing M06-001 APIs. This is infrastructure for later Controller capture/consolidation judgment, not autonomous memory writing itself.
 
-After Plan review, inspect the separate Plan-revision generation seam before deciding whether it is the final useful read integration or whether controlled memory capture/consolidation is the next smallest step.
+After M06-009, inspect the resulting mutation boundary and existing Controller observations before defining the smallest supervised memory-capture/consolidation judgment task. Semantic/vector retrieval remains later and should only be introduced with evidence that deterministic bounded retrieval is insufficient.
 
 ## M07 — Supervised autonomy
 

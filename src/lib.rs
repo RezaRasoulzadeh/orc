@@ -11,6 +11,7 @@ pub mod controller;
 pub mod controller_actions;
 pub mod controller_evaluation;
 pub mod controller_intake;
+pub mod controller_memory;
 pub mod controller_plan_persistence;
 pub mod controller_plan_review;
 pub mod controller_plan_review_persistence;
@@ -52,6 +53,9 @@ pub mod worker_protocol;
 pub mod workflow;
 
 // Re-export useful types for tests
+pub use controller_memory::{
+    ControllerMemoryAuthority, ControllerMemoryContext, ControllerMemoryError, ControllerMemoryItem,
+};
 pub use memory::{
     MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
     MemoryQuery, MemoryRecord, MemoryScope, MemoryService,

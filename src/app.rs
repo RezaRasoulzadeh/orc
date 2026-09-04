@@ -66,6 +66,15 @@ impl OrcApp {
         Ok(crate::memory::MemoryService::new(&self.db, project_id))
     }
 
+    /// Build the bounded, read-only Controller memory projection through the
+    /// canonical application memory service.
+    pub fn controller_memory_context(
+        &self,
+    ) -> Result<crate::controller_memory::ControllerMemoryContext> {
+        let memories = self.memories()?;
+        Ok(crate::controller_memory::ControllerMemoryContext::from_memory_service(&memories)?)
+    }
+
     pub fn start_workflow(
         &self,
         objective: &str,

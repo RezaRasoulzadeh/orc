@@ -75,6 +75,30 @@ impl OrcApp {
         Ok(crate::controller_memory::ControllerMemoryContext::from_memory_service(&memories)?)
     }
 
+    /// Judge one explicitly supplied memory candidate through the bounded,
+    /// read-only Controller capture seam. A proposed intent remains separate
+    /// from the M06-009 proposal, authorization, and execution boundaries.
+    pub fn judge_controller_memory_capture(
+        &self,
+        request: &crate::controller_memory_capture::ControllerMemoryCaptureRequest,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::controller_memory_capture::ControllerMemoryCaptureResult,
+        crate::controller_memory_capture::ControllerMemoryCaptureError,
+    > {
+        request.validate()?;
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller_memory_capture::ControllerMemoryCaptureError::MemoryContext(
+                error.to_string(),
+            )
+        })?;
+        let input = crate::controller_memory_capture::ControllerMemoryCaptureInput::from_request(
+            request, memory,
+        );
+        crate::controller_memory_capture::ControllerMemoryCaptureBuilder::new()
+            .capture_with_memory(&input, runtime)
+    }
+
     /// Propose one bounded typed Controller memory mutation after deterministic
     /// current-project and canonical target validation. This does not mutate
     /// memory or mint authorization.

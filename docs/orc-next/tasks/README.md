@@ -35,7 +35,8 @@ Only current/near-term milestones are decomposed here.
 | [M06-006](M06-006.md) | Done | M06 | Integrate bounded memory into Controller workflow intake |
 | [M06-007](M06-007.md) | Done | M06 | Integrate bounded memory into Controller Plan review |
 | [M06-008](M06-008.md) | Done | M06 | Integrate bounded memory into Controller Plan revision |
-| [M06-009](M06-009.md) | Planned | M06 | Establish supervised Controller memory mutation boundary |
+| [M06-009](M06-009.md) | Done | M06 | Establish supervised Controller memory mutation boundary |
+| [M06-010](M06-010.md) | Planned | M06 | Add supervised Controller memory capture judgment |
 
 ## Task format
 

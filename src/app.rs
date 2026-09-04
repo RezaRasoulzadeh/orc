@@ -340,7 +340,11 @@ impl OrcApp {
         crate::controller_intake::ControllerIntakeResult,
         crate::controller_intake::ControllerIntakeError,
     > {
-        crate::controller_intake::ControllerIntakeBuilder::new().classify(request, runtime)
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller_intake::ControllerIntakeError::MemoryContext(error.to_string())
+        })?;
+        crate::controller_intake::ControllerIntakeBuilder::new()
+            .classify_with_memory(request, memory, runtime)
     }
 
     /// Persist one exact Controller intake boundary for the supplied

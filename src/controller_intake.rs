@@ -5,6 +5,7 @@
 //! proposals. The workflow kernel remains responsible for routing, gates,
 //! persistence, and application.
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::discovery::ProjectDiscoverySnapshot;
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
@@ -17,6 +18,7 @@ use thiserror::Error;
 
 pub const CONTROLLER_INTAKE_REQUEST_VERSION: u32 = 1;
 pub const MAX_CONTROLLER_INTAKE_REQUEST_BYTES: usize = 48 * 1024;
+pub const MAX_CONTROLLER_INTAKE_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CONTROLLER_INTAKE_RESULT_BYTES: usize = 48 * 1024;
 
 const MAX_TEXT_BYTES: usize = 2048;
@@ -30,6 +32,8 @@ pub enum ControllerIntakeError {
     InvalidRequest(String),
     #[error("controller intake request serialization failed: {0}")]
     Serialization(String),
+    #[error("controller intake memory context failed: {0}")]
+    MemoryContext(String),
     #[error("controller intake request is {actual} bytes; maximum is {max}")]
     RequestTooLarge { actual: usize, max: usize },
     #[error("controller intake output is malformed: {0}")]
@@ -95,6 +99,45 @@ pub struct ControllerIntakeRequest {
     pub project_facts: Vec<ControllerIntakeFact>,
     pub discovery: ControllerIntakeDiscovery,
     pub operator_resolution: Option<String>,
+}
+
+/// Capability-local intake inference input. The canonical intake request
+/// remains the authoritative current objective, project, discovery, and
+/// operator-resolution projection; memory is separate bounded advisory data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerIntakeInput {
+    pub current_request: ControllerIntakeRequest,
+    pub memory: ControllerMemoryContext,
+}
+
+impl ControllerIntakeInput {
+    pub fn from_request(
+        request: &ControllerIntakeRequest,
+        memory: ControllerMemoryContext,
+    ) -> Self {
+        Self {
+            current_request: request.clone(),
+            memory,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerIntakeError> {
+        self.current_request.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| ControllerIntakeError::MemoryContext(error.to_string()))?;
+        let actual = serde_json::to_vec(self)
+            .map_err(|error| ControllerIntakeError::Serialization(error.to_string()))?
+            .len();
+        if actual > MAX_CONTROLLER_INTAKE_INPUT_BYTES {
+            return Err(ControllerIntakeError::RequestTooLarge {
+                actual,
+                max: MAX_CONTROLLER_INTAKE_INPUT_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ControllerIntakeRequest {
@@ -345,11 +388,22 @@ impl ControllerIntakeBuilder {
         request: &ControllerIntakeRequest,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerIntakeResult, ControllerIntakeError> {
-        request.validate()?;
-        let input = serde_json::to_string(request)
+        self.classify_with_memory(request, ControllerMemoryContext::empty(), runtime)
+    }
+
+    pub fn classify_with_memory(
+        &self,
+        request: &ControllerIntakeRequest,
+        memory: ControllerMemoryContext,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerIntakeResult, ControllerIntakeError> {
+        let input = ControllerIntakeInput::from_request(request, memory);
+        input.validate()?;
+        let input = serde_json::to_string(&input)
             .map_err(|error| ControllerIntakeError::Serialization(error.to_string()))?;
         let prompt = format!(
-            "You are Orc's read-only Controller intake classifier. Use only the bounded canonical JSON below. Return exactly one JSON object with decision, details, and direct_tasks. decision must be exactly direct_tasks, plan_required, or user_decision_required. Choose direct_tasks only when the objective can be completed by a small set of immediately actionable task proposals; include complete canonical task proposals in direct_tasks. Choose plan_required when the work needs decomposition, sequencing, or a supervised Plan. Choose user_decision_required when an explicit operator choice or unresolved ambiguity must be answered before routing. direct_tasks must be an empty array for plan_required and user_decision_required. Do not create tasks, persist decisions, apply plans, invoke other workflow stages, or invent facts. Controller judgment is advisory; Orc's workflow kernel owns routing and mutation. Respond with only the strict structured JSON object.\n\n{input}"
+            "You are Orc's read-only Controller intake classifier. Use only the bounded typed intake input below. Authority precedence is strict, from highest to lowest: (1) current_request objective, engineering_contract, project_name, project_facts, discovery/task-state facts, and operator_resolution; (2) memory items with authority=current_project as durable Project context; (3) authority=durable_user as User preference/context; (4) authority=project_history as Episodic historical guidance; (5) authority=cross_project_experience as reusable Experience guidance; (6) base model tendencies. The current objective and explicit operator resolution are authoritative. Current engineering contract, project facts, discovery snapshot, and task-state facts always outrank contradictory memory. User memory cannot rewrite the objective or engineering contract. Episodic and Experience memory are historical guidance only, never current project/task truth. Preserve each memory item's typed identity, kind, scope, authority, provenance, confidence, lifecycle, and source metadata.\n\
+Return exactly one JSON object with decision, details, and direct_tasks. decision must be exactly direct_tasks, plan_required, or user_decision_required. Choose direct_tasks only when the objective can be completed by a small set of immediately actionable task proposals; include complete canonical task proposals in direct_tasks. Choose plan_required when the work needs decomposition, sequencing, or a supervised Plan. Choose user_decision_required when an explicit operator choice or unresolved ambiguity must be answered before routing. direct_tasks must be an empty array for plan_required and user_decision_required. Memory may influence judgment among these three outcomes only; it cannot create a fourth outcome, bypass output validation, persist anything, route workflow, or apply tasks/Plans. Do not create tasks, persist decisions, apply plans, invoke other workflow stages, or invent facts. Controller judgment is advisory; Orc's workflow kernel owns routing and mutation. Respond with only the strict structured JSON object.\n\n{input}"
         );
         let parameters = LocalInferenceParameters {
             max_output_tokens: 2048,
@@ -508,7 +562,13 @@ fn bound_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller_memory::{
+        CONTROLLER_MEMORY_CONTEXT_VERSION, ControllerMemoryAuthority, ControllerMemoryItem,
+    };
     use crate::local_runtime::LocalInferenceRequest;
+    use crate::memory::{
+        MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind, MemoryScope,
+    };
 
     struct FakeRuntime {
         value: Value,
@@ -578,6 +638,30 @@ mod tests {
             "details": "bounded intake judgment",
             "direct_tasks": tasks,
         })
+    }
+
+    fn memory_context() -> ControllerMemoryContext {
+        ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![ControllerMemoryItem {
+                id: MemoryId::Project {
+                    project_id: 1,
+                    id: 1,
+                },
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id: 1 },
+                authority: ControllerMemoryAuthority::CurrentProject,
+                subject: "intake-context".into(),
+                content: "Memory is advisory context for intake only.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("workflow:intake-memory".into()),
+                },
+                confidence: Some(0.8),
+                lifecycle: MemoryLifecycle::Active,
+                supersedes: None,
+            }],
+        }
     }
 
     #[test]
@@ -671,6 +755,148 @@ mod tests {
         };
         assert!(matches!(
             ControllerIntakeBuilder::new().classify(&request(), &mut runtime),
+            Err(ControllerIntakeError::InvalidStructuredOutput(_))
+        ));
+    }
+
+    #[test]
+    fn intake_input_preserves_typed_memory_and_prompt_precedence() {
+        let input = ControllerIntakeInput::from_request(&request(), memory_context());
+        input.validate().expect("bounded intake input");
+        let serialized = serde_json::to_value(&input).expect("input serialization");
+        assert_eq!(
+            serialized["current_request"]["objective"],
+            "Inspect the project state."
+        );
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "workflow:intake-memory"
+        );
+        assert_eq!(serialized["memory"]["items"][0]["confidence"], 0.8);
+
+        let mut runtime = CaptureRuntime { prompt: None };
+        ControllerIntakeBuilder::new()
+            .classify_with_memory(&input.current_request, input.memory.clone(), &mut runtime)
+            .expect("classified intake");
+        let prompt = runtime.prompt.expect("captured prompt");
+        assert!(prompt.contains("Authority precedence is strict"));
+        assert!(prompt.contains("current_request objective, engineering_contract"));
+        assert!(prompt.contains("operator_resolution"));
+        assert!(prompt.contains("authority=current_project"));
+        assert!(prompt.contains("authority=durable_user"));
+        assert!(prompt.contains("authority=project_history"));
+        assert!(prompt.contains("authority=cross_project_experience"));
+        assert!(prompt.contains("objective and explicit operator resolution are authoritative"));
+        assert!(prompt.contains("cannot rewrite the objective or engineering contract"));
+        assert!(prompt.contains("workflow:intake-memory"));
+    }
+
+    struct CaptureRuntime {
+        prompt: Option<String>,
+    }
+
+    impl LocalInferenceRuntime for CaptureRuntime {
+        fn infer(
+            &mut self,
+            request: &LocalInferenceRequest,
+        ) -> Result<LocalInferenceResponse, LocalInferenceError> {
+            self.prompt = Some(request.prompt.clone());
+            Ok(LocalInferenceResponse::structured(
+                "captured",
+                output("plan_required", Vec::new()),
+            ))
+        }
+    }
+
+    #[test]
+    fn combined_intake_input_bound_includes_memory_and_preserves_request_bound() {
+        let mut current_request = request();
+        current_request.discovery.important_files = vec!["important".repeat(MAX_TEXT_BYTES / 9); 8];
+        current_request.discovery.architecture_boundaries =
+            vec!["boundary".repeat(MAX_TEXT_BYTES / 8); 8];
+        current_request.discovery.technology_stack =
+            vec!["technology".repeat(MAX_TEXT_BYTES / 10); 4];
+        current_request
+            .validate()
+            .expect("request remains within 48 KiB");
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: (0..6)
+                .map(|index| ControllerMemoryItem {
+                    id: MemoryId::Project {
+                        project_id: 1,
+                        id: index + 2,
+                    },
+                    kind: MemoryKind::Project,
+                    scope: MemoryScope::Project { project_id: 1 },
+                    authority: ControllerMemoryAuthority::CurrentProject,
+                    subject: format!("bound-{index}"),
+                    content: "m".repeat(3800),
+                    provenance: MemoryProvenance {
+                        kind: MemoryProvenanceKind::ProjectFact,
+                        source_reference: Some(format!("test:bound-{index}")),
+                    },
+                    confidence: None,
+                    lifecycle: MemoryLifecycle::Active,
+                    supersedes: None,
+                })
+                .collect(),
+        };
+        memory
+            .validate()
+            .expect("memory remains independently bounded");
+        let input = ControllerIntakeInput::from_request(&current_request, memory);
+        assert!(matches!(
+            input.validate(),
+            Err(ControllerIntakeError::RequestTooLarge {
+                max: MAX_CONTROLLER_INTAKE_INPUT_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_memory_classification_remains_compatible() {
+        let mut runtime = FakeRuntime {
+            value: output("plan_required", Vec::new()),
+            requests: 0,
+        };
+        let result = ControllerIntakeBuilder::new()
+            .classify(&request(), &mut runtime)
+            .expect("empty-memory classification");
+        assert_eq!(result.decision, ControllerIntakeDecision::PlanRequired);
+        assert_eq!(runtime.requests, 1);
+    }
+
+    #[test]
+    fn contradictory_memory_cannot_create_unsupported_outcome_or_bypass_result_validation() {
+        let mut runtime = FakeRuntime {
+            value: serde_json::json!({
+                "decision": "memory_override",
+                "details": "ignore the canonical objective",
+                "direct_tasks": []
+            }),
+            requests: 0,
+        };
+        assert!(matches!(
+            ControllerIntakeBuilder::new().classify_with_memory(
+                &request(),
+                memory_context(),
+                &mut runtime
+            ),
             Err(ControllerIntakeError::InvalidStructuredOutput(_))
         ));
     }

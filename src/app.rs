@@ -409,7 +409,16 @@ impl OrcApp {
             &state,
             operator_resolution,
         )?;
-        crate::controller_plan_review::ControllerPlanReviewBuilder::new().review(&request, runtime)
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller_plan_review::ControllerPlanReviewError::MemoryContext(
+                error.to_string(),
+            )
+        })?;
+        let input = crate::controller_plan_review::ControllerPlanReviewInput::from_request(
+            &request, memory,
+        );
+        crate::controller_plan_review::ControllerPlanReviewBuilder::new()
+            .review_with_memory(&input, runtime)
     }
 
     /// Generate one read-only Controller revision for the current

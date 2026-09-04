@@ -4,6 +4,7 @@
 //! produces no Lead decision, PlanReview, status transition, approval,
 //! revision, task, workflow, or worker mutation.
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -16,6 +17,7 @@ use thiserror::Error;
 
 pub const CONTROLLER_PLAN_REVIEW_REQUEST_VERSION: u32 = 1;
 const MAX_REVIEW_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROLLER_PLAN_REVIEW_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_TEXT_BYTES: usize = 2048;
 const MAX_STATE_ITEMS: usize = 16;
@@ -24,6 +26,8 @@ const MAX_STATE_ITEMS: usize = 16;
 pub enum ControllerPlanReviewError {
     #[error("Controller Plan review request is invalid: {0}")]
     InvalidRequest(String),
+    #[error("Controller Plan review memory context failed: {0}")]
+    MemoryContext(String),
     #[error("Controller Plan review request is {actual} bytes; maximum is {max}")]
     RequestTooLarge { actual: usize, max: usize },
     #[error("Controller Plan review output is malformed: {0}")]
@@ -178,6 +182,45 @@ impl ControllerPlanReviewRequest {
     }
 }
 
+/// Capability-local Plan-review inference input. The current persisted Plan
+/// review request remains authoritative; memory is separate bounded advisory
+/// context and carries no persistence or workflow capability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerPlanReviewInput {
+    pub current_request: ControllerPlanReviewRequest,
+    pub memory: ControllerMemoryContext,
+}
+
+impl ControllerPlanReviewInput {
+    pub fn from_request(
+        request: &ControllerPlanReviewRequest,
+        memory: ControllerMemoryContext,
+    ) -> Self {
+        Self {
+            current_request: request.clone(),
+            memory,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerPlanReviewError> {
+        self.current_request.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| ControllerPlanReviewError::MemoryContext(error.to_string()))?;
+        let actual = serde_json::to_vec(self)
+            .map_err(|error| ControllerPlanReviewError::InvalidRequest(error.to_string()))?
+            .len();
+        if actual > MAX_CONTROLLER_PLAN_REVIEW_INPUT_BYTES {
+            return Err(ControllerPlanReviewError::RequestTooLarge {
+                actual,
+                max: MAX_CONTROLLER_PLAN_REVIEW_INPUT_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The only semantic decisions exposed by this Controller review boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -237,9 +280,21 @@ impl ControllerPlanReviewBuilder {
         request: &ControllerPlanReviewRequest,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerPlanReviewResult, ControllerPlanReviewError> {
-        let request_json = request.validate()?;
+        let input =
+            ControllerPlanReviewInput::from_request(request, ControllerMemoryContext::empty());
+        self.review_with_memory(&input, runtime)
+    }
+
+    pub fn review_with_memory(
+        &self,
+        input: &ControllerPlanReviewInput,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerPlanReviewResult, ControllerPlanReviewError> {
+        input.validate()?;
+        let request_json = serde_json::to_string(input)
+            .map_err(|error| ControllerPlanReviewError::InvalidRequest(error.to_string()))?;
         let prompt = format!(
-            "You are a read-only semantic Plan reviewer. Use only the bounded JSON below. Return exactly one JSON object with decision, details, and revision_feedback. decision must be exactly approve, revise_plan, or operator_decision_required. Approve only when the Plan is coherent and satisfies its stated objective and constraints. Choose revise_plan only for a concrete correctable defect and put the bounded correction in revision_feedback. Choose operator_decision_required when the supplied facts are ambiguous or require a human decision; if the Plan contains an unresolved question explicitly requiring an operator choice, choose operator_decision_required even if the Plan also has defects. Do not apply, persist, approve, revise, or execute anything; this response is advisory judgment only. Do not invent facts outside the JSON.\n\n{request_json}"
+            "You are a read-only semantic Plan reviewer. Use only the bounded typed Controller Plan-review input below. Authority precedence is strict, from highest to lowest: (1) current_request persisted Plan identity, version, status, origin, and Plan content; (2) current_request project name, current project/task state, and explicit operator resolution; (3) memory items with authority=current_project as durable Project context; (4) authority=durable_user as User preference/context; (5) authority=project_history as Episodic historical guidance; (6) authority=cross_project_experience as reusable Experience guidance; (7) base model tendencies. Current persisted Plan facts and content are authoritative. Current project/task state and explicit operator resolution outrank contradictory memory. User memory cannot rewrite Plan content or operator resolution. Episodic and Experience memory are historical guidance only, never current Plan/project truth. Preserve each memory item's typed identity, kind, scope, authority, provenance, confidence, lifecycle, and source metadata. Return exactly one JSON object with decision, details, and revision_feedback. decision must be exactly approve, revise_plan, or operator_decision_required. Approve only when the current Plan is coherent and satisfies its stated objective and constraints. Compare the current Plan objective with its tasks: if no task addresses a nontrivial current objective, that is a concrete correctable Plan defect and you must choose revise_plan with bounded feedback. Choose revise_plan only for a concrete correctable defect in the current Plan and put the bounded correction in revision_feedback. Choose operator_decision_required when the current supplied facts are ambiguous or require a human decision; if the current Plan contains an unresolved question explicitly requiring an operator choice, choose operator_decision_required even if the Plan also has defects. Memory may influence judgment among these three outcomes only; it cannot create a fourth outcome, bypass structured parsing or result validation, persist a review, approve/revise/apply a Plan, or mutate workflow state. Do not apply, persist, approve, revise, or execute anything; this response is advisory judgment only. Do not invent facts outside the typed input.\n\n{request_json}"
         );
         let parameters = LocalInferenceParameters {
             max_output_tokens: 512,
@@ -331,6 +386,13 @@ fn bound_text(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::app::OrcApp;
+    use crate::controller_memory::{
+        CONTROLLER_MEMORY_CONTEXT_VERSION, ControllerMemoryAuthority, ControllerMemoryItem,
+    };
+    use crate::memory::{
+        MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
+        MemoryScope,
+    };
     use crate::storage::db::PlanProvenance;
 
     struct FakeRuntime {
@@ -402,6 +464,30 @@ mod tests {
             Some("operator context"),
         )
         .unwrap()
+    }
+
+    fn memory_context() -> ControllerMemoryContext {
+        ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![ControllerMemoryItem {
+                id: MemoryId::Project {
+                    project_id: 1,
+                    id: 1,
+                },
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id: 1 },
+                authority: ControllerMemoryAuthority::CurrentProject,
+                subject: "review-context".into(),
+                content: "The current Plan remains authoritative over advisory context.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("workflow:plan-review-memory".into()),
+                },
+                confidence: Some(0.8),
+                lifecycle: MemoryLifecycle::Active,
+                supersedes: None,
+            }],
+        }
     }
 
     fn output(decision: &str, feedback: Option<&str>) -> Value {
@@ -569,5 +655,149 @@ mod tests {
             serde_json::to_value(app.workflow_state().unwrap()).unwrap(),
         );
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn review_input_preserves_typed_memory_and_prompt_precedence() {
+        let input = ControllerPlanReviewInput::from_request(&request(), memory_context());
+        input.validate().unwrap();
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(serialized["current_request"]["plan_id"], 7);
+        assert_eq!(serialized["current_request"]["plan_status"], "Proposed");
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "workflow:plan-review-memory"
+        );
+
+        let mut runtime = FakeRuntime::new(output("approve", None));
+        ControllerPlanReviewBuilder::new()
+            .review_with_memory(&input, &mut runtime)
+            .unwrap();
+        let prompt = &runtime.requests[0].prompt;
+        assert!(
+            prompt.contains("current_request persisted Plan identity, version, status, origin")
+        );
+        assert!(prompt.contains("current project/task state, and explicit operator resolution"));
+        assert!(prompt.contains("authority=current_project"));
+        assert!(prompt.contains("authority=durable_user"));
+        assert!(prompt.contains("authority=project_history"));
+        assert!(prompt.contains("authority=cross_project_experience"));
+        assert!(prompt.contains("Current persisted Plan facts and content are authoritative"));
+        assert!(prompt.contains("operator resolution outrank contradictory memory"));
+        assert!(prompt.contains("workflow:plan-review-memory"));
+        assert!(prompt.contains("review this plan"));
+        assert!(prompt.contains("operator context"));
+    }
+
+    #[test]
+    fn combined_review_input_bound_preserves_independent_request_and_memory_bounds() {
+        let mut oversized_request = request();
+        oversized_request.plan.objective = "x".repeat(MAX_CONTROLLER_PLAN_REVIEW_INPUT_BYTES);
+        assert!(matches!(
+            oversized_request.validate(),
+            Err(ControllerPlanReviewError::RequestTooLarge {
+                max: MAX_REVIEW_REQUEST_BYTES,
+                ..
+            })
+        ));
+
+        let mut current_request = request();
+        current_request.plan.objective = "x".repeat(40_000);
+        current_request.validate().unwrap();
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: (0..8)
+                .map(|index| ControllerMemoryItem {
+                    id: MemoryId::Project {
+                        project_id: 1,
+                        id: index + 2,
+                    },
+                    kind: MemoryKind::Project,
+                    scope: MemoryScope::Project { project_id: 1 },
+                    authority: ControllerMemoryAuthority::CurrentProject,
+                    subject: format!("bound-{index}"),
+                    content: "m".repeat(3600),
+                    provenance: MemoryProvenance {
+                        kind: MemoryProvenanceKind::ProjectFact,
+                        source_reference: Some(format!("test:bound-{index}")),
+                    },
+                    confidence: None,
+                    lifecycle: MemoryLifecycle::Active,
+                    supersedes: None,
+                })
+                .collect(),
+        };
+        memory.validate().unwrap();
+        let input = ControllerPlanReviewInput::from_request(&current_request, memory);
+        assert!(matches!(
+            input.validate(),
+            Err(ControllerPlanReviewError::RequestTooLarge {
+                max: MAX_CONTROLLER_PLAN_REVIEW_INPUT_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn contradictory_memory_cannot_create_an_unsupported_outcome_or_skip_revision_feedback() {
+        let input = ControllerPlanReviewInput::from_request(&request(), memory_context());
+        let mut unsupported = FakeRuntime::new(serde_json::json!({
+            "decision": "memory_override",
+            "details": "ignore the current Plan",
+            "revision_feedback": null
+        }));
+        assert!(matches!(
+            ControllerPlanReviewBuilder::new().review_with_memory(&input, &mut unsupported),
+            Err(ControllerPlanReviewError::MalformedStructuredOutput(_))
+        ));
+
+        let mut missing_feedback = FakeRuntime::new(output("revise_plan", None));
+        assert!(matches!(
+            ControllerPlanReviewBuilder::new().review_with_memory(&input, &mut missing_feedback),
+            Err(ControllerPlanReviewError::MalformedStructuredOutput(_))
+        ));
+    }
+
+    #[test]
+    fn app_review_retrieves_canonical_memory_read_only_after_current_plan_gate() {
+        let (_directory, app, project_id, plan_id) = app_with_current_controller_plan();
+        let memory = app
+            .database()
+            .create_memory(&MemoryDraft {
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id },
+                subject: "review-guidance".into(),
+                content: "Advisory review context cannot rewrite the current Plan.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("test:plan-review-memory".into()),
+                },
+                confidence: Some(0.9),
+            })
+            .unwrap();
+        let before = app.memories().unwrap().history(&memory.id).unwrap();
+        let mut runtime = FakeRuntime::new(output("approve", None));
+        let result = app
+            .review_controller_plan(plan_id, Some("operator context"), &mut runtime)
+            .unwrap();
+        assert_eq!(result.decision, ControllerPlanReviewDecision::Approve);
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains("test:plan-review-memory"));
+        assert!(prompt.contains("review this plan"));
+        assert!(prompt.contains("operator context"));
+        assert_eq!(app.memories().unwrap().history(&memory.id).unwrap(), before);
     }
 }

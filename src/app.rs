@@ -59,6 +59,13 @@ impl OrcApp {
         &self.repo_path
     }
 
+    /// Return the canonical memory facade for this application's project.
+    /// Memory persistence remains explicit and is never invoked by a model.
+    pub fn memories(&self) -> Result<crate::memory::MemoryService<'_>> {
+        let project_id = self.lead().project_id()?;
+        Ok(crate::memory::MemoryService::new(&self.db, project_id))
+    }
+
     pub fn start_workflow(
         &self,
         objective: &str,

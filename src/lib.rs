@@ -28,6 +28,7 @@ pub mod git;
 pub mod interactive;
 pub mod lead;
 pub mod local_runtime;
+pub mod memory;
 pub mod operations;
 pub mod protocol;
 pub mod provider_context;
@@ -51,6 +52,10 @@ pub mod worker_protocol;
 pub mod workflow;
 
 // Re-export useful types for tests
+pub use memory::{
+    MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
+    MemoryQuery, MemoryRecord, MemoryScope, MemoryService,
+};
 pub use protocol::*;
 pub use queue::{
     BlockingReason, DependencyInfo, QueueCategory, QueueEntry, QueueItem, QueueReport,

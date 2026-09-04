@@ -1406,6 +1406,213 @@ fn parse_plan_review_decision(value: &str) -> Result<PlanReviewDecision, rusqlit
     }
 }
 
+fn memory_db_parse_error(error: crate::memory::MemoryError) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(error.to_string())
+}
+
+fn memory_table(scope: &crate::memory::MemoryScope) -> &'static str {
+    match scope {
+        crate::memory::MemoryScope::Global => "global_memories",
+        crate::memory::MemoryScope::Project { .. } => "project_memories",
+    }
+}
+
+fn decode_memory_row(
+    row: &Row<'_>,
+    scope: crate::memory::MemoryScope,
+) -> rusqlite::Result<crate::memory::MemoryRecord> {
+    let kind = crate::memory::MemoryKind::parse(&row.get::<_, String>(1)?)
+        .map_err(memory_db_parse_error)?;
+    let provenance = crate::memory::MemoryProvenance {
+        kind: crate::memory::MemoryProvenanceKind::parse(&row.get::<_, String>(4)?)
+            .map_err(memory_db_parse_error)?,
+        source_reference: row.get(5)?,
+    };
+    let lifecycle = crate::memory::MemoryLifecycle::parse(&row.get::<_, String>(7)?)
+        .map_err(memory_db_parse_error)?;
+    let id = row.get::<_, i64>(0)?;
+    let supersedes_id: Option<i64> = row.get(8)?;
+    let supersedes = supersedes_id.map(|parent| match &scope {
+        crate::memory::MemoryScope::Global => crate::memory::MemoryId::Global(parent),
+        crate::memory::MemoryScope::Project { project_id } => crate::memory::MemoryId::Project {
+            project_id: *project_id,
+            id: parent,
+        },
+    });
+    let record = crate::memory::MemoryRecord {
+        id: match &scope {
+            crate::memory::MemoryScope::Global => crate::memory::MemoryId::Global(id),
+            crate::memory::MemoryScope::Project { project_id } => {
+                crate::memory::MemoryId::Project {
+                    project_id: *project_id,
+                    id,
+                }
+            }
+        },
+        kind,
+        scope,
+        subject: row.get(2)?,
+        content: row.get(3)?,
+        provenance,
+        confidence: row.get(6)?,
+        lifecycle,
+        supersedes,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    };
+    record.validate().map_err(memory_db_parse_error)?;
+    Ok(record)
+}
+
+fn memory_select_sql(table: &str) -> String {
+    format!(
+        "SELECT id, kind, subject, content, provenance_kind, source_reference, confidence, lifecycle, supersedes_id, created_at, updated_at FROM {table}"
+    )
+}
+
+fn get_memory_row(
+    conn: &Connection,
+    scope: crate::memory::MemoryScope,
+    id: i64,
+) -> Result<Option<crate::memory::MemoryRecord>, DbError> {
+    let table = memory_table(&scope);
+    let sql = match scope {
+        crate::memory::MemoryScope::Global => {
+            format!("{} WHERE id = ?1", memory_select_sql(table))
+        }
+        crate::memory::MemoryScope::Project { .. } => {
+            format!(
+                "{} WHERE id = ?1 AND project_id = ?2",
+                memory_select_sql(table)
+            )
+        }
+    };
+    let result = match &scope {
+        crate::memory::MemoryScope::Global => conn
+            .query_row(&sql, [id], |row| decode_memory_row(row, scope.clone()))
+            .optional()?,
+        crate::memory::MemoryScope::Project { project_id } => conn
+            .query_row(&sql, params![id, project_id], |row| {
+                decode_memory_row(row, scope.clone())
+            })
+            .optional()?,
+    };
+    Ok(result)
+}
+
+fn get_memory_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope: crate::memory::MemoryScope,
+    id: i64,
+) -> Result<Option<crate::memory::MemoryRecord>, DbError> {
+    let table = memory_table(&scope);
+    let sql = match scope {
+        crate::memory::MemoryScope::Global => {
+            format!("{} WHERE id = ?1", memory_select_sql(table))
+        }
+        crate::memory::MemoryScope::Project { .. } => {
+            format!(
+                "{} WHERE id = ?1 AND project_id = ?2",
+                memory_select_sql(table)
+            )
+        }
+    };
+    let result = match &scope {
+        crate::memory::MemoryScope::Global => tx
+            .query_row(&sql, [id], |row| decode_memory_row(row, scope.clone()))
+            .optional()?,
+        crate::memory::MemoryScope::Project { project_id } => tx
+            .query_row(&sql, params![id, project_id], |row| {
+                decode_memory_row(row, scope.clone())
+            })
+            .optional()?,
+    };
+    Ok(result)
+}
+
+fn list_memory_rows(
+    conn: &Connection,
+    scope: crate::memory::MemoryScope,
+    kind: Option<crate::memory::MemoryKind>,
+    subject: Option<&str>,
+    include_historical: bool,
+) -> Result<Vec<crate::memory::MemoryRecord>, DbError> {
+    let table = memory_table(&scope);
+    let mut sql = memory_select_sql(table);
+    match scope {
+        crate::memory::MemoryScope::Global => {
+            sql.push_str(" WHERE (?1 IS NULL OR kind = ?1) AND (?2 IS NULL OR subject = ?2)")
+        }
+        crate::memory::MemoryScope::Project { .. } => sql.push_str(
+            " WHERE project_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR subject = ?3)",
+        ),
+    }
+    if !include_historical {
+        sql.push_str(" AND lifecycle = 'active'");
+    }
+    sql.push_str(" ORDER BY created_at ASC, id ASC");
+    let kind = kind.map(crate::memory::MemoryKind::as_str);
+    let rows = match &scope {
+        crate::memory::MemoryScope::Global => conn
+            .prepare(&sql)?
+            .query_map(params![kind, subject], |row| {
+                decode_memory_row(row, scope.clone())
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+        crate::memory::MemoryScope::Project { project_id } => conn
+            .prepare(&sql)?
+            .query_map(params![project_id, kind, subject], |row| {
+                decode_memory_row(row, scope.clone())
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(rows)
+}
+
+fn insert_memory_tx(
+    tx: &rusqlite::Transaction<'_>,
+    draft: &crate::memory::MemoryDraft,
+    supersedes: Option<&crate::memory::MemoryId>,
+) -> Result<crate::memory::MemoryRecord, DbError> {
+    let table = memory_table(&draft.scope);
+    let supersedes_id = supersedes.map(crate::memory::MemoryId::value);
+    let id = match draft.scope {
+        crate::memory::MemoryScope::Global => {
+            tx.execute(
+                &format!("INSERT INTO {table} (kind, subject, content, provenance_kind, source_reference, confidence, lifecycle, supersedes_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)"),
+                params![
+                    draft.kind.as_str(),
+                    draft.subject,
+                    draft.content,
+                    draft.provenance.kind.as_str(),
+                    draft.provenance.source_reference,
+                    draft.confidence,
+                    supersedes_id,
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+        crate::memory::MemoryScope::Project { project_id } => {
+            tx.execute(
+                &format!("INSERT INTO {table} (project_id, kind, subject, content, provenance_kind, source_reference, confidence, lifecycle, supersedes_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)"),
+                params![
+                    project_id,
+                    draft.kind.as_str(),
+                    draft.subject,
+                    draft.content,
+                    draft.provenance.kind.as_str(),
+                    draft.provenance.source_reference,
+                    draft.confidence,
+                    supersedes_id,
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    get_memory_row_tx(tx, draft.scope.clone(), id)?
+        .ok_or_else(|| DbError::Scheduler("new memory disappeared before commit".into()))
+}
+
 fn lead_proposal_from_row(row: &Row<'_>) -> rusqlite::Result<crate::lead::LeadProposal> {
     let proposal = serde_json::from_str(&row.get::<_, String>(1)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
@@ -2600,6 +2807,7 @@ impl Database {
         Self::ensure_resolution_records_table(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
         Self::ensure_controller_intake_table(&conn)?;
+        Self::ensure_project_memory_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
@@ -2653,6 +2861,7 @@ impl Database {
         Self::ensure_plan_tables(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
         Self::ensure_controller_intake_table(&conn)?;
+        Self::ensure_project_memory_table(&conn)?;
         Self::ensure_review_criteria_table(&conn)?;
         let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
         conn.execute(
@@ -2770,6 +2979,7 @@ impl Database {
             );",
         )?;
         Self::ensure_agent_columns(&registry)?;
+        Self::ensure_global_memory_table(&registry)?;
         Ok(registry)
     }
 
@@ -3676,6 +3886,49 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS controller_intake_project
                 ON controller_intake_boundaries(project_id, workflow_id);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_project_memory_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_memories (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN ('project', 'episodic')),
+                subject TEXT NOT NULL,
+                content TEXT NOT NULL,
+                provenance_kind TEXT NOT NULL CHECK (provenance_kind IN ('operator', 'project_fact', 'controller_approved', 'imported')),
+                source_reference TEXT,
+                confidence REAL,
+                lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'superseded', 'removed')),
+                supersedes_id INTEGER REFERENCES project_memories(id),
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
+            CREATE INDEX IF NOT EXISTS project_memories_scope
+                ON project_memories(project_id, kind, lifecycle, id);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_global_memory_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS global_memories (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('user', 'experience')),
+                subject TEXT NOT NULL,
+                content TEXT NOT NULL,
+                provenance_kind TEXT NOT NULL CHECK (provenance_kind IN ('operator', 'project_fact', 'controller_approved', 'imported')),
+                source_reference TEXT,
+                confidence REAL,
+                lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'superseded', 'removed')),
+                supersedes_id INTEGER REFERENCES global_memories(id),
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
+            CREATE INDEX IF NOT EXISTS global_memories_scope
+                ON global_memories(kind, lifecycle, id);",
         )?;
         Ok(())
     }
@@ -6514,6 +6767,259 @@ impl Database {
                 lead_proposal_status(from)
             ],
         )? != 0)
+    }
+
+    /// Create one explicit memory record in its canonical authority.
+    /// Controller/runtime code has no access to these storage connections;
+    /// callers must supply a validated Orc-owned draft.
+    pub fn create_memory(
+        &self,
+        draft: &crate::memory::MemoryDraft,
+    ) -> Result<crate::memory::MemoryRecord, DbError> {
+        draft
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        match draft.scope {
+            crate::memory::MemoryScope::Global => {
+                let tx = self.registry.unchecked_transaction()?;
+                let record = insert_memory_tx(&tx, draft, None)?;
+                tx.commit()?;
+                Ok(record)
+            }
+            crate::memory::MemoryScope::Project { project_id } => {
+                if !self.project_exists(project_id)? {
+                    return Err(DbError::ProjectNotFound(project_id));
+                }
+                let tx = self.conn.unchecked_transaction()?;
+                let record = insert_memory_tx(&tx, draft, None)?;
+                tx.commit()?;
+                Ok(record)
+            }
+        }
+    }
+
+    /// Get a memory by its authority-qualified stable identifier. Historical
+    /// records remain addressable through this API.
+    pub fn get_memory(
+        &self,
+        id: &crate::memory::MemoryId,
+    ) -> Result<Option<crate::memory::MemoryRecord>, DbError> {
+        match id {
+            crate::memory::MemoryId::Global(id) => {
+                get_memory_row(&self.registry, crate::memory::MemoryScope::Global, *id)
+            }
+            crate::memory::MemoryId::Project { project_id, id } => get_memory_row(
+                &self.conn,
+                crate::memory::MemoryScope::Project {
+                    project_id: *project_id,
+                },
+                *id,
+            ),
+        }
+    }
+
+    /// List memories using deterministic structured filters. By default only
+    /// active records are returned; historical inspection is explicit.
+    pub fn list_memories(
+        &self,
+        query: &crate::memory::MemoryQuery,
+    ) -> Result<Vec<crate::memory::MemoryRecord>, DbError> {
+        query
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        match query.scope {
+            crate::memory::MemoryScope::Global => list_memory_rows(
+                &self.registry,
+                crate::memory::MemoryScope::Global,
+                query.kind,
+                query.subject.as_deref(),
+                query.include_historical,
+            ),
+            crate::memory::MemoryScope::Project { project_id } => {
+                if !self.project_exists(project_id)? {
+                    return Err(DbError::ProjectNotFound(project_id));
+                }
+                list_memory_rows(
+                    &self.conn,
+                    crate::memory::MemoryScope::Project { project_id },
+                    query.kind,
+                    query.subject.as_deref(),
+                    query.include_historical,
+                )
+            }
+        }
+    }
+
+    /// Correct an active memory by inserting a new active version and
+    /// superseding the old version in one transaction.
+    pub fn correct_memory(
+        &self,
+        id: &crate::memory::MemoryId,
+        replacement: &crate::memory::MemoryDraft,
+    ) -> Result<crate::memory::MemoryRecord, DbError> {
+        self.supersede_memory(id, replacement)
+    }
+
+    /// Insert an explicit replacement while retaining the complete historical
+    /// record and provenance of the superseded version.
+    pub fn supersede_memory(
+        &self,
+        id: &crate::memory::MemoryId,
+        replacement: &crate::memory::MemoryDraft,
+    ) -> Result<crate::memory::MemoryRecord, DbError> {
+        replacement
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        if replacement.scope != id.scope() {
+            return Err(DbError::Scheduler(
+                "memory replacement scope does not match its source".into(),
+            ));
+        }
+        let old = self
+            .get_memory(id)?
+            .ok_or_else(|| DbError::Scheduler("memory to correct was not found".into()))?;
+        if old.lifecycle != crate::memory::MemoryLifecycle::Active {
+            return Err(DbError::Scheduler(
+                "only an active memory can be corrected or superseded".into(),
+            ));
+        }
+        if old.kind != replacement.kind || old.subject != replacement.subject {
+            return Err(DbError::Scheduler(
+                "memory correction must retain kind and subject".into(),
+            ));
+        }
+        match id {
+            crate::memory::MemoryId::Global(_) => {
+                let tx = self.registry.unchecked_transaction()?;
+                let record = insert_memory_tx(&tx, replacement, Some(id))?;
+                let changed = tx.execute(
+                    "UPDATE global_memories SET lifecycle = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND lifecycle = 'active'",
+                    [id.value()],
+                )?;
+                if changed != 1 {
+                    return Err(DbError::Scheduler(
+                        "memory changed before supersession".into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(record)
+            }
+            crate::memory::MemoryId::Project { project_id, .. } => {
+                if !self.project_exists(*project_id)? {
+                    return Err(DbError::ProjectNotFound(*project_id));
+                }
+                let tx = self.conn.unchecked_transaction()?;
+                let record = insert_memory_tx(&tx, replacement, Some(id))?;
+                let changed = tx.execute(
+                    "UPDATE project_memories SET lifecycle = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND project_id = ?2 AND lifecycle = 'active'",
+                    params![id.value(), project_id],
+                )?;
+                if changed != 1 {
+                    return Err(DbError::Scheduler(
+                        "memory changed before supersession".into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(record)
+            }
+        }
+    }
+
+    /// Deactivate an active memory transactionally. The historical row is
+    /// retained and remains available from `get_memory`/`memory_history`.
+    pub fn remove_memory(
+        &self,
+        id: &crate::memory::MemoryId,
+    ) -> Result<crate::memory::MemoryRecord, DbError> {
+        match id {
+            crate::memory::MemoryId::Global(_) => {
+                let tx = self.registry.unchecked_transaction()?;
+                let changed = tx.execute(
+                    "UPDATE global_memories SET lifecycle = 'removed', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND lifecycle = 'active'",
+                    [id.value()],
+                )?;
+                if changed != 1 {
+                    return Err(DbError::Scheduler(
+                        "only an active memory can be removed".into(),
+                    ));
+                }
+                let record =
+                    get_memory_row_tx(&tx, crate::memory::MemoryScope::Global, id.value())?
+                        .ok_or_else(|| DbError::Scheduler("removed memory disappeared".into()))?;
+                tx.commit()?;
+                Ok(record)
+            }
+            crate::memory::MemoryId::Project { project_id, .. } => {
+                if !self.project_exists(*project_id)? {
+                    return Err(DbError::ProjectNotFound(*project_id));
+                }
+                let tx = self.conn.unchecked_transaction()?;
+                let changed = tx.execute(
+                    "UPDATE project_memories SET lifecycle = 'removed', updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND project_id = ?2 AND lifecycle = 'active'",
+                    params![id.value(), project_id],
+                )?;
+                if changed != 1 {
+                    return Err(DbError::Scheduler(
+                        "only an active memory can be removed".into(),
+                    ));
+                }
+                let record = get_memory_row_tx(
+                    &tx,
+                    crate::memory::MemoryScope::Project {
+                        project_id: *project_id,
+                    },
+                    id.value(),
+                )?
+                .ok_or_else(|| DbError::Scheduler("removed memory disappeared".into()))?;
+                tx.commit()?;
+                Ok(record)
+            }
+        }
+    }
+
+    /// Return one memory's complete replacement lineage in deterministic
+    /// creation order, including removed and superseded records.
+    pub fn memory_history(
+        &self,
+        id: &crate::memory::MemoryId,
+    ) -> Result<Vec<crate::memory::MemoryRecord>, DbError> {
+        let target = self
+            .get_memory(id)?
+            .ok_or_else(|| DbError::Scheduler("memory history target was not found".into()))?;
+        let records = self.list_memories(&crate::memory::MemoryQuery {
+            scope: target.scope.clone(),
+            kind: Some(target.kind),
+            subject: Some(target.subject.clone()),
+            include_historical: true,
+        })?;
+        let mut lineage = vec![target.id.value()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for record in &records {
+                if let Some(parent) = &record.supersedes {
+                    if lineage.contains(&record.id.value()) && !lineage.contains(&parent.value()) {
+                        lineage.push(parent.value());
+                        changed = true;
+                    } else if lineage.contains(&parent.value())
+                        && !lineage.contains(&record.id.value())
+                    {
+                        lineage.push(record.id.value());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let mut history: Vec<_> = records
+            .into_iter()
+            .filter(|record| lineage.contains(&record.id.value()))
+            .collect();
+        history.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.value().cmp(&right.id.value()))
+        });
+        Ok(history)
     }
 
     pub fn create_project(&self, name: &str) -> Result<i64, DbError> {

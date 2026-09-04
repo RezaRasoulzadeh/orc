@@ -31,7 +31,8 @@ Only current/near-term milestones are decomposed here.
 | [M06-002](M06-002.md) | Done | M06 | Build deterministic bounded Controller memory context |
 | [M06-003](M06-003.md) | Done | M06 | Integrate bounded memory into Controller planning |
 | [M06-004](M06-004.md) | Done | M06 | Integrate bounded memory into Controller recovery |
-| [M06-005](M06-005.md) | Planned | M06 | Integrate bounded memory into normal Controller task recommendation |
+| [M06-005](M06-005.md) | Done | M06 | Integrate bounded memory into normal Controller task recommendation |
+| [M06-006](M06-006.md) | Planned | M06 | Integrate bounded memory into Controller workflow intake |
 
 ## Task format
 

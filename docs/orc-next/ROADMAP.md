@@ -51,9 +51,9 @@ Result: supervised Controller workflow now owns Plan generation/review/revision 
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established a reusable deterministic bounded read-only `ControllerMemoryContext` without forcing a universal Controller request type. M06-003 integrated that context into Controller Plan generation through a capability-local bounded input. M06-004 integrated it into recovery recommendation while preserving exact current legal-operation authority and deterministic post-inference actionability.
+M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 integrated it into Plan generation, M06-004 into recovery recommendation, and M06-005 into normal task recommendation through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
 
-Current work integrates the same bounded memory context into the original normal task recommendation path through the existing `ControllerStateBuilder` / `OrcApp::propose_controller_action` seam. `ControllerStatePacket` remains the current-facts projection; memory is advisory context around that packet rather than part of the packet itself. Later M06 work should continue through remaining repository-grounded capability seams or move toward controlled capture/consolidation only after those read paths establish enough evidence.
+Current work applies the same bounded read-only memory context to workflow intake through `ControllerIntakeRequest` / `ControllerIntakeBuilder::classify` / `OrcApp::propose_controller_intake`. The current objective, engineering contract, project/discovery/task facts, and operator resolution remain authoritative; the only valid outcomes remain DirectTasks, PlanRequired, and UserDecisionRequired. Later M06 work should inspect the remaining Plan review/revision seams before deciding whether more read integrations are useful or whether controlled capture/consolidation is the next smallest step.
 
 ## M07 — Supervised autonomy
 

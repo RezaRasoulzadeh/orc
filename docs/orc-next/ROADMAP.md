@@ -41,13 +41,17 @@ Move retry, validation-failure response, unusual recovery and escalation judgmen
 
 Result: bounded recovery observation/legality, read-only Controller recovery choice, one-shot supervised authorization/execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are complete. Deterministic validation/review/revision/economy facts remain kernel-owned; migrated post-failure recovery choices no longer automatically invoke economy escalation.
 
-## M05 — Planning and Lead unification — CURRENT
+## M05 — Planning and Lead unification — COMPLETE
 
 Move planning and Lead-like judgment into Controller. Preserve useful Plan/approval data while simplifying obsolete role/handoff machinery.
 
-## M06 — Persistent memory
+Result: supervised Controller workflow now owns Plan generation/review/revision and intake judgment while deterministic kernel code retains persistence, workflow routing, approval/application gates, validation, authorization, and lifecycle invariants.
+
+## M06 — Persistent memory — CURRENT
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
+
+M06-001 established typed durable memory and canonical project/global persistence. Current work adds deterministic bounded read-only retrieval into Controller context before later memory capture/consolidation or semantic retrieval.
 
 ## M07 — Supervised autonomy
 

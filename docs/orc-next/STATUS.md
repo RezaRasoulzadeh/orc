@@ -4,9 +4,9 @@
 
 **Current milestone:** M06 — Persistent memory
 
-**Current task:** M06-010 — Add supervised Controller memory capture judgment
+**Current task:** M06-011 — Add supervised Controller memory maintenance judgment
 
-**Last completed:** M06-009 — Establish supervised Controller memory mutation boundary
+**Last completed:** M06-010 — Add supervised Controller memory capture judgment
 
 **Blocked by:** Nothing
 
@@ -21,14 +21,15 @@
 - Controller capabilities retain capability-specific request/state types; memory reuse occurs through `ControllerMemoryContext`, not a universal Controller packet.
 - M06-003 through M06-008 integrate bounded memory into all currently identified Controller read/judgment seams while preserving current-facts authority and kernel boundaries.
 - M06-009 established the supervised write boundary: bounded typed create/correct/supersede/remove intents, deterministic legality, opaque exact-intent one-shot authorization, fresh-state revalidation, and canonical execution exclusively through M06-001 `MemoryService` operations.
-- M06-010 adds only the missing capture judgment: one explicit bounded candidate may be judged `Ignore` or proposed as one canonical M06-009 mutation intent. Capture inference cannot authorize or execute memory mutation.
-- Capture remains explicitly invoked and supervised; no background/implicit capture, transcript ingestion, or consolidation.
-- Structured facts and deterministic filters come first; semantic/vector retrieval remains later.
+- M06-010 established supervised capture judgment for one explicit bounded candidate: `Ignore` or one canonical candidate-backed Create proposal. Capture inference cannot authorize, execute, or persist mutation.
+- M06-011 is the remaining supervised maintenance/consolidation judgment seam: one explicit active target may be kept or proposed for canonical Correct/Supersede/Remove through the existing M06-009 boundary.
+- Capture and maintenance remain explicitly invoked and supervised; no background scanning, implicit writes, transcript ingestion, or autonomous consolidation.
+- Structured facts and deterministic filters come first; semantic/vector retrieval remains later and requires evidence.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M06-010.md`: add read-only Controller memory-capture judgment over one explicit bounded candidate, reusing `ControllerMemoryContext` and the existing M06-009 mutation-intent boundary without authorization or execution.
+Implement `tasks/M06-011.md`: add read-only Controller maintenance judgment over one explicitly selected active memory target, reusing `ControllerMemoryContext` and M06-009 Correct/Supersede/Remove intents without authorization, execution, automatic scanning, or background consolidation.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

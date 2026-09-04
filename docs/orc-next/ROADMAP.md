@@ -51,9 +51,9 @@ Result: supervised Controller workflow now owns Plan generation/review/revision 
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established a reusable deterministic bounded read-only `ControllerMemoryContext` without forcing a universal Controller request type. M06-003 integrated that context into Controller Plan generation through a capability-local bounded input and passed deterministic plus real-Qwen precedence evaluation.
+M06-001 established typed durable memory and canonical project/global persistence. M06-002 established a reusable deterministic bounded read-only `ControllerMemoryContext` without forcing a universal Controller request type. M06-003 integrated that context into Controller Plan generation through a capability-local bounded input. M06-004 integrated it into recovery recommendation while preserving exact current legal-operation authority and deterministic post-inference actionability.
 
-Current work integrates the same bounded memory context into Controller recovery through the existing `RecoveryInferenceRequest` / `OrcApp::recommend_recovery` seam. Current recovery observation and exact legal-operation facts remain authoritative; deterministic post-inference actionability remains the final gate. Later M06 work should continue only through repository-grounded capability seams or move toward controlled capture/consolidation when those integrations establish enough evidence.
+Current work integrates the same bounded memory context into the original normal task recommendation path through the existing `ControllerStateBuilder` / `OrcApp::propose_controller_action` seam. `ControllerStatePacket` remains the current-facts projection; memory is advisory context around that packet rather than part of the packet itself. Later M06 work should continue through remaining repository-grounded capability seams or move toward controlled capture/consolidation only after those read paths establish enough evidence.
 
 ## M07 — Supervised autonomy
 

@@ -4,39 +4,29 @@
 
 **Current milestone:** M06 — Persistent memory
 
-**Current task:** M06-007 — Integrate bounded memory into Controller Plan review
+**Current task:** M06-008 — Integrate bounded memory into Controller Plan revision
 
-**Last completed:** M06-006 — Integrate bounded memory into Controller workflow intake
+**Last completed:** M06-007 — Integrate bounded memory into Controller Plan review
 
 **Blocked by:** Nothing
 
 ## Current decisions
 
-- Local Controller from phase one.
-- Initial model/runtime target: Qwen3 8B through llama.cpp/GGUF.
-- Qwen/llama.cpp is an implementation choice, not a domain dependency; the runtime boundary must remain replaceable.
-- `ProjectOperations` is the primary existing provider-independent observation seam.
-- `OrcApp` is the existing canonical application/mutation seam.
-- M02 is complete: bounded read-only Controller state/recommendation and reliable structured output are in place.
-- M03 is complete: typed normal-action intents, deterministic legality, trusted one-shot authorization, fresh legality re-check, canonical execution, and supervised recommendation-to-intent bridge are in place.
-- M04 is complete: bounded recovery facts/legality, Controller recovery choice, supervised recovery execution, validation-repair exhaustion migration, and semantic revision non-convergence migration are in place.
-- M05 is complete: the normal supervised Controller workflow owns intake plus Plan generation/review/revision judgment; deterministic kernel code owns persistence, workflow routing, approval/application gates, validation, authorization, and lifecycle invariants.
-- Remaining legacy Lead/Planner APIs and durable records are compatibility-only; do not add cleanup tasks solely to delete them.
+- Local Controller from phase one; initial runtime target remains Qwen3 8B through llama.cpp/GGUF behind a model-independent runtime boundary.
+- `ProjectOperations` is the primary provider-independent observation seam; `OrcApp` is the canonical application/mutation seam.
+- M02–M05 are complete: Controller owns supervised judgment while deterministic kernel code owns persistence, legality, authorization, workflow routing, validation, approval/application gates, and lifecycle invariants.
 - Memory is explicit Orc data, separate from model weights.
-- M06-001 is complete: typed User/Project/Episodic/Experience memory, canonical project/global persistence, transactional lifecycle/history operations, and application-level `MemoryService` are established.
-- M06-002 is complete: standalone bounded `ControllerMemoryContext` retrieval through `OrcApp`, with deterministic active-only projection, project/global scope enforcement, explicit authority/provenance, and no inference integration.
-- Controller capabilities keep capability-specific request/state types; memory reuse happens through `ControllerMemoryContext`, not by forcing a universal `ControllerStatePacket`.
-- M06-003 is complete: Controller Plan generation receives typed bounded memory through a capability-local planning input.
-- M06-004 is complete: recovery recommendation receives typed bounded memory while exact current legal operations remain the only source of actionability.
-- M06-005 is complete: normal task recommendation receives typed bounded memory while `ControllerStatePacket` remains the authoritative current-facts projection and M03 deterministic action boundaries remain unchanged.
-- M06-006 is complete: workflow intake receives typed bounded memory while the canonical intake request, exactly three intake outcomes, and downstream workflow kernel authority remain unchanged.
-- M06-007 integrates bounded memory into Controller Plan review while preserving current persisted Plan facts, current project/task state, explicit operator resolution, the three review outcomes, and downstream review/Plan workflow authority.
-- Structured facts and deterministic filters come first; semantic/vector retrieval remains supplementary and later.
+- M06-001 established typed User/Project/Episodic/Experience durable memory and canonical project/global persistence.
+- M06-002 established deterministic bounded read-only `ControllerMemoryContext` through `OrcApp`.
+- Controller capabilities retain capability-specific request/state types; memory reuse occurs through `ControllerMemoryContext`, not a universal Controller packet.
+- M06-003 through M06-007 integrate bounded memory into Plan generation, recovery, normal task recommendation, workflow intake, and Plan review respectively while preserving current-facts authority and kernel boundaries.
+- M06-008 applies the same pattern to read-only Controller Plan revision. Current Plan content, persisted actionable revision feedback, and current planning facts remain authoritative; durable lineage remains outside model authority.
+- Structured facts and deterministic filters come first; semantic/vector retrieval remains later.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M06-007.md`: integrate canonical bounded memory into `ControllerPlanReviewRequest` / `ControllerPlanReviewBuilder::review` through `OrcApp::review_controller_plan`, preserving current-Plan checks, review schema/validation, persistence, approval/revision/application routing, and all kernel mutation boundaries.
+Implement `tasks/M06-008.md`: integrate canonical bounded memory into the existing Controller Plan-revision inference seam while preserving deterministic eligibility, persisted feedback authority, canonical PlanResponse output, trusted lineage attachment, and downstream kernel-owned persistence/workflow semantics.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

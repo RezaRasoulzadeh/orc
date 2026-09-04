@@ -51,9 +51,11 @@ Result: supervised Controller workflow now owns Plan generation/review/revision 
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 integrated it into Plan generation, M06-004 into recovery recommendation, and M06-005 into normal task recommendation through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
+M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 integrated it into Plan generation, M06-004 into recovery recommendation, M06-005 into normal task recommendation, and M06-006 into workflow intake through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
 
-Current work applies the same bounded read-only memory context to workflow intake through `ControllerIntakeRequest` / `ControllerIntakeBuilder::classify` / `OrcApp::propose_controller_intake`. The current objective, engineering contract, project/discovery/task facts, and operator resolution remain authoritative; the only valid outcomes remain DirectTasks, PlanRequired, and UserDecisionRequired. Later M06 work should inspect the remaining Plan review/revision seams before deciding whether more read integrations are useful or whether controlled capture/consolidation is the next smallest step.
+Current work integrates the same bounded read-only memory context into Controller Plan review through `ControllerPlanReviewRequest` / `ControllerPlanReviewBuilder::review` / `OrcApp::review_controller_plan`. The current persisted Plan, current project/task state, and explicit operator resolution remain authoritative; valid outcomes remain Approve, RevisePlan, and OperatorDecisionRequired. Review persistence and all approval/revision/application workflow mutation remain kernel-owned downstream.
+
+After Plan review, inspect the separate Plan-revision generation seam before deciding whether it is the final useful read integration or whether controlled memory capture/consolidation is the next smallest step.
 
 ## M07 — Supervised autonomy
 

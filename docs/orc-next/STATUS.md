@@ -4,9 +4,9 @@
 
 **Current milestone:** M06 — Persistent memory
 
-**Current task:** M06-002 — Add deterministic bounded memory retrieval to Controller context
+**Current task:** M06-003 — Integrate bounded memory into Controller planning
 
-**Last completed:** M06-001 — Establish typed persistent memory records and deterministic storage
+**Last completed:** M06-002 — Build deterministic bounded Controller memory context
 
 **Blocked by:** Nothing
 
@@ -24,14 +24,15 @@
 - Remaining legacy Lead/Planner APIs and durable records are compatibility-only; do not add cleanup tasks solely to delete them.
 - Memory is explicit Orc data, separate from model weights.
 - M06-001 is complete: typed User/Project/Episodic/Experience memory, canonical project/global persistence, transactional lifecycle/history operations, and application-level `MemoryService` are established.
-- User/experience memory is cross-project global state; project/episodic memory is project-scoped. Working memory remains transient bounded context.
-- M06-002 adds deterministic read-only active-memory projection to the existing bounded Controller state packet while preserving current project/task/Plan authority.
+- M06-002 is complete: standalone bounded `ControllerMemoryContext` retrieval through `OrcApp`, with deterministic active-only projection, project/global scope enforcement, explicit authority/provenance, and no inference integration.
+- Controller capabilities keep capability-specific request/state types; memory reuse happens through `ControllerMemoryContext`, not by forcing a universal `ControllerStatePacket`.
+- M06-003 integrates that bounded memory context into Controller Plan generation only, preserving current planning-request authority and the model-independent runtime boundary.
 - Structured facts and deterministic filters come first; semantic/vector retrieval remains supplementary and later.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M06-002.md`: retrieve active memory through the canonical M06-001 API, enforce exact scope/authority and deterministic bounds/order/truncation, and project it read-only into the canonical Controller state context. Do not add memory writes, consolidation, semantic/vector retrieval, embeddings, or model-specific behavior.
+Implement `tasks/M06-003.md`: embed the canonical M06-002 memory context into the existing Controller planning request/application path, preserve the 64 KiB planning request bound and explicit precedence, and do not widen persistence authority or redesign other Controller capabilities.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

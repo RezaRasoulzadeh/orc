@@ -204,6 +204,13 @@ pub struct ControllerPlanOutcome {
     pub plan_id: i64,
 }
 
+/// Result of one Controller intake boundary. The outcome is intentionally
+/// limited to semantic routing; durable workflow state remains kernel-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerIntakeOutcome {
+    pub decision: crate::controller_intake::ControllerIntakeDecision,
+}
+
 /// Result of one Controller Plan-review persistence boundary. The workflow
 /// kernel owns the transition mapping; Controller output cannot supply any
 /// workflow or persistence metadata.
@@ -295,6 +302,43 @@ pub trait WorkflowActions {
         Ok(None)
     }
 
+    fn controller_intake(
+        &self,
+        workflow: &WorkflowRun,
+        _: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerIntakeOutcome>> {
+        // Source-compatible custom action implementations which predate the
+        // Controller intake seam retain their legacy adapter behavior. The
+        // production AppWorkflowActions implementation below overrides this
+        // method, so normal Controller workflows never use this fallback.
+        let outcome = self.lead(workflow)?;
+        let decision = match outcome.kind {
+            LeadDecisionKind::DirectTasks => {
+                crate::controller_intake::ControllerIntakeDecision::DirectTasks
+            }
+            LeadDecisionKind::PlanRequired => {
+                crate::controller_intake::ControllerIntakeDecision::PlanRequired
+            }
+            LeadDecisionKind::UserDecisionRequired => {
+                crate::controller_intake::ControllerIntakeDecision::UserDecisionRequired
+            }
+            other => anyhow::bail!("Lead returned illegal intake decision {other:?}"),
+        };
+        Ok(Some(ControllerIntakeOutcome { decision }))
+    }
+
+    fn recover_controller_intake(
+        &self,
+        _: &WorkflowRun,
+    ) -> Result<Option<ControllerIntakeOutcome>> {
+        Ok(None)
+    }
+
+    fn apply_controller_direct(&self, workflow: &WorkflowRun) -> Result<()> {
+        let _ = workflow;
+        self.apply_direct()
+    }
+
     fn recover_controller_plan(&self, _: &WorkflowRun) -> Result<Option<ControllerPlanOutcome>> {
         Ok(None)
     }
@@ -331,7 +375,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
     }
 
     /// Start a workflow with an explicitly supplied local Controller runtime.
-    /// The runtime is used only by the Controller Plan boundaries; all stage,
+    /// The runtime is used only by Controller judgment boundaries; all stage,
     /// status, approval, and application decisions remain in this engine.
     pub fn start_with_controller_runtime(
         &self,
@@ -638,6 +682,36 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 ))
             }
             WorkflowStage::Lead => {
+                if current.plan_path == WorkflowPlanPath::Controller {
+                    let outcome =
+                        if let Some(outcome) = self.actions.recover_controller_intake(current)? {
+                            outcome
+                        } else {
+                            let runtime = runtime
+                                .as_deref_mut()
+                                .context("Controller runtime is required for this workflow")?;
+                            self.actions
+                                .controller_intake(current, runtime)?
+                                .context("Controller intake adapter returned no outcome")?
+                        };
+                    let mut next = current.clone();
+                    next.user_resolution = None;
+                    match outcome.decision {
+                        crate::controller_intake::ControllerIntakeDecision::DirectTasks => {
+                            next.stage = WorkflowStage::ApplyDirect
+                        }
+                        crate::controller_intake::ControllerIntakeDecision::PlanRequired => {
+                            next.stage = WorkflowStage::Planner
+                        }
+                        crate::controller_intake::ControllerIntakeDecision::UserDecisionRequired => {
+                            next.status = WorkflowStatus::WaitingUser;
+                            next.resume_stage = Some(WorkflowStage::Lead);
+                            next.stop_reason =
+                                Some("Controller intake requires a user decision".into());
+                        }
+                    }
+                    return Ok(NextTransition::semantic(next, "controller_intake_decided"));
+                }
                 let outcome = self
                     .actions
                     .recover_lead(current)?
@@ -663,7 +737,11 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 ))
             }
             WorkflowStage::ApplyDirect => {
-                self.actions.apply_direct()?;
+                if current.plan_path == WorkflowPlanPath::Controller {
+                    self.actions.apply_controller_direct(current)?;
+                } else {
+                    self.actions.apply_direct()?;
+                }
                 let mut next = current.clone();
                 next.stage = WorkflowStage::Tasks;
                 Ok(NextTransition::deterministic(
@@ -1192,6 +1270,31 @@ impl<'a> AppWorkflowActions<'a> {
         request.kind = "project_plan".into();
         Ok(request)
     }
+
+    fn controller_intake_request(
+        &self,
+        workflow: &WorkflowRun,
+    ) -> Result<crate::controller_intake::ControllerIntakeRequest> {
+        let planning = self.app.planning_request()?;
+        let snapshot = crate::discovery::snapshot_for_provider(self.app.repo_path())?;
+        let project_name = planning
+            .project
+            .as_ref()
+            .map(|project| project.name.as_str())
+            .unwrap_or_default();
+        let engineering_contract = planning.engineering_contract;
+        let facts = self.app.database().project_facts(workflow.project_id)?;
+        Ok(
+            crate::controller_intake::ControllerIntakeRequest::from_canonical(
+                project_name,
+                &engineering_contract,
+                &workflow.objective,
+                &facts,
+                &snapshot,
+                workflow.user_resolution.as_deref(),
+            )?,
+        )
+    }
 }
 
 impl WorkflowActions for AppWorkflowActions<'_> {
@@ -1264,6 +1367,26 @@ impl WorkflowActions for AppWorkflowActions<'_> {
             } => Ok(Some(ControllerPlanOutcome { plan_id })),
             result => anyhow::bail!("Controller Plan persistence failed: {result:?}"),
         }
+    }
+
+    fn controller_intake(
+        &self,
+        workflow: &WorkflowRun,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerIntakeOutcome>> {
+        let request = self.controller_intake_request(workflow)?;
+        let result = self
+            .app
+            .propose_controller_intake(&request, runtime)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.app.persist_controller_intake_for_workflow(
+            workflow.id,
+            workflow.user_resolution.as_deref(),
+            &result,
+        )?;
+        Ok(Some(ControllerIntakeOutcome {
+            decision: result.decision,
+        }))
     }
 
     fn controller_plan_revision(
@@ -1357,24 +1480,43 @@ impl WorkflowActions for AppWorkflowActions<'_> {
         Ok(plan.map(|plan| ControllerPlanOutcome { plan_id: plan.id }))
     }
 
+    fn recover_controller_intake(
+        &self,
+        workflow: &WorkflowRun,
+    ) -> Result<Option<ControllerIntakeOutcome>> {
+        let boundary = self.app.database().controller_intake_for_workflow(
+            workflow.id,
+            workflow.project_id,
+            workflow.user_resolution.as_deref(),
+        )?;
+        Ok(boundary.map(|boundary| ControllerIntakeOutcome {
+            decision: boundary.decision,
+        }))
+    }
+
+    fn apply_controller_direct(&self, workflow: &WorkflowRun) -> Result<()> {
+        self.app
+            .database()
+            .apply_controller_direct_tasks_for_workflow(workflow.project_id, workflow.id)?;
+        Ok(())
+    }
+
     fn recover_controller_plan_review(
         &self,
         workflow: &WorkflowRun,
     ) -> Result<Option<ControllerPlanReviewOutcome>> {
-        // A resolution means the prior operator-decision review has already
-        // been consumed by the workflow edge; the resumed review must infer
-        // once with that resolution as context.
-        if workflow.user_resolution.is_some() {
-            return Ok(None);
-        }
         let Some(plan_id) = workflow.plan_id else {
             return Ok(None);
         };
-        let review = self.app.database().controller_plan_review_for_workflow(
-            workflow.id,
-            workflow.project_id,
-            plan_id,
-        )?;
+        let review = self
+            .app
+            .database()
+            .controller_plan_review_for_workflow_with_resolution(
+                workflow.id,
+                workflow.project_id,
+                plan_id,
+                workflow.user_resolution.as_deref(),
+            )?;
         Ok(review.map(|decision| ControllerPlanReviewOutcome {
             decision: match decision {
                 crate::storage::db::PlanReviewDecision::Approve => {

@@ -310,6 +310,37 @@ impl OrcApp {
         crate::controller_planning::ControllerPlanningBuilder::new().propose(&request, runtime)
     }
 
+    /// Classify normal workflow intake through the bounded read-only
+    /// Controller capability. No workflow or task state is changed here.
+    pub fn propose_controller_intake(
+        &self,
+        request: &crate::controller_intake::ControllerIntakeRequest,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<
+        crate::controller_intake::ControllerIntakeResult,
+        crate::controller_intake::ControllerIntakeError,
+    > {
+        crate::controller_intake::ControllerIntakeBuilder::new().classify(request, runtime)
+    }
+
+    /// Persist one exact Controller intake boundary for the supplied
+    /// workflow. Routing and task application remain separate kernel edges.
+    pub fn persist_controller_intake_for_workflow(
+        &self,
+        workflow_id: i64,
+        operator_resolution: Option<&str>,
+        result: &crate::controller_intake::ControllerIntakeResult,
+    ) -> Result<()> {
+        let project_id = self.lead().project_id()?;
+        self.db.store_controller_intake_for_workflow(
+            project_id,
+            workflow_id,
+            operator_resolution,
+            result,
+        )?;
+        Ok(())
+    }
+
     /// Review a current valid persisted Plan through the read-only Controller
     /// judgment boundary. This never persists the returned decision.
     pub fn review_controller_plan(
@@ -703,15 +734,18 @@ impl OrcApp {
             };
         };
         let stored = match proposal.workflow_id() {
-            Some(workflow_id) => self.db.store_controller_plan_review_for_workflow(
-                project_id,
-                workflow_id,
-                proposal.plan_id(),
-                proposal.plan_version(),
-                proposal.plan(),
-                crate::controller_plan_review_persistence::database_decision(proposal),
-                &details,
-            ),
+            Some(workflow_id) => self
+                .db
+                .store_controller_plan_review_for_workflow_with_resolution(
+                    project_id,
+                    workflow_id,
+                    proposal.operator_resolution(),
+                    proposal.plan_id(),
+                    proposal.plan_version(),
+                    proposal.plan(),
+                    crate::controller_plan_review_persistence::database_decision(proposal),
+                    &details,
+                ),
             None => self.db.store_controller_plan_review(
                 project_id,
                 proposal.plan_id(),

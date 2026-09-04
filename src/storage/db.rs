@@ -97,6 +97,17 @@ pub struct PersistedPlan {
     pub superseded_by_plan_id: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControllerIntakeBoundary {
+    pub workflow_id: i64,
+    pub project_id: i64,
+    pub operator_resolution: Option<String>,
+    pub decision: crate::controller_intake::ControllerIntakeDecision,
+    pub details: String,
+    pub direct_tasks: Vec<crate::protocol::TaskProposal>,
+    pub applied: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanHistoryEntry {
     pub plan_id: i64,
@@ -310,10 +321,11 @@ fn record_plan_review_tx(
     decision: PlanReviewDecision,
     details: &str,
     workflow_id: Option<i64>,
+    operator_resolution: Option<&str>,
 ) -> Result<i64, DbError> {
     provenance.validate()?;
     tx.execute(
-        "INSERT INTO plan_reviews (plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO plan_reviews (plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details, operator_resolution) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             plan_id,
             workflow_id,
@@ -321,7 +333,8 @@ fn record_plan_review_tx(
             provenance.lead_run_id,
             provenance.lead_decision_id,
             decision.as_str(),
-            details
+            details,
+            operator_resolution
         ],
     )?;
     let review_id = tx.last_insert_rowid();
@@ -1897,6 +1910,27 @@ impl Database {
         project_id: i64,
         plan_id: i64,
     ) -> Result<Option<PlanReviewDecision>, DbError> {
+        self.controller_plan_review_for_workflow_with_resolution(
+            workflow_id,
+            project_id,
+            plan_id,
+            None,
+        )
+    }
+
+    /// Return a persisted Controller review only for the exact workflow,
+    /// Plan, and operator-resolution context. The resolution is part of the
+    /// durable inference boundary: a prior USER_DECISION_REQUIRED review
+    /// must not be mistaken for the resumed review after the operator
+    /// answers it.
+    pub fn controller_plan_review_for_workflow_with_resolution(
+        &self,
+        workflow_id: i64,
+        project_id: i64,
+        plan_id: i64,
+        operator_resolution: Option<&str>,
+    ) -> Result<Option<PlanReviewDecision>, DbError> {
+        let resolution = operator_resolution.map(str::trim);
         self.conn
             .query_row(
                 "SELECT r.decision FROM plan_reviews r
@@ -1904,8 +1938,10 @@ impl Database {
                  WHERE r.workflow_id = ?1 AND r.plan_id = ?2
                    AND p.workflow_id = ?1 AND p.project_id = ?3
                    AND r.origin = 'controller' AND r.superseded_by_review_id IS NULL
+                   AND ((r.operator_resolution = ?4)
+                        OR (r.operator_resolution IS NULL AND ?4 IS NULL))
                  ORDER BY r.id DESC LIMIT 1",
-                params![workflow_id, plan_id, project_id],
+                params![workflow_id, plan_id, project_id, resolution],
                 |row| parse_plan_review_decision(&row.get::<_, String>(0)?),
             )
             .optional()
@@ -2162,6 +2198,110 @@ impl Database {
         match result {
             Ok(mapping) => Ok(mapping),
             Err(error) => Err(error),
+        }
+    }
+
+    fn apply_task_proposals_in_transaction(
+        &self,
+        project_id: i64,
+        tasks: &[crate::protocol::TaskProposal],
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        let mut mapping = std::collections::BTreeMap::new();
+        for task in tasks {
+            let id = self.allocate_task_id()?;
+            self.insert_task_from_proposal(project_id, &id, task)?;
+            mapping.insert(task.local_id.clone(), id);
+        }
+        for task in tasks {
+            for dependency in &task.depends_on {
+                self.add_task_dependency(&mapping[&task.local_id], &mapping[dependency])?;
+            }
+        }
+        Ok(mapping)
+    }
+
+    /// Apply Controller-owned direct task proposals through the same
+    /// canonical task insertion/dependency transaction used by legacy
+    /// DIRECT_TASKS application. The workflow boundary is marked applied in
+    /// this transaction so a crash before the workflow edge cannot duplicate
+    /// task creation.
+    pub fn apply_controller_direct_tasks_for_workflow(
+        &self,
+        project_id: i64,
+        workflow_id: i64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let boundary: Option<(String, String, String, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT decision, details, direct_tasks, applied FROM controller_intake_boundaries WHERE workflow_id = ?1 AND project_id = ?2",
+                    params![workflow_id, project_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((decision, _details, direct_tasks, applied)) = boundary else {
+                return Err(DbError::Scheduler(
+                    "Controller direct-task intake boundary is missing".into(),
+                ));
+            };
+            if applied != 0 {
+                return Ok(None);
+            }
+            let decision = serde_json::from_value::<
+                crate::controller_intake::ControllerIntakeDecision,
+            >(serde_json::Value::String(decision))
+            .map_err(|error| {
+                DbError::Scheduler(format!("invalid Controller intake decision: {error}"))
+            })?;
+            if decision != crate::controller_intake::ControllerIntakeDecision::DirectTasks {
+                return Err(DbError::Scheduler(
+                    "Controller intake boundary is not DIRECT_TASKS".into(),
+                ));
+            }
+            let tasks = serde_json::from_str::<Vec<crate::protocol::TaskProposal>>(&direct_tasks)
+                .map_err(|error| {
+                DbError::Scheduler(format!("invalid Controller direct-task proposals: {error}"))
+            })?;
+            let response = crate::protocol::PlanResponse {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
+                objective: "Controller direct tasks".into(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                questions: Vec::new(),
+                tasks,
+            };
+            response
+                .validate()
+                .map_err(|error| DbError::Scheduler(error.to_string()))?;
+            let mapping = self.apply_task_proposals_in_transaction(project_id, &response.tasks)?;
+            let changed = self.conn.execute(
+                "UPDATE controller_intake_boundaries SET applied = 1 WHERE workflow_id = ?1 AND project_id = ?2 AND applied = 0",
+                params![workflow_id, project_id],
+            )?;
+            if changed != 1 {
+                return Err(DbError::Scheduler(
+                    "Controller direct-task intake boundary was already applied".into(),
+                ));
+            }
+            self.record_lifecycle_event(
+                "controller_direct_tasks_applied",
+                None,
+                None,
+                None,
+                Some(&format!("{{\"task_count\":{}}}", response.tasks.len())),
+            )?;
+            Ok(Some(mapping))
+        })();
+        match result {
+            Ok(mapping) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(mapping)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
     }
 
@@ -2459,6 +2599,7 @@ impl Database {
         Self::ensure_provider_escalation_columns(&conn)?;
         Self::ensure_resolution_records_table(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
+        Self::ensure_controller_intake_table(&conn)?;
         Self::ensure_lifecycle_events_table(&conn)?;
         Self::ensure_worktree_metadata_table(&conn)?;
         Self::ensure_change_evidence_table(&conn)?;
@@ -2511,6 +2652,7 @@ impl Database {
         Self::ensure_lead_provider_config_table(&conn)?;
         Self::ensure_plan_tables(&conn)?;
         Self::ensure_workflow_tables(&conn)?;
+        Self::ensure_controller_intake_table(&conn)?;
         Self::ensure_review_criteria_table(&conn)?;
         let registry_path = Self::absolute_registry_path(registry_path.as_ref())?;
         conn.execute(
@@ -3520,6 +3662,24 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_controller_intake_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS controller_intake_boundaries (
+                workflow_id INTEGER PRIMARY KEY REFERENCES workflow_runs(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                operator_resolution TEXT,
+                decision TEXT NOT NULL CHECK (decision IN ('direct_tasks', 'plan_required', 'user_decision_required')),
+                details TEXT NOT NULL,
+                direct_tasks TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0 CHECK (applied IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            );
+            CREATE INDEX IF NOT EXISTS controller_intake_project
+                ON controller_intake_boundaries(project_id, workflow_id);",
+        )?;
+        Ok(())
+    }
+
     pub fn provider_resolution(
         &self,
         invocation_id: i64,
@@ -4516,6 +4676,115 @@ impl Database {
             .map_err(DbError::from)
     }
 
+    /// Persist one Controller intake result as a workflow-owned boundary.
+    /// This is advisory semantic content only; the workflow transition is
+    /// still committed separately by `WorkflowEngine`.
+    pub fn store_controller_intake_for_workflow(
+        &self,
+        project_id: i64,
+        workflow_id: i64,
+        operator_resolution: Option<&str>,
+        result: &crate::controller_intake::ControllerIntakeResult,
+    ) -> Result<(), DbError> {
+        result
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let resolution = operator_resolution.map(str::trim).map(str::to_owned);
+        if resolution.as_deref().is_some_and(str::is_empty) {
+            return Err(DbError::Scheduler(
+                "Controller intake resolution must not be empty".into(),
+            ));
+        }
+        let decision = serde_json::to_value(result.decision)?
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| DbError::Scheduler("invalid Controller intake decision".into()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let workflow_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM workflow_runs WHERE id = ?1 AND project_id = ?2",
+                params![workflow_id, project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(workflow_state) = workflow_state else {
+            return Err(DbError::Scheduler(
+                "Controller intake workflow is missing or belongs to another project".into(),
+            ));
+        };
+        let workflow: crate::workflow::WorkflowRun = serde_json::from_str(&workflow_state)?;
+        if workflow.plan_path != crate::workflow::WorkflowPlanPath::Controller {
+            return Err(DbError::Scheduler(
+                "Controller intake requires a Controller workflow path".into(),
+            ));
+        }
+        let applied: Option<i64> = tx
+            .query_row(
+                "SELECT applied FROM controller_intake_boundaries WHERE workflow_id = ?1",
+                [workflow_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if applied == Some(1) {
+            return Err(DbError::Scheduler(
+                "Controller intake boundary was already applied".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO controller_intake_boundaries (workflow_id, project_id, operator_resolution, decision, details, direct_tasks, applied)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT(workflow_id) DO UPDATE SET project_id=excluded.project_id, operator_resolution=excluded.operator_resolution, decision=excluded.decision, details=excluded.details, direct_tasks=excluded.direct_tasks, applied=0, created_at=CURRENT_TIMESTAMP",
+            params![
+                workflow_id,
+                project_id,
+                resolution,
+                decision,
+                result.details,
+                serde_json::to_string(&result.direct_tasks)?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recover the latest persisted Controller intake result only when its
+    /// exact operator context matches the workflow's persisted context.
+    pub fn controller_intake_for_workflow(
+        &self,
+        workflow_id: i64,
+        project_id: i64,
+        operator_resolution: Option<&str>,
+    ) -> Result<Option<ControllerIntakeBoundary>, DbError> {
+        let resolution = operator_resolution.map(str::trim);
+        self.conn
+            .query_row(
+                "SELECT workflow_id, project_id, operator_resolution, decision, details, direct_tasks, applied
+                 FROM controller_intake_boundaries
+                 WHERE workflow_id = ?1 AND project_id = ?2
+                   AND ((operator_resolution = ?3) OR (operator_resolution IS NULL AND ?3 IS NULL))",
+                params![workflow_id, project_id, resolution],
+                |row| {
+                    let decision = serde_json::from_value(serde_json::Value::String(
+                        row.get::<_, String>(3)?,
+                    ))
+                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+                    let direct_tasks = serde_json::from_str(&row.get::<_, String>(5)?)
+                        .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+                    Ok(ControllerIntakeBoundary {
+                        workflow_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        operator_resolution: row.get(2)?,
+                        decision,
+                        details: row.get(4)?,
+                        direct_tasks,
+                        applied: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
     pub fn active_workflow(
         &self,
         project_id: i64,
@@ -5292,6 +5561,7 @@ impl Database {
                 "workflow_id",
                 "INTEGER REFERENCES workflow_runs(id)",
             ),
+            ("plan_reviews", "operator_resolution", "TEXT"),
         ] {
             let exists: i64 = conn
                 .query_row(
@@ -5362,12 +5632,13 @@ impl Database {
                     lead_decision_id INTEGER REFERENCES lead_decisions(id),
                     decision TEXT NOT NULL,
                     details TEXT NOT NULL,
+                    operator_resolution TEXT,
                     created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                     superseded_by_review_id INTEGER REFERENCES plan_reviews_new(id),
                     CHECK ((origin = 'legacy_lead' AND lead_run_id IS NOT NULL AND lead_decision_id IS NOT NULL) OR (origin = 'controller' AND lead_run_id IS NULL AND lead_decision_id IS NULL))
                  );
-                 INSERT INTO plan_reviews_new (id, plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id)
-                    SELECT id, plan_id, workflow_id, 'legacy_lead', lead_run_id, lead_decision_id, decision, details, created_at, superseded_by_review_id FROM plan_reviews;
+                 INSERT INTO plan_reviews_new (id, plan_id, workflow_id, origin, lead_run_id, lead_decision_id, decision, details, operator_resolution, created_at, superseded_by_review_id)
+                    SELECT id, plan_id, workflow_id, 'legacy_lead', lead_run_id, lead_decision_id, decision, details, NULL, created_at, superseded_by_review_id FROM plan_reviews;
                  DROP TABLE plan_reviews;
                  ALTER TABLE plan_reviews_new RENAME TO plan_reviews;
                  COMMIT;",
@@ -5407,6 +5678,7 @@ impl Database {
             PlanReviewProvenance::legacy(lead_run_id, decision_id),
             decision,
             details,
+            None,
             None,
         )?;
         tx.commit()?;
@@ -5463,13 +5735,14 @@ impl Database {
             decision,
             details,
             None,
+            None,
         )?;
         tx.commit()?;
         Ok(review_id)
     }
 
-    /// Persist a Controller-origin review bound to one workflow in the same
-    /// transaction as the canonical Plan status update.
+    /// Compatibility form for Controller review persistence without an
+    /// operator-resolution context.
     #[allow(clippy::too_many_arguments)]
     pub fn store_controller_plan_review_for_workflow(
         &self,
@@ -5481,6 +5754,38 @@ impl Database {
         decision: PlanReviewDecision,
         details: &str,
     ) -> Result<i64, DbError> {
+        self.store_controller_plan_review_for_workflow_with_resolution(
+            project_id,
+            workflow_id,
+            None,
+            plan_id,
+            expected_version,
+            expected_plan,
+            decision,
+            details,
+        )
+    }
+
+    /// Persist a Controller-origin review bound to one workflow in the same
+    /// transaction as the canonical Plan status update.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_controller_plan_review_for_workflow_with_resolution(
+        &self,
+        project_id: i64,
+        workflow_id: i64,
+        operator_resolution: Option<&str>,
+        plan_id: i64,
+        expected_version: i64,
+        expected_plan: &crate::protocol::PlanResponse,
+        decision: PlanReviewDecision,
+        details: &str,
+    ) -> Result<i64, DbError> {
+        let operator_resolution = operator_resolution.map(str::trim);
+        if operator_resolution.is_some_and(str::is_empty) {
+            return Err(DbError::Scheduler(
+                "Controller Plan review resolution must not be empty".into(),
+            ));
+        }
         let tx = self.conn.unchecked_transaction()?;
         let workflow_project: Option<i64> = tx
             .query_row(
@@ -5518,11 +5823,32 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
+        let review_context_valid = match plan.status {
+            PlanStatus::Proposed => true,
+            PlanStatus::UnderReview => operator_resolution.is_some(),
+            _ => false,
+        };
+        let resumed_user_decision = if plan.status == PlanStatus::UnderReview {
+            tx.query_row(
+                "SELECT decision FROM plan_reviews
+                 WHERE plan_id = ?1 AND origin = 'controller'
+                   AND superseded_by_review_id IS NULL
+                 ORDER BY id DESC LIMIT 1",
+                [plan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+                == Some("USER_DECISION_REQUIRED")
+        } else {
+            true
+        };
         if plan_workflow_id != Some(workflow_id)
             || plan.project_id != project_id
             || latest != Some(plan_id)
             || plan.version != expected_version
-            || !matches!(plan.status, PlanStatus::Proposed | PlanStatus::UnderReview)
+            || !review_context_valid
+            || !resumed_user_decision
             || plan.provenance != PlanProvenance::controller()
             || plan.response != *expected_plan
             || plan.response.validate().is_err()
@@ -5538,6 +5864,7 @@ impl Database {
             decision,
             details,
             Some(workflow_id),
+            operator_resolution,
         )?;
         tx.commit()?;
         Ok(review_id)
@@ -6033,17 +6360,7 @@ impl Database {
             .map_err(|e| DbError::Scheduler(e.to_string()))?;
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let mut mapping = std::collections::BTreeMap::new();
-            for task in &response.tasks {
-                let id = self.allocate_task_id()?;
-                self.insert_task_from_proposal(project_id, &id, task)?;
-                mapping.insert(task.local_id.clone(), id);
-            }
-            for task in &response.tasks {
-                for dependency in &task.depends_on {
-                    self.add_task_dependency(&mapping[&task.local_id], &mapping[dependency])?;
-                }
-            }
+            let mapping = self.apply_task_proposals_in_transaction(project_id, &response.tasks)?;
             let changed = self.conn.execute("UPDATE lead_decisions SET status='consumed', resolved_at=CURRENT_TIMESTAMP WHERE id=?1 AND project_id=?2 AND status='pending'", params![decision.id, project_id])?;
             if changed != 1 {
                 return Err(DbError::Scheduler(

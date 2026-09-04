@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
+use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -419,6 +420,41 @@ fn controller_plan_response(objective: &str) -> orc::local_runtime::LocalInferen
     )
 }
 
+fn controller_intake_response(
+    decision: &str,
+    direct_tasks: Vec<orc::protocol::TaskProposal>,
+) -> orc::local_runtime::LocalInferenceResponse {
+    orc::local_runtime::LocalInferenceResponse::structured(
+        "controller intake fixture",
+        serde_json::json!({
+            "decision": decision,
+            "details": "bounded intake fixture",
+            "direct_tasks": direct_tasks,
+        }),
+    )
+}
+
+fn controller_direct_task(local_id: &str) -> orc::protocol::TaskProposal {
+    orc::protocol::TaskProposal {
+        local_id: local_id.into(),
+        title: "Inspect the bounded workflow".into(),
+        objective: "Inspect the bounded workflow state.".into(),
+        role: "developer".into(),
+        priority: TaskPriority::Normal,
+        depends_on: vec![],
+        capabilities: vec![],
+        scope_mode: None,
+        context_files: vec![],
+        expected_changes: vec!["workflow inspection evidence".into()],
+        unchanged: vec!["unrelated behavior".into()],
+        acceptance_criteria: vec!["The workflow state is inspected.".into()],
+        required_tests: vec!["cargo test --lib".into()],
+        validation: vec!["cargo test --lib".into()],
+        execution_hints: orc::protocol::ExecutionHints::default(),
+        risk_factors: vec![],
+    }
+}
+
 fn controller_plan_result(objective: &str) -> orc::controller_planning::ControllerPlanResult {
     orc::controller_planning::ControllerPlanResult {
         plan: orc::protocol::PlanResponse {
@@ -557,6 +593,22 @@ fn automatic_policy() -> WorkflowPolicy {
         acceptance: AcceptancePolicy::Automatic,
         ..WorkflowPolicy::default()
     }
+}
+
+fn init_test_repo(directory: &TempDir) {
+    let status = Command::new("git")
+        .args(["init", "--quiet", directory.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+}
+
+fn app_database_path(directory: &TempDir) -> std::path::PathBuf {
+    let orc_directory = directory.path().join(".orc");
+    fs::create_dir_all(&orc_directory).unwrap();
+    let path = orc_directory.join("orc.db");
+    fs::copy(directory.path().join("orc.db"), &path).unwrap();
+    path
 }
 
 #[test]
@@ -1546,4 +1598,377 @@ fn non_convergence_cancellation_and_supersession_are_explicit() {
         .cancel(second.id, Some("operator stop"))
         .unwrap();
     assert_eq!(cancelled.status, WorkflowStatus::Cancelled);
+}
+
+#[test]
+fn controller_intake_direct_tasks_use_canonical_application_without_legacy_lineage() {
+    let (directory, db, project) = setup();
+    init_test_repo(&directory);
+    drop(db);
+    let db_path = app_database_path(&directory);
+    fs::write(
+        directory.path().join(".orc/engineering.md"),
+        "Controller intake direct contract",
+    )
+    .unwrap();
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut direct_runtime = AppControllerRuntime {
+        responses: VecDeque::from([controller_intake_response(
+            "direct_tasks",
+            vec![controller_direct_task("inspect")],
+        )]),
+        calls: 0,
+    };
+    let direct = app
+        .start_workflow_with_controller_runtime(
+            "controller intake direct",
+            WorkflowPolicy {
+                max_transitions: 3,
+                ..automatic_policy()
+            },
+            &mut direct_runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        direct.status,
+        WorkflowStatus::NonConvergent,
+        "{}",
+        direct.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(
+        direct.plan_path,
+        orc::workflow::WorkflowPlanPath::Controller
+    );
+    assert_eq!(direct_runtime.calls, 1);
+    assert_eq!(app.workflow_state().unwrap().tasks.len(), 1);
+    assert!(app.lead_decisions().unwrap().is_empty());
+    assert!(app.workflow_state().unwrap().runs.is_empty());
+    assert_eq!(project, direct.project_id);
+}
+
+#[test]
+fn controller_intake_app_path_routes_plan_without_legacy_semantic_runs() {
+    let (directory, db, _project) = setup();
+    init_test_repo(&directory);
+    drop(db);
+    let db_path = app_database_path(&directory);
+    fs::write(
+        directory.path().join(".orc/engineering.md"),
+        "Controller intake routing contract",
+    )
+    .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut runtime = AppControllerRuntime {
+        responses: VecDeque::from([
+            controller_intake_response("plan_required", vec![]),
+            controller_plan_response("controller intake plan"),
+            orc::local_runtime::LocalInferenceResponse::structured(
+                "controller fixture",
+                serde_json::json!({
+                    "decision": "approve",
+                    "details": "bounded intake plan approved",
+                    "revision_feedback": null
+                }),
+            ),
+        ]),
+        calls: 0,
+    };
+    let completed = app
+        .start_workflow_with_controller_runtime(
+            "controller intake plan",
+            automatic_policy(),
+            &mut runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        completed.status,
+        WorkflowStatus::Completed,
+        "{}",
+        completed.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(runtime.calls, 3);
+    assert_eq!(app.workflow_state().unwrap().plans.len(), 1);
+    assert_eq!(app.workflow_state().unwrap().plan_reviews.len(), 1);
+    assert!(app.lead_decisions().unwrap().is_empty());
+    assert!(app.workflow_state().unwrap().runs.is_empty());
+}
+
+#[test]
+fn controller_intake_user_decision_waits_reopens_and_resumes_without_replaying_intake() {
+    let (directory, db, _project) = setup();
+    init_test_repo(&directory);
+    drop(db);
+    let db_path = app_database_path(&directory);
+    fs::write(
+        directory.path().join(".orc/engineering.md"),
+        "Controller intake user decision contract",
+    )
+    .unwrap();
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let mut first_runtime = AppControllerRuntime {
+        responses: VecDeque::from([controller_intake_response("user_decision_required", vec![])]),
+        calls: 0,
+    };
+    let waiting = app
+        .start_workflow_with_controller_runtime(
+            "controller intake question",
+            automatic_policy(),
+            &mut first_runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        waiting.status,
+        WorkflowStatus::WaitingUser,
+        "{}",
+        waiting.stop_reason.as_deref().unwrap_or("no reason")
+    );
+    assert_eq!(waiting.stage, WorkflowStage::Lead);
+    assert_eq!(first_runtime.calls, 1);
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let still_waiting = reopened.continue_workflow(waiting.id).unwrap();
+    assert_eq!(still_waiting.status, WorkflowStatus::WaitingUser);
+    assert_eq!(still_waiting.stage, WorkflowStage::Lead);
+
+    let mut resumed_runtime = AppControllerRuntime {
+        responses: VecDeque::from([
+            controller_intake_response("plan_required", vec![]),
+            controller_plan_response("controller intake question"),
+            orc::local_runtime::LocalInferenceResponse::structured(
+                "controller fixture",
+                serde_json::json!({
+                    "decision": "approve",
+                    "details": "operator resolution is sufficient",
+                    "revision_feedback": null
+                }),
+            ),
+        ]),
+        calls: 0,
+    };
+    let completed = reopened
+        .resolve_workflow_with_controller_runtime(
+            waiting.id,
+            "use the bounded option",
+            &mut resumed_runtime,
+        )
+        .unwrap();
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert_eq!(resumed_runtime.calls, 3);
+    assert!(reopened.lead_decisions().unwrap().is_empty());
+    assert!(reopened.workflow_state().unwrap().runs.is_empty());
+}
+
+#[test]
+fn persisted_controller_intake_recovers_after_reopen_without_runtime_or_duplicate_mutation() {
+    let (directory, db, project) = setup();
+    let policy = WorkflowPolicy {
+        max_transitions: 3,
+        ..automatic_policy()
+    };
+    let workflow = db
+        .start_controller_workflow(project, "persisted intake", &policy)
+        .unwrap();
+    let mut lead = workflow.clone();
+    lead.stage = WorkflowStage::Lead;
+    let lead = db
+        .commit_workflow_transition(
+            &workflow,
+            &lead,
+            "test_discovery_boundary",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    app.persist_controller_intake_for_workflow(
+        lead.id,
+        None,
+        &orc::controller_intake::ControllerIntakeResult {
+            decision: orc::controller_intake::ControllerIntakeDecision::DirectTasks,
+            details: "persisted direct task boundary".into(),
+            direct_tasks: vec![controller_direct_task("restart-safe")],
+        },
+    )
+    .unwrap();
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let first = reopened.continue_workflow(lead.id).unwrap();
+    assert_eq!(first.status, WorkflowStatus::NonConvergent);
+    assert_eq!(reopened.workflow_state().unwrap().tasks.len(), 1);
+    let observer = Database::open(&db_path).unwrap();
+    assert!(
+        observer
+            .controller_intake_for_workflow(lead.id, project, None)
+            .unwrap()
+            .unwrap()
+            .applied
+    );
+    drop(observer);
+    let second = reopened.continue_workflow(lead.id).unwrap();
+    assert_eq!(second.transition_count, first.transition_count);
+    assert_eq!(reopened.workflow_state().unwrap().tasks.len(), 1);
+    assert!(reopened.lead_decisions().unwrap().is_empty());
+}
+
+#[test]
+fn controller_intake_recovery_never_adopts_another_workflows_boundary() {
+    let (directory, db, project) = setup();
+    let first = db
+        .start_controller_workflow(project, "same intake objective", &automatic_policy())
+        .unwrap();
+    let mut first_lead = first.clone();
+    first_lead.stage = WorkflowStage::Lead;
+    let first_lead = db
+        .commit_workflow_transition(
+            &first,
+            &first_lead,
+            "test_discovery_boundary",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    app.persist_controller_intake_for_workflow(
+        first_lead.id,
+        None,
+        &orc::controller_intake::ControllerIntakeResult {
+            decision: orc::controller_intake::ControllerIntakeDecision::DirectTasks,
+            details: "first workflow only".into(),
+            direct_tasks: vec![controller_direct_task("first-only")],
+        },
+    )
+    .unwrap();
+    drop(app);
+
+    let db = Database::open(&db_path).unwrap();
+    let second = db
+        .start_controller_workflow(project, "same intake objective", &automatic_policy())
+        .unwrap();
+    let mut second_lead = second.clone();
+    second_lead.stage = WorkflowStage::Lead;
+    let second_lead = db
+        .commit_workflow_transition(
+            &second,
+            &second_lead,
+            "test_discovery_boundary",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(db);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let stopped = reopened.continue_workflow(second_lead.id).unwrap();
+    assert_eq!(stopped.status, WorkflowStatus::Blocked);
+    assert_eq!(stopped.stage, WorkflowStage::Lead);
+    assert!(reopened.workflow_state().unwrap().tasks.is_empty());
+    let observer = Database::open(&db_path).unwrap();
+    assert!(
+        observer
+            .controller_intake_for_workflow(second_lead.id, project, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        observer
+            .controller_intake_for_workflow(first_lead.id, project, None)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn resumed_controller_review_boundary_recovers_after_reopen_without_runtime() {
+    let (directory, db, project) = setup();
+    let workflow = db
+        .start_controller_workflow(project, "review restart boundary", &automatic_policy())
+        .unwrap();
+    let mut planning = workflow.clone();
+    planning.stage = WorkflowStage::Planner;
+    let planning = db
+        .commit_workflow_transition(
+            &workflow,
+            &planning,
+            "test_controller_plan_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let db_path = directory.path().join("orc.db");
+    drop(db);
+
+    let app = OrcApp::open(&db_path, directory.path()).unwrap();
+    let plan_id = persist_workflow_plan(&app, planning.id, "review restart boundary");
+    persist_workflow_review(
+        &app,
+        planning.id,
+        plan_id,
+        None,
+        orc::controller_plan_review::ControllerPlanReviewDecision::OperatorDecisionRequired,
+    );
+    let current = app.workflow_run(planning.id).unwrap().unwrap();
+    let mut waiting = current.clone();
+    waiting.stage = WorkflowStage::PlanReview;
+    waiting.plan_id = Some(plan_id);
+    waiting.status = WorkflowStatus::WaitingUser;
+    waiting.resume_stage = Some(WorkflowStage::PlanReview);
+    waiting.stop_reason = Some("Controller plan review requires a user decision".into());
+    let observer = Database::open(&db_path).unwrap();
+    let waiting = observer
+        .commit_workflow_transition(
+            &current,
+            &waiting,
+            "test_review_user_gate",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let mut resumed = waiting.clone();
+    resumed.status = WorkflowStatus::Running;
+    resumed.resume_stage = None;
+    resumed.user_resolution = Some("use the bounded option".into());
+    resumed.stop_reason = None;
+    let resumed = observer
+        .commit_workflow_transition(&waiting, &resumed, "user_resolved", true, None, None)
+        .unwrap();
+    persist_workflow_review(
+        &app,
+        resumed.id,
+        plan_id,
+        resumed.user_resolution.as_deref(),
+        orc::controller_plan_review::ControllerPlanReviewDecision::Approve,
+    );
+    drop(observer);
+    drop(app);
+
+    let reopened = OrcApp::open(&db_path, directory.path()).unwrap();
+    let completed = reopened.continue_workflow(resumed.id).unwrap();
+    assert_eq!(completed.status, WorkflowStatus::Completed);
+    assert_eq!(reopened.workflow_state().unwrap().plan_reviews.len(), 2);
+    assert_eq!(
+        reopened
+            .workflow_state()
+            .unwrap()
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == plan_id)
+            .unwrap()
+            .status,
+        orc::storage::db::PlanStatus::Applied
+    );
+    assert_eq!(project, completed.project_id);
 }

@@ -477,7 +477,14 @@ impl OrcApp {
             .map_err(|error| RevisionError::PlanningContext(error.to_string()))?;
         let request =
             ControllerPlanRevisionRequest::from_canonical(&plan, &feedback, &planning_request)?;
-        let revised_plan = ControllerPlanRevisionBuilder::new().revise(&request, runtime)?;
+        let memory = self
+            .controller_memory_context()
+            .map_err(|error| RevisionError::MemoryContext(error.to_string()))?;
+        let input = crate::controller_plan_revision::ControllerPlanRevisionInput::from_request(
+            &request, memory,
+        );
+        let revised_plan =
+            ControllerPlanRevisionBuilder::new().revise_with_memory(&input, runtime)?;
         ControllerPlanRevisionResult::from_generated(
             plan.id,
             plan.version,

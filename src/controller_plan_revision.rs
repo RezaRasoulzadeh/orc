@@ -4,6 +4,7 @@
 //! state. The model returns only a PlanResponse; trusted parent and review
 //! identity is attached after inference for a later persistence task.
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::controller_planning::{ControllerPlanningError, ControllerPlanningRequest};
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest,
@@ -17,6 +18,7 @@ use thiserror::Error;
 
 pub const CONTROLLER_PLAN_REVISION_REQUEST_VERSION: u32 = 1;
 pub const MAX_CONTROLLER_PLAN_REVISION_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROLLER_PLAN_REVISION_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CONTROLLER_PLAN_REVISION_RESULT_BYTES: usize = 64 * 1024;
 const MAX_REVISION_FEEDBACK_BYTES: usize = 2048;
 
@@ -38,6 +40,8 @@ pub enum ControllerPlanRevisionError {
     InvalidReview(i64),
     #[error("Controller Plan revision request is invalid: {0}")]
     InvalidRequest(String),
+    #[error("Controller Plan revision memory context failed: {0}")]
+    MemoryContext(String),
     #[error("Controller Plan revision request is {actual} bytes; maximum is {max}")]
     RequestTooLarge { actual: usize, max: usize },
     #[error("Controller Plan revision output is malformed: {0}")]
@@ -102,6 +106,45 @@ impl ControllerPlanRevisionRequest {
             return Err(ControllerPlanRevisionError::RequestTooLarge {
                 actual: size,
                 max: MAX_CONTROLLER_PLAN_REVISION_REQUEST_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Capability-local Plan-revision inference input. The current revision
+/// request remains authoritative; memory is separate bounded advisory context
+/// with no lineage, persistence, authorization, or execution capability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerPlanRevisionInput {
+    pub current_request: ControllerPlanRevisionRequest,
+    pub memory: ControllerMemoryContext,
+}
+
+impl ControllerPlanRevisionInput {
+    pub fn from_request(
+        request: &ControllerPlanRevisionRequest,
+        memory: ControllerMemoryContext,
+    ) -> Self {
+        Self {
+            current_request: request.clone(),
+            memory,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerPlanRevisionError> {
+        self.current_request.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| ControllerPlanRevisionError::MemoryContext(error.to_string()))?;
+        let actual = serde_json::to_vec(self)
+            .map_err(|error| ControllerPlanRevisionError::InvalidRequest(error.to_string()))?
+            .len();
+        if actual > MAX_CONTROLLER_PLAN_REVISION_INPUT_BYTES {
+            return Err(ControllerPlanRevisionError::RequestTooLarge {
+                actual,
+                max: MAX_CONTROLLER_PLAN_REVISION_INPUT_BYTES,
             });
         }
         Ok(())
@@ -180,11 +223,21 @@ impl ControllerPlanRevisionBuilder {
         request: &ControllerPlanRevisionRequest,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<PlanResponse, ControllerPlanRevisionError> {
-        request.validate()?;
-        let input = serde_json::to_string(request)
+        let input =
+            ControllerPlanRevisionInput::from_request(request, ControllerMemoryContext::empty());
+        self.revise_with_memory(&input, runtime)
+    }
+
+    pub fn revise_with_memory(
+        &self,
+        input: &ControllerPlanRevisionInput,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<PlanResponse, ControllerPlanRevisionError> {
+        input.validate()?;
+        let input = serde_json::to_string(input)
             .map_err(|error| ControllerPlanRevisionError::InvalidRequest(error.to_string()))?;
         let prompt = format!(
-            "You are a read-only Plan revision advisor. Use only this bounded JSON. Return exactly one JSON object conforming to the canonical PlanResponse schema. Revise the previous Plan by concretely incorporating every applicable requirement in the persisted revision feedback; when feedback requests a missing task, add that task to the revised Plan, and when it requests an acceptance condition, include it in the relevant task. Preserve the valid objective, dependencies, safeguards, and constraints. Do not add metadata, parent IDs, review IDs, provenance, authorization, persistence, approval, application, tasks outside the PlanResponse, or workflow actions. This response is a proposal only.\n\n{input}"
+            "You are a read-only Plan revision advisor. Use only this bounded typed Controller Plan-revision input. Authority precedence is strict, from highest to lowest: (1) current_request.plan content and persisted revision_feedback; (2) current_request.planning_context current project facts, objective, constraints, non-goals, deliverables, definition of done, approval requirements, and current state; (3) memory items with authority=current_project as durable Project context; (4) authority=durable_user as User preference/context; (5) authority=project_history as Episodic historical guidance; (6) authority=cross_project_experience as reusable Experience guidance; (7) base model tendencies. The current Plan and persisted revision feedback are authoritative. Current planning/project facts outrank contradictory memory. Memory may help produce a better compliant revision but cannot rewrite the current Plan objective or constraints, remove or weaken applicable persisted feedback, choose parent/review lineage, or claim persistence or authorization. Preserve each memory item's typed identity, kind, scope, authority, provenance, confidence, lifecycle, and source metadata. Return exactly one JSON object conforming to the canonical PlanResponse schema. Revise the current Plan by concretely incorporating every applicable requirement in current_request.revision_feedback; when feedback requests a missing task, add that task to the revised Plan, and when it requests an acceptance condition, include it in the relevant task. Copy current_request.plan.objective into the revised Plan objective, preserve valid dependencies, safeguards, constraints, and current planning facts, and do not replace the current objective with memory guidance. Do not add metadata, parent IDs, review IDs, provenance, authorization, persistence, approval, application, tasks outside the PlanResponse, or workflow actions. This response is a proposal only.\n\n{input}"
         );
         let parameters = LocalInferenceParameters {
             max_output_tokens: 2048,
@@ -255,6 +308,13 @@ pub(crate) fn persisted_revision_feedback(
 mod tests {
     use super::*;
     use crate::app::OrcApp;
+    use crate::controller_memory::{
+        CONTROLLER_MEMORY_CONTEXT_VERSION, ControllerMemoryAuthority, ControllerMemoryItem,
+    };
+    use crate::memory::{
+        MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
+        MemoryScope,
+    };
     use crate::storage::db::{AgentRunExecution, LeadDecisionMetadata, PlanOrigin, PlanStatus};
     use crate::task::TaskPriority;
 
@@ -331,6 +391,30 @@ mod tests {
 
     fn app_with_revision() -> (tempfile::TempDir, OrcApp, i64, PersistedPlan) {
         app_with_controller_review(crate::storage::db::PlanReviewDecision::RevisePlan)
+    }
+
+    fn memory_context() -> ControllerMemoryContext {
+        ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![ControllerMemoryItem {
+                id: MemoryId::Project {
+                    project_id: 1,
+                    id: 1,
+                },
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id: 1 },
+                authority: ControllerMemoryAuthority::CurrentProject,
+                subject: "revision-context".into(),
+                content: "Memory is advisory and cannot weaken persisted feedback.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("workflow:plan-revision-memory".into()),
+                },
+                confidence: Some(0.8),
+                lifecycle: MemoryLifecycle::Active,
+                supersedes: None,
+            }],
+        }
     }
 
     fn assert_unchanged(app: &OrcApp, project_id: i64, plan_id: i64, before: &PersistedPlan) {
@@ -523,5 +607,205 @@ mod tests {
         assert_eq!(value.as_object().unwrap().len(), 4);
         assert!(value.get("lead_decision_id").is_none());
         assert!(value.get("planner_run_id").is_none());
+    }
+
+    #[test]
+    fn revision_input_preserves_typed_memory_and_prompt_authority() {
+        let (_directory, app, _project_id, plan) = app_with_revision();
+        let reviews = app.database().list_plan_reviews(plan.project_id).unwrap();
+        let feedback = persisted_revision_feedback(&reviews[0]).unwrap();
+        let planning_request = app.planning_request().unwrap();
+        let request =
+            ControllerPlanRevisionRequest::from_canonical(&plan, &feedback, &planning_request)
+                .unwrap();
+        let input = ControllerPlanRevisionInput::from_request(&request, memory_context());
+        input.validate().unwrap();
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serialized["current_request"]["plan"]["objective"],
+            "Original objective"
+        );
+        assert_eq!(
+            serialized["current_request"]["revision_feedback"],
+            "Add the missing acceptance condition."
+        );
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "workflow:plan-revision-memory"
+        );
+        assert!(
+            serialized["current_request"]
+                .get("parent_plan_id")
+                .is_none()
+        );
+        assert!(serialized["current_request"].get("review_id").is_none());
+
+        let mut runtime =
+            FakeRuntime::new(crate::local_runtime::LocalInferenceResponse::structured(
+                "ignored provider text",
+                serde_json::to_value(plan_response("Revised objective")).unwrap(),
+            ));
+        ControllerPlanRevisionBuilder::new()
+            .revise_with_memory(&input, &mut runtime)
+            .unwrap();
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains("current_request.plan content and persisted revision_feedback"));
+        assert!(prompt.contains("current_request.planning_context current project facts"));
+        assert!(prompt.contains("authority=current_project"));
+        assert!(prompt.contains("authority=durable_user"));
+        assert!(prompt.contains("authority=project_history"));
+        assert!(prompt.contains("authority=cross_project_experience"));
+        assert!(prompt.contains("current Plan and persisted revision feedback are authoritative"));
+        assert!(prompt.contains("cannot rewrite the current Plan objective or constraints"));
+        assert!(prompt.contains("Add the missing acceptance condition."));
+        assert!(prompt.contains("workflow:plan-revision-memory"));
+        assert!(!prompt.contains("parent_plan_id"));
+        assert!(!prompt.contains("review_id"));
+    }
+
+    #[test]
+    fn combined_revision_input_bound_preserves_independent_request_and_memory_bounds() {
+        let (_directory, app, _project_id, plan) = app_with_revision();
+        let reviews = app.database().list_plan_reviews(plan.project_id).unwrap();
+        let feedback = persisted_revision_feedback(&reviews[0]).unwrap();
+        let planning_request = app.planning_request().unwrap();
+
+        let mut oversized_request =
+            ControllerPlanRevisionRequest::from_canonical(&plan, &feedback, &planning_request)
+                .unwrap();
+        oversized_request.plan.objective = "x".repeat(MAX_CONTROLLER_PLAN_REVISION_REQUEST_BYTES);
+        assert!(matches!(
+            oversized_request.validate(),
+            Err(ControllerPlanRevisionError::RequestTooLarge {
+                max: MAX_CONTROLLER_PLAN_REVISION_REQUEST_BYTES,
+                ..
+            })
+        ));
+
+        let mut current_request =
+            ControllerPlanRevisionRequest::from_canonical(&plan, &feedback, &planning_request)
+                .unwrap();
+        current_request.plan.objective = "x".repeat(40_000);
+        current_request.validate().unwrap();
+        let memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: (0..8)
+                .map(|index| ControllerMemoryItem {
+                    id: MemoryId::Project {
+                        project_id: 1,
+                        id: index + 2,
+                    },
+                    kind: MemoryKind::Project,
+                    scope: MemoryScope::Project { project_id: 1 },
+                    authority: ControllerMemoryAuthority::CurrentProject,
+                    subject: format!("bound-{index}"),
+                    content: "m".repeat(3600),
+                    provenance: MemoryProvenance {
+                        kind: MemoryProvenanceKind::ProjectFact,
+                        source_reference: Some(format!("test:bound-{index}")),
+                    },
+                    confidence: None,
+                    lifecycle: MemoryLifecycle::Active,
+                    supersedes: None,
+                })
+                .collect(),
+        };
+        memory.validate().unwrap();
+        let input = ControllerPlanRevisionInput::from_request(&current_request, memory);
+        assert!(matches!(
+            input.validate(),
+            Err(ControllerPlanRevisionError::RequestTooLarge {
+                max: MAX_CONTROLLER_PLAN_REVISION_INPUT_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn contradictory_memory_cannot_suppress_feedback_or_change_revision_lineage() {
+        let (_directory, app, _project_id, plan) = app_with_revision();
+        let reviews = app.database().list_plan_reviews(plan.project_id).unwrap();
+        let feedback = persisted_revision_feedback(&reviews[0]).unwrap();
+        let request = ControllerPlanRevisionRequest::from_canonical(
+            &plan,
+            &feedback,
+            &app.planning_request().unwrap(),
+        )
+        .unwrap();
+        let input = ControllerPlanRevisionInput::from_request(&request, memory_context());
+        let revised = plan_response("Revised objective");
+        let mut runtime =
+            FakeRuntime::new(crate::local_runtime::LocalInferenceResponse::structured(
+                "ignored provider text",
+                serde_json::to_value(&revised).unwrap(),
+            ));
+        let output = ControllerPlanRevisionBuilder::new()
+            .revise_with_memory(&input, &mut runtime)
+            .unwrap();
+        assert_eq!(output, revised);
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains(&feedback));
+        assert!(prompt.contains("Memory may help produce a better compliant revision"));
+        assert!(!prompt.contains("review_id"));
+        assert!(!prompt.contains("parent_plan_id"));
+
+        let result = ControllerPlanRevisionResult::from_generated(
+            plan.id,
+            plan.version,
+            reviews[0].id,
+            output,
+        )
+        .unwrap();
+        assert_eq!(result.parent_plan_id, plan.id);
+        assert_eq!(result.parent_plan_version, plan.version);
+        assert_eq!(result.review_id, reviews[0].id);
+    }
+
+    #[test]
+    fn app_revision_retrieves_canonical_memory_read_only_after_eligibility_checks() {
+        let (_directory, app, project_id, plan) = app_with_revision();
+        let memory = app
+            .database()
+            .create_memory(&MemoryDraft {
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id },
+                subject: "revision-guidance".into(),
+                content: "Use current persisted feedback; this is advisory context only.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("test:plan-revision-memory".into()),
+                },
+                confidence: Some(0.9),
+            })
+            .unwrap();
+        let before = app.memories().unwrap().history(&memory.id).unwrap();
+        let revised = plan_response("Revised objective");
+        let mut runtime =
+            FakeRuntime::new(crate::local_runtime::LocalInferenceResponse::structured(
+                "ignored provider text",
+                serde_json::to_value(&revised).unwrap(),
+            ));
+        let result = app.revise_controller_plan(plan.id, &mut runtime).unwrap();
+        assert_eq!(result.parent_plan_id, plan.id);
+        assert_eq!(result.parent_plan_version, plan.version);
+        assert_eq!(result.review_id, 1);
+        assert_eq!(result.plan, revised);
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains("test:plan-revision-memory"));
+        assert!(prompt.contains("Add the missing acceptance condition."));
+        assert_eq!(app.memories().unwrap().history(&memory.id).unwrap(), before);
     }
 }

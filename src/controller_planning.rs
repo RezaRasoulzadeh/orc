@@ -6,6 +6,7 @@
 //! provider-specific seam. Durable Planner execution remains in
 //! [`crate::automated::run_plan`].
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -38,6 +39,8 @@ pub enum ControllerPlanningError {
     InvalidRequest(String),
     #[error("controller planning request serialization failed: {0}")]
     Serialization(String),
+    #[error("controller planning memory context failed: {0}")]
+    MemoryContext(String),
     #[error("controller planning request is {actual} bytes; maximum is {max}")]
     RequestTooLarge { actual: usize, max: usize },
     #[error("controller planning output is malformed: {0}")]
@@ -141,6 +144,48 @@ pub struct ControllerPlanningRequest {
     pub planning_constraints: Vec<String>,
     pub approval_requirements: Vec<String>,
     pub current_state: Option<ControllerPlanningState>,
+}
+
+/// Capability-local inference input for Controller Plan generation. Keeping
+/// the current request and reusable memory context as separate typed fields
+/// preserves their authority boundary and avoids changing other Controller
+/// capability request/state types.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerPlanningInput {
+    pub current_request: ControllerPlanningRequest,
+    pub memory: ControllerMemoryContext,
+}
+
+impl ControllerPlanningInput {
+    pub fn from_canonical(
+        request: &PlanningRequest,
+        memory: ControllerMemoryContext,
+    ) -> Result<Self, ControllerPlanningError> {
+        let input = Self {
+            current_request: ControllerPlanningRequest::from_canonical(request)?,
+            memory,
+        };
+        input.validate()?;
+        Ok(input)
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerPlanningError> {
+        self.current_request.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| ControllerPlanningError::MemoryContext(error.to_string()))?;
+        let actual = serde_json::to_vec(self)
+            .map_err(|error| ControllerPlanningError::Serialization(error.to_string()))?
+            .len();
+        if actual > MAX_CONTROLLER_PLANNING_REQUEST_BYTES {
+            return Err(ControllerPlanningError::RequestTooLarge {
+                actual,
+                max: MAX_CONTROLLER_PLANNING_REQUEST_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ControllerPlanningRequest {
@@ -476,11 +521,23 @@ impl ControllerPlanningBuilder {
         request: &ControllerPlanningRequest,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerPlanResult, ControllerPlanningError> {
+        let input = ControllerPlanningInput {
+            current_request: request.clone(),
+            memory: ControllerMemoryContext::empty(),
+        };
+        self.propose_with_memory(&input, runtime)
+    }
+
+    pub fn propose_with_memory(
+        &self,
+        request: &ControllerPlanningInput,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerPlanResult, ControllerPlanningError> {
         request.validate()?;
         let input = serde_json::to_string(request)
             .map_err(|error| ControllerPlanningError::Serialization(error.to_string()))?;
         let prompt = format!(
-            "You are a read-only planning advisor. Use only this bounded canonical Controller planning request. Return exactly one JSON object with plan, rationale, and optional uncertainty. The plan must be a PlanResponse. Propose work only; do not apply tasks, mutate state, consume decisions, dispatch agents, or claim execution.\n\n{input}"
+            "You are a read-only planning advisor. Use only this bounded typed Controller planning input. Authority precedence is strict, from highest to lowest: (1) current_request objective/instruction, engineering contract, explicit constraints, non-goals, deliverables, definition of done, role boundaries, planning constraints, approval requirements, and canonical current state; (2) memory items with authority=current_project as durable Project context; (3) authority=durable_user as cross-project User preference/context; (4) authority=project_history as Episodic historical context; (5) authority=cross_project_experience as reusable Experience guidance; (6) base model tendencies. Memory is advisory context: it must not rewrite or contradict current_request, durable User memory cannot override current project/request constraints, and Episodic or Experience memory must not be presented as current-project truth. Copy current_request.objective verbatim into plan.objective. Preserve and reason from each memory item's typed identity, kind, scope, authority, provenance, confidence, lifecycle, and source metadata. Return exactly one JSON object with plan, rationale, and optional uncertainty. The plan must be a PlanResponse, and every output array must contain unique entries. Propose work only; do not apply tasks, mutate state, consume decisions, dispatch agents, create or modify memory, or claim execution.\n\n{input}"
         );
         let parameters = LocalInferenceParameters {
             max_output_tokens: 2048,
@@ -629,6 +686,14 @@ pub fn controller_plan_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller_memory::{
+        ControllerMemoryAuthority, ControllerMemoryItem, MAX_CONTROLLER_MEMORY_CONTENT_BYTES,
+        MAX_CONTROLLER_MEMORY_ITEMS_PER_KIND,
+    };
+    use crate::memory::{
+        MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
+        MemoryScope,
+    };
     use crate::protocol::{PROTOCOL_VERSION, PlanResponseSchema};
 
     struct FakeRuntime {
@@ -735,6 +800,84 @@ mod tests {
         )
     }
 
+    fn memory_item(
+        id: MemoryId,
+        kind: MemoryKind,
+        scope: MemoryScope,
+        authority: ControllerMemoryAuthority,
+        subject: &str,
+        content: &str,
+        provenance_kind: MemoryProvenanceKind,
+    ) -> ControllerMemoryItem {
+        ControllerMemoryItem {
+            id,
+            kind,
+            scope,
+            authority,
+            subject: subject.into(),
+            content: content.into(),
+            provenance: MemoryProvenance {
+                kind: provenance_kind,
+                source_reference: Some("workflow:memory-source".into()),
+            },
+            confidence: Some(0.8),
+            lifecycle: MemoryLifecycle::Active,
+            supersedes: None,
+        }
+    }
+
+    fn memory_context() -> ControllerMemoryContext {
+        let context = ControllerMemoryContext {
+            context_version: crate::controller_memory::CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![
+                memory_item(
+                    MemoryId::Project {
+                        project_id: 1,
+                        id: 1,
+                    },
+                    MemoryKind::Project,
+                    MemoryScope::Project { project_id: 1 },
+                    ControllerMemoryAuthority::CurrentProject,
+                    "http-layout",
+                    "Health routes live in src/http.rs.",
+                    MemoryProvenanceKind::ProjectFact,
+                ),
+                memory_item(
+                    MemoryId::Global(1),
+                    MemoryKind::User,
+                    MemoryScope::Global,
+                    ControllerMemoryAuthority::DurableUser,
+                    "language-preference",
+                    "Prefer concise Rust changes.",
+                    MemoryProvenanceKind::Operator,
+                ),
+                memory_item(
+                    MemoryId::Project {
+                        project_id: 1,
+                        id: 2,
+                    },
+                    MemoryKind::Episodic,
+                    MemoryScope::Project { project_id: 1 },
+                    ControllerMemoryAuthority::ProjectHistory,
+                    "prior-release",
+                    "A prior release needed an extra migration check.",
+                    MemoryProvenanceKind::Imported,
+                ),
+                memory_item(
+                    MemoryId::Global(2),
+                    MemoryKind::Experience,
+                    MemoryScope::Global,
+                    ControllerMemoryAuthority::CrossProjectExperience,
+                    "review-guidance",
+                    "Prefer focused validation before broad validation.",
+                    MemoryProvenanceKind::ControllerApproved,
+                ),
+            ],
+        };
+        context.validate().unwrap();
+        context
+    }
+
     #[test]
     fn successful_proposal_returns_canonical_typed_plan() {
         let bounded = ControllerPlanningRequest::from_canonical(&request()).unwrap();
@@ -752,6 +895,98 @@ mod tests {
                 .contains("/private/repository/path")
         );
         assert!(runtime.requests[0].prompt.len() < MAX_CONTROLLER_PLANNING_REQUEST_BYTES);
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("\"memory\":{\"context_version\":1,\"items\":[]}")
+        );
+    }
+
+    #[test]
+    fn planning_input_preserves_typed_memory_and_prompt_precedence() {
+        let input = ControllerPlanningInput::from_canonical(&request(), memory_context()).unwrap();
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serialized["current_request"]["objective"],
+            "Plan one bounded change."
+        );
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "workflow:memory-source"
+        );
+        assert_eq!(serialized["memory"]["items"][0]["confidence"], 0.8);
+
+        let mut runtime = FakeRuntime::new(response());
+        ControllerPlanningBuilder::new()
+            .propose_with_memory(&input, &mut runtime)
+            .unwrap();
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains("Authority precedence is strict"));
+        assert!(prompt.contains("current_request objective/instruction"));
+        assert!(prompt.contains("authority=current_project"));
+        assert!(prompt.contains("authority=durable_user"));
+        assert!(prompt.contains("authority=project_history"));
+        assert!(prompt.contains("authority=cross_project_experience"));
+        assert!(prompt.contains("must not rewrite or contradict current_request"));
+        assert!(prompt.contains("Copy current_request.objective verbatim"));
+        assert!(prompt.contains("every output array must contain unique entries"));
+        assert!(prompt.contains("\"subject\":\"http-layout\""));
+    }
+
+    #[test]
+    fn combined_request_bound_includes_memory_context() {
+        let mut canonical = request();
+        canonical.constraints = vec!["c".repeat(MAX_TEXT_BYTES); MAX_LIST_ITEMS];
+        canonical.deliverables = vec!["d".repeat(1000); 4];
+        let current_request = ControllerPlanningRequest::from_canonical(&canonical).unwrap();
+        let memory = ControllerMemoryContext {
+            context_version: crate::controller_memory::CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: (0..MAX_CONTROLLER_MEMORY_ITEMS_PER_KIND)
+                .map(|index| {
+                    memory_item(
+                        MemoryId::Project {
+                            project_id: 1,
+                            id: index as i64 + 1,
+                        },
+                        MemoryKind::Project,
+                        MemoryScope::Project { project_id: 1 },
+                        ControllerMemoryAuthority::CurrentProject,
+                        &format!("large-{index}"),
+                        &"m".repeat(MAX_CONTROLLER_MEMORY_CONTENT_BYTES - 896),
+                        MemoryProvenanceKind::ProjectFact,
+                    )
+                })
+                .collect(),
+        };
+        current_request.validate().unwrap();
+        memory.validate().unwrap();
+        let combined = ControllerPlanningInput {
+            current_request,
+            memory,
+        };
+        assert!(
+            serde_json::to_vec(&combined).unwrap().len() > MAX_CONTROLLER_PLANNING_REQUEST_BYTES
+        );
+        assert!(matches!(
+            combined.validate(),
+            Err(ControllerPlanningError::RequestTooLarge {
+                max: MAX_CONTROLLER_PLANNING_REQUEST_BYTES,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -826,6 +1061,7 @@ mod tests {
     fn schema_reuses_canonical_plan_schema() {
         let schema = controller_plan_schema();
         assert!(schema.to_string().contains("expected_changes"));
+        assert!(schema["properties"].get("memory").is_none());
     }
 
     #[test]
@@ -833,6 +1069,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = crate::storage::Database::init(directory.path().join("orc.db")).unwrap();
         let project_id = database.create_project("read-only-planning").unwrap();
+        let memory = database
+            .create_memory(&MemoryDraft {
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id },
+                subject: "planning-layout".into(),
+                content: "Planning code lives in src/controller_planning.rs.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("project:fact:planning-layout".into()),
+                },
+                confidence: Some(1.0),
+            })
+            .unwrap();
+        let before_memory = database.memory_history(&memory.id).unwrap();
         let before = serde_json::to_value(database.planning_project_state().unwrap()).unwrap();
         let before_decisions = database.list_lead_decisions(project_id).unwrap();
         let app =
@@ -842,6 +1092,8 @@ mod tests {
             .propose_controller_plan(&request(), &mut runtime)
             .unwrap();
         assert_eq!(result.plan.tasks.len(), 1);
+        assert!(runtime.requests[0].prompt.contains("planning-layout"));
+        assert!(runtime.requests[0].prompt.contains("current_project"));
         let after_database =
             crate::storage::Database::open(directory.path().join("orc.db")).unwrap();
         assert_eq!(
@@ -857,6 +1109,30 @@ mod tests {
                 .list_plan_history(project_id)
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            after_database.memory_history(&memory.id).unwrap(),
+            before_memory
+        );
+    }
+
+    #[test]
+    fn app_api_preserves_empty_memory_compatibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orc.db");
+        let database = crate::storage::Database::init(&path).unwrap();
+        database.create_project("empty-memory-planning").unwrap();
+        drop(database);
+        let app = crate::app::OrcApp::open(&path, directory.path()).unwrap();
+        let mut runtime = FakeRuntime::new(response());
+        let result = app
+            .propose_controller_plan(&request(), &mut runtime)
+            .unwrap();
+        assert_eq!(result.plan.tasks.len(), 1);
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("\"memory\":{\"context_version\":1,\"items\":[]}")
         );
     }
 }

@@ -321,9 +321,13 @@ impl OrcApp {
         crate::controller_planning::ControllerPlanResult,
         crate::controller_planning::ControllerPlanningError,
     > {
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller_planning::ControllerPlanningError::MemoryContext(error.to_string())
+        })?;
         let request =
-            crate::controller_planning::ControllerPlanningRequest::from_canonical(request)?;
-        crate::controller_planning::ControllerPlanningBuilder::new().propose(&request, runtime)
+            crate::controller_planning::ControllerPlanningInput::from_canonical(request, memory)?;
+        crate::controller_planning::ControllerPlanningBuilder::new()
+            .propose_with_memory(&request, runtime)
     }
 
     /// Classify normal workflow intake through the bounded read-only

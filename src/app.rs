@@ -75,6 +75,63 @@ impl OrcApp {
         Ok(crate::controller_memory::ControllerMemoryContext::from_memory_service(&memories)?)
     }
 
+    /// Propose one bounded typed Controller memory mutation after deterministic
+    /// current-project and canonical target validation. This does not mutate
+    /// memory or mint authorization.
+    pub fn propose_controller_memory_mutation(
+        &self,
+        intent: crate::controller_memory_mutation::ControllerMemoryMutationIntent,
+    ) -> std::result::Result<
+        crate::controller_memory_mutation::ControllerMemoryMutationProposal,
+        crate::controller_memory_mutation::ControllerMemoryMutationError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_mutation::ControllerMemoryMutationError::NoActiveProject
+        })?;
+        let memories = self.memories().map_err(|error| {
+            crate::controller_memory_mutation::ControllerMemoryMutationError::MemoryService(
+                error.to_string(),
+            )
+        })?;
+        crate::controller_memory_mutation::ControllerMemoryMutationProposal::from_intent(
+            project_id, intent, &memories,
+        )
+    }
+
+    /// Mint opaque one-shot authorization for one exact validated memory
+    /// mutation proposal.
+    pub fn authorize_controller_memory_mutation(
+        &self,
+        proposal: &crate::controller_memory_mutation::ControllerMemoryMutationProposal,
+    ) -> crate::controller_memory_mutation::ControllerMemoryMutationAuthorization {
+        crate::controller_memory_mutation::authorize(proposal)
+    }
+
+    /// Consume authorization, revalidate fresh canonical memory state, and
+    /// execute only through the existing M06-001 MemoryService operations.
+    pub fn execute_authorized_controller_memory_mutation(
+        &self,
+        proposal: &crate::controller_memory_mutation::ControllerMemoryMutationProposal,
+        authorization: Option<
+            crate::controller_memory_mutation::ControllerMemoryMutationAuthorization,
+        >,
+    ) -> crate::controller_memory_mutation::ControllerMemoryMutationExecutionResult {
+        let operation = proposal.operation();
+        let Ok(project_id) = self.lead().project_id() else {
+            return crate::controller_memory_mutation::ControllerMemoryMutationExecutionResult::FreshValidationRejected {
+                operation,
+                reason: crate::controller_memory_mutation::ControllerMemoryMutationRejection::StorageReadFailed,
+            };
+        };
+        let Ok(memories) = self.memories() else {
+            return crate::controller_memory_mutation::ControllerMemoryMutationExecutionResult::FreshValidationRejected {
+                operation,
+                reason: crate::controller_memory_mutation::ControllerMemoryMutationRejection::StorageReadFailed,
+            };
+        };
+        crate::controller_memory_mutation::execute(proposal, authorization, project_id, &memories)
+    }
+
     pub fn start_workflow(
         &self,
         objective: &str,

@@ -4,9 +4,9 @@
 
 **Current milestone:** M06 — Persistent memory
 
-**Current task:** M06-003 — Integrate bounded memory into Controller planning
+**Current task:** M06-004 — Integrate bounded memory into Controller recovery
 
-**Last completed:** M06-002 — Build deterministic bounded Controller memory context
+**Last completed:** M06-003 — Integrate bounded memory into Controller planning
 
 **Blocked by:** Nothing
 
@@ -26,13 +26,14 @@
 - M06-001 is complete: typed User/Project/Episodic/Experience memory, canonical project/global persistence, transactional lifecycle/history operations, and application-level `MemoryService` are established.
 - M06-002 is complete: standalone bounded `ControllerMemoryContext` retrieval through `OrcApp`, with deterministic active-only projection, project/global scope enforcement, explicit authority/provenance, and no inference integration.
 - Controller capabilities keep capability-specific request/state types; memory reuse happens through `ControllerMemoryContext`, not by forcing a universal `ControllerStatePacket`.
-- M06-003 integrates that bounded memory context into Controller Plan generation only, preserving current planning-request authority and the model-independent runtime boundary.
+- M06-003 is complete: Controller Plan generation now receives typed bounded memory through a capability-local planning input with explicit precedence and combined 64 KiB enforcement; real Qwen precedence evaluation passed 3/3.
+- M06-004 integrates the same reusable context into recovery recommendation only; current recovery observation and exact legal operations must remain authoritative and deterministic actionability must not change.
 - Structured facts and deterministic filters come first; semantic/vector retrieval remains supplementary and later.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M06-003.md`: embed the canonical M06-002 memory context into the existing Controller planning request/application path, preserve the 64 KiB planning request bound and explicit precedence, and do not widen persistence authority or redesign other Controller capabilities.
+Implement `tasks/M06-004.md`: integrate the canonical bounded memory context into `OrcApp::recommend_recovery` / the existing recovery inference path while preserving exact legal-operation authority, the deterministic post-inference actionability gate, and the combined 64 KiB request bound.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

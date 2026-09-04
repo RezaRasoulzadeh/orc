@@ -51,7 +51,9 @@ Result: supervised Controller workflow now owns Plan generation/review/revision 
 
 Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established a reusable deterministic bounded read-only `ControllerMemoryContext` without changing capability prompts or forcing a universal Controller request type. Current work integrates that context into Controller Plan generation through the existing capability-specific planning request/application seam before deciding the next memory-capability integration or moving toward controlled capture/consolidation.
+M06-001 established typed durable memory and canonical project/global persistence. M06-002 established a reusable deterministic bounded read-only `ControllerMemoryContext` without forcing a universal Controller request type. M06-003 integrated that context into Controller Plan generation through a capability-local bounded input and passed deterministic plus real-Qwen precedence evaluation.
+
+Current work integrates the same bounded memory context into Controller recovery through the existing `RecoveryInferenceRequest` / `OrcApp::recommend_recovery` seam. Current recovery observation and exact legal-operation facts remain authoritative; deterministic post-inference actionability remains the final gate. Later M06 work should continue only through repository-grounded capability seams or move toward controlled capture/consolidation when those integrations establish enough evidence.
 
 ## M07 — Supervised autonomy
 

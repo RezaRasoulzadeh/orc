@@ -29,7 +29,8 @@ Only current/near-term milestones are decomposed here.
 | [M05-009](M05-009.md) | Done | M05 | Replace Lead intake judgment with supervised Controller routing |
 | [M06-001](M06-001.md) | Done | M06 | Establish typed persistent memory records and deterministic storage |
 | [M06-002](M06-002.md) | Done | M06 | Build deterministic bounded Controller memory context |
-| [M06-003](M06-003.md) | Planned | M06 | Integrate bounded memory into Controller planning |
+| [M06-003](M06-003.md) | Done | M06 | Integrate bounded memory into Controller planning |
+| [M06-004](M06-004.md) | Planned | M06 | Integrate bounded memory into Controller recovery |
 
 ## Task format
 

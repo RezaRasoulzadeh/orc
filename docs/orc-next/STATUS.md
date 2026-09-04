@@ -4,9 +4,9 @@
 
 **Current milestone:** M06 — Persistent memory
 
-**Current task:** M06-006 — Integrate bounded memory into Controller workflow intake
+**Current task:** M06-007 — Integrate bounded memory into Controller Plan review
 
-**Last completed:** M06-005 — Integrate bounded memory into normal Controller task recommendation
+**Last completed:** M06-006 — Integrate bounded memory into Controller workflow intake
 
 **Blocked by:** Nothing
 
@@ -29,13 +29,14 @@
 - M06-003 is complete: Controller Plan generation receives typed bounded memory through a capability-local planning input.
 - M06-004 is complete: recovery recommendation receives typed bounded memory while exact current legal operations remain the only source of actionability.
 - M06-005 is complete: normal task recommendation receives typed bounded memory while `ControllerStatePacket` remains the authoritative current-facts projection and M03 deterministic action boundaries remain unchanged.
-- M06-006 integrates bounded memory into Controller workflow intake while preserving the canonical intake request, exactly three intake outcomes, and downstream workflow kernel authority.
+- M06-006 is complete: workflow intake receives typed bounded memory while the canonical intake request, exactly three intake outcomes, and downstream workflow kernel authority remain unchanged.
+- M06-007 integrates bounded memory into Controller Plan review while preserving current persisted Plan facts, current project/task state, explicit operator resolution, the three review outcomes, and downstream review/Plan workflow authority.
 - Structured facts and deterministic filters come first; semantic/vector retrieval remains supplementary and later.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M06-006.md`: integrate canonical bounded memory into `ControllerIntakeRequest` / `ControllerIntakeBuilder::classify` through `OrcApp::propose_controller_intake`, preserving current intake facts, the three-outcome schema, workflow routing, persistence, and application semantics.
+Implement `tasks/M06-007.md`: integrate canonical bounded memory into `ControllerPlanReviewRequest` / `ControllerPlanReviewBuilder::review` through `OrcApp::review_controller_plan`, preserving current-Plan checks, review schema/validation, persistence, approval/revision/application routing, and all kernel mutation boundaries.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

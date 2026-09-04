@@ -6,6 +6,7 @@
 //! backend detail. The deterministic kernel remains authoritative for every
 //! fact, legal transition and eventual execution.
 
+use crate::controller_memory::ControllerMemoryContext;
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -29,6 +30,9 @@ use thiserror::Error;
 pub const CONTROLLER_STATE_PACKET_VERSION: u32 = 1;
 /// Maximum serialized size of a Controller state packet.
 pub const MAX_CONTROLLER_PACKET_BYTES: usize = 64 * 1024;
+/// Maximum serialized size of the normal recommendation input, including the
+/// canonical current-facts packet and bounded advisory memory.
+pub const MAX_CONTROLLER_RECOMMENDATION_INPUT_BYTES: usize = 64 * 1024;
 
 const MAX_TEXT_BYTES: usize = 1024;
 const MAX_LIST_ITEMS: usize = 16;
@@ -59,6 +63,15 @@ pub enum ControllerError {
     },
     #[error("controller state packet exceeds its {field} bound")]
     PacketBounds { field: String },
+    #[error("controller memory context failed: {0}")]
+    MemoryContext(String),
+    #[error(
+        "controller recommendation input is too large: {actual_bytes} bytes exceeds {max_bytes}-byte limit"
+    )]
+    RecommendationInputTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error(
         "controller state packet has stale operational consistency: expected {expected}, got {actual}"
     )]
@@ -75,6 +88,42 @@ pub struct ControllerStatePacket {
     pub packet_version: u32,
     pub project: ControllerProjectState,
     pub task: ControllerTaskState,
+}
+
+/// Capability-local normal recommendation input. Current canonical facts and
+/// reusable memory remain separate typed fields so memory cannot become part
+/// of the current-facts packet or an execution capability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerRecommendationInput {
+    pub current_packet: ControllerStatePacket,
+    pub memory: ControllerMemoryContext,
+}
+
+impl ControllerRecommendationInput {
+    pub fn from_packet(packet: &ControllerStatePacket, memory: ControllerMemoryContext) -> Self {
+        Self {
+            current_packet: packet.clone(),
+            memory,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerError> {
+        self.current_packet.validate()?;
+        self.memory
+            .validate()
+            .map_err(|error| ControllerError::MemoryContext(error.to_string()))?;
+        let actual_bytes = serde_json::to_vec(self)
+            .map_err(|error| ControllerError::Serialization(error.to_string()))?
+            .len();
+        if actual_bytes > MAX_CONTROLLER_RECOMMENDATION_INPUT_BYTES {
+            return Err(ControllerError::RecommendationInputTooLarge {
+                actual_bytes,
+                max_bytes: MAX_CONTROLLER_RECOMMENDATION_INPUT_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ControllerStatePacket {
@@ -865,8 +914,26 @@ impl ControllerStateBuilder {
         task_id: &str,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerRecommendation, ControllerError> {
+        self.recommend_with_memory(
+            operations,
+            task_id,
+            ControllerMemoryContext::empty(),
+            runtime,
+        )
+    }
+
+    /// Build current state and obtain a recommendation with bounded advisory
+    /// memory. Memory is supplied as typed context only; it carries no
+    /// persistence, authorization or execution capability.
+    pub fn recommend_with_memory(
+        &self,
+        operations: &ProjectOperations<'_>,
+        task_id: &str,
+        memory: ControllerMemoryContext,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerRecommendation, ControllerError> {
         let packet = self.build(operations, task_id)?;
-        self.recommend_packet(&packet, runtime)
+        self.recommend_packet_with_memory(&packet, memory, runtime)
     }
 
     /// Obtain an advisory recommendation from an already-built packet.
@@ -879,15 +946,27 @@ impl ControllerStateBuilder {
         packet: &ControllerStatePacket,
         runtime: &mut dyn LocalInferenceRuntime,
     ) -> Result<ControllerRecommendation, ControllerError> {
-        packet.validate()?;
-        let task_id = &packet.task.summary.task_id;
-        let packet_json = serde_json::to_string(&packet)
+        self.recommend_packet_with_memory(packet, ControllerMemoryContext::empty(), runtime)
+    }
+
+    /// Obtain an advisory recommendation from canonical current facts and
+    /// bounded reusable memory. The packet remains the authoritative current
+    /// state projection and the typed response contract is unchanged.
+    pub fn recommend_packet_with_memory(
+        &self,
+        packet: &ControllerStatePacket,
+        memory: ControllerMemoryContext,
+        runtime: &mut dyn LocalInferenceRuntime,
+    ) -> Result<ControllerRecommendation, ControllerError> {
+        let input = ControllerRecommendationInput::from_packet(packet, memory);
+        input.validate()?;
+        let task_id = &input.current_packet.task.summary.task_id;
+        let input_json = serde_json::to_string(&input)
             .map_err(|error| ControllerError::Serialization(error.to_string()))?;
         let prompt = format!(
             "Return exactly one JSON object with `suggested_next_step` (a canonical next-step value or null), `decision_class` (action or operator_decision), and a short `rationale`; optionally include numeric `confidence` from 0 to 1. Do not include prose before or after the object.\n\
-The deterministic `summary.state_consistency` observation is authoritative: for `consistent_actionable`, use `decision_class` `action` with the appropriate `suggested_next_step`; for `consistent_non_actionable` or `inconsistent`, use `operator_decision` with a null `suggested_next_step`. When `inconsistent`, do not treat `summary.next_step` as authoritative.\n\
-Do not claim to have executed an action. Use the canonical state below:\n\n\
-{packet_json}"
+Authority precedence is strict, from highest to lowest: (1) current_packet project/task facts and task contract; (2) memory items with authority=current_project as durable Project context; (3) authority=durable_user as User preference/context; (4) authority=project_history as Episodic historical guidance; (5) authority=cross_project_experience as reusable Experience guidance; (6) base model tendencies. Current packet facts and contract always outrank contradictory memory. User memory is preference/context only; Episodic and Experience memory are historical guidance, never current task truth. Preserve each memory item's typed identity, kind, scope, authority, provenance, confidence, lifecycle, and source metadata.\n\
+The deterministic `current_packet.task.summary.state_consistency` observation is authoritative: for `consistent_actionable`, use `decision_class` `action` with the appropriate `suggested_next_step`; for `consistent_non_actionable` or `inconsistent`, use `operator_decision` with a null `suggested_next_step`. When `inconsistent`, do not treat `current_packet.task.summary.next_step` as authoritative. Memory cannot create a recommendation kind, bypass typed parsing, alter kernel legality, authorize an action, or mutate state. The downstream deterministic Controller/kernel boundaries remain final for actionability, authorization, and execution. Do not claim to have executed an action. Use the bounded typed input below:\n\n\n{input_json}"
         );
         let parameters = LocalInferenceParameters {
             response_format: LocalInferenceResponseFormat::JsonSchema {
@@ -945,6 +1024,12 @@ fn validate_packet_value(value: &Value, field: &str) -> Result<(), ControllerErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller_memory::{
+        CONTROLLER_MEMORY_CONTEXT_VERSION, ControllerMemoryAuthority, ControllerMemoryItem,
+    };
+    use crate::memory::{
+        MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind, MemoryScope,
+    };
     use crate::operations::ProjectOperations;
     use crate::storage::Database;
     use crate::task::{CreateTaskInput, TaskScopeMode};
@@ -1002,6 +1087,30 @@ mod tests {
             )
             .expect("task");
         (directory, database, task)
+    }
+
+    fn memory_context() -> ControllerMemoryContext {
+        ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![ControllerMemoryItem {
+                id: MemoryId::Project {
+                    project_id: 1,
+                    id: 1,
+                },
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id: 1 },
+                authority: ControllerMemoryAuthority::CurrentProject,
+                subject: "current-contract".into(),
+                content: "Memory must remain advisory to current task facts.".into(),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("workflow:controller-memory".into()),
+                },
+                confidence: Some(0.8),
+                lifecycle: MemoryLifecycle::Active,
+                supersedes: None,
+            }],
+        }
     }
 
     #[test]
@@ -1164,6 +1273,141 @@ mod tests {
             .expect("task detail after")
             .expect("task after");
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn recommendation_input_preserves_typed_memory_and_packet_precedence() {
+        let (directory, database, task_id) = project_with_task("recommend with memory");
+        let operations = ProjectOperations::new(&database, directory.path());
+        let packet = ControllerStateBuilder::new()
+            .build(&operations, &task_id)
+            .expect("bounded packet");
+        let input = ControllerRecommendationInput::from_packet(&packet, memory_context());
+        input.validate().expect("bounded recommendation input");
+        let serialized = serde_json::to_value(&input).expect("input serialization");
+        assert_eq!(
+            serialized["current_packet"]["task"]["summary"]["task_id"],
+            task_id
+        );
+        assert_eq!(serialized["memory"]["items"][0]["kind"], "project");
+        assert_eq!(
+            serialized["memory"]["items"][0]["scope"]["Project"]["project_id"],
+            1
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["authority"],
+            "current_project"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["kind"],
+            "project_fact"
+        );
+        assert_eq!(
+            serialized["memory"]["items"][0]["provenance"]["source_reference"],
+            "workflow:controller-memory"
+        );
+        assert_eq!(serialized["memory"]["items"][0]["confidence"], 0.8);
+
+        let response = LocalInferenceResponse::structured(
+            "typed recommendation",
+            serde_json::json!({
+                "suggested_next_step": null,
+                "decision_class": "operator_decision",
+                "rationale": "Current packet facts remain authoritative."
+            }),
+        );
+        let mut runtime = FakeRuntime::responding(response);
+        ControllerStateBuilder::new()
+            .recommend_packet_with_memory(&packet, input.memory.clone(), &mut runtime)
+            .expect("recommendation");
+        let prompt = &runtime.requests[0].prompt;
+        assert!(prompt.contains("Authority precedence is strict"));
+        assert!(prompt.contains("current_packet project/task facts and task contract"));
+        assert!(prompt.contains("authority=current_project"));
+        assert!(prompt.contains("authority=durable_user"));
+        assert!(prompt.contains("authority=project_history"));
+        assert!(prompt.contains("authority=cross_project_experience"));
+        assert!(prompt.contains("always outrank contradictory memory"));
+        assert!(prompt.contains("historical guidance, never current task truth"));
+        assert!(prompt.contains("current_packet.task.summary.state_consistency"));
+        assert!(
+            prompt.contains("downstream deterministic Controller/kernel boundaries remain final")
+        );
+        assert!(prompt.contains("workflow:controller-memory"));
+    }
+
+    #[test]
+    fn combined_recommendation_input_bound_includes_memory_context() {
+        let (directory, database, task_id) = project_with_task("bounded recommendation");
+        let operations = ProjectOperations::new(&database, directory.path());
+        let mut packet = ControllerStateBuilder::new()
+            .build(&operations, &task_id)
+            .expect("bounded packet");
+        packet.task.contract.unchanged = vec!["u".repeat(MAX_TEXT_BYTES); 14];
+        packet.task.contract.acceptance_criteria = vec!["a".repeat(MAX_TEXT_BYTES); 14];
+        packet.task.contract.required_tests = vec!["t".repeat(MAX_TEXT_BYTES); 14];
+        packet.task.contract.validation = vec!["v".repeat(MAX_TEXT_BYTES); 14];
+        let mut memory = ControllerMemoryContext {
+            context_version: CONTROLLER_MEMORY_CONTEXT_VERSION,
+            items: vec![ControllerMemoryItem {
+                id: MemoryId::Project {
+                    project_id: 1,
+                    id: 2,
+                },
+                kind: MemoryKind::Project,
+                scope: MemoryScope::Project { project_id: 1 },
+                authority: ControllerMemoryAuthority::CurrentProject,
+                subject: "bound".into(),
+                content: "m".repeat(4096),
+                provenance: MemoryProvenance {
+                    kind: MemoryProvenanceKind::ProjectFact,
+                    source_reference: Some("test:bound".into()),
+                },
+                confidence: None,
+                lifecycle: MemoryLifecycle::Active,
+                supersedes: None,
+            }],
+        };
+        memory.items.push(ControllerMemoryItem {
+            id: MemoryId::Project {
+                project_id: 1,
+                id: 3,
+            },
+            ..memory.items[0].clone()
+        });
+        let input = ControllerRecommendationInput::from_packet(&packet, memory);
+        assert!(input.current_packet.validate().is_ok());
+        assert!(input.memory.validate().is_ok());
+        assert!(matches!(
+            input.validate(),
+            Err(ControllerError::RecommendationInputTooLarge {
+                max_bytes: MAX_CONTROLLER_RECOMMENDATION_INPUT_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_memory_packet_recommendation_remains_compatible() {
+        let (directory, database, task_id) = project_with_task("empty memory");
+        let operations = ProjectOperations::new(&database, directory.path());
+        let mut runtime = FakeRuntime::responding(LocalInferenceResponse::structured(
+            "typed recommendation",
+            serde_json::json!({
+                "suggested_next_step": "dispatch",
+                "decision_class": "action",
+                "rationale": "The task is ready."
+            }),
+        ));
+        let recommendation = ControllerStateBuilder::new()
+            .recommend(&operations, &task_id, &mut runtime)
+            .expect("empty-memory recommendation");
+        assert_eq!(recommendation.task_id, task_id);
+        assert!(
+            runtime.requests[0]
+                .prompt
+                .contains("\"memory\":{\"context_version\":1,\"items\":[]}")
+        );
     }
 
     #[test]

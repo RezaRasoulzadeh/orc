@@ -1367,11 +1367,11 @@ impl OrcApp {
         crate::controller_actions::ControllerActionProposal,
         crate::controller::ControllerError,
     > {
-        let recommendation = crate::controller::ControllerStateBuilder::new().recommend(
-            &self.operations(),
-            task_id,
-            runtime,
-        )?;
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller::ControllerError::MemoryContext(error.to_string())
+        })?;
+        let recommendation = crate::controller::ControllerStateBuilder::new()
+            .recommend_with_memory(&self.operations(), task_id, memory, runtime)?;
         Ok(crate::controller_actions::propose_controller_action(
             &recommendation,
         ))

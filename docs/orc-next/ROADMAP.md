@@ -50,9 +50,11 @@ Add user, project, episodic and experience memory, consolidation, provenance and
 
 M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 through M06-008 integrated it into Plan generation, recovery recommendation, normal task recommendation, workflow intake, Plan review, and Plan revision through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
 
-The currently identified Controller read/judgment seams now consume bounded typed memory. The next smallest seam is the write boundary: M06-009 establishes typed memory mutation intents, deterministic legality, trusted one-shot authorization, fresh-state revalidation, and execution through existing M06-001 APIs. This is infrastructure for later Controller capture/consolidation judgment, not autonomous memory writing itself.
+M06-009 established the supervised write boundary: typed Create/Correct/Supersede/Remove intents, deterministic legality, trusted one-shot authorization, fresh-state revalidation, and execution through existing M06-001 APIs. M06-010 then established explicit-candidate capture judgment: one bounded candidate can be ignored or proposed as a canonical Create intent without authorization or execution.
 
-After M06-009, inspect the resulting mutation boundary and existing Controller observations before defining the smallest supervised memory-capture/consolidation judgment task. Semantic/vector retrieval remains later and should only be introduced with evidence that deterministic bounded retrieval is insufficient.
+The remaining identified M06 seam is M06-011: supervised maintenance/consolidation judgment over one explicitly selected active memory target. It should reuse `ControllerMemoryContext` plus M06-009 Correct/Supersede/Remove intents, keep all mutation supervised, and avoid automatic scanning or background cleanup. If M06-011 closes without exposing another repository-grounded gap, M06 can complete there.
+
+Automatic invocation of capture/maintenance belongs with later supervised-autonomy work rather than being smuggled into persistent-memory infrastructure. Semantic/vector retrieval likewise remains later and should only be introduced with evidence that deterministic bounded retrieval is insufficient.
 
 ## M07 — Supervised autonomy
 

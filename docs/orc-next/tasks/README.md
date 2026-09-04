@@ -26,7 +26,7 @@ Only current/near-term milestones are decomposed here.
 | [M05-006](M05-006.md) | Done | M05 | Add read-only Controller Plan revision generation |
 | [M05-007](M05-007.md) | Done | M05 | Persist Controller Plan revisions through explicit authorization |
 | [M05-008](M05-008.md) | Done | M05 | Route supervised Plan workflow through Controller capabilities |
-| [M05-009](M05-009.md) | Planned | M05 | Replace Lead intake judgment with supervised Controller routing |
+| [M05-009](M05-009.md) | Done | M05 | Replace Lead intake judgment with supervised Controller routing |
 
 ## Task format
 

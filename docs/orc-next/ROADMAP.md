@@ -56,7 +56,9 @@ M06 intentionally stops before automatic invocation. Capture and maintenance rem
 
 Allow routine safe continuation inside explicit operator permissions and budgets.
 
-Before decomposing M07, inspect the existing continuation, permission, approval, budget/economy, Controller-action, and workflow seams. Reuse current typed Controller intents and deterministic authorization boundaries; do not introduce a generic autonomous loop or duplicate workflow engine merely to automate continuation.
+Repository inspection shows Orc already has the two core execution seams M07 should build on: `ControllerActionIntent` + exact one-shot `ControllerActionAuthorization` with fresh legality at execution, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits. M07 must not create another action schema or orchestration loop.
+
+M07-001 therefore establishes explicit project-bound finite continuation grants over only routine Dispatch/SemanticReview/Revise actions. A successful grant inspection may mint the existing one-shot authorization for one exact currently legal intent while consuming one grant budget unit. Accept remains explicitly authorized, existing workflow/economy/quota/permission facts stay authoritative, and M07-001 itself adds no autonomous loop. Later M07 tasks should be defined only after this permission boundary is implemented and reviewed.
 
 ## M08 — Experience dataset
 

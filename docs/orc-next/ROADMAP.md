@@ -44,21 +44,19 @@ Move planning and Lead-like judgment into Controller. Preserve useful Plan/appro
 
 Result: supervised Controller workflow now owns Plan generation/review/revision and intake judgment while deterministic kernel code retains persistence, workflow routing, approval/application gates, validation, authorization, and lifecycle invariants.
 
-## M06 — Persistent memory — CURRENT
+## M06 — Persistent memory — COMPLETE
 
-Add user, project, episodic and experience memory, consolidation, provenance and retrieval.
+Add user, project, episodic and experience memory, consolidation judgment, provenance and retrieval.
 
-M06-001 established typed durable memory and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 through M06-008 integrated it into Plan generation, recovery recommendation, normal task recommendation, workflow intake, Plan review, and Plan revision through capability-local inputs that preserve current-facts authority and deterministic kernel boundaries.
+Result: M06-001 established typed durable User/Project/Episodic/Experience records and canonical project/global persistence. M06-002 established reusable deterministic bounded read-only `ControllerMemoryContext`. M06-003 through M06-008 integrated bounded memory into all currently identified Controller read/judgment seams while preserving current-facts authority and capability-local request types. M06-009 established canonical supervised Create/Correct/Supersede/Remove mutation intents, deterministic legality, one-shot authorization, fresh-state validation, and execution through `MemoryService`. M06-010 added explicit-candidate capture judgment for Create. M06-011 added explicit-target maintenance judgment for Keep/Correct/Supersede/Remove.
 
-M06-009 established the supervised write boundary: typed Create/Correct/Supersede/Remove intents, deterministic legality, trusted one-shot authorization, fresh-state revalidation, and execution through existing M06-001 APIs. M06-010 then established explicit-candidate capture judgment: one bounded candidate can be ignored or proposed as a canonical Create intent without authorization or execution.
+M06 intentionally stops before automatic invocation. Capture and maintenance remain explicitly invoked and supervised. No background memory scan, transcript ingestion, autonomous consolidation, semantic/vector retrieval, embeddings, learned ranking, or model-specific memory behavior is introduced. Automatic safe continuation and invocation decisions belong to M07; semantic retrieval remains evidence-driven future work if deterministic bounded retrieval proves insufficient.
 
-The remaining identified M06 seam is M06-011: supervised maintenance/consolidation judgment over one explicitly selected active memory target. It should reuse `ControllerMemoryContext` plus M06-009 Correct/Supersede/Remove intents, keep all mutation supervised, and avoid automatic scanning or background cleanup. If M06-011 closes without exposing another repository-grounded gap, M06 can complete there.
-
-Automatic invocation of capture/maintenance belongs with later supervised-autonomy work rather than being smuggled into persistent-memory infrastructure. Semantic/vector retrieval likewise remains later and should only be introduced with evidence that deterministic bounded retrieval is insufficient.
-
-## M07 — Supervised autonomy
+## M07 — Supervised autonomy — CURRENT
 
 Allow routine safe continuation inside explicit operator permissions and budgets.
+
+Before decomposing M07, inspect the existing continuation, permission, approval, budget/economy, Controller-action, and workflow seams. Reuse current typed Controller intents and deterministic authorization boundaries; do not introduce a generic autonomous loop or duplicate workflow engine merely to automate continuation.
 
 ## M08 — Experience dataset
 

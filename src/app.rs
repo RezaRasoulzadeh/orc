@@ -99,6 +99,66 @@ impl OrcApp {
             .capture_with_memory(&input, runtime)
     }
 
+    /// Resolve one explicit active memory target, then judge maintenance with
+    /// bounded read-only data. Any proposed intent remains separate from the
+    /// M06-009 proposal, authorization, and execution boundaries.
+    pub fn judge_controller_memory_maintenance(
+        &self,
+        request: &crate::controller_memory_maintenance::ControllerMemoryMaintenanceRequest,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::controller_memory_maintenance::ControllerMemoryMaintenanceResult,
+        crate::controller_memory_maintenance::ControllerMemoryMaintenanceError,
+    > {
+        request.validate()?;
+        let project_id = self.lead().project_id().map_err(|error| {
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::InvalidTarget(
+                error.to_string(),
+            )
+        })?;
+        if let crate::memory::MemoryId::Project {
+            project_id: target_project,
+            ..
+        } = request.target()
+            && *target_project != project_id
+        {
+            return Err(
+                crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::CrossProjectTarget,
+            );
+        }
+        let memories = self.memories().map_err(|error| {
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::MemoryService(
+                error.to_string(),
+            )
+        })?;
+        let target = memories
+            .get(request.target())
+            .map_err(|error| {
+                crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::MemoryService(
+                    error.to_string(),
+                )
+            })?
+            .ok_or(
+                crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::TargetNotFound,
+            )?;
+        if target.lifecycle != crate::memory::MemoryLifecycle::Active {
+            return Err(
+                crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::TargetNotActive,
+            );
+        }
+        let memory = self.controller_memory_context().map_err(|error| {
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceError::MemoryContext(
+                error.to_string(),
+            )
+        })?;
+        let input =
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceInput::from_resolved_target(
+                request, target, memory,
+            );
+        crate::controller_memory_maintenance::ControllerMemoryMaintenanceBuilder::new()
+            .maintain(&input, runtime)
+    }
+
     /// Propose one bounded typed Controller memory mutation after deterministic
     /// current-project and canonical target validation. This does not mutate
     /// memory or mint authorization.

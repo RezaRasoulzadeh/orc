@@ -13,6 +13,7 @@ pub mod controller_evaluation;
 pub mod controller_intake;
 pub mod controller_memory;
 pub mod controller_memory_capture;
+pub mod controller_memory_maintenance;
 pub mod controller_memory_mutation;
 pub mod controller_plan_persistence;
 pub mod controller_plan_review;

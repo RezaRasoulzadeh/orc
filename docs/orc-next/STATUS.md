@@ -4,9 +4,9 @@
 
 **Current milestone:** M07 — Supervised autonomy
 
-**Current task:** M07-010 — Add bounded Controller memory maintenance target selection
+**Current task:** M07-011 — Compose one selected Controller memory maintenance step
 
-**Last completed:** M07-009 — Compose one supervised Controller memory maintenance step
+**Last completed:** M07-010 — Add bounded Controller memory maintenance target selection
 
 **Blocked by:** Nothing
 
@@ -18,17 +18,19 @@
 - M07-001..005 provide finite grant-aware routine task continuation through the existing workflow engine; Acceptance/user/external gates remain authoritative.
 - M07-006/M07-007 provide separate finite Project/Episodic capture Create permission and one-step explicit capture composition. Automatic capture candidate derivation remains unresolved because the capture request contains a full `MemoryDraft`; deterministic code must not invent what should be remembered.
 - M07-008/M07-009 provide separate finite Project/Episodic Correct/Supersede/Remove maintenance permission and one-step explicit maintenance composition.
-- `OrcApp::maintain_controller_memory_once(...)` performs at most one M06-011 inference, one M06-009 proposal, one M07-008 authorization mint, and one M06-009 execution attempt. Keep/pre-mint failure consumes zero; successful mint consumes one; post-mint failure is not refunded.
-- M07-009 public results are state-safe; M06-011 inference semantics remain unchanged.
-- The remaining maintenance judgment before safe automatic-capable invocation is target selection. `MemoryService::list(...)` can deterministically enumerate current-project memory, but deterministic code must not decide which record warrants maintenance.
-- M07-010 therefore adds read-only bounded Controller target selection from active exact-current-project Project/Episodic candidates plus explicit current facts. It returns no target or one exact candidate only.
-- M07-010 does not invoke M06-011, inspect grants, mutate memory, select maintenance operations, derive current facts from workflow events, scan in background, or create a second orchestration loop.
-- User/Experience/global/historical/cross-project records remain outside automatic-capable maintenance.
+- M07-010 is complete. `OrcApp::select_controller_memory_target(...)` performs bounded read-only selection from canonical active exact-current-project Project/Episodic candidates and returns only `NoTarget` or one exact supplied candidate.
+- M07-010 filtering, ordering, bounds, omission metadata, and output validation are deterministic. User/Experience/global/historical/cross-project records remain excluded. Real-Qwen evaluation passed strict 7/7 and semantic 7/7.
+- The next smallest M07 seam is composition rather than event automation: one M07-010 selection followed by at most one existing M07-009 maintenance call.
+- M07-011 must reuse the exact same caller-supplied `current_facts` for both selection and M06-011 maintenance judgment. Application code must not derive or reinterpret maintenance evidence.
+- A selected target must be freshly re-resolved by existing M06-011/M07-009 logic; the M07-010 candidate record must not be cached as mutation authority.
+- M07-011 may perform at most two Controller inference calls total, one proposal, one authorization mint, and one execution attempt, with no retry, alternate target, omitted-candidate fallback, or batch loop.
+- `NoTarget`, selection failures, Keep, and all pre-mint maintenance failures consume zero maintenance budget; successful authorization consumes one; post-mint failure is not refunded.
+- Automatic current-fact derivation, workflow/task/Plan/review/validation/recovery hooks, background maintenance, batch maintenance, User/Experience/global mutation, semantic/vector retrieval, and embeddings remain out of scope.
 - Continuation, capture, and maintenance grants remain distinct in-process capability budgets. No provider token hard cap.
 - Rust/native runtime; no Python.
 
 ## Immediate next action
 
-Implement `tasks/M07-010.md`: bounded read-only Controller selection of zero or one exact active current-project Project/Episodic maintenance target from deterministic candidates and explicit current facts.
+Implement `tasks/M07-011.md`: compose one bounded target-selection judgment with at most one existing explicit-target maintenance operation using the same current facts and existing maintenance grant.
 
 See `M00-REPOSITORY-MAP.md` for repository-grounded fact-versus-judgment classification and migration map.

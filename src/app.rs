@@ -182,6 +182,44 @@ impl OrcApp {
         )
     }
 
+    /// Create an opaque, finite memory-capture grant bound to this
+    /// application's current project. The grant authorizes no capture
+    /// judgment and carries no persistence or mutation capability.
+    pub fn create_controller_memory_capture_grant(
+        &self,
+        action_budget: usize,
+    ) -> std::result::Result<
+        crate::controller_memory_capture_grant::ControllerMemoryCaptureGrant,
+        crate::controller_memory_capture_grant::ControllerMemoryCaptureGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_capture_grant::ControllerMemoryCaptureGrantError::InvalidProject
+        })?;
+        crate::controller_memory_capture_grant::ControllerMemoryCaptureGrant::new(
+            project_id,
+            action_budget,
+        )
+    }
+
+    /// Inspect one already validated M06-009 proposal against an explicit
+    /// capture grant and mint the existing exact one-shot authorization.
+    /// Capture judgment remains a separate caller-owned step.
+    pub fn inspect_controller_memory_capture_grant(
+        &self,
+        grant: &crate::controller_memory_capture_grant::ControllerMemoryCaptureGrant,
+        proposal: &crate::controller_memory_mutation::ControllerMemoryMutationProposal,
+    ) -> std::result::Result<
+        crate::controller_memory_mutation::ControllerMemoryMutationAuthorization,
+        crate::controller_memory_capture_grant::ControllerMemoryCaptureGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_capture_grant::ControllerMemoryCaptureGrantError::InvalidProject
+        })?;
+        grant.inspect_and_authorize(project_id, proposal, |exact_proposal| {
+            Ok(crate::controller_memory_mutation::authorize(exact_proposal))
+        })
+    }
+
     /// Mint opaque one-shot authorization for one exact validated memory
     /// mutation proposal.
     pub fn authorize_controller_memory_mutation(

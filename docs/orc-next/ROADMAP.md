@@ -56,13 +56,15 @@ M06 intentionally stops before automatic invocation. Capture and maintenance rem
 
 Allow routine safe continuation inside explicit operator permissions and budgets.
 
-Orc already has the canonical pieces M07 must compose rather than replace: bounded `OrcApp::propose_controller_action` recommendation, exact typed M03 action intents and one-shot authorization/execution with fresh legality, the M07-001 finite project-bound continuation grant, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits.
+Orc already has the canonical pieces M07 must compose rather than replace: bounded `OrcApp::propose_controller_action` recommendation, exact typed M03 action intents and one-shot authorization/execution with fresh legality, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits.
 
 M07-001 is complete. It established opaque project-bound grants over only Dispatch/SemanticReview/Revise, with a finite 1–128 action budget, shared anti-reset state, Active/Exhausted/Revoked lifecycle, current legality inspection, exact M03 authorization reuse, and deterministic exclusion of Accept.
 
-M07-002 is the next smallest seam: compose one explicit task recommendation → grant inspection/authorization → existing M03 execution in one application call. Each invocation may perform at most one Controller inference and one routine action. It adds no retry loop, repeated continuation, task enumeration, automatic acceptance, second workflow engine, or new action schema.
+M07-002 is complete. It established `OrcApp::continue_controller_action_once()`, composing one existing Controller recommendation/proposal, exact task validation, M07-001 grant inspection, and the exact existing M03 execution boundary. One call performs at most one inference, one successful grant consumption, and one routine action, with no retry, task enumeration, automatic acceptance, or second orchestration loop.
 
-Only after this one-step composition is implemented and reviewed should M07 decide how repeated safe continuation interacts with the existing `WorkflowEngine`, operator gates, and restart semantics.
+Repository inspection after M07-002 shows the next integration constraint: `WorkflowEngine` already deterministically owns `Dispatch`, `Review`, and `Revision` stages. A future grant-aware workflow adapter must be able to require the action implied by the current trusted stage before grant authorization; otherwise a different Controller recommendation can reach the grant boundary and consume budget before the action-specific execution context rejects it.
+
+M07-003 therefore adds only a trusted expected-action constraint to the existing one-step continuation seam. Mismatched recommendations must stop before grant inspection with zero budget consumption. This preserves the existing action schema, grant model, M03 fresh legality, and workflow authority while unlocking a later narrow integration into the existing `WorkflowEngine` rather than creating a new loop.
 
 ## M08 — Experience dataset
 

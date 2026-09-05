@@ -11,10 +11,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 use crate::controller_actions::{
-    ControllerActionAuthorization, ControllerActionError, ControllerActionIntent,
-    ControllerActionKind, ControllerActionLegality,
+    ControllerActionAuthorization, ControllerActionError, ControllerActionExecutionResult,
+    ControllerActionIntent, ControllerActionKind, ControllerActionLegality,
+    ControllerActionProposal,
 };
 use crate::operations::ProjectOperations;
+
+const MAX_CONTROLLER_CONTINUATION_TASK_ID_BYTES: usize = 256;
 
 /// The maximum number of routine actions one continuation grant can authorize.
 /// This is a grant bound, independent of workflow transition and revision
@@ -156,6 +159,55 @@ pub enum ControllerContinuationGrantError {
     Authorization(#[source] ControllerActionError),
 }
 
+/// Bounded grant-stage rejection exposed by the one-step application seam.
+/// Detailed kernel legality and storage diagnostics remain in the existing
+/// grant/M03 boundaries rather than becoming a new result protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ControllerContinuationStepGrantRejection {
+    InvalidGrant,
+    WrongProject,
+    Exhausted,
+    Revoked,
+    StateUnavailable,
+    UnsupportedAction { action: ControllerActionKind },
+    InvalidIntent,
+    LegalityInspection,
+    CanonicallyIllegal,
+    Authorization,
+}
+
+/// Bounded result of exactly one supervised Controller continuation attempt.
+/// The existing proposal, intent, and M03 execution result remain the typed
+/// payloads; this enum adds no parallel action or lifecycle schema.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ControllerContinuationStepResult {
+    NoActionableProposal {
+        task_id: String,
+        proposal: ControllerActionProposal,
+    },
+    ProposalTaskMismatch {
+        task_id: String,
+        intent: ControllerActionIntent,
+    },
+    GrantRejected {
+        task_id: String,
+        intent: ControllerActionIntent,
+        reason: ControllerContinuationStepGrantRejection,
+    },
+    Executed {
+        task_id: String,
+        intent: ControllerActionIntent,
+        result: ControllerActionExecutionResult,
+    },
+    ExecutionRejected {
+        task_id: String,
+        intent: ControllerActionIntent,
+        result: ControllerActionExecutionResult,
+    },
+}
+
 impl ControllerContinuationGrant {
     pub(crate) fn new(
         project_id: i64,
@@ -281,6 +333,38 @@ impl ControllerContinuationGrant {
         self.state
             .lock()
             .map_err(|_| ControllerContinuationGrantError::StateUnavailable)
+    }
+}
+
+impl ControllerContinuationStepGrantRejection {
+    pub(crate) fn from_grant_error(error: &ControllerContinuationGrantError) -> Self {
+        match error {
+            ControllerContinuationGrantError::WrongProject { .. } => Self::WrongProject,
+            ControllerContinuationGrantError::Exhausted => Self::Exhausted,
+            ControllerContinuationGrantError::Revoked => Self::Revoked,
+            ControllerContinuationGrantError::StateUnavailable => Self::StateUnavailable,
+            ControllerContinuationGrantError::UnsupportedAction(action) => {
+                Self::UnsupportedAction { action: *action }
+            }
+            ControllerContinuationGrantError::InvalidIntent(_) => Self::InvalidIntent,
+            ControllerContinuationGrantError::LegalityInspection(_) => Self::LegalityInspection,
+            ControllerContinuationGrantError::CanonicallyIllegal(_) => Self::CanonicallyIllegal,
+            ControllerContinuationGrantError::Authorization(_) => Self::Authorization,
+            ControllerContinuationGrantError::InvalidProject
+            | ControllerContinuationGrantError::EmptyAllowedActions
+            | ControllerContinuationGrantError::AcceptNotGrantable
+            | ControllerContinuationGrantError::InvalidBudget => Self::InvalidGrant,
+        }
+    }
+}
+
+impl ControllerContinuationStepResult {
+    pub(crate) fn task_id(task_id: &str) -> String {
+        let mut end = task_id.len().min(MAX_CONTROLLER_CONTINUATION_TASK_ID_BYTES);
+        while end > 0 && !task_id.is_char_boundary(end) {
+            end -= 1;
+        }
+        task_id[..end].to_owned()
     }
 }
 

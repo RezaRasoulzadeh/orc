@@ -1578,6 +1578,83 @@ impl OrcApp {
         })
     }
 
+    /// Perform at most one supervised Controller continuation step.
+    ///
+    /// This composes recommendation, exact proposal/task validation, M07-001
+    /// grant inspection, and the existing M03 execution boundary once. It
+    /// never retries, selects another task, continues a workflow, or accepts
+    /// a task automatically.
+    pub fn continue_controller_action_once(
+        &self,
+        task_id: &str,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+        context: crate::controller_actions::ControllerActionExecutionContext<'_>,
+    ) -> std::result::Result<
+        crate::controller_continuation::ControllerContinuationStepResult,
+        crate::controller::ControllerError,
+    > {
+        let proposal = self.propose_controller_action(task_id, runtime)?;
+        let requested_task_id =
+            crate::controller_continuation::ControllerContinuationStepResult::task_id(task_id);
+        let intent = match proposal {
+            crate::controller_actions::ControllerActionProposal::Proposed { intent } => intent,
+            proposal => {
+                return Ok(
+                    crate::controller_continuation::ControllerContinuationStepResult::NoActionableProposal {
+                        task_id: requested_task_id,
+                        proposal,
+                    },
+                )
+            }
+        };
+
+        if intent.task_id() != task_id {
+            return Ok(
+                crate::controller_continuation::ControllerContinuationStepResult::ProposalTaskMismatch {
+                    task_id: requested_task_id,
+                    intent,
+                },
+            );
+        }
+
+        let authorization = match self.inspect_controller_continuation_grant(grant, &intent) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return Ok(
+                    crate::controller_continuation::ControllerContinuationStepResult::GrantRejected {
+                        task_id: requested_task_id,
+                        intent,
+                        reason: crate::controller_continuation::ControllerContinuationStepGrantRejection::from_grant_error(&error),
+                    },
+                )
+            }
+        };
+
+        let execution =
+            self.execute_authorized_controller_action(&intent, Some(authorization), context);
+        if matches!(
+            execution,
+            crate::controller_actions::ControllerActionExecutionResult::Executed { .. }
+        ) {
+            Ok(
+                crate::controller_continuation::ControllerContinuationStepResult::Executed {
+                    task_id: requested_task_id,
+                    intent,
+                    result: execution,
+                },
+            )
+        } else {
+            Ok(
+                crate::controller_continuation::ControllerContinuationStepResult::ExecutionRejected {
+                    task_id: requested_task_id,
+                    intent,
+                    result: execution,
+                },
+            )
+        }
+    }
+
     pub fn task_operations(
         &self,
         id: &str,

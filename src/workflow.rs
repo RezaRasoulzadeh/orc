@@ -417,7 +417,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
     }
 
     pub fn continue_run(&self, workflow_id: i64) -> Result<WorkflowRun> {
-        self.continue_run_inner(workflow_id, None)
+        self.continue_run_inner(workflow_id, None, None)
     }
 
     pub fn continue_run_with_controller_runtime(
@@ -425,19 +425,42 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
         workflow_id: i64,
         runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
     ) -> Result<WorkflowRun> {
-        self.continue_run_inner(workflow_id, Some(runtime))
+        self.continue_run_inner(workflow_id, Some(runtime), None)
+    }
+
+    /// Continue a Controller workflow across persisted edges using one finite,
+    /// in-process continuation grant. Deterministic workflow edges use the
+    /// ordinary path; only routine task stages use the M07-004 adapter.
+    pub fn continue_run_with_controller_grant(
+        &self,
+        workflow_id: i64,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+    ) -> Result<WorkflowRun> {
+        let current = self
+            .db
+            .get_workflow(workflow_id)?
+            .context("workflow not found")?;
+        if current.status != WorkflowStatus::Running {
+            return Ok(current);
+        }
+        if current.plan_path != WorkflowPlanPath::Controller {
+            anyhow::bail!("grant-aware Controller continuation requires a Controller workflow")
+        }
+        self.continue_run_inner(workflow_id, Some(runtime), Some(grant))
     }
 
     fn continue_run_inner(
         &self,
         workflow_id: i64,
         mut runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+        continuation_grant: Option<&crate::controller_continuation::ControllerContinuationGrant>,
     ) -> Result<WorkflowRun> {
         let mut initial = self
             .db
             .get_workflow(workflow_id)?
             .context("workflow not found")?;
-        if initial.status == WorkflowStatus::WaitingExternal {
+        if continuation_grant.is_none() && initial.status == WorkflowStatus::WaitingExternal {
             initial = self.reconcile_external_wait(&initial)?;
         }
         if initial.status != WorkflowStatus::Running {
@@ -448,11 +471,39 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             .max_transitions
             .saturating_sub(initial.transition_count);
         for _ in 0..remaining {
+            let current = self
+                .db
+                .get_workflow(workflow_id)?
+                .context("workflow disappeared")?;
+            if current.status != WorkflowStatus::Running {
+                return Ok(current);
+            }
+
+            if let Some(grant) = continuation_grant {
+                if current.stage == WorkflowStage::Acceptance {
+                    return self.stop_before_controller_acceptance(&current);
+                }
+                if matches!(
+                    current.stage,
+                    WorkflowStage::Dispatch | WorkflowStage::Review | WorkflowStage::Revision
+                ) && let Some(stopped) =
+                    self.stop_for_unusable_continuation_grant(&current, grant)?
+                {
+                    return Ok(stopped);
+                }
+            }
+
+            let task_grant = continuation_grant.filter(|_| {
+                matches!(
+                    current.stage,
+                    WorkflowStage::Dispatch | WorkflowStage::Review | WorkflowStage::Revision
+                )
+            });
             let committed = match runtime.as_mut() {
                 Some(runtime) => {
-                    self.continue_one_inner(workflow_id, Some(&mut **runtime), None)?
+                    self.continue_one_inner(workflow_id, Some(&mut **runtime), task_grant)?
                 }
-                None => self.continue_one_inner(workflow_id, None, None)?,
+                None => self.continue_one_inner(workflow_id, None, task_grant)?,
             };
             if committed.status != WorkflowStatus::Running {
                 return Ok(committed);
@@ -475,6 +526,80 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 stopped.stop_reason.as_deref(),
             )
             .map_err(Into::into)
+    }
+
+    fn stop_before_controller_acceptance(&self, current: &WorkflowRun) -> Result<WorkflowRun> {
+        let mut next = current.clone();
+        next.status = WorkflowStatus::AcceptanceReady;
+        next.resume_stage = Some(WorkflowStage::Acceptance);
+        next.stop_reason =
+            Some("grant-aware Controller continuation stopped before acceptance".into());
+        self.db
+            .commit_workflow_transition(
+                current,
+                &next,
+                "controller_continuation_acceptance_gate",
+                true,
+                None,
+                next.stop_reason.as_deref(),
+            )
+            .map_err(Into::into)
+    }
+
+    fn stop_for_unusable_continuation_grant(
+        &self,
+        current: &WorkflowRun,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+    ) -> Result<Option<WorkflowRun>> {
+        let (status, reason) = match grant.project_id() {
+            Ok(project_id) if project_id != current.project_id => (
+                WorkflowStatus::Blocked,
+                format!(
+                    "continuation grant is bound to project {project_id}, not current workflow project {}",
+                    current.project_id
+                ),
+            ),
+            Ok(_) => match grant.state() {
+                crate::controller_continuation::ControllerContinuationGrantState::Active => {
+                    match grant.remaining_actions() {
+                        Ok(remaining) if remaining > 0 => return Ok(None),
+                        Ok(_) => (
+                            WorkflowStatus::BudgetExhausted,
+                            "continuation action budget exhausted before next routine task edge"
+                                .into(),
+                        ),
+                        Err(error) => (
+                            WorkflowStatus::Blocked,
+                            format!("continuation grant is unusable: {error}"),
+                        ),
+                    }
+                }
+                crate::controller_continuation::ControllerContinuationGrantState::Exhausted => (
+                    WorkflowStatus::BudgetExhausted,
+                    "continuation action budget exhausted before next routine task edge".into(),
+                ),
+                crate::controller_continuation::ControllerContinuationGrantState::Revoked => (
+                    WorkflowStatus::Blocked,
+                    "continuation grant was revoked before next routine task edge".into(),
+                ),
+            },
+            Err(error) => (
+                WorkflowStatus::Blocked,
+                format!("continuation grant is unusable: {error}"),
+            ),
+        };
+
+        let mut next = current.clone();
+        next.status = status;
+        next.stop_reason = Some(reason.clone());
+        Ok(Some(self.db.commit_workflow_transition(
+            current,
+            &next,
+            "controller_continuation_stopped",
+            true,
+            None,
+            Some(&reason),
+        )?))
     }
 
     /// Reconcile an external/manual dispatch without replaying the completed
@@ -628,7 +753,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             None,
             Some(resolution),
         )?;
-        self.continue_run_inner(resumed.id, runtime)
+        self.continue_run_inner(resumed.id, runtime, None)
     }
 
     pub fn cancel(&self, workflow_id: i64, reason: Option<&str>) -> Result<WorkflowRun> {

@@ -56,9 +56,13 @@ M06 intentionally stops before automatic invocation. Capture and maintenance rem
 
 Allow routine safe continuation inside explicit operator permissions and budgets.
 
-Repository inspection shows Orc already has the two core execution seams M07 should build on: `ControllerActionIntent` + exact one-shot `ControllerActionAuthorization` with fresh legality at execution, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits. M07 must not create another action schema or orchestration loop.
+Orc already has the canonical pieces M07 must compose rather than replace: bounded `OrcApp::propose_controller_action` recommendation, exact typed M03 action intents and one-shot authorization/execution with fresh legality, the M07-001 finite project-bound continuation grant, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits.
 
-M07-001 therefore establishes explicit project-bound finite continuation grants over only routine Dispatch/SemanticReview/Revise actions. A successful grant inspection may mint the existing one-shot authorization for one exact currently legal intent while consuming one grant budget unit. Accept remains explicitly authorized, existing workflow/economy/quota/permission facts stay authoritative, and M07-001 itself adds no autonomous loop. Later M07 tasks should be defined only after this permission boundary is implemented and reviewed.
+M07-001 is complete. It established opaque project-bound grants over only Dispatch/SemanticReview/Revise, with a finite 1–128 action budget, shared anti-reset state, Active/Exhausted/Revoked lifecycle, current legality inspection, exact M03 authorization reuse, and deterministic exclusion of Accept.
+
+M07-002 is the next smallest seam: compose one explicit task recommendation → grant inspection/authorization → existing M03 execution in one application call. Each invocation may perform at most one Controller inference and one routine action. It adds no retry loop, repeated continuation, task enumeration, automatic acceptance, second workflow engine, or new action schema.
+
+Only after this one-step composition is implemented and reviewed should M07 decide how repeated safe continuation interacts with the existing `WorkflowEngine`, operator gates, and restart semantics.
 
 ## M08 — Experience dataset
 

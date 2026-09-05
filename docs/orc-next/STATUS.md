@@ -4,9 +4,9 @@
 
 **Current milestone:** M07 — Supervised autonomy
 
-**Current task:** M07-004 — Route one Controller workflow task edge through a continuation grant
+**Current task:** M07-005 — Continue Controller workflows across routine task edges within one finite grant
 
-**Last completed:** M07-003 — Constrain supervised continuation to one expected routine action
+**Last completed:** M07-004 — Route one Controller workflow task edge through a continuation grant
 
 **Blocked by:** Nothing
 
@@ -22,18 +22,20 @@
 - M07-001 established opaque project-bound finite continuation grants over only Dispatch/SemanticReview/Revise. Grant inspection checks current canonical legality, consumes one budget unit only when an exact M03 authorization is minted, and cannot grant Accept.
 - M07-002 established `OrcApp::continue_controller_action_once()`, composing one existing Controller proposal → exact task check → M07-001 grant inspection → existing M03 execution. Each call performs at most one inference and one routine action with no retry or automatic continuation.
 - M07-003 added trusted expected-action enforcement to that one-step seam. The caller supplies an existing action kind; mismatched Controller recommendations and `Accept` stop before grant inspection and consume zero budget.
-- `WorkflowEngine::route_tasks()` already owns task selection. Its persisted `Dispatch`, `Review`, and `Revision` stages already imply the exact routine action; M07 must not add Controller-driven task enumeration or another scheduler.
-- M07-004 integrates exactly one such task-stage edge with the existing continuation grant. The stage supplies the expected action, `current_task_id` supplies the task, and `AppWorkflowActions` maps successful M07-003 execution back into the workflow's existing `ProviderOutcome` / `ReviewOutcome` transition logic.
-- M07-004 does not pass grants through the existing multi-step `continue_run_with_controller_runtime`; repeated budget spending remains a later decision.
-- Acceptance remains outside routine continuation grants and keeps existing workflow policy/user-gate semantics.
+- `WorkflowEngine::route_tasks()` remains the sole task selector for workflow continuation. Persisted `Dispatch`, `Review`, and `Revision` stages imply the exact routine action.
+- M07-004 is complete. `WorkflowEngine::continue_one_with_controller_grant()` now routes exactly one persisted Controller task edge through M07-003/M07-001/M03 and maps successful canonical evidence back into the workflow's existing provider/review outcomes. There is no fallback provider execution after supervised rejection/failure.
+- M07-004 keeps Acceptance and non-task stages outside its grant-aware single-edge entry point. Existing ordinary workflow APIs retain their prior semantics.
+- The next repository-grounded seam is repeated bounded continuation using the existing `continue_run_inner()` loop. The same finite grant should apply only when that loop reaches Dispatch/Review/Revision; deterministic routing edges consume no grant.
+- M07-005 must stop at Acceptance/user/external gates and must not automatically execute Accept even when the ordinary workflow policy is automatic. That restriction applies only to the new grant-aware multi-edge API; existing non-grant workflow behavior remains unchanged.
 - Continuation cannot bypass scheduler/agent permissions, quota/economy facts, task lifecycle, validation/review evidence, revision requirements, workflow limits, or fresh M03 legality.
-- No provider token hard cap is reintroduced; provider usage remains optimized and observable.
+- Continuation-action budget and workflow transition/revision limits are independent kernel constraints; no provider token hard cap is reintroduced.
+- Grants remain in-process and are not persisted or reconstructed after restart.
 - Automatic memory capture/maintenance remains separate from the routine action continuation seam.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Implement `tasks/M07-004.md`: add one opt-in grant-aware `WorkflowEngine` single-edge continuation path that reuses the trusted current task stage as the expected M07-003 action and preserves existing workflow transition logic without adding a second loop or fallback execution path.
+Implement `tasks/M07-005.md`: reuse the existing bounded workflow loop to continue across multiple persisted routine task edges under one finite continuation grant, while deterministic edges consume no grant and Acceptance/user/external boundaries stop supervised continuation.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

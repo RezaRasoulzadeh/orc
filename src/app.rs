@@ -218,6 +218,66 @@ impl OrcApp {
             .maintain(&input, runtime)
     }
 
+    /// Perform at most one supervised Controller memory-maintenance step.
+    ///
+    /// This composes the existing M06-011 judgment, M06-009 proposal,
+    /// M07-008 grant inspection, and M06-009 execution boundaries exactly
+    /// once. It never retries, invokes another inference, or mutates memory
+    /// outside the canonical authorized mutation path.
+    pub fn maintain_controller_memory_once(
+        &self,
+        request: &crate::controller_memory_maintenance::ControllerMemoryMaintenanceRequest,
+        grant: &crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> crate::controller_memory_maintenance::ControllerMemoryMaintenanceStepResult {
+        use crate::controller_memory_maintenance::{
+            ControllerMemoryMaintenanceMutationSuccess, ControllerMemoryMaintenanceStepError,
+            ControllerMemoryMaintenanceStepResult,
+        };
+
+        let judgment = match self.judge_controller_memory_maintenance(request, runtime) {
+            Ok(result) => result,
+            Err(error) => {
+                return ControllerMemoryMaintenanceStepResult::Rejected {
+                    error: ControllerMemoryMaintenanceStepError::Judgment(error),
+                };
+            }
+        };
+        let intent = match judgment {
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceResult::Keep => {
+                return ControllerMemoryMaintenanceStepResult::Kept;
+            }
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceResult::ProposeMutation {
+                intent,
+            } => intent,
+        };
+        let proposal = match self.propose_controller_memory_mutation(intent) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                return ControllerMemoryMaintenanceStepResult::Rejected {
+                    error: ControllerMemoryMaintenanceStepError::Proposal(error),
+                };
+            }
+        };
+        let authorization = match self.inspect_controller_memory_maintenance_grant(grant, &proposal)
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return ControllerMemoryMaintenanceStepResult::Rejected {
+                    error: ControllerMemoryMaintenanceStepError::Grant(error),
+                };
+            }
+        };
+        let execution =
+            self.execute_authorized_controller_memory_mutation(&proposal, Some(authorization));
+        match ControllerMemoryMaintenanceMutationSuccess::from_execution(execution) {
+            Ok(result) => ControllerMemoryMaintenanceStepResult::Mutated { result },
+            Err(error) => ControllerMemoryMaintenanceStepResult::Rejected {
+                error: ControllerMemoryMaintenanceStepError::Execution(error),
+            },
+        }
+    }
+
     /// Propose one bounded typed Controller memory mutation after deterministic
     /// current-project and canonical target validation. This does not mutate
     /// memory or mint authorization.

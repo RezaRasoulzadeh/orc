@@ -5,7 +5,9 @@
 //! authorization, execution, or broad-scanning capability.
 
 use crate::controller_memory::ControllerMemoryContext;
-use crate::controller_memory_mutation::ControllerMemoryMutationIntent;
+use crate::controller_memory_mutation::{
+    ControllerMemoryMutationExecutionResult, ControllerMemoryMutationIntent,
+};
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -183,6 +185,98 @@ impl ControllerMemoryMaintenanceResult {
         }
         Ok(())
     }
+}
+
+/// The stage at which one composed supervised maintenance step stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerMemoryMaintenanceStepStage {
+    Judgment,
+    Proposal,
+    Grant,
+    Execution,
+}
+
+/// The canonical successful M06-009 mutation result returned by one composed
+/// maintenance step. Construction is private so this type cannot contain a
+/// rejected execution outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControllerMemoryMaintenanceMutationSuccess {
+    result: ControllerMemoryMutationExecutionResult,
+}
+
+impl ControllerMemoryMaintenanceMutationSuccess {
+    /// Return the canonical M06-009 result and record identity.
+    pub fn canonical_result(&self) -> &ControllerMemoryMutationExecutionResult {
+        &self.result
+    }
+
+    pub(crate) fn from_execution(
+        result: ControllerMemoryMutationExecutionResult,
+    ) -> Result<Self, ControllerMemoryMaintenanceExecutionRejection> {
+        match result {
+            result @ ControllerMemoryMutationExecutionResult::Mutated { .. } => Ok(Self { result }),
+            result => Err(ControllerMemoryMaintenanceExecutionRejection { result }),
+        }
+    }
+}
+
+/// A canonical M06-009 execution outcome that did not mutate memory. The
+/// private field and construction path prevent a successful result from being
+/// represented as an execution rejection.
+#[derive(Debug, thiserror::Error)]
+#[error("canonical memory mutation execution was rejected: {result:?}")]
+pub struct ControllerMemoryMaintenanceExecutionRejection {
+    result: ControllerMemoryMutationExecutionResult,
+}
+
+impl ControllerMemoryMaintenanceExecutionRejection {
+    /// Return the underlying canonical M06-009 rejection outcome.
+    pub fn canonical_result(&self) -> &ControllerMemoryMutationExecutionResult {
+        &self.result
+    }
+}
+
+/// Failure or rejection from one composed maintenance step. The variant
+/// itself identifies the stopping stage, so a caller cannot provide a
+/// mismatched stage and error pair.
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerMemoryMaintenanceStepError {
+    #[error("maintenance judgment failed: {0}")]
+    Judgment(#[source] ControllerMemoryMaintenanceError),
+    #[error("memory mutation proposal was rejected: {0}")]
+    Proposal(#[source] crate::controller_memory_mutation::ControllerMemoryMutationError),
+    #[error("memory maintenance grant rejected the proposal: {0}")]
+    Grant(
+        #[source] crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError,
+    ),
+    #[error(transparent)]
+    Execution(ControllerMemoryMaintenanceExecutionRejection),
+}
+
+impl ControllerMemoryMaintenanceStepError {
+    pub fn stage(&self) -> ControllerMemoryMaintenanceStepStage {
+        match self {
+            Self::Judgment(_) => ControllerMemoryMaintenanceStepStage::Judgment,
+            Self::Proposal(_) => ControllerMemoryMaintenanceStepStage::Proposal,
+            Self::Grant(_) => ControllerMemoryMaintenanceStepStage::Grant,
+            Self::Execution(_) => ControllerMemoryMaintenanceStepStage::Execution,
+        }
+    }
+}
+
+/// Result of exactly one explicit supervised Controller memory-maintenance
+/// step. `Mutated` is only constructed from the existing M06-009 canonical
+/// mutation result; all other proposed paths are returned as one bounded
+/// rejection.
+#[derive(Debug)]
+pub enum ControllerMemoryMaintenanceStepResult {
+    Kept,
+    Mutated {
+        result: ControllerMemoryMaintenanceMutationSuccess,
+    },
+    Rejected {
+        error: ControllerMemoryMaintenanceStepError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -1538,6 +1538,46 @@ impl OrcApp {
         ))
     }
 
+    /// Create an opaque, finite continuation grant bound to this project's
+    /// current identity.  Grant construction is trusted application code;
+    /// the grant contains no model, workflow, provider, or execution handle.
+    pub fn create_controller_continuation_grant(
+        &self,
+        allowed_actions: crate::controller_continuation::ControllerContinuationAllowedActions,
+        action_budget: usize,
+    ) -> std::result::Result<
+        crate::controller_continuation::ControllerContinuationGrant,
+        crate::controller_continuation::ControllerContinuationGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_continuation::ControllerContinuationGrantError::InvalidProject
+        })?;
+        crate::controller_continuation::ControllerContinuationGrant::new(
+            project_id,
+            allowed_actions,
+            action_budget,
+        )
+    }
+
+    /// Inspect one exact existing Controller action against an opaque grant
+    /// and current canonical legality.  A successful call mints only the
+    /// existing one-shot M03 authorization; it never executes the action.
+    pub fn inspect_controller_continuation_grant(
+        &self,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+        intent: &crate::controller_actions::ControllerActionIntent,
+    ) -> std::result::Result<
+        crate::controller_actions::ControllerActionAuthorization,
+        crate::controller_continuation::ControllerContinuationGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_continuation::ControllerContinuationGrantError::InvalidProject
+        })?;
+        grant.inspect_and_authorize(project_id, intent, &self.operations(), |exact_intent| {
+            self.authorize_controller_action(exact_intent)
+        })
+    }
+
     pub fn task_operations(
         &self,
         id: &str,

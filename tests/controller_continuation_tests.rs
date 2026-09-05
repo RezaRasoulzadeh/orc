@@ -290,6 +290,7 @@ fn one_step_composes_dispatch_once_and_preserves_execution_evidence() {
     let result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::Dispatch,
             &grant,
             &mut runtime,
             orc::controller_actions::ControllerActionExecutionContext::dispatch_with_worker(
@@ -328,6 +329,7 @@ fn one_step_composes_semantic_review_once() {
     let result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
             &grant,
             &mut runtime,
             orc::controller_actions::ControllerActionExecutionContext::semantic_review(
@@ -458,6 +460,7 @@ fn one_step_composes_revise_once() {
     let result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::Revise,
             &grant,
             &mut runtime,
             orc::controller_actions::ControllerActionExecutionContext::revise_with_worker(
@@ -486,6 +489,85 @@ fn one_step_composes_revise_once() {
 }
 
 #[test]
+fn expected_action_mismatches_and_accept_are_rejected_before_grant_use() {
+    let directory = tempdir().unwrap();
+    let (app, task_id) = open_app_with_task_status(orc::task::TaskStatus::Review, &directory);
+    let dispatch_grant = app
+        .create_controller_continuation_grant(ControllerContinuationAllowedActions::routine(), 1)
+        .unwrap();
+    let mut review_runtime = runtime_for("run_semantic_review");
+    let review_mismatch = app
+        .continue_controller_action_once(
+            &task_id,
+            orc::controller_actions::ControllerActionKind::Dispatch,
+            &dispatch_grant,
+            &mut review_runtime,
+            orc::controller_actions::ControllerActionExecutionContext::accept(),
+        )
+        .unwrap();
+    assert!(matches!(
+        review_mismatch,
+        ControllerContinuationStepResult::ExpectedActionMismatch {
+            expected_action: orc::controller_actions::ControllerActionKind::Dispatch,
+            proposed_action: orc::controller_actions::ControllerActionKind::SemanticReview,
+            ..
+        }
+    ));
+    assert_eq!(review_runtime.calls, 1);
+    assert_eq!(dispatch_grant.remaining_actions().unwrap(), 1);
+
+    let revision_directory = tempdir().unwrap();
+    let (revision_app, revision_task) =
+        open_app_with_task_status(orc::task::TaskStatus::RevisionRequired, &revision_directory);
+    let review_grant = revision_app
+        .create_controller_continuation_grant(ControllerContinuationAllowedActions::routine(), 1)
+        .unwrap();
+    let mut revision_runtime = runtime_for("revise");
+    let revision_mismatch = revision_app
+        .continue_controller_action_once(
+            &revision_task,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
+            &review_grant,
+            &mut revision_runtime,
+            orc::controller_actions::ControllerActionExecutionContext::accept(),
+        )
+        .unwrap();
+    assert!(matches!(
+        revision_mismatch,
+        ControllerContinuationStepResult::ExpectedActionMismatch {
+            expected_action: orc::controller_actions::ControllerActionKind::SemanticReview,
+            proposed_action: orc::controller_actions::ControllerActionKind::Revise,
+            ..
+        }
+    ));
+    assert_eq!(revision_runtime.calls, 1);
+    assert_eq!(review_grant.remaining_actions().unwrap(), 1);
+
+    let accept_grant = app
+        .create_controller_continuation_grant(ControllerContinuationAllowedActions::routine(), 1)
+        .unwrap();
+    let mut accept_runtime = runtime_for("run_semantic_review");
+    let accept_expected = app
+        .continue_controller_action_once(
+            &task_id,
+            orc::controller_actions::ControllerActionKind::Accept,
+            &accept_grant,
+            &mut accept_runtime,
+            orc::controller_actions::ControllerActionExecutionContext::accept(),
+        )
+        .unwrap();
+    assert!(matches!(
+        accept_expected,
+        ControllerContinuationStepResult::ExpectedActionRejected {
+            expected_action: orc::controller_actions::ControllerActionKind::Accept,
+            ..
+        }
+    ));
+    assert_eq!(accept_runtime.calls, 0);
+    assert_eq!(accept_grant.remaining_actions().unwrap(), 1);
+}
+
+#[test]
 fn accept_and_unsupported_recommendations_do_not_consume_or_execute() {
     let directory = tempdir().unwrap();
     let (app, task_id) = open_app_with_task_status(orc::task::TaskStatus::Review, &directory);
@@ -497,6 +579,7 @@ fn accept_and_unsupported_recommendations_do_not_consume_or_execute() {
     let accept = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
             &grant,
             &mut accept_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -504,11 +587,9 @@ fn accept_and_unsupported_recommendations_do_not_consume_or_execute() {
         .unwrap();
     assert!(matches!(
         accept,
-        ControllerContinuationStepResult::GrantRejected {
-            reason:
-                orc::controller_continuation::ControllerContinuationStepGrantRejection::UnsupportedAction {
-                    action: orc::controller_actions::ControllerActionKind::Accept
-                },
+        ControllerContinuationStepResult::ExpectedActionMismatch {
+            expected_action: orc::controller_actions::ControllerActionKind::SemanticReview,
+            proposed_action: orc::controller_actions::ControllerActionKind::Accept,
             ..
         }
     ));
@@ -519,6 +600,7 @@ fn accept_and_unsupported_recommendations_do_not_consume_or_execute() {
     let unsupported = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
             &grant,
             &mut unsupported_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -545,6 +627,7 @@ fn grant_rejection_stages_never_execute_and_preserve_or_consume_only_as_defined(
     let revoked_result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
             &revoked,
             &mut revoked_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -572,6 +655,7 @@ fn grant_rejection_stages_never_execute_and_preserve_or_consume_only_as_defined(
     let unsupported_result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::Dispatch,
             &unsupported,
             &mut unsupported_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -596,6 +680,7 @@ fn grant_rejection_stages_never_execute_and_preserve_or_consume_only_as_defined(
     let illegal_result = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::Revise,
             &illegal,
             &mut illegal_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -610,6 +695,37 @@ fn grant_rejection_stages_never_execute_and_preserve_or_consume_only_as_defined(
         }
     ));
     assert_eq!(illegal.remaining_actions().unwrap(), 1);
+
+    let exhausted = app
+        .create_controller_continuation_grant(ControllerContinuationAllowedActions::routine(), 1)
+        .unwrap();
+    app.inspect_controller_continuation_grant(
+        &exhausted,
+        &ControllerActionIntent::SemanticReview {
+            task_id: task_id.clone(),
+        },
+    )
+    .unwrap();
+    let mut exhausted_runtime = runtime_for("run_semantic_review");
+    let exhausted_result = app
+        .continue_controller_action_once(
+            &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
+            &exhausted,
+            &mut exhausted_runtime,
+            orc::controller_actions::ControllerActionExecutionContext::accept(),
+        )
+        .unwrap();
+    assert!(matches!(
+        exhausted_result,
+        ControllerContinuationStepResult::GrantRejected {
+            reason:
+                orc::controller_continuation::ControllerContinuationStepGrantRejection::Exhausted,
+            ..
+        }
+    ));
+    assert_eq!(exhausted_runtime.calls, 1);
+    assert_eq!(exhausted.remaining_actions().unwrap(), 0);
 }
 
 #[test]
@@ -624,6 +740,7 @@ fn execution_context_mismatch_and_execution_failure_do_not_refund_budget() {
     let mismatch = app
         .continue_controller_action_once(
             &task_id,
+            orc::controller_actions::ControllerActionKind::SemanticReview,
             &mismatch_grant,
             &mut mismatch_runtime,
             orc::controller_actions::ControllerActionExecutionContext::accept(),
@@ -658,6 +775,7 @@ fn execution_context_mismatch_and_execution_failure_do_not_refund_budget() {
     let failure = failure_app
         .continue_controller_action_once(
             &failure_task,
+            orc::controller_actions::ControllerActionKind::Dispatch,
             &failure_grant,
             &mut failure_runtime,
             orc::controller_actions::ControllerActionExecutionContext::dispatch_with_worker(

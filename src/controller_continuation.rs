@@ -183,12 +183,22 @@ pub enum ControllerContinuationStepGrantRejection {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum ControllerContinuationStepResult {
+    ExpectedActionRejected {
+        task_id: String,
+        expected_action: ControllerActionKind,
+    },
     NoActionableProposal {
         task_id: String,
         proposal: ControllerActionProposal,
     },
     ProposalTaskMismatch {
         task_id: String,
+        intent: ControllerActionIntent,
+    },
+    ExpectedActionMismatch {
+        task_id: String,
+        expected_action: ControllerActionKind,
+        proposed_action: ControllerActionKind,
         intent: ControllerActionIntent,
     },
     GrantRejected {

@@ -1580,13 +1580,14 @@ impl OrcApp {
 
     /// Perform at most one supervised Controller continuation step.
     ///
-    /// This composes recommendation, exact proposal/task validation, M07-001
-    /// grant inspection, and the existing M03 execution boundary once. It
-    /// never retries, selects another task, continues a workflow, or accepts
-    /// a task automatically.
+    /// This composes recommendation, exact proposal/task/expected-action
+    /// validation, M07-001 grant inspection, and the existing M03 execution
+    /// boundary once. It never retries, selects another task, continues a
+    /// workflow, or accepts a task automatically.
     pub fn continue_controller_action_once(
         &self,
         task_id: &str,
+        expected_action: crate::controller_actions::ControllerActionKind,
         grant: &crate::controller_continuation::ControllerContinuationGrant,
         runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
         context: crate::controller_actions::ControllerActionExecutionContext<'_>,
@@ -1594,9 +1595,23 @@ impl OrcApp {
         crate::controller_continuation::ControllerContinuationStepResult,
         crate::controller::ControllerError,
     > {
-        let proposal = self.propose_controller_action(task_id, runtime)?;
         let requested_task_id =
             crate::controller_continuation::ControllerContinuationStepResult::task_id(task_id);
+        if !matches!(
+            expected_action,
+            crate::controller_actions::ControllerActionKind::Dispatch
+                | crate::controller_actions::ControllerActionKind::SemanticReview
+                | crate::controller_actions::ControllerActionKind::Revise
+        ) {
+            return Ok(
+                crate::controller_continuation::ControllerContinuationStepResult::ExpectedActionRejected {
+                    task_id: requested_task_id,
+                    expected_action,
+                },
+            );
+        }
+
+        let proposal = self.propose_controller_action(task_id, runtime)?;
         let intent = match proposal {
             crate::controller_actions::ControllerActionProposal::Proposed { intent } => intent,
             proposal => {
@@ -1613,6 +1628,18 @@ impl OrcApp {
             return Ok(
                 crate::controller_continuation::ControllerContinuationStepResult::ProposalTaskMismatch {
                     task_id: requested_task_id,
+                    intent,
+                },
+            );
+        }
+
+        let proposed_action = intent.action_kind();
+        if proposed_action != expected_action {
+            return Ok(
+                crate::controller_continuation::ControllerContinuationStepResult::ExpectedActionMismatch {
+                    task_id: requested_task_id,
+                    expected_action,
+                    proposed_action,
                     intent,
                 },
             );

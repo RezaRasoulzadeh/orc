@@ -99,6 +99,65 @@ impl OrcApp {
             .capture_with_memory(&input, runtime)
     }
 
+    /// Perform at most one supervised Controller memory-capture step.
+    ///
+    /// This composes the existing M06-010 judgment, M06-009 proposal,
+    /// M07-006 grant inspection, and M06-009 execution boundaries exactly
+    /// once. It never retries, invokes another inference, or mutates memory
+    /// outside the canonical authorized mutation path.
+    pub fn capture_controller_memory_once(
+        &self,
+        request: &crate::controller_memory_capture::ControllerMemoryCaptureRequest,
+        grant: &crate::controller_memory_capture_grant::ControllerMemoryCaptureGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> crate::controller_memory_capture::ControllerMemoryCaptureStepResult {
+        use crate::controller_memory_capture::{
+            ControllerMemoryCaptureMutationSuccess, ControllerMemoryCaptureStepError,
+            ControllerMemoryCaptureStepResult,
+        };
+
+        let capture = match self.judge_controller_memory_capture(request, runtime) {
+            Ok(result) => result,
+            Err(error) => {
+                return ControllerMemoryCaptureStepResult::Rejected {
+                    error: ControllerMemoryCaptureStepError::Capture(error),
+                };
+            }
+        };
+        let intent = match capture {
+            crate::controller_memory_capture::ControllerMemoryCaptureResult::Ignore => {
+                return ControllerMemoryCaptureStepResult::Ignored;
+            }
+            crate::controller_memory_capture::ControllerMemoryCaptureResult::ProposeMutation {
+                intent,
+            } => intent,
+        };
+        let proposal = match self.propose_controller_memory_mutation(intent) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                return ControllerMemoryCaptureStepResult::Rejected {
+                    error: ControllerMemoryCaptureStepError::Proposal(error),
+                };
+            }
+        };
+        let authorization = match self.inspect_controller_memory_capture_grant(grant, &proposal) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return ControllerMemoryCaptureStepResult::Rejected {
+                    error: ControllerMemoryCaptureStepError::Grant(error),
+                };
+            }
+        };
+        let execution =
+            self.execute_authorized_controller_memory_mutation(&proposal, Some(authorization));
+        match ControllerMemoryCaptureMutationSuccess::from_execution(execution) {
+            Ok(result) => ControllerMemoryCaptureStepResult::Mutated { result },
+            Err(error) => ControllerMemoryCaptureStepResult::Rejected {
+                error: ControllerMemoryCaptureStepError::Execution(error),
+            },
+        }
+    }
+
     /// Resolve one explicit active memory target, then judge maintenance with
     /// bounded read-only data. Any proposed intent remains separate from the
     /// M06-009 proposal, authorization, and execution boundaries.

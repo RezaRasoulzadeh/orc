@@ -6,7 +6,11 @@
 //! intent through the supervised mutation boundary.
 
 use crate::controller_memory::ControllerMemoryContext;
-use crate::controller_memory_mutation::ControllerMemoryMutationIntent;
+use crate::controller_memory_capture_grant::ControllerMemoryCaptureGrantError;
+use crate::controller_memory_mutation::{
+    ControllerMemoryMutationError, ControllerMemoryMutationExecutionResult,
+    ControllerMemoryMutationIntent,
+};
 use crate::local_runtime::{
     LocalInferenceError, LocalInferenceParameters, LocalInferenceRequest, LocalInferenceResponse,
     LocalInferenceResponseFormat, LocalInferenceRuntime,
@@ -164,6 +168,95 @@ pub enum ControllerMemoryCaptureResult {
     Ignore,
     ProposeMutation {
         intent: ControllerMemoryMutationIntent,
+    },
+}
+
+/// The stage at which one composed supervised capture step stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerMemoryCaptureStepStage {
+    Capture,
+    Proposal,
+    Grant,
+    Execution,
+}
+
+/// The canonical successful M06-009 mutation result returned by one composed
+/// capture step. Construction is private so this type cannot contain a
+/// rejected execution outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControllerMemoryCaptureMutationSuccess {
+    result: ControllerMemoryMutationExecutionResult,
+}
+
+impl ControllerMemoryCaptureMutationSuccess {
+    /// Return the canonical M06-009 result and record identity.
+    pub fn canonical_result(&self) -> &ControllerMemoryMutationExecutionResult {
+        &self.result
+    }
+
+    pub(crate) fn from_execution(
+        result: ControllerMemoryMutationExecutionResult,
+    ) -> Result<Self, ControllerMemoryCaptureExecutionRejection> {
+        match result {
+            result @ ControllerMemoryMutationExecutionResult::Mutated { .. } => Ok(Self { result }),
+            result => Err(ControllerMemoryCaptureExecutionRejection { result }),
+        }
+    }
+}
+
+/// A canonical M06-009 execution outcome that did not mutate memory. The
+/// private field and construction path prevent a successful result from being
+/// represented as an execution rejection.
+#[derive(Debug, thiserror::Error)]
+#[error("canonical memory mutation execution was rejected: {result:?}")]
+pub struct ControllerMemoryCaptureExecutionRejection {
+    result: ControllerMemoryMutationExecutionResult,
+}
+
+impl ControllerMemoryCaptureExecutionRejection {
+    /// Return the underlying canonical M06-009 rejection outcome.
+    pub fn canonical_result(&self) -> &ControllerMemoryMutationExecutionResult {
+        &self.result
+    }
+}
+
+/// Failure or rejection from one composed capture step. The variant itself
+/// identifies the stopping stage, so a caller cannot provide a mismatched
+/// stage and error pair.
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerMemoryCaptureStepError {
+    #[error("capture judgment failed: {0}")]
+    Capture(#[source] ControllerMemoryCaptureError),
+    #[error("memory mutation proposal was rejected: {0}")]
+    Proposal(#[source] ControllerMemoryMutationError),
+    #[error("memory capture grant rejected the proposal: {0}")]
+    Grant(#[source] ControllerMemoryCaptureGrantError),
+    #[error(transparent)]
+    Execution(ControllerMemoryCaptureExecutionRejection),
+}
+
+impl ControllerMemoryCaptureStepError {
+    pub fn stage(&self) -> ControllerMemoryCaptureStepStage {
+        match self {
+            Self::Capture(_) => ControllerMemoryCaptureStepStage::Capture,
+            Self::Proposal(_) => ControllerMemoryCaptureStepStage::Proposal,
+            Self::Grant(_) => ControllerMemoryCaptureStepStage::Grant,
+            Self::Execution(_) => ControllerMemoryCaptureStepStage::Execution,
+        }
+    }
+}
+
+/// Result of exactly one explicit supervised Controller memory-capture step.
+/// `Mutated` is only constructed from the existing M06-009 canonical mutation
+/// result; all other proposed paths are returned as one bounded rejection.
+#[derive(Debug)]
+pub enum ControllerMemoryCaptureStepResult {
+    Ignored,
+    Mutated {
+        result: ControllerMemoryCaptureMutationSuccess,
+    },
+    Rejected {
+        error: ControllerMemoryCaptureStepError,
     },
 }
 

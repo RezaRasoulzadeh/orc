@@ -200,8 +200,16 @@ impl ControllerMemoryCaptureGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::OrcApp;
+    use crate::controller_memory_capture::{
+        ControllerMemoryCaptureCandidate, ControllerMemoryCaptureRequest,
+        ControllerMemoryCaptureStepError, ControllerMemoryCaptureStepResult,
+    };
     use crate::controller_memory_mutation::{
         ControllerMemoryMutationExecutionResult, ControllerMemoryMutationIntent, authorize, execute,
+    };
+    use crate::local_runtime::{
+        LocalInferenceError, LocalInferenceRequest, LocalInferenceResponse, LocalInferenceRuntime,
     };
     use crate::memory::{MemoryDraft, MemoryProvenance, MemoryProvenanceKind, MemoryService};
     use crate::storage::Database;
@@ -304,5 +312,64 @@ mod tests {
         ));
         assert_eq!(grant.remaining_actions().unwrap(), 0);
         assert_eq!(grant.state(), ControllerMemoryCaptureGrantState::Exhausted);
+    }
+
+    struct Runtime {
+        response: LocalInferenceResponse,
+        calls: usize,
+    }
+
+    impl LocalInferenceRuntime for Runtime {
+        fn infer(
+            &mut self,
+            _request: &LocalInferenceRequest,
+        ) -> Result<LocalInferenceResponse, LocalInferenceError> {
+            self.calls += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    #[test]
+    fn composed_step_rejects_wrong_project_grant_before_authorization() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".orc")).unwrap();
+        let path = directory.path().join(".orc/orc.db");
+        let registry = directory.path().join(".orc/global.db");
+        let db = Database::init_with_registry(&path, &registry).unwrap();
+        let project_id = db.create_project("capture step wrong project").unwrap();
+        drop(db);
+        let app = OrcApp::open_with_registry(&path, directory.path(), &registry).unwrap();
+        let request =
+            ControllerMemoryCaptureRequest::from_candidate(ControllerMemoryCaptureCandidate {
+                draft: draft(
+                    MemoryKind::Project,
+                    MemoryScope::Project { project_id },
+                    "wrong-project-grant",
+                ),
+                source_facts: vec!["explicit test candidate".into()],
+            });
+        let response = serde_json::json!({
+            "decision": "propose_mutation",
+            "intent": {
+                "operation": "create",
+                "draft": request.candidate.draft,
+            }
+        });
+        let grant = ControllerMemoryCaptureGrant::new(project_id + 1, 1).unwrap();
+        let mut runtime = Runtime {
+            response: LocalInferenceResponse::structured("propose", response),
+            calls: 0,
+        };
+        assert!(matches!(
+            app.capture_controller_memory_once(&request, &grant, &mut runtime),
+            ControllerMemoryCaptureStepResult::Rejected {
+                error: ControllerMemoryCaptureStepError::Grant(
+                    ControllerMemoryCaptureGrantError::WrongProject { .. }
+                ),
+            }
+        ));
+        assert_eq!(runtime.calls, 1);
+        assert_eq!(grant.remaining_actions().unwrap(), 1);
+        assert_eq!(app.memories().unwrap().list(None, false).unwrap().len(), 0);
     }
 }

@@ -46,20 +46,9 @@ Only current/near-term milestones are decomposed here.
 | [M07-006](M07-006.md) | Done | M07 | Establish explicit bounded Controller memory capture grants |
 | [M07-007](M07-007.md) | Done | M07 | Compose one supervised Controller memory capture step |
 | [M07-008](M07-008.md) | Done | M07 | Establish explicit bounded Controller memory maintenance grants |
-| [M07-009](M07-009.md) | Planned | M07 | Compose one supervised Controller memory maintenance step |
+| [M07-009](M07-009.md) | Done | M07 | Compose one supervised Controller memory maintenance step |
+| [M07-010](M07-010.md) | Planned | M07 | Add bounded Controller memory maintenance target selection |
 
 ## Task format
 
-Each task records:
-- ID and status;
-- milestone;
-- objective and why;
-- scope;
-- non-goals;
-- dependencies;
-- acceptance criteria;
-- required tests/evidence;
-- implementation notes/decisions;
-- result.
-
-A task should be independently reviewable. Architectural assumptions discovered during execution must be reflected in the canonical architecture/decision docs before dependent work proceeds.
+Each task records ID/status, milestone, objective/why, scope/non-goals, dependencies, acceptance criteria, required evidence, implementation decisions, and result. A task should be independently reviewable. Architectural assumptions discovered during execution must be reflected in canonical architecture/decision docs before dependent work proceeds.

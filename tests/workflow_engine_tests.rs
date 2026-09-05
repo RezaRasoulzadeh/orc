@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use orc::app::OrcApp;
+use orc::controller_actions::ControllerActionKind;
 use orc::lead::LeadDecisionKind;
 use orc::registry::{AgentAction, AgentDefinition, EconomyTier, ReasoningEffort, ResolutionRecord};
 use orc::storage::Database;
@@ -12,8 +13,9 @@ use orc::storage::db::AgentRunExecution;
 use orc::task::{CreateTaskInput, TaskPriority, TaskStatus};
 use orc::workflow::{
     AcceptancePolicy, AppWorkflowActions, ControllerPlanOutcome, ControllerPlanReviewDecision,
-    ControllerPlanReviewOutcome, LeadOutcome, PlanOutcome, PlanReviewOutcome, ProviderOutcome,
-    ReviewOutcome, WorkflowActions, WorkflowEngine, WorkflowPolicy, WorkflowStage, WorkflowStatus,
+    ControllerPlanReviewOutcome, ControllerTaskActionOutcome, LeadOutcome, PlanOutcome,
+    PlanReviewOutcome, ProviderOutcome, ReviewOutcome, WorkflowActions, WorkflowEngine,
+    WorkflowPolicy, WorkflowStage, WorkflowStatus,
 };
 use tempfile::TempDir;
 
@@ -58,6 +60,8 @@ struct FakeActions<'a> {
     controller_revision_persisted: Mutex<bool>,
     controller_review_persisted: Mutex<bool>,
     controller_review_plan_id: Mutex<Option<i64>>,
+    controller_task_calls: Mutex<Vec<(String, ControllerActionKind)>>,
+    controller_task_error: Option<&'static str>,
 }
 
 impl<'a> FakeActions<'a> {
@@ -83,6 +87,8 @@ impl<'a> FakeActions<'a> {
             controller_revision_persisted: Mutex::new(false),
             controller_review_persisted: Mutex::new(false),
             controller_review_plan_id: Mutex::new(None),
+            controller_task_calls: Mutex::new(Vec::new()),
+            controller_task_error: None,
         }
     }
 
@@ -307,6 +313,61 @@ impl WorkflowActions for FakeActions<'_> {
 
     fn apply_plan(&self) -> Result<()> {
         self.create_tasks()
+    }
+
+    fn controller_task_action(
+        &self,
+        _: &orc::workflow::WorkflowRun,
+        task_id: &str,
+        expected_action: ControllerActionKind,
+        _: &orc::controller_continuation::ControllerContinuationGrant,
+        _: &mut dyn orc::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerTaskActionOutcome>> {
+        self.controller_task_calls
+            .lock()
+            .unwrap()
+            .push((task_id.into(), expected_action));
+        if let Some(error) = self.controller_task_error {
+            anyhow::bail!(error)
+        }
+        match expected_action {
+            ControllerActionKind::Dispatch => {
+                self.db.update_task_status(task_id, TaskStatus::Review)?;
+                let run = self.semantic_run(Some(task_id), "general", "implementation")?;
+                Ok(Some(ControllerTaskActionOutcome::Provider(
+                    ProviderOutcome {
+                        provider_run_id: run,
+                    },
+                )))
+            }
+            ControllerActionKind::SemanticReview => {
+                let verdict = self
+                    .task_reviews
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or("PASS");
+                let run = self.semantic_run(Some(task_id), "review", "review")?;
+                Ok(Some(ControllerTaskActionOutcome::Review(ReviewOutcome {
+                    provider_run_id: run,
+                    verdict: verdict.into(),
+                    feedback: (verdict == "REVISE").then(|| "fix exact blocker".into()),
+                })))
+            }
+            ControllerActionKind::Revise => {
+                *self.revisions.lock().unwrap() += 1;
+                self.db.update_task_status(task_id, TaskStatus::Review)?;
+                let run = self.semantic_run(Some(task_id), "general", "revision")?;
+                Ok(Some(ControllerTaskActionOutcome::Provider(
+                    ProviderOutcome {
+                        provider_run_id: run,
+                    },
+                )))
+            }
+            ControllerActionKind::Accept => {
+                anyhow::bail!("Accept is not a routine Controller edge")
+            }
+        }
     }
 
     fn dispatch(&self, task_id: &str) -> Result<ProviderOutcome> {
@@ -593,6 +654,186 @@ fn automatic_policy() -> WorkflowPolicy {
         acceptance: AcceptancePolicy::Automatic,
         ..WorkflowPolicy::default()
     }
+}
+
+#[test]
+fn controller_grant_aware_edges_use_persisted_stage_mapping_once() {
+    let (directory, db, project) = setup();
+    let workflow = db
+        .start_controller_workflow(project, "supervised task edges", &automatic_policy())
+        .unwrap();
+    let actions = FakeActions::new(&db, project, Intake::Direct);
+    actions.create_tasks().unwrap();
+    let task_id = db
+        .list_tasks_for_project(project)
+        .unwrap()
+        .first()
+        .unwrap()
+        .id
+        .clone();
+
+    let mut dispatch_stage = workflow.clone();
+    dispatch_stage.stage = WorkflowStage::Dispatch;
+    dispatch_stage.current_task_id = Some(task_id.clone());
+    let dispatch_stage = db
+        .commit_workflow_transition(
+            &workflow,
+            &dispatch_stage,
+            "test_controller_dispatch_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let app = OrcApp::open(directory.path().join("orc.db"), directory.path()).unwrap();
+    let dispatch_grant = app
+        .create_controller_continuation_grant(
+            orc::controller_continuation::ControllerContinuationAllowedActions::routine(),
+            1,
+        )
+        .unwrap();
+    let mut dispatch_runtime = NoopControllerRuntime;
+    let after_dispatch = WorkflowEngine::new(&db, &actions)
+        .continue_one_with_controller_grant(
+            dispatch_stage.id,
+            &mut dispatch_runtime,
+            &dispatch_grant,
+        )
+        .unwrap();
+    assert_eq!(after_dispatch.stage, WorkflowStage::Review);
+    assert_eq!(
+        after_dispatch.current_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+    assert_eq!(
+        actions.controller_task_calls.lock().unwrap().as_slice(),
+        &[(task_id.clone(), ControllerActionKind::Dispatch),]
+    );
+
+    actions.task_reviews.lock().unwrap().clear();
+    actions.task_reviews.lock().unwrap().push_back("REVISE");
+    let review_grant = app
+        .create_controller_continuation_grant(
+            orc::controller_continuation::ControllerContinuationAllowedActions::routine(),
+            1,
+        )
+        .unwrap();
+    let mut review_runtime = NoopControllerRuntime;
+    let after_review = WorkflowEngine::new(&db, &actions)
+        .continue_one_with_controller_grant(after_dispatch.id, &mut review_runtime, &review_grant)
+        .unwrap();
+    assert_eq!(after_review.stage, WorkflowStage::Revision);
+    assert_eq!(after_review.task_revision_count, 0);
+    assert_eq!(
+        after_review.revision_feedback.as_deref(),
+        Some("fix exact blocker")
+    );
+
+    let revision_grant = app
+        .create_controller_continuation_grant(
+            orc::controller_continuation::ControllerContinuationAllowedActions::routine(),
+            1,
+        )
+        .unwrap();
+    let mut revision_runtime = NoopControllerRuntime;
+    let after_revision = WorkflowEngine::new(&db, &actions)
+        .continue_one_with_controller_grant(after_review.id, &mut revision_runtime, &revision_grant)
+        .unwrap();
+    assert_eq!(after_revision.stage, WorkflowStage::Review);
+    assert_eq!(after_revision.task_revision_count, 1);
+    assert_eq!(*actions.revisions.lock().unwrap(), 1);
+    assert_eq!(
+        actions.controller_task_calls.lock().unwrap().as_slice(),
+        &[
+            (task_id.clone(), ControllerActionKind::Dispatch),
+            (task_id.clone(), ControllerActionKind::SemanticReview),
+            (task_id.clone(), ControllerActionKind::Revise),
+        ]
+    );
+
+    let mut acceptance_stage = after_revision.clone();
+    acceptance_stage.stage = WorkflowStage::Acceptance;
+    let acceptance_stage = db
+        .commit_workflow_transition(
+            &after_revision,
+            &acceptance_stage,
+            "test_controller_acceptance_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let acceptance_grant = app
+        .create_controller_continuation_grant(
+            orc::controller_continuation::ControllerContinuationAllowedActions::routine(),
+            1,
+        )
+        .unwrap();
+    let mut acceptance_runtime = NoopControllerRuntime;
+    assert!(
+        WorkflowEngine::new(&db, &actions)
+            .continue_one_with_controller_grant(
+                acceptance_stage.id,
+                &mut acceptance_runtime,
+                &acceptance_grant,
+            )
+            .is_err()
+    );
+    assert_eq!(acceptance_grant.remaining_actions().unwrap(), 1);
+    assert!(
+        actions
+            .controller_task_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, action)| *action != ControllerActionKind::Accept)
+    );
+}
+
+#[test]
+fn controller_grant_aware_edge_failure_stops_without_legacy_fallback() {
+    let (directory, db, project) = setup();
+    let workflow = db
+        .start_controller_workflow(project, "supervised task failure", &automatic_policy())
+        .unwrap();
+    let mut actions = FakeActions::new(&db, project, Intake::Direct);
+    actions.controller_task_error = Some("supervised Controller edge rejected");
+    actions.create_tasks().unwrap();
+    let task_id = db
+        .list_tasks_for_project(project)
+        .unwrap()
+        .first()
+        .unwrap()
+        .id
+        .clone();
+    let mut dispatch_stage = workflow.clone();
+    dispatch_stage.stage = WorkflowStage::Dispatch;
+    dispatch_stage.current_task_id = Some(task_id);
+    let dispatch_stage = db
+        .commit_workflow_transition(
+            &workflow,
+            &dispatch_stage,
+            "test_controller_failure_stage",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    let app = OrcApp::open(directory.path().join("orc.db"), directory.path()).unwrap();
+    let grant = app
+        .create_controller_continuation_grant(
+            orc::controller_continuation::ControllerContinuationAllowedActions::routine(),
+            1,
+        )
+        .unwrap();
+    let mut runtime = NoopControllerRuntime;
+    let stopped = WorkflowEngine::new(&db, &actions)
+        .continue_one_with_controller_grant(dispatch_stage.id, &mut runtime, &grant)
+        .unwrap();
+    assert_eq!(stopped.status, WorkflowStatus::Blocked);
+    assert!(actions.dispatches.lock().unwrap().is_empty());
+    assert_eq!(actions.controller_task_calls.lock().unwrap().len(), 1);
+    assert_eq!(grant.remaining_actions().unwrap(), 1);
 }
 
 fn init_test_repo(directory: &TempDir) {

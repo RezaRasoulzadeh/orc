@@ -238,6 +238,15 @@ pub struct ProviderOutcome {
     pub provider_run_id: i64,
 }
 
+/// Result returned by the opt-in Controller task-action adapter. It reuses
+/// the existing workflow provider/review outcomes and carries no lifecycle or
+/// transition state of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControllerTaskActionOutcome {
+    Provider(ProviderOutcome),
+    Review(ReviewOutcome),
+}
+
 /// Semantic and mutation boundaries used by the workflow. Implementations may
 /// invoke a provider only in `lead`, `plan`, `revise_plan`, `review_plan`,
 /// `dispatch`, `review`, and `revise_task`. All other methods are deterministic.
@@ -349,6 +358,20 @@ pub trait WorkflowActions {
     ) -> Result<Option<ControllerPlanReviewOutcome>> {
         Ok(None)
     }
+
+    /// Optional single-edge Controller task action. The default keeps custom
+    /// and legacy workflow action implementations source-compatible; only the
+    /// production AppWorkflowActions adapter opts in when a grant is supplied.
+    fn controller_task_action(
+        &self,
+        _: &WorkflowRun,
+        _: &str,
+        _: crate::controller_actions::ControllerActionKind,
+        _: &crate::controller_continuation::ControllerContinuationGrant,
+        _: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerTaskActionOutcome>> {
+        Ok(None)
+    }
 }
 
 pub struct WorkflowEngine<'a, A: WorkflowActions> {
@@ -426,8 +449,10 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
             .saturating_sub(initial.transition_count);
         for _ in 0..remaining {
             let committed = match runtime.as_mut() {
-                Some(runtime) => self.continue_one_inner(workflow_id, Some(&mut **runtime))?,
-                None => self.continue_one_inner(workflow_id, None)?,
+                Some(runtime) => {
+                    self.continue_one_inner(workflow_id, Some(&mut **runtime), None)?
+                }
+                None => self.continue_one_inner(workflow_id, None, None)?,
             };
             if committed.status != WorkflowStatus::Running {
                 return Ok(committed);
@@ -633,13 +658,17 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
     /// and makes restart tests exercise the exact same production transition
     /// code as continuous orchestration.
     pub fn continue_one(&self, workflow_id: i64) -> Result<WorkflowRun> {
-        self.continue_one_inner(workflow_id, None)
+        self.continue_one_inner(workflow_id, None, None)
     }
 
-    fn continue_one_inner(
+    /// Continue at most one current Controller workflow task edge through the
+    /// existing M07-003 expected-action and M03 execution boundaries. The
+    /// persisted workflow stage remains the only source of task/action choice.
+    pub fn continue_one_with_controller_grant(
         &self,
         workflow_id: i64,
-        runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
     ) -> Result<WorkflowRun> {
         let current = self
             .db
@@ -648,7 +677,45 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
         if current.status != WorkflowStatus::Running {
             return Ok(current);
         }
-        let next = match self.advance(&current, runtime) {
+        if current.plan_path != WorkflowPlanPath::Controller {
+            anyhow::bail!("grant-aware Controller continuation requires a Controller workflow")
+        }
+        if !matches!(
+            current.stage,
+            WorkflowStage::Dispatch | WorkflowStage::Review | WorkflowStage::Revision
+        ) {
+            anyhow::bail!(
+                "grant-aware Controller continuation is only valid for Dispatch, Review, or Revision stages"
+            )
+        }
+        self.continue_one_inner(workflow_id, Some(runtime), Some(grant))
+    }
+
+    fn continue_one_inner(
+        &self,
+        workflow_id: i64,
+        runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+        continuation_grant: Option<&crate::controller_continuation::ControllerContinuationGrant>,
+    ) -> Result<WorkflowRun> {
+        let current = self
+            .db
+            .get_workflow(workflow_id)?
+            .context("workflow disappeared")?;
+        if current.status != WorkflowStatus::Running {
+            return Ok(current);
+        }
+        if continuation_grant.is_some()
+            && (current.plan_path != WorkflowPlanPath::Controller
+                || !matches!(
+                    current.stage,
+                    WorkflowStage::Dispatch | WorkflowStage::Review | WorkflowStage::Revision
+                ))
+        {
+            anyhow::bail!(
+                "grant-aware Controller continuation is only valid for Controller task stages"
+            )
+        }
+        let next = match self.advance(&current, runtime, continuation_grant) {
             Ok(next) => next,
             Err(error) => self.stop_for_error(&current, &error)?,
         };
@@ -668,6 +735,7 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
         &self,
         current: &WorkflowRun,
         mut runtime: Option<&mut dyn crate::local_runtime::LocalInferenceRuntime>,
+        continuation_grant: Option<&crate::controller_continuation::ControllerContinuationGrant>,
     ) -> Result<NextTransition> {
         match current.stage {
             WorkflowStage::Discovery => {
@@ -902,10 +970,26 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                     .current_task_id
                     .as_deref()
                     .context("dispatch stage has no task")?;
-                let outcome = self
-                    .actions
-                    .recover_dispatch(current)?
-                    .map_or_else(|| self.actions.dispatch(task_id), Ok)?;
+                let outcome = if let Some(grant) = continuation_grant {
+                    let runtime =
+                        runtime.context("Controller runtime is required for this workflow")?;
+                    match self.controller_task_action(
+                        current,
+                        task_id,
+                        crate::controller_actions::ControllerActionKind::Dispatch,
+                        runtime,
+                        grant,
+                    )? {
+                        ControllerTaskActionOutcome::Provider(outcome) => outcome,
+                        ControllerTaskActionOutcome::Review(_) => {
+                            anyhow::bail!("Controller Dispatch adapter returned review outcome")
+                        }
+                    }
+                } else {
+                    self.actions
+                        .recover_dispatch(current)?
+                        .map_or_else(|| self.actions.dispatch(task_id), Ok)?
+                };
                 let task = self
                     .db
                     .get_task(task_id)?
@@ -938,10 +1022,26 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                     .current_task_id
                     .as_deref()
                     .context("review stage has no task")?;
-                let outcome = self
-                    .actions
-                    .recover_review(current)?
-                    .map_or_else(|| self.actions.review(task_id), Ok)?;
+                let outcome = if let Some(grant) = continuation_grant {
+                    let runtime =
+                        runtime.context("Controller runtime is required for this workflow")?;
+                    match self.controller_task_action(
+                        current,
+                        task_id,
+                        crate::controller_actions::ControllerActionKind::SemanticReview,
+                        runtime,
+                        grant,
+                    )? {
+                        ControllerTaskActionOutcome::Review(outcome) => outcome,
+                        ControllerTaskActionOutcome::Provider(_) => {
+                            anyhow::bail!("Controller Review adapter returned provider outcome")
+                        }
+                    }
+                } else {
+                    self.actions
+                        .recover_review(current)?
+                        .map_or_else(|| self.actions.review(task_id), Ok)?
+                };
                 let mut next = current.clone();
                 next.provider_run_id = Some(outcome.provider_run_id);
                 match outcome.verdict.trim().to_ascii_uppercase().as_str() {
@@ -983,10 +1083,26 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                     .revision_feedback
                     .as_deref()
                     .unwrap_or("Resolve the persisted review blockers.");
-                let outcome = self
-                    .actions
-                    .recover_revision(current)?
-                    .map_or_else(|| self.actions.revise_task(task_id, feedback), Ok)?;
+                let outcome = if let Some(grant) = continuation_grant {
+                    let runtime =
+                        runtime.context("Controller runtime is required for this workflow")?;
+                    match self.controller_task_action(
+                        current,
+                        task_id,
+                        crate::controller_actions::ControllerActionKind::Revise,
+                        runtime,
+                        grant,
+                    )? {
+                        ControllerTaskActionOutcome::Provider(outcome) => outcome,
+                        ControllerTaskActionOutcome::Review(_) => {
+                            anyhow::bail!("Controller Revision adapter returned review outcome")
+                        }
+                    }
+                } else {
+                    self.actions
+                        .recover_revision(current)?
+                        .map_or_else(|| self.actions.revise_task(task_id, feedback), Ok)?
+                };
                 let task = self
                     .db
                     .get_task(task_id)?
@@ -1029,6 +1145,19 @@ impl<'a, A: WorkflowActions> WorkflowEngine<'a, A> {
                 Ok(NextTransition::deterministic(next, "completed", None))
             }
         }
+    }
+
+    fn controller_task_action(
+        &self,
+        workflow: &WorkflowRun,
+        task_id: &str,
+        expected_action: crate::controller_actions::ControllerActionKind,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+    ) -> Result<ControllerTaskActionOutcome> {
+        self.actions
+            .controller_task_action(workflow, task_id, expected_action, grant, runtime)?
+            .context("Controller task-action adapter returned no executed outcome")
     }
 
     fn route_tasks(&self, current: &WorkflowRun) -> Result<NextTransition> {
@@ -1295,6 +1424,114 @@ impl<'a> AppWorkflowActions<'a> {
             )?,
         )
     }
+
+    fn controller_task_action(
+        &self,
+        workflow: &WorkflowRun,
+        task_id: &str,
+        expected_action: crate::controller_actions::ControllerActionKind,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerTaskActionOutcome>> {
+        if workflow.plan_path != WorkflowPlanPath::Controller
+            || workflow.current_task_id.as_deref() != Some(task_id)
+        {
+            anyhow::bail!("Controller task action is not bound to the current workflow task")
+        }
+
+        let result = match expected_action {
+            crate::controller_actions::ControllerActionKind::Dispatch => {
+                self.app.continue_controller_action_once(
+                    task_id,
+                    expected_action,
+                    grant,
+                    runtime,
+                    crate::controller_actions::ControllerActionExecutionContext::dispatch(
+                        None, None, None,
+                    ),
+                )
+            }
+            crate::controller_actions::ControllerActionKind::SemanticReview => {
+                let backend = crate::automated::WorkerActionBackend::new(self.app.repo_path());
+                self.app.continue_controller_action_once(
+                    task_id,
+                    expected_action,
+                    grant,
+                    runtime,
+                    crate::controller_actions::ControllerActionExecutionContext::semantic_review(
+                        crate::automated::ActionOverrides::default(),
+                        &backend,
+                        &crate::validation::SystemValidationRunner,
+                    ),
+                )
+            }
+            crate::controller_actions::ControllerActionKind::Revise => {
+                self.app.continue_controller_action_once(
+                    task_id,
+                    expected_action,
+                    grant,
+                    runtime,
+                    crate::controller_actions::ControllerActionExecutionContext::revise(),
+                )
+            }
+            crate::controller_actions::ControllerActionKind::Accept => {
+                anyhow::bail!("Accept is not a grant-aware Controller workflow task action")
+            }
+        }
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let evidence = match result {
+            crate::controller_continuation::ControllerContinuationStepResult::Executed {
+                result:
+                    crate::controller_actions::ControllerActionExecutionResult::Executed {
+                        action,
+                        evidence,
+                        ..
+                    },
+                ..
+            } if action == expected_action => evidence,
+            result => {
+                anyhow::bail!("Controller workflow task edge did not execute: {result:?}")
+            }
+        };
+
+        match expected_action {
+            crate::controller_actions::ControllerActionKind::Dispatch
+            | crate::controller_actions::ControllerActionKind::Revise => {
+                let provider_run_id = match evidence.run_id {
+                    Some(run_id) => run_id,
+                    None => self
+                        .app
+                        .review(task_id)?
+                        .run
+                        .map(|run| run.id)
+                        .context("Controller task action has no persisted provider run")?,
+                };
+                Ok(Some(ControllerTaskActionOutcome::Provider(
+                    ProviderOutcome { provider_run_id },
+                )))
+            }
+            crate::controller_actions::ControllerActionKind::SemanticReview => {
+                let review_run_id = evidence
+                    .review_run_id
+                    .or(evidence.run_id)
+                    .context("Controller review has no persisted review run identity")?;
+                let review = self
+                    .app
+                    .review_for_run(task_id, review_run_id)?
+                    .automated_reviews
+                    .into_iter()
+                    .find(|review| review.run_id == review_run_id)
+                    .context("Controller review result was not persisted")?;
+                Ok(Some(ControllerTaskActionOutcome::Review(ReviewOutcome {
+                    provider_run_id: review_run_id,
+                    verdict: review.verdict,
+                    feedback: review.revision_feedback,
+                })))
+            }
+            crate::controller_actions::ControllerActionKind::Accept => unreachable!(),
+        }
+    }
 }
 
 impl WorkflowActions for AppWorkflowActions<'_> {
@@ -1387,6 +1624,17 @@ impl WorkflowActions for AppWorkflowActions<'_> {
         Ok(Some(ControllerIntakeOutcome {
             decision: result.decision,
         }))
+    }
+
+    fn controller_task_action(
+        &self,
+        workflow: &WorkflowRun,
+        task_id: &str,
+        expected_action: crate::controller_actions::ControllerActionKind,
+        grant: &crate::controller_continuation::ControllerContinuationGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> Result<Option<ControllerTaskActionOutcome>> {
+        self.controller_task_action(workflow, task_id, expected_action, grant, runtime)
     }
 
     fn controller_plan_revision(

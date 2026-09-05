@@ -45,7 +45,8 @@ Only current/near-term milestones are decomposed here.
 | [M07-005](M07-005.md) | Done | M07 | Continue Controller workflows across routine task edges within one finite grant |
 | [M07-006](M07-006.md) | Done | M07 | Establish explicit bounded Controller memory capture grants |
 | [M07-007](M07-007.md) | Done | M07 | Compose one supervised Controller memory capture step |
-| [M07-008](M07-008.md) | Planned | M07 | Establish explicit bounded Controller memory maintenance grants |
+| [M07-008](M07-008.md) | Done | M07 | Establish explicit bounded Controller memory maintenance grants |
+| [M07-009](M07-009.md) | Planned | M07 | Compose one supervised Controller memory maintenance step |
 
 ## Task format
 

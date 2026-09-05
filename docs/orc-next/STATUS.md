@@ -4,7 +4,7 @@
 
 **Current milestone:** M07 — Supervised autonomy
 
-**Current task:** Not yet decomposed
+**Current task:** M07-001 — Establish explicit bounded Controller continuation grants
 
 **Last completed:** M06-011 — Add supervised Controller memory maintenance judgment
 
@@ -17,14 +17,17 @@
 - M02–M05 are complete: Controller owns supervised judgment while deterministic kernel code owns persistence, legality, authorization, workflow routing, validation, approval/application gates, and lifecycle invariants.
 - M06 is complete: memory remains explicit Orc data separate from model weights, with typed User/Project/Episodic/Experience persistence, deterministic bounded retrieval, capability-local Controller integration, supervised mutation, explicit-candidate capture judgment, and explicit-target maintenance judgment.
 - `ControllerMemoryContext` remains the reusable bounded read-only memory projection; capability-specific requests retain their own current-fact/state types rather than converging on a universal packet.
-- M06 mutation remains supervised: Controller judgments may propose Create/Correct/Supersede/Remove, while deterministic M06-009 legality, one-shot authorization, fresh-state validation, and `MemoryService` execution remain authoritative.
-- Capture and maintenance are explicitly invoked. M06 intentionally adds no background scanning, implicit writes, transcript ingestion, autonomous consolidation, semantic/vector retrieval, embeddings, or learned ranking.
-- Automatic invocation/continuation decisions now belong to M07 supervised-autonomy design and must reuse existing Controller/kernel boundaries rather than bypassing them.
+- Existing M03 task actions already have typed intents, deterministic legality, exact one-shot trusted authorization, fresh legality at execution, and canonical mutation paths.
+- Existing `WorkflowEngine` remains the one authoritative restart-safe continuation path and already owns finite revision/transition limits. M07 must reuse it rather than introduce another loop.
+- M07-001 establishes the missing operator-supervision contract: a project-bound finite continuation grant may permit only routine Dispatch/SemanticReview/Revise authorization. Accept remains explicitly authorized and is not grantable in this task.
+- Continuation grants cannot bypass scheduler/agent permissions, quota/economy facts, task lifecycle, validation/review evidence, revision requirements, workflow limits, or fresh M03 legality.
+- No provider token hard cap is reintroduced; provider usage remains optimized and observable.
+- Automatic memory capture/maintenance remains out of M07-001.
 - Preserve Dispatch/Review/Revise/Accept execution primitives and deterministic validation truth.
 - Rust/native runtime; avoid Python.
 
 ## Immediate next action
 
-Inspect the existing continuation, permission, approval, budget/economy, Controller-action, and workflow boundaries before defining the first narrow M07 supervised-autonomy task. Do not add a generic autonomous loop until the smallest safe continuation seam is identified.
+Implement `tasks/M07-001.md`: establish an explicit project-bound finite continuation grant and deterministic inspection/authorization seam over existing Controller task actions, without adding an autonomous loop or automatic acceptance.
 
 See `M00-REPOSITORY-MAP.md` for the repository-grounded fact-versus-judgment classification and migration map.

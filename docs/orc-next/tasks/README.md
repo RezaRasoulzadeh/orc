@@ -41,7 +41,8 @@ Only current/near-term milestones are decomposed here.
 | [M07-001](M07-001.md) | Done | M07 | Establish explicit bounded Controller continuation grants |
 | [M07-002](M07-002.md) | Done | M07 | Compose one supervised Controller continuation step |
 | [M07-003](M07-003.md) | Done | M07 | Constrain supervised continuation to one expected routine action |
-| [M07-004](M07-004.md) | Planned | M07 | Route one Controller workflow task edge through a continuation grant |
+| [M07-004](M07-004.md) | Done | M07 | Route one Controller workflow task edge through a continuation grant |
+| [M07-005](M07-005.md) | Planned | M07 | Continue Controller workflows across routine task edges within one finite grant |
 
 ## Task format
 

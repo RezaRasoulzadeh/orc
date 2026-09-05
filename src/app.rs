@@ -75,6 +75,32 @@ impl OrcApp {
         Ok(crate::controller_memory::ControllerMemoryContext::from_memory_service(&memories)?)
     }
 
+    /// Select at most one explicit current-project Project/Episodic memory
+    /// target through a bounded, read-only Controller judgment. This API does
+    /// not invoke maintenance judgment, grant inspection, authorization, or
+    /// mutation.
+    pub fn select_controller_memory_target(
+        &self,
+        request: &crate::controller_memory_selection::ControllerMemorySelectionRequest,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> std::result::Result<
+        crate::controller_memory_selection::ControllerMemorySelectionResult,
+        crate::controller_memory_selection::ControllerMemorySelectionError,
+    > {
+        request.validate()?;
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_selection::ControllerMemorySelectionError::InvalidProject
+        })?;
+        let memories = self.memories().map_err(|error| {
+            crate::controller_memory_selection::ControllerMemorySelectionError::MemoryService(
+                error.to_string(),
+            )
+        })?;
+        let builder = crate::controller_memory_selection::ControllerMemorySelectionBuilder::new();
+        let input = builder.input_from_memory_service(project_id, request, &memories)?;
+        builder.select(&input, runtime)
+    }
+
     /// Judge one explicitly supplied memory candidate through the bounded,
     /// read-only Controller capture seam. A proposed intent remains separate
     /// from the M06-009 proposal, authorization, and execution boundaries.

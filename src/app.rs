@@ -279,6 +279,67 @@ impl OrcApp {
         })
     }
 
+    /// Create an opaque, finite memory-maintenance grant bound to this
+    /// application's current project. The grant authorizes no judgment and
+    /// carries no persistence or mutation capability.
+    pub fn create_controller_memory_maintenance_grant(
+        &self,
+        action_budget: usize,
+    ) -> std::result::Result<
+        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrant,
+        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError::InvalidProject
+        })?;
+        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrant::new(
+            project_id,
+            action_budget,
+        )
+    }
+
+    /// Inspect one already validated M06-009 maintenance proposal against an
+    /// explicit maintenance grant and mint the existing exact one-shot
+    /// authorization. Maintenance judgment remains a separate caller-owned
+    /// step.
+    pub fn inspect_controller_memory_maintenance_grant(
+        &self,
+        grant: &crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrant,
+        proposal: &crate::controller_memory_mutation::ControllerMemoryMutationProposal,
+    ) -> std::result::Result<
+        crate::controller_memory_mutation::ControllerMemoryMutationAuthorization,
+        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError,
+    > {
+        let project_id = self.lead().project_id().map_err(|_| {
+            crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError::InvalidProject
+        })?;
+        grant.inspect_and_authorize(
+            project_id,
+            proposal,
+            |target| {
+                let memories = self.memories().map_err(|error| {
+                    crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError::TargetLookupFailed(
+                        error.to_string(),
+                    )
+                })?;
+                memories
+                    .get(target)
+                    .map_err(|error| {
+                        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError::TargetLookupFailed(
+                            error.to_string(),
+                        )
+                    })?
+                    .map(|record| record.kind)
+                    .ok_or(
+                        crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrantError::TargetNotFound,
+                    )
+            },
+            |exact_proposal| {
+                Ok(crate::controller_memory_mutation::authorize(exact_proposal))
+            },
+        )
+    }
+
     /// Mint opaque one-shot authorization for one exact validated memory
     /// mutation proposal.
     pub fn authorize_controller_memory_mutation(

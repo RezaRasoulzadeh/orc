@@ -39,7 +39,8 @@ Only current/near-term milestones are decomposed here.
 | [M06-010](M06-010.md) | Done | M06 | Add supervised Controller memory capture judgment |
 | [M06-011](M06-011.md) | Done | M06 | Add supervised Controller memory maintenance judgment |
 | [M07-001](M07-001.md) | Done | M07 | Establish explicit bounded Controller continuation grants |
-| [M07-002](M07-002.md) | Planned | M07 | Compose one supervised Controller continuation step |
+| [M07-002](M07-002.md) | Done | M07 | Compose one supervised Controller continuation step |
+| [M07-003](M07-003.md) | Planned | M07 | Constrain supervised continuation to one expected routine action |
 
 ## Task format
 

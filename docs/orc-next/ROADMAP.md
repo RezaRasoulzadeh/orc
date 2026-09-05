@@ -56,15 +56,19 @@ M06 intentionally stops before automatic invocation. Capture and maintenance rem
 
 Allow routine safe continuation inside explicit operator permissions and budgets.
 
-Orc already has the canonical pieces M07 must compose rather than replace: bounded `OrcApp::propose_controller_action` recommendation, exact typed M03 action intents and one-shot authorization/execution with fresh legality, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits.
+Orc already has the canonical pieces M07 must compose rather than replace: bounded `OrcApp::propose_controller_action` recommendation, exact typed M03 action intents and one-shot authorization/execution with fresh legality, the M07-001 finite project-bound continuation grant, and the restart-safe `WorkflowEngine` with finite plan/task revision and transition limits.
 
 M07-001 is complete. It established opaque project-bound grants over only Dispatch/SemanticReview/Revise, with a finite 1–128 action budget, shared anti-reset state, Active/Exhausted/Revoked lifecycle, current legality inspection, exact M03 authorization reuse, and deterministic exclusion of Accept.
 
 M07-002 is complete. It established `OrcApp::continue_controller_action_once()`, composing one existing Controller recommendation/proposal, exact task validation, M07-001 grant inspection, and the exact existing M03 execution boundary. One call performs at most one inference, one successful grant consumption, and one routine action, with no retry, task enumeration, automatic acceptance, or second orchestration loop.
 
-Repository inspection after M07-002 shows the next integration constraint: `WorkflowEngine` already deterministically owns `Dispatch`, `Review`, and `Revision` stages. A future grant-aware workflow adapter must be able to require the action implied by the current trusted stage before grant authorization; otherwise a different Controller recommendation can reach the grant boundary and consume budget before the action-specific execution context rejects it.
+M07-003 is complete. The one-step seam now accepts a trusted existing expected action. Only Dispatch/SemanticReview/Revise are valid; expected Accept and mismatched Controller recommendations stop before grant inspection, preserving zero budget consumption and preventing an action-specific execution-context mismatch from burning permission the workflow stage never granted.
 
-M07-003 therefore adds only a trusted expected-action constraint to the existing one-step continuation seam. Mismatched recommendations must stop before grant inspection with zero budget consumption. This preserves the existing action schema, grant model, M03 fresh legality, and workflow authority while unlocking a later narrow integration into the existing `WorkflowEngine` rather than creating a new loop.
+Repository inspection after M07-003 confirms that `WorkflowEngine` already owns exactly the deterministic structure needed for the next step: `route_tasks()` selects the canonical task, persisted `Dispatch`/`Review`/`Revision` stages imply the exact routine action, `continue_one_inner()` commits at most one legal edge, and the existing stage code already owns task-state/verdict/revision-counter/acceptance routing. Therefore M07 must integrate with that engine rather than duplicate any of it.
+
+M07-004 is the next seam: add one explicit grant-aware single-edge Controller workflow continuation path. The workflow stage supplies the expected M07-003 action and persisted `current_task_id`; the production adapter invokes the existing one-step grant/M03 path and maps successful canonical evidence back into the existing `ProviderOutcome` / `ReviewOutcome` transition logic. Non-executed supervised results must stop the edge with no fallback provider call, second inference, or second action.
+
+M07-004 intentionally does **not** pass the grant through `continue_run_with_controller_runtime` or automatically spend multiple grant units. Repeated safe continuation across multiple persisted edges remains a later decision after the single-edge integration is proven. Acceptance remains outside routine grants.
 
 ## M08 — Experience dataset
 

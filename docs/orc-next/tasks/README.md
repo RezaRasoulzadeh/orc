@@ -59,7 +59,8 @@ Only current/near-term milestones are decomposed here.
 | [M08-008](M08-008.md) | Done | M08 | Add explicit typed curation for Controller memory capture judgment |
 | [M08-009](M08-009.md) | Done | M08 | Add explicit typed curation for Controller memory maintenance judgment |
 | [M08-010](M08-010.md) | Done | M08 | Add explicit typed curation for Controller memory maintenance target selection |
-| [M08-011](M08-011.md) | Planned | M08 | Add deterministic Controller experience dataset inventory |
+| [M08-011](M08-011.md) | Done | M08 | Add deterministic Controller experience dataset inventory |
+| [M09-001](M09-001.md) | Planned | M09 | Add deterministic trainer-neutral Controller dataset snapshot |
 
 ## Task format
 

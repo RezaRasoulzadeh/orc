@@ -106,6 +106,13 @@ impl OrcApp {
         Ok(self.db.controller_experience_inventory()?)
     }
 
+    /// Return the complete deterministic Active Controller experience snapshot.
+    pub fn controller_experience_snapshot(
+        &self,
+    ) -> Result<crate::controller_experience::ControllerExperienceSnapshot> {
+        Ok(self.db.controller_experience_snapshot()?)
+    }
+
     pub fn retire_controller_experience_example(
         &self,
         id: i64,

@@ -20,6 +20,7 @@ pub const MAX_CONTROLLER_EXPERIENCE_EXAMPLE_BYTES: usize = 32 * 1024;
 pub const MAX_CONTROLLER_EXPERIENCE_PAGE_SIZE: usize = 128;
 pub const MAX_CONTROLLER_EXPERIENCE_PAGE_OFFSET: usize = 1_000_000;
 pub const CONTROLLER_EXPERIENCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
+pub const CONTROLLER_EXPERIENCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +118,76 @@ pub struct ControllerExperienceExampleQuery {
     pub lifecycle: ControllerExperienceLifecycleFilter,
     pub limit: usize,
     pub offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerExperienceSnapshot {
+    pub schema_version: u32,
+    pub count: u64,
+    pub examples: Vec<ControllerExperienceExample>,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ControllerExperienceSnapshotValidationError {
+    #[error("unsupported Controller experience snapshot schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("invalid Controller experience snapshot: {0}")]
+    Invalid(String),
+    #[error("invalid Controller experience snapshot example {id}: {error}")]
+    InvalidExample {
+        id: i64,
+        error: ControllerExperienceValidationError,
+    },
+}
+
+impl ControllerExperienceSnapshot {
+    pub fn validate(&self) -> Result<(), ControllerExperienceSnapshotValidationError> {
+        if self.schema_version != CONTROLLER_EXPERIENCE_SNAPSHOT_SCHEMA_VERSION {
+            return Err(
+                ControllerExperienceSnapshotValidationError::UnsupportedSchemaVersion(
+                    self.schema_version,
+                ),
+            );
+        }
+        let expected_count = u64::try_from(self.examples.len()).map_err(|_| {
+            ControllerExperienceSnapshotValidationError::Invalid(
+                "snapshot example count cannot be represented".into(),
+            )
+        })?;
+        if self.count != expected_count {
+            return Err(ControllerExperienceSnapshotValidationError::Invalid(
+                "snapshot count must equal the number of examples".into(),
+            ));
+        }
+
+        let mut previous_id = None;
+        for example in &self.examples {
+            if example.id <= 0 {
+                return Err(ControllerExperienceSnapshotValidationError::Invalid(
+                    "snapshot example IDs must be positive".into(),
+                ));
+            }
+            if previous_id.is_some_and(|previous| example.id <= previous) {
+                return Err(ControllerExperienceSnapshotValidationError::Invalid(
+                    "snapshot examples must be strictly ordered by ascending ID".into(),
+                ));
+            }
+            previous_id = Some(example.id);
+            if example.lifecycle != ControllerExperienceExampleLifecycle::Active {
+                return Err(ControllerExperienceSnapshotValidationError::Invalid(
+                    "snapshot examples must all be active".into(),
+                ));
+            }
+            example.validate().map_err(|error| {
+                ControllerExperienceSnapshotValidationError::InvalidExample {
+                    id: example.id,
+                    error,
+                }
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

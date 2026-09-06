@@ -7634,6 +7634,41 @@ impl Database {
         Ok(inventory)
     }
 
+    pub fn controller_experience_snapshot(
+        &self,
+    ) -> Result<crate::controller_experience::ControllerExperienceSnapshot, DbError> {
+        let mut statement = self.registry.prepare(
+            "SELECT id, schema_version, capability, input_payload,
+                    accepted_output_payload, verification_basis, provenance,
+                    correction, outcome, quality, created_at, lifecycle
+             FROM controller_experience_examples
+             ORDER BY id ASC",
+        )?;
+        let examples = statement
+            .query_map([], decode_controller_experience_example)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let examples = examples
+            .into_iter()
+            .filter(|example| {
+                example.lifecycle
+                    == crate::controller_experience::ControllerExperienceExampleLifecycle::Active
+            })
+            .collect::<Vec<_>>();
+        let count = u64::try_from(examples.len()).map_err(|_| {
+            DbError::Scheduler("Controller experience snapshot count overflow".into())
+        })?;
+        let snapshot = crate::controller_experience::ControllerExperienceSnapshot {
+            schema_version:
+                crate::controller_experience::CONTROLLER_EXPERIENCE_SNAPSHOT_SCHEMA_VERSION,
+            count,
+            examples,
+        };
+        snapshot
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        Ok(snapshot)
+    }
+
     pub fn create_controller_experience_example(
         &self,
         draft: &crate::controller_experience::ControllerExperienceExampleDraft,

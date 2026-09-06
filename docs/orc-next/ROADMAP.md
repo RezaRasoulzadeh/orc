@@ -50,9 +50,11 @@ M08-002 is complete. It established capability-local curation for normal task re
 
 M08-003 is complete. It established capability-local curation for recovery recommendation with fixed capability `controller.recovery_recommendation`, exact validated `RecoveryInferenceInput`, exact accepted `RecoveryRecommendation`, explicit correction semantics, and persistence only through M08-001. `RecoveryRecommendationValidation` remains deterministic runtime legality/actionability evidence rather than a dataset reasoning target.
 
-M08-004 now extends the same narrow pattern to Controller planning. Planning already has canonical bounded `ControllerPlanningInput` and validated `ControllerPlanResult`, which contains the canonical `PlanResponse` plus Controller rationale and optional uncertainty. The dataset adapter must preserve the complete exact typed result rather than collapsing it to persisted Plan state or downstream workflow outcome.
+M08-004 is complete. It established capability-local curation for Controller planning with fixed capability `controller.plan_generation`, exact validated `ControllerPlanningInput`, and exact complete accepted `ControllerPlanResult`, preserving its canonical `PlanResponse`, rationale, and optional uncertainty. Planning inference behavior and downstream Plan/workflow semantics remain unchanged.
 
-M08-004 does not infer labels from Plan persistence, Plan review approval, task application, workflow advancement, validation/review, operator acceptance, or eventual task success. It adds no automatic planner hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
+M08-005 now extends the same narrow pattern to Controller workflow intake. Intake already has canonical bounded `ControllerIntakeInput` and `ControllerIntakeResult` contracts with reusable production validation, including DirectTasks task-proposal validation and exact decision/direct-task consistency.
+
+M08-005 must preserve the complete exact typed intake interaction. It does not infer labels from workflow routing, DirectTasks application, Plan creation/application, later operator resolution, task validation/review/acceptance, or eventual workflow success. It adds no automatic intake hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
 
 Later M08 tasks should continue capability-local curation only where existing typed contracts make the projection unambiguous, then add deterministic dataset inspection/export/evaluation preparation as repository evidence warrants.
 

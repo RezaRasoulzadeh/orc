@@ -14,6 +14,7 @@ pub mod controller_evaluation;
 pub mod controller_experience;
 pub mod controller_experience_intake;
 pub mod controller_experience_plan_review;
+pub mod controller_experience_plan_revision;
 pub mod controller_experience_planning;
 pub mod controller_experience_recommendation;
 pub mod controller_experience_recovery;

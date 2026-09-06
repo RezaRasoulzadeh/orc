@@ -62,7 +62,10 @@ pub struct RecoveryRecommendation {
 }
 
 impl RecoveryRecommendation {
-    fn validate(&self) -> Result<(), RecoveryControllerError> {
+    /// Validate the canonical structured recommendation contract used by the
+    /// recovery inference parser. This remains a pure, bounded check and does
+    /// not perform legality or execution.
+    pub fn validate(&self) -> Result<(), RecoveryControllerError> {
         if self.rationale.is_empty() || self.rationale.len() > MAX_RECOVERY_RATIONALE_BYTES {
             return Err(RecoveryControllerError::MalformedStructuredOutput(
                 "rationale must be non-empty and bounded".into(),

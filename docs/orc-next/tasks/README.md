@@ -57,7 +57,8 @@ Only current/near-term milestones are decomposed here.
 | [M08-006](M08-006.md) | Done | M08 | Add explicit typed curation for Controller Plan review |
 | [M08-007](M08-007.md) | Done | M08 | Add explicit typed curation for Controller Plan revision generation |
 | [M08-008](M08-008.md) | Done | M08 | Add explicit typed curation for Controller memory capture judgment |
-| [M08-009](M08-009.md) | Planned | M08 | Add explicit typed curation for Controller memory maintenance judgment |
+| [M08-009](M08-009.md) | Done | M08 | Add explicit typed curation for Controller memory maintenance judgment |
+| [M08-010](M08-010.md) | Planned | M08 | Add explicit typed curation for Controller memory maintenance target selection |
 
 ## Task format
 

@@ -56,13 +56,15 @@ M08-005 is complete. It established capability-local curation for Controller wor
 
 M08-006 is complete. It established capability-local curation for Controller Plan review with fixed capability `controller.plan_review`, exact validated `ControllerPlanReviewInput`, and exact complete accepted `ControllerPlanReviewResult`. Persisted PlanReview rows, Plan status transitions, later revisions/approvals, task application, workflow advancement, and downstream outcomes remain outside dataset verification.
 
-M08-007 now targets Controller Plan revision generation. The production inference boundary consumes `ControllerPlanRevisionInput` and returns a canonical generated `PlanResponse`; only after inference does trusted application code construct `ControllerPlanRevisionResult` by attaching parent Plan ID/version and review ID.
+M08-007 is complete. It established capability-local curation for Controller Plan revision generation with fixed capability `controller.plan_revision`, exact validated `ControllerPlanRevisionInput`, and exact generated/accepted canonical `PlanResponse` as the reasoning output authority. Trusted parent Plan/version/review lineage attached after inference is deliberately excluded from the reasoning target.
 
-Therefore M08-007 must use the exact generated/accepted `PlanResponse` as the dataset output authority and must exclude trusted lineage from the reasoning target. The exact typed revision input, including current Plan, persisted revision feedback, planning context, and bounded memory, remains the dataset input authority.
+M08-008 now targets Controller memory capture judgment. The production reasoning boundary consumes exact `ControllerMemoryCaptureInput`, containing one explicit candidate and bounded memory context, and returns canonical `ControllerMemoryCaptureResult`: either `Ignore` or one `ProposeMutation` result. Production result validation already requires a proposed mutation to be exactly one create intent preserving the explicit candidate draft.
 
-M08-007 must not infer labels from revised-Plan persistence, lineage consistency, subsequent Plan review, task application, workflow advancement, validation/review, operator acceptance, or eventual task/workflow outcomes. It adds no automatic revision hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
+M08-008 must curate that typed judgment only. Mutation-proposal validation, capture grants, composed capture-step execution, durable memory creation, later retrieval/maintenance, and workflow outcomes remain downstream facts and must not automatically verify or correct dataset examples.
 
-Later M08 tasks should continue capability-local curation only where existing typed contracts make the projection unambiguous, then add deterministic dataset inspection/export/evaluation preparation as repository evidence warrants.
+Memory maintenance judgment and maintenance-target selection remain later capability-local seams. Later M08 work should then add deterministic dataset inspection/export/evaluation preparation only as repository evidence warrants.
+
+M08-008 adds no automatic capture hook, generic curation framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
 
 ## M09 — Controller specialization
 

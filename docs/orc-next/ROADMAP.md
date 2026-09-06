@@ -56,13 +56,15 @@ M09 begins with specialization preparation rather than immediately choosing a tr
 
 M09-001 completed the deterministic trainer-neutral specialization handoff at `481fe624777a03dc841ae1742dd5f9461e854fc7`. The snapshot reads and validates the complete canonical global-registry experience set in ascending example identity order, returns only Active examples, preserves the full canonical M08 record without capability-specific transformation, serializes deterministically, and performs zero writes or inference.
 
-The next prerequisite is evaluation coverage that matches the actual Controller capability surface. The original M02 evaluation corpus established typed semantic evaluation for normal recommendations, but later milestones added recovery, planning, workflow intake, Plan review/revision, memory capture, memory maintenance, and maintenance-target selection.
+M09-002 completed the full-surface specialization evaluation substrate at `6ceed5cda0627c82667664e4d7d54790207edbf9`. Specialization-evaluation schema version 1 covers all nine current inference-backed Controller capabilities using production-aligned typed builders/validators, explicit deterministic semantic fixtures, stable scenario ordering, non-aborting incorrect/runtime/validation failure recording, and exact global/per-capability accounting.
 
-M09-002 therefore establishes a deterministic model-independent specialization evaluation suite over all nine current inference-backed Controller capabilities. Expected results remain explicit fixture authority, evaluation compares typed semantics rather than prose, fake-runtime execution is deterministic and read-only, and global/per-capability result accounting must be exact.
+The next prerequisite is a measured baseline from the current local Controller model over that exact full-surface suite. The older M02 `ORC_QWEN3_GGUF` smoke test proves native llama.cpp execution but covers only recommendation scenarios and uses evaluation-specific prompt augmentation, so it is not sufficient baseline evidence for the mature Controller surface.
 
-M09-002 must not modify production prompts/parsers/runtime settings, infer expected answers from the training snapshot, choose a trainer, split/balance/sample the dataset, define promotion thresholds, or mutate model weights.
+M09-003 therefore adds an ignored llama-cpp baseline path over the exact M09-002 suite, preserving production prompt/runtime semantics and recording stable suite/model/runtime identity plus typed per-scenario/global/per-capability evidence. It remains read-only and does not make one developer machine's measured score semantic authority.
 
-Later M09 work should use the trainer-neutral snapshot plus the full-surface evaluation suite to investigate a native/offline specialization path, define an explicit candidate-vs-baseline promotion gate, perform controlled training/evaluation, and only then consider changing the default Controller model.
+M09-003 must not change scenario expectations to fit Qwen, add benchmark-specific prompt instructions, choose a trainer, transform/split/balance/sample the dataset, define promotion thresholds, mutate weights, or change the default Controller model.
+
+Later M09 work should use the trainer-neutral snapshot, full-surface evaluation suite, and measured current-model baseline to investigate a native/offline specialization path, define an explicit candidate-vs-baseline promotion gate, perform controlled training/evaluation, and only then consider changing the default Controller model.
 
 ## M10 — Interface integration
 

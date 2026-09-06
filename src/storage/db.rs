@@ -1773,6 +1773,93 @@ fn decode_controller_experience_example(
     Ok(record)
 }
 
+#[derive(Debug)]
+struct ControllerExperienceInventoryMetadata {
+    capability: String,
+    verification_basis: crate::controller_experience::ControllerExperienceVerificationBasis,
+    outcome: crate::controller_experience::ControllerExperienceOutcome,
+    lifecycle: crate::controller_experience::ControllerExperienceExampleLifecycle,
+}
+
+fn decode_controller_experience_inventory_metadata(
+    row: &Row<'_>,
+) -> rusqlite::Result<ControllerExperienceInventoryMetadata> {
+    fn parse_enum<T: serde::de::DeserializeOwned>(
+        column: usize,
+        field: &str,
+        value: String,
+    ) -> rusqlite::Result<T> {
+        serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
+            controller_experience_json_error(
+                column,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid Controller experience {field}: {error}"),
+                ),
+            )
+        })
+    }
+
+    let id: i64 = row.get(0)?;
+    if id <= 0 {
+        return Err(controller_experience_json_error(
+            0,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Controller experience example id must be positive",
+            ),
+        ));
+    }
+    let stored_schema_version: i64 = row.get(1)?;
+    let schema_version = u32::try_from(stored_schema_version).map_err(|error| {
+        controller_experience_json_error(
+            1,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid Controller experience schema version: {error}"),
+            ),
+        )
+    })?;
+    if schema_version != crate::controller_experience::CONTROLLER_EXPERIENCE_EXAMPLE_SCHEMA_VERSION
+    {
+        return Err(controller_experience_json_error(
+            1,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported Controller experience schema version: {schema_version}"),
+            ),
+        ));
+    }
+
+    let capability: String = row.get(2)?;
+    if capability.trim().is_empty()
+        || capability.len()
+            > crate::controller_experience::MAX_CONTROLLER_EXPERIENCE_CAPABILITY_BYTES
+    {
+        return Err(controller_experience_json_error(
+            2,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Controller experience capability must be non-empty and bounded",
+            ),
+        ));
+    }
+
+    Ok(ControllerExperienceInventoryMetadata {
+        capability,
+        verification_basis: parse_enum(3, "verification basis", row.get(3)?)?,
+        outcome: parse_enum(4, "outcome", row.get(4)?)?,
+        lifecycle: parse_enum(5, "lifecycle", row.get(5)?)?,
+    })
+}
+
+fn increment_controller_experience_inventory_count(count: &mut u64) -> Result<(), DbError> {
+    *count = count.checked_add(1).ok_or_else(|| {
+        DbError::Scheduler("Controller experience inventory count overflow".into())
+    })?;
+    Ok(())
+}
+
 impl Drop for RunFinalizer<'_> {
     fn drop(&mut self) {
         let _ = self.db.abandon_agent_run(
@@ -7459,6 +7546,94 @@ impl Database {
     /// Persist one explicitly verified, globally owned Controller experience
     /// example. The registry is the sole authority; provenance never grants
     /// project ownership or mutation authority.
+    pub fn controller_experience_inventory(
+        &self,
+    ) -> Result<crate::controller_experience::ControllerExperienceInventory, DbError> {
+        use std::collections::BTreeMap;
+
+        let mut statement = self.registry.prepare(
+            "SELECT id, schema_version, capability, verification_basis, outcome, lifecycle
+             FROM controller_experience_examples
+             ORDER BY id ASC",
+        )?;
+        let rows = statement
+            .query_map([], decode_controller_experience_inventory_metadata)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut total = 0;
+        let mut active = 0;
+        let mut retired = 0;
+        let mut summaries = BTreeMap::new();
+        for row in rows {
+            increment_controller_experience_inventory_count(&mut total)?;
+            match row.lifecycle {
+                crate::controller_experience::ControllerExperienceExampleLifecycle::Active => {
+                    increment_controller_experience_inventory_count(&mut active)?;
+                }
+                crate::controller_experience::ControllerExperienceExampleLifecycle::Retired => {
+                    increment_controller_experience_inventory_count(&mut retired)?;
+                }
+            }
+
+            let summary = summaries.entry(row.capability.clone()).or_insert_with(|| {
+                crate::controller_experience::ControllerExperienceCapabilitySummary {
+                    capability: row.capability.clone(),
+                    ..Default::default()
+                }
+            });
+            increment_controller_experience_inventory_count(&mut summary.total)?;
+            match row.lifecycle {
+                crate::controller_experience::ControllerExperienceExampleLifecycle::Active => {
+                    increment_controller_experience_inventory_count(&mut summary.active)?;
+                }
+                crate::controller_experience::ControllerExperienceExampleLifecycle::Retired => {
+                    increment_controller_experience_inventory_count(&mut summary.retired)?;
+                }
+            }
+            match row.outcome {
+                crate::controller_experience::ControllerExperienceOutcome::Accepted => {
+                    increment_controller_experience_inventory_count(&mut summary.accepted)?;
+                }
+                crate::controller_experience::ControllerExperienceOutcome::Corrected => {
+                    increment_controller_experience_inventory_count(&mut summary.corrected)?;
+                }
+                crate::controller_experience::ControllerExperienceOutcome::Rejected => {
+                    increment_controller_experience_inventory_count(&mut summary.rejected)?;
+                }
+            }
+            match row.verification_basis {
+                crate::controller_experience::ControllerExperienceVerificationBasis::OperatorAttestation => {
+                    increment_controller_experience_inventory_count(
+                        &mut summary.operator_attestation,
+                    )?;
+                }
+                crate::controller_experience::ControllerExperienceVerificationBasis::ExplicitCorrection => {
+                    increment_controller_experience_inventory_count(
+                        &mut summary.explicit_correction,
+                    )?;
+                }
+                crate::controller_experience::ControllerExperienceVerificationBasis::ExternalEvaluation => {
+                    increment_controller_experience_inventory_count(
+                        &mut summary.external_evaluation,
+                    )?;
+                }
+            }
+        }
+
+        let inventory = crate::controller_experience::ControllerExperienceInventory {
+            schema_version:
+                crate::controller_experience::CONTROLLER_EXPERIENCE_INVENTORY_SCHEMA_VERSION,
+            total,
+            active,
+            retired,
+            capabilities: summaries.into_values().collect(),
+        };
+        inventory
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        Ok(inventory)
+    }
+
     pub fn create_controller_experience_example(
         &self,
         draft: &crate::controller_experience::ControllerExperienceExampleDraft,

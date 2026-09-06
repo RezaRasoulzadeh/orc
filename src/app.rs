@@ -98,6 +98,14 @@ impl OrcApp {
         Ok(self.db.list_controller_experience_examples(query)?)
     }
 
+    /// Return deterministic counts over the complete global Controller
+    /// experience dataset without reading capability-specific payloads.
+    pub fn controller_experience_inventory(
+        &self,
+    ) -> Result<crate::controller_experience::ControllerExperienceInventory> {
+        Ok(self.db.controller_experience_inventory()?)
+    }
+
     pub fn retire_controller_experience_example(
         &self,
         id: i64,

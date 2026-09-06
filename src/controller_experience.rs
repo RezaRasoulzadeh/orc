@@ -19,6 +19,7 @@ pub const MAX_CONTROLLER_EXPERIENCE_TIMESTAMP_BYTES: usize = 64;
 pub const MAX_CONTROLLER_EXPERIENCE_EXAMPLE_BYTES: usize = 32 * 1024;
 pub const MAX_CONTROLLER_EXPERIENCE_PAGE_SIZE: usize = 128;
 pub const MAX_CONTROLLER_EXPERIENCE_PAGE_OFFSET: usize = 1_000_000;
+pub const CONTROLLER_EXPERIENCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +117,159 @@ pub struct ControllerExperienceExampleQuery {
     pub lifecycle: ControllerExperienceLifecycleFilter,
     pub limit: usize,
     pub offset: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerExperienceCapabilitySummary {
+    pub capability: String,
+    pub total: u64,
+    pub active: u64,
+    pub retired: u64,
+    pub accepted: u64,
+    pub corrected: u64,
+    pub rejected: u64,
+    pub operator_attestation: u64,
+    pub explicit_correction: u64,
+    pub external_evaluation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerExperienceInventory {
+    pub schema_version: u32,
+    pub total: u64,
+    pub active: u64,
+    pub retired: u64,
+    pub capabilities: Vec<ControllerExperienceCapabilitySummary>,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ControllerExperienceInventoryValidationError {
+    #[error("unsupported Controller experience inventory schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("invalid Controller experience inventory: {0}")]
+    Invalid(String),
+}
+
+impl ControllerExperienceInventory {
+    pub fn validate(&self) -> Result<(), ControllerExperienceInventoryValidationError> {
+        if self.schema_version != CONTROLLER_EXPERIENCE_INVENTORY_SCHEMA_VERSION {
+            return Err(
+                ControllerExperienceInventoryValidationError::UnsupportedSchemaVersion(
+                    self.schema_version,
+                ),
+            );
+        }
+
+        let mut capability_total: u64 = 0;
+        let mut capability_active: u64 = 0;
+        let mut capability_retired: u64 = 0;
+        let mut previous_capability: Option<&str> = None;
+        for summary in &self.capabilities {
+            if summary.capability.trim().is_empty()
+                || summary.capability.len() > MAX_CONTROLLER_EXPERIENCE_CAPABILITY_BYTES
+            {
+                return Err(ControllerExperienceInventoryValidationError::Invalid(
+                    "capability must be non-empty and bounded".into(),
+                ));
+            }
+            if previous_capability.is_some_and(|previous| previous >= summary.capability.as_str()) {
+                return Err(ControllerExperienceInventoryValidationError::Invalid(
+                    "capability summaries must be sorted lexicographically without duplicates"
+                        .into(),
+                ));
+            }
+            previous_capability = Some(&summary.capability);
+
+            let lifecycle_total = summary.active.checked_add(summary.retired).ok_or_else(|| {
+                ControllerExperienceInventoryValidationError::Invalid(
+                    "capability lifecycle counts overflow".into(),
+                )
+            })?;
+            if summary.total != lifecycle_total {
+                return Err(ControllerExperienceInventoryValidationError::Invalid(
+                    "capability total must equal active plus retired".into(),
+                ));
+            }
+            let outcome_total = summary
+                .accepted
+                .checked_add(summary.corrected)
+                .and_then(|value| value.checked_add(summary.rejected))
+                .ok_or_else(|| {
+                    ControllerExperienceInventoryValidationError::Invalid(
+                        "capability outcome counts overflow".into(),
+                    )
+                })?;
+            if summary.total != outcome_total {
+                return Err(ControllerExperienceInventoryValidationError::Invalid(
+                    "capability total must equal accepted plus corrected plus rejected".into(),
+                ));
+            }
+            let verification_total = summary
+                .operator_attestation
+                .checked_add(summary.explicit_correction)
+                .and_then(|value| value.checked_add(summary.external_evaluation))
+                .ok_or_else(|| {
+                    ControllerExperienceInventoryValidationError::Invalid(
+                        "capability verification counts overflow".into(),
+                    )
+                })?;
+            if summary.total != verification_total {
+                return Err(ControllerExperienceInventoryValidationError::Invalid(
+                    "capability total must equal verification-basis counts".into(),
+                ));
+            }
+
+            capability_total = capability_total.checked_add(summary.total).ok_or_else(|| {
+                ControllerExperienceInventoryValidationError::Invalid(
+                    "global capability totals overflow".into(),
+                )
+            })?;
+            capability_active = capability_active
+                .checked_add(summary.active)
+                .ok_or_else(|| {
+                    ControllerExperienceInventoryValidationError::Invalid(
+                        "global active totals overflow".into(),
+                    )
+                })?;
+            capability_retired =
+                capability_retired
+                    .checked_add(summary.retired)
+                    .ok_or_else(|| {
+                        ControllerExperienceInventoryValidationError::Invalid(
+                            "global retired totals overflow".into(),
+                        )
+                    })?;
+        }
+
+        let lifecycle_total = self.active.checked_add(self.retired).ok_or_else(|| {
+            ControllerExperienceInventoryValidationError::Invalid(
+                "global lifecycle counts overflow".into(),
+            )
+        })?;
+        if self.total != lifecycle_total {
+            return Err(ControllerExperienceInventoryValidationError::Invalid(
+                "global total must equal active plus retired".into(),
+            ));
+        }
+        if capability_total != self.total {
+            return Err(ControllerExperienceInventoryValidationError::Invalid(
+                "capability totals must equal global total".into(),
+            ));
+        }
+        if capability_active != self.active {
+            return Err(ControllerExperienceInventoryValidationError::Invalid(
+                "capability active totals must equal global active".into(),
+            ));
+        }
+        if capability_retired != self.retired {
+            return Err(ControllerExperienceInventoryValidationError::Invalid(
+                "capability retired totals must equal global retired".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ControllerExperienceExampleQuery {

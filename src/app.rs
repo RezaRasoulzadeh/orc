@@ -75,6 +75,36 @@ impl OrcApp {
         Ok(crate::controller_memory::ControllerMemoryContext::from_memory_service(&memories)?)
     }
 
+    /// Persist one explicitly specified Controller experience example in the
+    /// shared global registry. This API performs no inference or harvesting.
+    pub fn create_controller_experience_example(
+        &self,
+        draft: &crate::controller_experience::ControllerExperienceExampleDraft,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample> {
+        Ok(self.db.create_controller_experience_example(draft)?)
+    }
+
+    pub fn get_controller_experience_example(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::controller_experience::ControllerExperienceExample>> {
+        Ok(self.db.get_controller_experience_example(id)?)
+    }
+
+    pub fn list_controller_experience_examples(
+        &self,
+        query: &crate::controller_experience::ControllerExperienceExampleQuery,
+    ) -> Result<Vec<crate::controller_experience::ControllerExperienceExample>> {
+        Ok(self.db.list_controller_experience_examples(query)?)
+    }
+
+    pub fn retire_controller_experience_example(
+        &self,
+        id: i64,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample> {
+        Ok(self.db.retire_controller_experience_example(id)?)
+    }
+
     /// Select at most one explicit current-project Project/Episodic memory
     /// target through a bounded, read-only Controller judgment. This API does
     /// not invoke maintenance judgment, grant inspection, authorization, or

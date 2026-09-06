@@ -11,6 +11,7 @@ pub mod controller;
 pub mod controller_actions;
 pub mod controller_continuation;
 pub mod controller_evaluation;
+pub mod controller_experience;
 pub mod controller_intake;
 pub mod controller_memory;
 pub mod controller_memory_capture;

@@ -1701,6 +1701,78 @@ pub struct RunFinalizer<'a> {
     run_id: i64,
 }
 
+fn controller_experience_json_error(
+    column: usize,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn decode_controller_experience_example(
+    row: &Row<'_>,
+) -> rusqlite::Result<crate::controller_experience::ControllerExperienceExample> {
+    use crate::controller_experience::{
+        ControllerExperienceExample, ControllerExperienceExampleLifecycle,
+        ControllerExperienceOutcome, ControllerExperienceVerificationBasis,
+    };
+
+    fn parse_json<T: serde::de::DeserializeOwned>(
+        column: usize,
+        value: String,
+    ) -> rusqlite::Result<T> {
+        serde_json::from_str(&value)
+            .map_err(|error| controller_experience_json_error(column, error))
+    }
+    fn parse_enum<T: serde::de::DeserializeOwned>(
+        column: usize,
+        value: String,
+    ) -> rusqlite::Result<T> {
+        serde_json::from_value(serde_json::Value::String(value))
+            .map_err(|error| controller_experience_json_error(column, error))
+    }
+    let lifecycle = match row.get::<_, String>(11)?.as_str() {
+        "active" => ControllerExperienceExampleLifecycle::Active,
+        "retired" => ControllerExperienceExampleLifecycle::Retired,
+        value => {
+            return Err(controller_experience_json_error(
+                11,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid Controller experience lifecycle: {value}"),
+                ),
+            ));
+        }
+    };
+    let verification_basis: ControllerExperienceVerificationBasis = parse_enum(5, row.get(5)?)?;
+    let outcome: ControllerExperienceOutcome = parse_enum(8, row.get(8)?)?;
+    let record = ControllerExperienceExample {
+        id: row.get(0)?,
+        schema_version: row.get(1)?,
+        capability: row.get(2)?,
+        input: serde_json::from_str(&row.get::<_, String>(3)?)
+            .map_err(|error| controller_experience_json_error(3, error))?,
+        accepted_output: serde_json::from_str(&row.get::<_, String>(4)?)
+            .map_err(|error| controller_experience_json_error(4, error))?,
+        verification_basis,
+        provenance: parse_json(6, row.get(6)?)?,
+        correction: row
+            .get::<_, Option<String>>(7)?
+            .map(|value| parse_json(7, value))
+            .transpose()?,
+        outcome,
+        quality: parse_json(9, row.get(9)?)?,
+        created_at: row.get(10)?,
+        lifecycle,
+    };
+    record.validate().map_err(|error| {
+        controller_experience_json_error(
+            0,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+        )
+    })?;
+    Ok(record)
+}
+
 impl Drop for RunFinalizer<'_> {
     fn drop(&mut self) {
         let _ = self.db.abandon_agent_run(
@@ -2980,6 +3052,7 @@ impl Database {
         )?;
         Self::ensure_agent_columns(&registry)?;
         Self::ensure_global_memory_table(&registry)?;
+        Self::ensure_controller_experience_examples_table(&registry)?;
         Ok(registry)
     }
 
@@ -3929,6 +4002,28 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS global_memories_scope
                 ON global_memories(kind, lifecycle, id);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_controller_experience_examples_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS controller_experience_examples (
+                id INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                capability TEXT NOT NULL,
+                input_payload TEXT NOT NULL,
+                accepted_output_payload TEXT NOT NULL,
+                verification_basis TEXT NOT NULL,
+                provenance TEXT NOT NULL,
+                correction TEXT,
+                outcome TEXT NOT NULL,
+                quality TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'retired'))
+            );
+            CREATE INDEX IF NOT EXISTS controller_experience_examples_order
+                ON controller_experience_examples(lifecycle, capability, created_at, id);",
         )?;
         Ok(())
     }
@@ -7359,6 +7454,138 @@ impl Database {
             params![serde_json::to_string(permissions)?, id],
         )?;
         Ok(changed != 0)
+    }
+
+    /// Persist one explicitly verified, globally owned Controller experience
+    /// example. The registry is the sole authority; provenance never grants
+    /// project ownership or mutation authority.
+    pub fn create_controller_experience_example(
+        &self,
+        draft: &crate::controller_experience::ControllerExperienceExampleDraft,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample, DbError> {
+        draft
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let provenance = serde_json::to_string(&draft.provenance)?;
+        let correction = draft
+            .correction
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let quality = serde_json::to_string(&draft.quality)?;
+        self.registry.execute(
+            "INSERT INTO controller_experience_examples
+             (schema_version, capability, input_payload, accepted_output_payload,
+              verification_basis, provenance, correction, outcome, quality)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                draft.schema_version,
+                draft.capability,
+                serde_json::to_string(&draft.input)?,
+                serde_json::to_string(&draft.accepted_output)?,
+                serde_json::to_value(draft.verification_basis)?
+                    .as_str()
+                    .ok_or_else(|| DbError::Scheduler("invalid verification basis".into()))?,
+                provenance,
+                correction,
+                serde_json::to_value(draft.outcome)?
+                    .as_str()
+                    .ok_or_else(|| DbError::Scheduler("invalid outcome".into()))?,
+                quality,
+            ],
+        )?;
+        let id = self.registry.last_insert_rowid();
+        self.get_controller_experience_example(id)?.ok_or_else(|| {
+            DbError::Scheduler("new Controller experience example disappeared".into())
+        })
+    }
+
+    pub fn get_controller_experience_example(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::controller_experience::ControllerExperienceExample>, DbError> {
+        if id <= 0 {
+            return Err(DbError::Scheduler(
+                "Controller experience example id must be positive".into(),
+            ));
+        }
+        self.registry
+            .query_row(
+                "SELECT id, schema_version, capability, input_payload,
+                        accepted_output_payload, verification_basis, provenance,
+                        correction, outcome, quality, created_at, lifecycle
+                 FROM controller_experience_examples WHERE id = ?1",
+                [id],
+                decode_controller_experience_example,
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn list_controller_experience_examples(
+        &self,
+        query: &crate::controller_experience::ControllerExperienceExampleQuery,
+    ) -> Result<Vec<crate::controller_experience::ControllerExperienceExample>, DbError> {
+        query
+            .validate()
+            .map_err(|error| DbError::Scheduler(error.to_string()))?;
+        let lifecycle = match query.lifecycle {
+            crate::controller_experience::ControllerExperienceLifecycleFilter::Active => {
+                Some("active")
+            }
+            crate::controller_experience::ControllerExperienceLifecycleFilter::Retired => {
+                Some("retired")
+            }
+            crate::controller_experience::ControllerExperienceLifecycleFilter::All => None,
+        };
+        let mut statement = self.registry.prepare(
+            "SELECT id, schema_version, capability, input_payload,
+                    accepted_output_payload, verification_basis, provenance,
+                    correction, outcome, quality, created_at, lifecycle
+             FROM controller_experience_examples
+             WHERE (?1 IS NULL OR capability = ?1)
+               AND (?2 IS NULL OR lifecycle = ?2)
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        Ok(statement
+            .query_map(
+                params![
+                    query.capability,
+                    lifecycle,
+                    query.limit as i64,
+                    query.offset as i64
+                ],
+                decode_controller_experience_example,
+            )?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Retire an example from the active curated set without deleting its
+    /// provenance or historical inspectability.
+    pub fn retire_controller_experience_example(
+        &self,
+        id: i64,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample, DbError> {
+        if id <= 0 {
+            return Err(DbError::Scheduler(
+                "Controller experience example id must be positive".into(),
+            ));
+        }
+        if self.registry.execute(
+            "UPDATE controller_experience_examples
+             SET lifecycle = 'retired'
+             WHERE id = ?1 AND lifecycle = 'active'",
+            [id],
+        )? != 1
+        {
+            return Err(DbError::Scheduler(
+                "Controller experience example is missing or already retired".into(),
+            ));
+        }
+        self.get_controller_experience_example(id)?.ok_or_else(|| {
+            DbError::Scheduler("retired Controller experience example disappeared".into())
+        })
     }
 
     pub fn get_global_agent(&self, id: &str) -> Result<Option<crate::registry::Agent>, DbError> {

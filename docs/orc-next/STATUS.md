@@ -2,11 +2,11 @@
 
 **Architecture:** Orc Next / local Controller + deterministic kernel
 
-**Current milestone:** M07 — Supervised autonomy
+**Current milestone:** M08 — Experience dataset
 
-**Current task:** M07-011 — Compose one selected Controller memory maintenance step
+**Current task:** M08-001 — Establish typed verified Controller experience examples
 
-**Last completed:** M07-010 — Add bounded Controller memory maintenance target selection
+**Last completed:** M07-011 — Compose one selected Controller memory maintenance step
 
 **Blocked by:** Nothing
 
@@ -15,22 +15,17 @@
 - Local Controller remains Qwen3 8B through llama.cpp/GGUF behind model-independent `LocalInferenceRuntime`.
 - Controller owns judgment; deterministic kernel/application code owns canonical facts, legality, authorization, persistence, workflow transitions, validation, and mutation.
 - M06 is complete: typed durable memory, bounded deterministic retrieval, capability-local memory context, supervised mutation, explicit-candidate capture judgment, and explicit-target maintenance judgment.
-- M07-001..005 provide finite grant-aware routine task continuation through the existing workflow engine; Acceptance/user/external gates remain authoritative.
-- M07-006/M07-007 provide separate finite Project/Episodic capture Create permission and one-step explicit capture composition. Automatic capture candidate derivation remains unresolved because the capture request contains a full `MemoryDraft`; deterministic code must not invent what should be remembered.
-- M07-008/M07-009 provide separate finite Project/Episodic Correct/Supersede/Remove maintenance permission and one-step explicit maintenance composition.
-- M07-010 is complete. `OrcApp::select_controller_memory_target(...)` performs bounded read-only selection from canonical active exact-current-project Project/Episodic candidates and returns only `NoTarget` or one exact supplied candidate.
-- M07-010 filtering, ordering, bounds, omission metadata, and output validation are deterministic. User/Experience/global/historical/cross-project records remain excluded. Real-Qwen evaluation passed strict 7/7 and semantic 7/7.
-- The next smallest M07 seam is composition rather than event automation: one M07-010 selection followed by at most one existing M07-009 maintenance call.
-- M07-011 must reuse the exact same caller-supplied `current_facts` for both selection and M06-011 maintenance judgment. Application code must not derive or reinterpret maintenance evidence.
-- A selected target must be freshly re-resolved by existing M06-011/M07-009 logic; the M07-010 candidate record must not be cached as mutation authority.
-- M07-011 may perform at most two Controller inference calls total, one proposal, one authorization mint, and one execution attempt, with no retry, alternate target, omitted-candidate fallback, or batch loop.
-- `NoTarget`, selection failures, Keep, and all pre-mint maintenance failures consume zero maintenance budget; successful authorization consumes one; post-mint failure is not refunded.
-- Automatic current-fact derivation, workflow/task/Plan/review/validation/recovery hooks, background maintenance, batch maintenance, User/Experience/global mutation, semantic/vector retrieval, and embeddings remain out of scope.
-- Continuation, capture, and maintenance grants remain distinct in-process capability budgets. No provider token hard cap.
-- Rust/native runtime; no Python.
+- M07 is complete: finite grant-aware routine task continuation, supervised Project/Episodic capture Create, explicit-target maintenance, bounded Controller maintenance-target selection, and one selected-target maintenance composition.
+- M07-011 preserves the exact caller-supplied current facts across selection and maintenance, carries only canonical `MemoryId` across that boundary, freshly re-resolves target state through M06-011/M07-009, and adds no retry/fallback/second loop.
+- Automatic workflow-derived memory facts/candidates remain intentionally excluded. Deterministic application code must not invent what should be remembered or what evidence warrants maintenance merely to enable automation.
+- M08 now begins the curated Controller experience dataset required by D-006.
+- Runtime `MemoryKind::Experience` remains distinct from training/evaluation dataset examples. Runtime memory is for Controller context; the M08 dataset is curated reasoning evidence.
+- M08-001 establishes the first typed/versioned persistent verified-example record in the existing global registry database with explicit trusted creation only.
+- M08-001 must not automatically classify executed/accepted/reviewed/validated Controller behavior as verified training data. Verification evidence remains explicit until later curation tasks define narrower capture seams.
+- No model training, export, embeddings, Python runtime dependency, or provider token hard cap is introduced by M08-001.
 
 ## Immediate next action
 
-Implement `tasks/M07-011.md`: compose one bounded target-selection judgment with at most one existing explicit-target maintenance operation using the same current facts and existing maintenance grant.
+Implement `tasks/M08-001.md`: establish the canonical typed persistent verified Controller experience-example record and explicit trusted create/get/list/retire APIs, distinct from runtime Experience memory and without automatic harvesting.
 
 See `M00-REPOSITORY-MAP.md` for repository-grounded fact-versus-judgment classification and migration map.

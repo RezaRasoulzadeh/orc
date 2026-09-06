@@ -719,47 +719,72 @@ pub struct ControllerRecommendation {
 }
 
 impl ControllerRecommendation {
+    /// Validate an already-produced recommendation against the same canonical
+    /// structured-output contract used by normal Controller inference.
+    pub fn validate(&self) -> Result<(), ControllerError> {
+        let (suggested_next_step, rationale) =
+            validate_recommendation_response(&self.response_text, self.structured_output.as_ref())?;
+        if self.suggested_next_step != suggested_next_step
+            || self.rationale != bounded_text(&rationale)
+        {
+            return Err(ControllerError::InvalidRecommendation(
+                "typed recommendation fields do not match structured output".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn from_response(
         task_id: &str,
         response: LocalInferenceResponse,
     ) -> Result<Self, ControllerError> {
-        if response.text.len() > MAX_RECOMMENDATION_TEXT_BYTES {
-            return Err(ControllerError::InvalidRecommendation(format!(
-                "response text exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
-            )));
-        }
-        let value = response.structured_output.as_ref().ok_or_else(|| {
-            ControllerError::InvalidRecommendation(
-                "structured response is missing its JSON object".into(),
-            )
-        })?;
-        let size = serde_json::to_vec(value)
-            .map_err(|error| ControllerError::InvalidRecommendation(error.to_string()))?
-            .len();
-        if size > MAX_RECOMMENDATION_STRUCTURED_BYTES {
-            return Err(ControllerError::InvalidRecommendation(format!(
-                "structured output exceeds the {MAX_RECOMMENDATION_STRUCTURED_BYTES}-byte limit"
-            )));
-        }
-        let (suggested_next_step, rationale) = validate_recommendation_value(value)?;
-        if rationale.len() > MAX_RECOMMENDATION_TEXT_BYTES {
-            return Err(ControllerError::InvalidRecommendation(format!(
-                "rationale exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
-            )));
-        }
-        if response.text.trim().is_empty() && rationale.trim().is_empty() {
-            return Err(ControllerError::InvalidRecommendation(
-                "response text and rationale must not both be empty".into(),
-            ));
-        }
+        let structured_output = response.structured_output;
+        let (suggested_next_step, rationale) =
+            validate_recommendation_response(&response.text, structured_output.as_ref())?;
         Ok(Self {
             task_id: bounded_text(task_id),
             response_text: response.text,
             suggested_next_step,
             rationale: bounded_text(&rationale),
-            structured_output: response.structured_output,
+            structured_output,
         })
     }
+}
+
+fn validate_recommendation_response(
+    response_text: &str,
+    structured_output: Option<&Value>,
+) -> Result<(Option<OperationalNextStep>, String), ControllerError> {
+    if response_text.len() > MAX_RECOMMENDATION_TEXT_BYTES {
+        return Err(ControllerError::InvalidRecommendation(format!(
+            "response text exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
+        )));
+    }
+    let value = structured_output.ok_or_else(|| {
+        ControllerError::InvalidRecommendation(
+            "structured response is missing its JSON object".into(),
+        )
+    })?;
+    let size = serde_json::to_vec(value)
+        .map_err(|error| ControllerError::InvalidRecommendation(error.to_string()))?
+        .len();
+    if size > MAX_RECOMMENDATION_STRUCTURED_BYTES {
+        return Err(ControllerError::InvalidRecommendation(format!(
+            "structured output exceeds the {MAX_RECOMMENDATION_STRUCTURED_BYTES}-byte limit"
+        )));
+    }
+    let (suggested_next_step, rationale) = validate_recommendation_value(value)?;
+    if rationale.len() > MAX_RECOMMENDATION_TEXT_BYTES {
+        return Err(ControllerError::InvalidRecommendation(format!(
+            "rationale exceeds the {MAX_RECOMMENDATION_TEXT_BYTES}-byte limit"
+        )));
+    }
+    if response_text.trim().is_empty() && rationale.trim().is_empty() {
+        return Err(ControllerError::InvalidRecommendation(
+            "response text and rationale must not both be empty".into(),
+        ));
+    }
+    Ok((suggested_next_step, rationale))
 }
 
 fn validate_recommendation_value(

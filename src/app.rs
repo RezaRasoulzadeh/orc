@@ -105,6 +105,19 @@ impl OrcApp {
         Ok(self.db.retire_controller_experience_example(id)?)
     }
 
+    /// Persist one explicitly curated normal Controller recommendation through
+    /// the canonical M08-001 dataset API. This performs no inference or
+    /// automatic harvesting.
+    pub fn create_controller_recommendation_experience_example(
+        &self,
+        request: &crate::controller_experience_recommendation::ControllerExperienceRecommendationRequest,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample> {
+        let draft = request
+            .into_example_draft()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.create_controller_experience_example(&draft)
+    }
+
     /// Select at most one explicit current-project Project/Episodic memory
     /// target through a bounded, read-only Controller judgment. This API does
     /// not invoke maintenance judgment, grant inspection, authorization, or

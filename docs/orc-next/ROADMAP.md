@@ -54,13 +54,13 @@ M08-004 is complete. It established capability-local curation for Controller pla
 
 M08-005 is complete. It established capability-local curation for Controller workflow intake with fixed capability `controller.workflow_intake`, exact validated `ControllerIntakeInput`, and exact complete accepted `ControllerIntakeResult`, preserving DirectTasks proposals and decision semantics without deriving labels from routing/application/outcomes.
 
-M08-006 now extends the same narrow pattern to Controller Plan review. Plan review already has canonical bounded `ControllerPlanReviewInput` and `ControllerPlanReviewResult` contracts with reusable production validation. The input includes the current persisted Plan identity/version/status/origin/content, current state, operator resolution, and bounded memory; the result contains only the advisory semantic decision, details, and optional revision feedback.
+M08-006 is complete. It established capability-local curation for Controller Plan review with fixed capability `controller.plan_review`, exact validated `ControllerPlanReviewInput`, and exact complete accepted `ControllerPlanReviewResult`. Persisted PlanReview rows, Plan status transitions, later revisions/approvals, task application, workflow advancement, and downstream outcomes remain outside dataset verification.
 
-M08-006 must preserve the complete exact typed Plan-review interaction. Persisted PlanReview rows, Plan status transitions, subsequent Plan revision or approval, task application, workflow advancement, operator acceptance, and eventual task/workflow success do not automatically verify or correct dataset examples.
+M08-007 now targets Controller Plan revision generation. The production inference boundary consumes `ControllerPlanRevisionInput` and returns a canonical generated `PlanResponse`; only after inference does trusted application code construct `ControllerPlanRevisionResult` by attaching parent Plan ID/version and review ID.
 
-Plan revision remains a later M08 seam. Its current `ControllerPlanRevisionResult` mixes model-generated revised Plan content with trusted parent Plan/review lineage attached after inference, so its dataset target must be chosen deliberately rather than by blindly copying the Plan-review adapter.
+Therefore M08-007 must use the exact generated/accepted `PlanResponse` as the dataset output authority and must exclude trusted lineage from the reasoning target. The exact typed revision input, including current Plan, persisted revision feedback, planning context, and bounded memory, remains the dataset input authority.
 
-M08-006 adds no automatic Plan-review hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
+M08-007 must not infer labels from revised-Plan persistence, lineage consistency, subsequent Plan review, task application, workflow advancement, validation/review, operator acceptance, or eventual task/workflow outcomes. It adds no automatic revision hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
 
 Later M08 tasks should continue capability-local curation only where existing typed contracts make the projection unambiguous, then add deterministic dataset inspection/export/evaluation preparation as repository evidence warrants.
 

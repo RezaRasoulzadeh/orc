@@ -61,7 +61,8 @@ Only current/near-term milestones are decomposed here.
 | [M08-010](M08-010.md) | Done | M08 | Add explicit typed curation for Controller memory maintenance target selection |
 | [M08-011](M08-011.md) | Done | M08 | Add deterministic Controller experience dataset inventory |
 | [M09-001](M09-001.md) | Done | M09 | Add deterministic trainer-neutral Controller dataset snapshot |
-| [M09-002](M09-002.md) | Planned | M09 | Establish full-surface Controller specialization evaluation suite |
+| [M09-002](M09-002.md) | Done | M09 | Establish full-surface Controller specialization evaluation suite |
+| [M09-003](M09-003.md) | Planned | M09 | Capture reproducible full-surface Controller baseline |
 
 ## Task format
 

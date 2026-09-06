@@ -52,7 +52,8 @@ Only current/near-term milestones are decomposed here.
 | [M08-001](M08-001.md) | Done | M08 | Establish typed verified Controller experience examples |
 | [M08-002](M08-002.md) | Done | M08 | Add explicit typed curation for normal Controller recommendations |
 | [M08-003](M08-003.md) | Done | M08 | Add explicit typed curation for Controller recovery recommendations |
-| [M08-004](M08-004.md) | Planned | M08 | Add explicit typed curation for Controller planning results |
+| [M08-004](M08-004.md) | Done | M08 | Add explicit typed curation for Controller planning results |
+| [M08-005](M08-005.md) | Planned | M08 | Add explicit typed curation for Controller workflow intake |
 
 ## Task format
 

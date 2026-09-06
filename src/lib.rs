@@ -15,6 +15,7 @@ pub mod controller_experience;
 pub mod controller_experience_intake;
 pub mod controller_experience_memory_capture;
 pub mod controller_experience_memory_maintenance;
+pub mod controller_experience_memory_selection;
 pub mod controller_experience_plan_review;
 pub mod controller_experience_plan_revision;
 pub mod controller_experience_planning;

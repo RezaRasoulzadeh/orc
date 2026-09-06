@@ -51,7 +51,8 @@ Only current/near-term milestones are decomposed here.
 | [M07-011](M07-011.md) | Done | M07 | Compose one selected Controller memory maintenance step |
 | [M08-001](M08-001.md) | Done | M08 | Establish typed verified Controller experience examples |
 | [M08-002](M08-002.md) | Done | M08 | Add explicit typed curation for normal Controller recommendations |
-| [M08-003](M08-003.md) | Planned | M08 | Add explicit typed curation for Controller recovery recommendations |
+| [M08-003](M08-003.md) | Done | M08 | Add explicit typed curation for Controller recovery recommendations |
+| [M08-004](M08-004.md) | Planned | M08 | Add explicit typed curation for Controller planning results |
 
 ## Task format
 

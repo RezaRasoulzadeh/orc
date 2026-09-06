@@ -34,31 +34,31 @@ Typed User/Project/Episodic/Experience persistence, deterministic bounded `Contr
 
 Finite routine grants and supervised continuation are complete. Memory capture/maintenance grants, one-step composition, bounded maintenance-target selection, and selected-target maintenance composition are complete without bypassing deterministic mutation/authorization boundaries.
 
-## M08 — Experience dataset — CURRENT
+## M08 — Experience dataset — COMPLETE
 
-Turn verified Controller decisions, corrections, and outcomes into a curated evaluation/training dataset as required by D-006. Curated examples remain distinct from runtime `MemoryKind::Experience`.
+M08 established the curated Controller experience dataset required by D-006 while keeping it distinct from runtime `MemoryKind::Experience`.
 
 M08-001 established the canonical typed/versioned experience-example format, explicit trusted verification metadata, bounded validation, deterministic query, and lifecycle.
 
-M08-002 through M08-007 established capability-local curation for normal recommendations, recovery, planning, workflow intake, Plan review, and Plan revision generation.
+M08-002 through M08-010 added explicit capability-local curation for every current inference-backed Controller judgment boundary: normal recommendations, recovery, planning, workflow intake, Plan review, Plan revision, memory capture, memory maintenance, and memory-maintenance target selection.
 
-M08-008 completed exact Controller memory-capture curation under fixed capability `controller.memory_capture`.
+M08-010 completed exact memory-selection curation at `87db2f24151d3522394f7ed9a2a7042aedf66b50`, preserving exact supplied candidate projections and production candidate-membership validation.
 
-M08-009 completed exact Controller memory-maintenance curation at `6af29dc8fdd3a444ce5903ce308289cdd882b370` under fixed capability `controller.memory_maintenance`, preserving target-bound production validation.
+M08-011 completed deterministic read-only complete-dataset inventory at `6791f81e38cf9af6ac04d16d9a6d5998e3369337`. Inventory reads only canonical global-registry metadata, reports exact global/per-capability lifecycle, outcome, and verification counts, preserves exact capability strings, validates aggregate invariants, and fails closed on malformed persisted metadata.
 
-M08-010 completed exact Controller memory-maintenance target-selection curation at `87db2f24151d3522394f7ed9a2a7042aedf66b50` under fixed capability `controller.memory_selection`, preserving exact supplied candidate projections and production candidate-membership validation.
+M08 introduces no automatic harvesting, runtime-memory coupling, embeddings, provider fallback, provider token hard cap, trainer-specific export, or continuous weight mutation.
 
-With M08-010 complete, every current inference-backed Controller judgment module has an explicit capability-local M08 curation adapter. The next M08 work should therefore move from capture coverage to deterministic dataset inspection and evaluation preparation rather than inventing another reasoning seam.
-
-M08-011 now targets a deterministic read-only inventory of the canonical global-registry experience dataset. It should report exact complete-dataset totals plus lexicographically sorted per-capability lifecycle, outcome, and verification-basis counts, validate aggregate invariants, and fail closed on malformed persisted metadata.
-
-M08-011 must not reinterpret input/output payload semantics, infer training readiness, rank or balance examples, mutate lifecycle, export trainer formats, run Controller inference, read runtime Experience memory, or introduce Python.
-
-Later M08 work may add deterministic export/evaluation preparation only after inspection establishes the concrete dataset shape. Train/validation/test splitting, balancing, sampling, deduplication, weighting, trainer-specific transforms, and specialization policy remain separate decisions and should not be bundled into the inventory task.
-
-## M09 — Controller specialization
+## M09 — Controller specialization — CURRENT
 
 Fine-tune/evaluate the local Controller model. A new model becomes default only when evaluation demonstrates improvement without unacceptable regressions.
+
+M09 begins with specialization preparation rather than immediately choosing a trainer or mutating model weights.
+
+M09-001 targets one deterministic trainer-neutral snapshot of the complete Active canonical M08 dataset. The snapshot preserves exact canonical example fields in stable code-owned order and provides a reproducible handoff to later training/evaluation work.
+
+M09-001 must not introduce trainer-specific prompt/chat transforms, train/validation/test splitting, balancing, sampling, deduplication, ranking, weighting, quality/readiness policy, model promotion, inference changes, Python runtime dependencies, embeddings, provider fallback, or provider token hard caps.
+
+Later M09 work should use the trainer-neutral snapshot plus existing Controller evaluation surfaces to investigate a native/offline specialization path, establish an explicit baseline and promotion gate, perform controlled training/evaluation, and only then consider changing the default Controller model.
 
 ## M10 — Interface integration
 

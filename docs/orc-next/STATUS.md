@@ -4,9 +4,9 @@
 
 **Current milestone:** M08 — Experience dataset
 
-**Current task:** M08-004 — Add explicit typed curation for Controller planning results
+**Current task:** M08-005 — Add explicit typed curation for Controller workflow intake
 
-**Last completed:** M08-003 — Add explicit typed curation for Controller recovery recommendations
+**Last completed:** M08-004 — Add explicit typed curation for Controller planning results
 
 **Blocked by:** Nothing
 
@@ -19,14 +19,14 @@
 - M08-001 established the canonical typed/versioned global-registry experience-example substrate with explicit trusted creation, bounded validation, provenance, correction/outcome/quality metadata, deterministic query, and active/retired lifecycle.
 - M08-002 is complete at implementation `adfac96dd5c8f77ef7d627858beb8a9aa58ded3b`, providing explicit typed curation for normal task recommendation with fixed capability `controller.task_recommendation`.
 - M08-003 is complete at implementation `947d2d8e9cf201e82daaa62474be74d26df7ef4f`, providing explicit typed curation for recovery recommendation with fixed capability `controller.recovery_recommendation`.
-- M08-003 preserves exact validated `RecoveryInferenceInput` and `RecoveryRecommendation`, keeps `RecoveryRecommendationValidation` as runtime legality evidence rather than dataset target, and uses M08-001 as the only persistence path.
+- M08-004 is complete at implementation `12dd31c0086ff2356ac3e5c75508ed6a4bab7438`, providing explicit typed curation for planning with fixed capability `controller.plan_generation` and exact complete `ControllerPlanningInput` / `ControllerPlanResult` projection.
 - Verification, accepted output, quality, correction, and provenance remain explicit trusted inputs. Execution/workflow/review/validation success does not automatically label dataset examples.
-- The next smallest proven seam is Controller planning. `ControllerPlanningInput` and `ControllerPlanResult` already form a bounded typed input/output contract with reusable validation, so M08-004 can remain capability-local without a generic experience framework.
-- M08-004 must preserve the exact planning input and complete accepted `ControllerPlanResult`, including its `PlanResponse`, rationale, and optional uncertainty. Plan persistence/review/workflow outcomes are not dataset targets and must not automatically label examples.
-- No automatic harvesting, workflow/planner hook, runtime-memory change, export, splitting/balancing, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap is introduced.
+- The next smallest repository-grounded seam is Controller workflow intake. `ControllerIntakeInput` and `ControllerIntakeResult` already form a bounded typed input/output contract with reusable production validation, including canonical DirectTasks validation.
+- M08-005 must preserve the exact intake input and complete accepted intake result. Workflow routing, task application, Plan creation, later operator resolution, and eventual task success must not automatically verify or correct examples.
+- No automatic harvesting, intake/workflow hook, runtime-memory change, export, splitting/balancing, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap is introduced.
 
 ## Immediate next action
 
-Implement `tasks/M08-004.md`: explicit typed curation of one already-produced Controller planning interaction into the canonical M08-001 dataset format.
+Implement `tasks/M08-005.md`: explicit typed curation of one already-produced Controller workflow-intake interaction into the canonical M08-001 dataset format.
 
 See `M00-REPOSITORY-MAP.md` for repository-grounded fact-versus-judgment classification and migration map.

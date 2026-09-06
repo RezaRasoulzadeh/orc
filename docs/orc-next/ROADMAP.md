@@ -58,13 +58,19 @@ M08-006 is complete. It established capability-local curation for Controller Pla
 
 M08-007 is complete. It established capability-local curation for Controller Plan revision generation with fixed capability `controller.plan_revision`, exact validated `ControllerPlanRevisionInput`, and exact generated/accepted canonical `PlanResponse` as the reasoning output authority. Trusted parent Plan/version/review lineage attached after inference is deliberately excluded from the reasoning target.
 
-M08-008 now targets Controller memory capture judgment. The production reasoning boundary consumes exact `ControllerMemoryCaptureInput`, containing one explicit candidate and bounded memory context, and returns canonical `ControllerMemoryCaptureResult`: either `Ignore` or one `ProposeMutation` result. Production result validation already requires a proposed mutation to be exactly one create intent preserving the explicit candidate draft.
+M08-008 is complete. It established capability-local curation for Controller memory capture judgment with fixed capability `controller.memory_capture`, exact validated `ControllerMemoryCaptureInput`, and exact production-validated `ControllerMemoryCaptureResult`. Candidate-backed production validation remains authoritative; mutation proposal/grant/execution and later durable memory state stay outside dataset labels.
 
-M08-008 must curate that typed judgment only. Mutation-proposal validation, capture grants, composed capture-step execution, durable memory creation, later retrieval/maintenance, and workflow outcomes remain downstream facts and must not automatically verify or correct dataset examples.
+M08-009 now targets Controller memory maintenance judgment. The production reasoning boundary consumes exact `ControllerMemoryMaintenanceInput`, containing one explicitly requested and already-resolved canonical target, bounded current facts, and bounded memory context. `ControllerMemoryMaintenanceResult` is exactly `Keep` or one target-bound `ProposeMutation` result.
 
-Memory maintenance judgment and maintenance-target selection remain later capability-local seams. Later M08 work should then add deterministic dataset inspection/export/evaluation preparation only as repository evidence warrants.
+Production maintenance validation already rejects `Create`, requires any `Correct`, `Supersede`, or `Remove` intent to target the exact supplied memory identity, and requires Correct/Supersede replacements to preserve target kind, scope, and subject. M08-009 must curate this exact judgment only.
 
-M08-008 adds no automatic capture hook, generic curation framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
+Mutation-proposal validation, maintenance grants, composed maintenance execution, later durable memory lifecycle/state, and maintenance-target selection remain downstream or separate reasoning boundaries and must not automatically verify or correct M08-009 examples.
+
+Maintenance-target selection remains the next likely capability-local seam because it separately exposes bounded `ControllerMemorySelectionInput` / `ControllerMemorySelectionResult` contracts over deterministic current-project candidate construction. It should not be merged into M08-009.
+
+M08-009 adds no automatic maintenance hook, generic curation framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, provider fallback, or provider token hard cap.
+
+Later M08 work should finish remaining unambiguous capability-local judgment seams, then add deterministic dataset inspection/export/evaluation preparation only as repository evidence warrants.
 
 ## M09 — Controller specialization
 

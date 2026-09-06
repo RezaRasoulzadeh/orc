@@ -13,6 +13,7 @@ pub mod controller_continuation;
 pub mod controller_evaluation;
 pub mod controller_experience;
 pub mod controller_experience_intake;
+pub mod controller_experience_memory_capture;
 pub mod controller_experience_plan_review;
 pub mod controller_experience_plan_revision;
 pub mod controller_experience_planning;

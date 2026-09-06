@@ -46,11 +46,13 @@ M08 keeps dataset examples distinct from runtime `MemoryKind::Experience`. Runti
 
 M08-001 is complete. It established canonical typed/versioned `ControllerExperienceExampleDraft` and `ControllerExperienceExample` records in the existing global registry, with bounded canonical input/accepted-output payloads, verification basis, correction/outcome/quality metadata, provenance, deterministic bounded query, and active/retired lifecycle. Creation remains explicit trusted application work only; no automatic harvesting or verification policy exists.
 
-M08-002 now adds the first capability-local curation adapter for a real Controller reasoning surface: normal task recommendation. It must project the existing validated `ControllerRecommendationInput` and existing canonical structured recommendation result into M08-001 without parallel schemas or caller-controlled capability labels. Accepted/corrected output, verification, quality, and provenance remain explicit trusted inputs.
+M08-002 is complete. It established the first capability-local typed curation adapter for normal task recommendation with fixed capability `controller.task_recommendation`. The adapter preserves exact validated `ControllerRecommendationInput`, persists only canonical structured recommendation output, enforces explicit observed-versus-accepted correction semantics, and delegates persistence exclusively to M08-001. It adds no inference, workflow hook, automatic harvesting, or automatic verification policy.
 
-M08-002 does not infer labels from workflow execution, validation, review, acceptance, or task success. It adds no inference, runtime hook, automatic harvesting, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, or model-specific behavior.
+M08-003 extends the same narrow pattern to Controller recovery. Recovery already has canonical bounded `RecoveryInferenceInput` and canonical `RecoveryRecommendation` output. The adapter must preserve those exact typed values, keep the capability code-owned, require explicit verification/correction/quality/provenance, and use M08-001 as the only persistence format. `RecoveryRecommendationValidation` remains deterministic runtime legality/actionability evidence and must not be substituted for the accepted reasoning target.
 
-Later M08 tasks should expand curation across additional Controller capabilities only after this typed projection seam is proven, then add deterministic dataset inspection/export/evaluation preparation as repository evidence warrants.
+M08-003 does not infer labels from recovery authorization/execution, workflow advancement, validation/review, or operator continuation. It adds no automatic recovery hook, generic capture framework, dataset export, balancing/splitting, embeddings, fine-tuning, Python runtime dependency, model-specific behavior, or provider token hard cap.
+
+Later M08 tasks should continue capability-local curation only where existing typed contracts make the projection unambiguous, then add deterministic dataset inspection/export/evaluation preparation as repository evidence warrants.
 
 ## M09 — Controller specialization
 

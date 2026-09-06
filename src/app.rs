@@ -101,6 +101,67 @@ impl OrcApp {
         builder.select(&input, runtime)
     }
 
+    /// Select at most one current-project memory target and pass only its
+    /// canonical identity, together with the caller's unchanged facts, into
+    /// exactly one existing supervised maintenance step.
+    pub fn maintain_selected_controller_memory_once(
+        &self,
+        request: &crate::controller_memory_selection::ControllerMemorySelectionRequest,
+        grant: &crate::controller_memory_maintenance_grant::ControllerMemoryMaintenanceGrant,
+        runtime: &mut dyn crate::local_runtime::LocalInferenceRuntime,
+    ) -> crate::controller_memory_selection_maintenance::ControllerMemorySelectionMaintenanceStepResult
+    {
+        use crate::controller_memory_selection::ControllerMemorySelectionResult;
+        use crate::controller_memory_selection_maintenance::{
+            ControllerMemorySelectionMaintenanceKept,
+            ControllerMemorySelectionMaintenanceMutationSuccess,
+            ControllerMemorySelectionMaintenanceRejection,
+            ControllerMemorySelectionMaintenanceStepError,
+            ControllerMemorySelectionMaintenanceStepResult,
+        };
+
+        let selection = match self.select_controller_memory_target(request, runtime) {
+            Ok(result) => result,
+            Err(error) => {
+                return ControllerMemorySelectionMaintenanceStepResult::Rejected {
+                    error: ControllerMemorySelectionMaintenanceStepError::Selection(error),
+                };
+            }
+        };
+        let target = match selection {
+            ControllerMemorySelectionResult::NoTarget => {
+                return ControllerMemorySelectionMaintenanceStepResult::NoTarget;
+            }
+            ControllerMemorySelectionResult::SelectTarget { target } => target,
+        };
+        let maintenance_request =
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceRequest::new(
+                target.clone(),
+                request.current_facts.clone(),
+            );
+        match self.maintain_controller_memory_once(&maintenance_request, grant, runtime) {
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceStepResult::Kept => {
+                ControllerMemorySelectionMaintenanceStepResult::Kept {
+                    result: ControllerMemorySelectionMaintenanceKept::from_selected(target),
+                }
+            }
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceStepResult::Mutated {
+                result,
+            } => ControllerMemorySelectionMaintenanceStepResult::Mutated {
+                result: ControllerMemorySelectionMaintenanceMutationSuccess::from_selected(
+                    target, result,
+                ),
+            },
+            crate::controller_memory_maintenance::ControllerMemoryMaintenanceStepResult::Rejected {
+                error,
+            } => ControllerMemorySelectionMaintenanceStepResult::Rejected {
+                error: ControllerMemorySelectionMaintenanceStepError::Maintenance(
+                    ControllerMemorySelectionMaintenanceRejection::from_selected(target, error),
+                ),
+            },
+        }
+    }
+
     /// Judge one explicitly supplied memory candidate through the bounded,
     /// read-only Controller capture seam. A proposed intent remains separate
     /// from the M06-009 proposal, authorization, and execution boundaries.

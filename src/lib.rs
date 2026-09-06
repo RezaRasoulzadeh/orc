@@ -19,6 +19,7 @@ pub mod controller_memory_maintenance;
 pub mod controller_memory_maintenance_grant;
 pub mod controller_memory_mutation;
 pub mod controller_memory_selection;
+pub mod controller_memory_selection_maintenance;
 pub mod controller_plan_persistence;
 pub mod controller_plan_review;
 pub mod controller_plan_review_persistence;

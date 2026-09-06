@@ -54,7 +54,8 @@ Only current/near-term milestones are decomposed here.
 | [M08-003](M08-003.md) | Done | M08 | Add explicit typed curation for Controller recovery recommendations |
 | [M08-004](M08-004.md) | Done | M08 | Add explicit typed curation for Controller planning results |
 | [M08-005](M08-005.md) | Done | M08 | Add explicit typed curation for Controller workflow intake |
-| [M08-006](M08-006.md) | Planned | M08 | Add explicit typed curation for Controller Plan review |
+| [M08-006](M08-006.md) | Done | M08 | Add explicit typed curation for Controller Plan review |
+| [M08-007](M08-007.md) | Planned | M08 | Add explicit typed curation for Controller Plan revision generation |
 
 ## Task format
 

@@ -54,11 +54,15 @@ Fine-tune/evaluate the local Controller model. A new model becomes default only 
 
 M09 begins with specialization preparation rather than immediately choosing a trainer or mutating model weights.
 
-M09-001 targets one deterministic trainer-neutral snapshot of the complete Active canonical M08 dataset. The snapshot preserves exact canonical example fields in stable code-owned order and provides a reproducible handoff to later training/evaluation work.
+M09-001 completed the deterministic trainer-neutral specialization handoff at `481fe624777a03dc841ae1742dd5f9461e854fc7`. The snapshot reads and validates the complete canonical global-registry experience set in ascending example identity order, returns only Active examples, preserves the full canonical M08 record without capability-specific transformation, serializes deterministically, and performs zero writes or inference.
 
-M09-001 must not introduce trainer-specific prompt/chat transforms, train/validation/test splitting, balancing, sampling, deduplication, ranking, weighting, quality/readiness policy, model promotion, inference changes, Python runtime dependencies, embeddings, provider fallback, or provider token hard caps.
+The next prerequisite is evaluation coverage that matches the actual Controller capability surface. The original M02 evaluation corpus established typed semantic evaluation for normal recommendations, but later milestones added recovery, planning, workflow intake, Plan review/revision, memory capture, memory maintenance, and maintenance-target selection.
 
-Later M09 work should use the trainer-neutral snapshot plus existing Controller evaluation surfaces to investigate a native/offline specialization path, establish an explicit baseline and promotion gate, perform controlled training/evaluation, and only then consider changing the default Controller model.
+M09-002 therefore establishes a deterministic model-independent specialization evaluation suite over all nine current inference-backed Controller capabilities. Expected results remain explicit fixture authority, evaluation compares typed semantics rather than prose, fake-runtime execution is deterministic and read-only, and global/per-capability result accounting must be exact.
+
+M09-002 must not modify production prompts/parsers/runtime settings, infer expected answers from the training snapshot, choose a trainer, split/balance/sample the dataset, define promotion thresholds, or mutate model weights.
+
+Later M09 work should use the trainer-neutral snapshot plus the full-surface evaluation suite to investigate a native/offline specialization path, define an explicit candidate-vs-baseline promotion gate, perform controlled training/evaluation, and only then consider changing the default Controller model.
 
 ## M10 — Interface integration
 

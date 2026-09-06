@@ -42,15 +42,19 @@ M08-001 established the canonical typed/versioned experience-example format, exp
 
 M08-002 through M08-007 established capability-local curation for normal recommendations, recovery, planning, workflow intake, Plan review, and Plan revision generation.
 
-M08-008 is complete. It curates exact `ControllerMemoryCaptureInput` / `ControllerMemoryCaptureResult` under fixed capability `controller.memory_capture`, with production candidate-backed validation authoritative and later mutation/grant/execution outside dataset labels.
+M08-008 completed exact Controller memory-capture curation under fixed capability `controller.memory_capture`.
 
-M08-009 is complete at `6af29dc8fdd3a444ce5903ce308289cdd882b370`. It curates exact `ControllerMemoryMaintenanceInput` / `ControllerMemoryMaintenanceResult` under fixed capability `controller.memory_maintenance`, preserving exact target-bound Correct/Supersede/Remove validation and excluding target selection, grants, execution, and later memory state from the reasoning target.
+M08-009 completed exact Controller memory-maintenance curation at `6af29dc8fdd3a444ce5903ce308289cdd882b370` under fixed capability `controller.memory_maintenance`, preserving target-bound production validation.
 
-M08-010 now targets Controller memory-maintenance target selection. The production reasoning boundary consumes exact `ControllerMemorySelectionInput`, containing current project ID, explicit current facts, a bounded deterministic candidate projection, candidate ordering, and eligible/selected/omitted counts. The output is exactly `NoTarget` or `SelectTarget { target }`, and production validation requires any selected identity to be one exact supplied candidate.
+M08-010 completed exact Controller memory-maintenance target-selection curation at `87db2f24151d3522394f7ed9a2a7042aedf66b50` under fixed capability `controller.memory_selection`, preserving exact supplied candidate projections and production candidate-membership validation.
 
-M08-010 must curate the exact already-supplied typed inference packet and result. It must not re-enumerate memory, rebuild candidate order, infer omitted candidates, refresh storage, call maintenance judgment, issue grants, execute mutations, or derive verification from downstream results.
+With M08-010 complete, every current inference-backed Controller judgment module has an explicit capability-local M08 curation adapter. The next M08 work should therefore move from capture coverage to deterministic dataset inspection and evaluation preparation rather than inventing another reasoning seam.
 
-After remaining unambiguous capability-local judgment seams are covered, later M08 work should shift to deterministic dataset inspection/export/evaluation preparation only as repository evidence warrants. No generic capture framework, embeddings, Python runtime dependency, automatic harvesting, provider fallback, or provider token hard cap is introduced.
+M08-011 now targets a deterministic read-only inventory of the canonical global-registry experience dataset. It should report exact complete-dataset totals plus lexicographically sorted per-capability lifecycle, outcome, and verification-basis counts, validate aggregate invariants, and fail closed on malformed persisted metadata.
+
+M08-011 must not reinterpret input/output payload semantics, infer training readiness, rank or balance examples, mutate lifecycle, export trainer formats, run Controller inference, read runtime Experience memory, or introduce Python.
+
+Later M08 work may add deterministic export/evaluation preparation only after inspection establishes the concrete dataset shape. Train/validation/test splitting, balancing, sampling, deduplication, weighting, trainer-specific transforms, and specialization policy remain separate decisions and should not be bundled into the inventory task.
 
 ## M09 — Controller specialization
 

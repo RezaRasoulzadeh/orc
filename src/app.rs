@@ -196,6 +196,19 @@ impl OrcApp {
         self.create_controller_experience_example(&draft)
     }
 
+    /// Persist one explicitly curated Controller memory-maintenance judgment
+    /// through the canonical M08-001 dataset API. This performs no inference,
+    /// target lookup or selection, mutation, grant handling, or harvesting.
+    pub fn create_controller_memory_maintenance_experience_example(
+        &self,
+        request: &crate::controller_experience_memory_maintenance::ControllerExperienceMemoryMaintenanceRequest,
+    ) -> Result<crate::controller_experience::ControllerExperienceExample> {
+        let draft = request
+            .into_example_draft()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.create_controller_experience_example(&draft)
+    }
+
     /// Select at most one explicit current-project Project/Episodic memory
     /// target through a bounded, read-only Controller judgment. This API does
     /// not invoke maintenance judgment, grant inspection, authorization, or

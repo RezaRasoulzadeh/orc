@@ -4,9 +4,9 @@
 
 **Current milestone:** M08 — Experience dataset
 
-**Current task:** M08-001 — Establish typed verified Controller experience examples
+**Current task:** M08-002 — Add explicit typed curation for normal Controller recommendations
 
-**Last completed:** M07-011 — Compose one selected Controller memory maintenance step
+**Last completed:** M08-001 — Establish typed verified Controller experience examples
 
 **Blocked by:** Nothing
 
@@ -14,18 +14,19 @@
 
 - Local Controller remains Qwen3 8B through llama.cpp/GGUF behind model-independent `LocalInferenceRuntime`.
 - Controller owns judgment; deterministic kernel/application code owns canonical facts, legality, authorization, persistence, workflow transitions, validation, and mutation.
-- M06 is complete: typed durable memory, bounded deterministic retrieval, capability-local memory context, supervised mutation, explicit-candidate capture judgment, and explicit-target maintenance judgment.
-- M07 is complete: finite grant-aware routine task continuation, supervised Project/Episodic capture Create, explicit-target maintenance, bounded Controller maintenance-target selection, and one selected-target maintenance composition.
-- M07-011 preserves the exact caller-supplied current facts across selection and maintenance, carries only canonical `MemoryId` across that boundary, freshly re-resolves target state through M06-011/M07-009, and adds no retry/fallback/second loop.
-- Automatic workflow-derived memory facts/candidates remain intentionally excluded. Deterministic application code must not invent what should be remembered or what evidence warrants maintenance merely to enable automation.
-- M08 now begins the curated Controller experience dataset required by D-006.
-- Runtime `MemoryKind::Experience` remains distinct from training/evaluation dataset examples. Runtime memory is for Controller context; the M08 dataset is curated reasoning evidence.
-- M08-001 establishes the first typed/versioned persistent verified-example record in the existing global registry database with explicit trusted creation only.
-- M08-001 must not automatically classify executed/accepted/reviewed/validated Controller behavior as verified training data. Verification evidence remains explicit until later curation tasks define narrower capture seams.
-- No model training, export, embeddings, Python runtime dependency, or provider token hard cap is introduced by M08-001.
+- M06 and M07 are complete.
+- Automatic workflow-derived memory facts/candidates remain intentionally excluded; deterministic code must not invent memory evidence merely to create automation.
+- M08 is the curated Controller experience dataset required by D-006.
+- Runtime `MemoryKind::Experience` remains distinct from M08 dataset examples. Runtime memory is Controller context; M08 records are curated reasoning evidence for evaluation/training.
+- M08-001 is complete at implementation `c4af7f72c739aabb59ea618925a02eb6244f6574`.
+- M08-001 provides typed/versioned global-registry examples, explicit verification/correction/outcome/quality/provenance metadata, hard bounds, deterministic create/get/list/retire APIs, and no automatic inference or harvesting.
+- M08-002 adds the smallest capability-local curation adapter for normal Controller task recommendation only.
+- The adapter must use the existing typed `ControllerRecommendationInput` and existing canonical recommendation structured output rather than parallel schemas or caller-built arbitrary JSON.
+- Verification, accepted output, quality, correction, and provenance remain explicit trusted inputs. Workflow success, validation/review, acceptance, or execution must not automatically label an example.
+- M08-002 is explicit curation only: no inference, workflow hook, automatic harvesting, dataset export, splitting/balancing, embeddings, training, model-specific behavior, Python runtime dependency, or provider token hard cap.
 
 ## Immediate next action
 
-Implement `tasks/M08-001.md`: establish the canonical typed persistent verified Controller experience-example record and explicit trusted create/get/list/retire APIs, distinct from runtime Experience memory and without automatic harvesting.
+Implement `tasks/M08-002.md`: explicit typed curation of one already-produced normal Controller recommendation interaction into the canonical M08-001 dataset format.
 
 See `M00-REPOSITORY-MAP.md` for repository-grounded fact-versus-judgment classification and migration map.

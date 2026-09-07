@@ -28,43 +28,31 @@ Controller planning/intake/Plan review/revision with deterministic persistence a
 
 ## M06 — Persistent memory — COMPLETE
 
-Typed User/Project/Episodic/Experience persistence, deterministic bounded `ControllerMemoryContext`, capability-local integration, supervised mutation, explicit-candidate capture judgment, and explicit-target maintenance judgment. Memory remains separate from model weights.
+Typed User/Project/Episodic/Experience persistence, deterministic bounded Controller memory context, capability-local integration, and supervised capture/maintenance. Memory remains separate from model weights.
 
 ## M07 — Supervised autonomy — COMPLETE
 
-Finite routine grants and supervised continuation are complete. Memory capture/maintenance grants, one-step composition, bounded maintenance-target selection, and selected-target maintenance composition are complete without bypassing deterministic mutation/authorization boundaries.
+Finite routine grants and supervised continuation, including bounded memory capture/maintenance and target selection, without bypassing deterministic mutation/authorization boundaries.
 
 ## M08 — Experience dataset — COMPLETE
 
-M08 established the curated Controller experience dataset required by D-006 while keeping it distinct from runtime `MemoryKind::Experience`.
-
-M08-001 established the canonical typed/versioned experience-example format, explicit trusted verification metadata, bounded validation, deterministic query, and lifecycle.
-
-M08-002 through M08-010 added explicit capability-local curation for every current inference-backed Controller judgment boundary: normal recommendations, recovery, planning, workflow intake, Plan review, Plan revision, memory capture, memory maintenance, and memory-maintenance target selection.
-
-M08-010 completed exact memory-selection curation at `87db2f24151d3522394f7ed9a2a7042aedf66b50`, preserving exact supplied candidate projections and production candidate-membership validation.
-
-M08-011 completed deterministic read-only complete-dataset inventory at `6791f81e38cf9af6ac04d16d9a6d5998e3369337`. Inventory reads only canonical global-registry metadata, reports exact global/per-capability lifecycle, outcome, and verification counts, preserves exact capability strings, validates aggregate invariants, and fails closed on malformed persisted metadata.
-
-M08 introduces no automatic harvesting, runtime-memory coupling, embeddings, provider fallback, provider token hard cap, trainer-specific export, or continuous weight mutation.
+M08 established the distinct canonical curated Controller experience dataset required by D-006. M08-001 established typed verified examples; M08-002 through M08-010 added capability-local curation across all nine inference-backed judgment boundaries; M08-011 added deterministic complete-dataset inventory. No automatic harvesting, runtime-memory coupling, embeddings, provider fallback, provider token hard cap, trainer-specific export, or continuous weight mutation.
 
 ## M09 — Controller specialization — CURRENT
 
 Fine-tune/evaluate the local Controller model. A new model becomes default only when evaluation demonstrates improvement without unacceptable regressions.
 
-M09 begins with specialization preparation rather than immediately choosing a trainer or mutating model weights.
+M09-001 completed the trainer-neutral Active experience snapshot at `481fe624777a03dc841ae1742dd5f9461e854fc7`.
 
-M09-001 completed the deterministic trainer-neutral specialization handoff at `481fe624777a03dc841ae1742dd5f9461e854fc7`. The snapshot reads and validates the complete canonical global-registry experience set in ascending example identity order, returns only Active examples, preserves the full canonical M08 record without capability-specific transformation, serializes deterministically, and performs zero writes or inference.
+M09-002 completed the full-surface nine-capability semantic evaluation suite at `6ceed5cda0627c82667664e4d7d54790207edbf9`.
 
-M09-002 completed the full-surface specialization evaluation substrate at `6ceed5cda0627c82667664e4d7d54790207edbf9`. Specialization-evaluation schema version 1 covers all nine current inference-backed Controller capabilities using production-aligned typed builders/validators, explicit deterministic semantic fixtures, stable scenario ordering, non-aborting incorrect/runtime/parse/validation failure recording, and exact global/per-capability accounting.
+M09-003 completed reproducible production-aligned baseline reporting at `552144121367b730d48dc0d10c808e99a0739852`. Its ignored real-model path uses `ORC_QWEN3_GGUF`; no measured Qwen score was asserted because the model was unavailable.
 
-M09-003 completed the reproducible full-surface baseline boundary at `552144121367b730d48dc0d10c808e99a0739852`. It wraps the exact M09-002 suite in a versioned typed baseline report with privacy-safe model identity, llama.cpp runtime/request evidence, deterministic per-scenario/global/per-capability results, and distinct bounded Parse/Validation/Runtime evidence. The ignored real-model target uses `ORC_QWEN3_GGUF` without benchmark-specific prompt augmentation or production inference changes. No measured Qwen score was asserted because the model file was unavailable in implementation/review environments.
+M09-004 completed the deterministic candidate-vs-baseline promotion gate at `8ddc47bc498d57d6729db2a85fcf1b3eeae2370f`. It requires fully comparable reports, strict global pass improvement, no execution/error increase, no capability pass-count regression, no baseline-pass regression, no newly introduced Parse/Validation/Runtime failure, and exact accounting. Typed transitions, signed deltas, and ordered reasons are validated. The gate is read-only and model-independent.
 
-Before trainer selection or candidate training, M09-004 defines the candidate-vs-baseline promotion gate over validated M09-003 reports. Promotion semantics are fixed before candidate results exist: reports must be fully comparable; the candidate must strictly improve global passes; no capability may lose passes; no baseline-passing scenario may regress; and no new Parse/Validation/Runtime failure may be introduced under the canonical failure taxonomy.
+M09-005 investigates native/offline specialization backends and the smallest justified training/export boundary. It must verify upstream support, Qwen3/GGUF/adapter compatibility, actual hardware/model/data readiness, and preserve canonical dataset and evaluation authority. No trainer is selected by assumption and no training occurs in this investigation.
 
-M09-004 is deterministic and model-independent. It does not run inference, train models, choose a trainer/backend, transform the dataset, persist benchmark results, or change the default Controller model.
-
-Later M09 work should use the trainer-neutral snapshot, full-surface evaluation suite, baseline-report boundary, and fixed promotion gate to investigate the native/offline specialization path, choose the smallest justified training/export boundary, perform controlled candidate training/evaluation, and only then consider changing the default Controller model.
+Later M09 work should use the investigation to define narrow dataset preparation and controlled candidate training/evaluation tasks. A default-model change is considered only after actual comparable evidence satisfies the fixed gate and explicit operator authorization.
 
 ## M10 — Interface integration
 

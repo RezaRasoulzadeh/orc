@@ -53,7 +53,7 @@ use crate::controller_planning::{
     ControllerPlanResult, ControllerPlanningError, ControllerPlanningInput,
     ControllerPlanningRequest,
 };
-use crate::local_runtime::{LocalInferenceResponse, LocalInferenceRuntime};
+use crate::local_runtime::{LocalInferenceError, LocalInferenceResponse, LocalInferenceRuntime};
 use crate::memory::{
     MemoryDraft, MemoryId, MemoryKind, MemoryLifecycle, MemoryProvenance, MemoryProvenanceKind,
     MemoryRecord, MemoryScope,
@@ -77,7 +77,8 @@ use thiserror::Error;
 pub const CONTROLLER_SPECIALIZATION_EVALUATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CONTROLLER_SPECIALIZATION_SCENARIOS: usize = 64;
 pub const MAX_CONTROLLER_SPECIALIZATION_ALTERNATIVES: usize = 8;
-const MAX_SCENARIO_ID_BYTES: usize = 256;
+pub const MAX_CONTROLLER_SPECIALIZATION_SCENARIO_ID_BYTES: usize = 256;
+pub const MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES: usize = 4096;
 const MAX_SCENARIO_DESCRIPTION_BYTES: usize = 1024;
 
 pub const CONTROLLER_SPECIALIZATION_CAPABILITIES: [&str; 9] = [
@@ -336,6 +337,18 @@ impl ControllerSpecializationOutput {
             }),
         }
     }
+
+    /// Project a validated production output into the semantic value used by
+    /// the specialization evaluator. This exposes the existing evaluator
+    /// projection to the baseline-report boundary without introducing a
+    /// second comparison implementation.
+    pub fn semantic_result(
+        &self,
+        input: &ControllerSpecializationInput,
+    ) -> Result<ControllerSpecializationSemanticResult, ControllerSpecializationEvaluationError>
+    {
+        self.semantic(input)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -416,7 +429,7 @@ impl ControllerSpecializationScenario {
     }
 
     pub fn validate(&self) -> Result<(), ControllerSpecializationEvaluationError> {
-        if self.id.is_empty() || self.id.len() > MAX_SCENARIO_ID_BYTES {
+        if self.id.is_empty() || self.id.len() > MAX_CONTROLLER_SPECIALIZATION_SCENARIO_ID_BYTES {
             return Err(ControllerSpecializationEvaluationError::ScenarioBounds(
                 "id".into(),
             ));
@@ -450,6 +463,18 @@ impl ControllerSpecializationScenario {
             self.validate_output(alternative, "acceptable_alternative")?;
         }
         Ok(())
+    }
+
+    /// Whether the production builder is expected to call the local runtime
+    /// for this already-validated scenario. The empty memory-selection input
+    /// is the production no-target fast path and intentionally makes no model
+    /// request.
+    pub fn requires_runtime(&self) -> bool {
+        !matches!(
+            &self.input,
+            ControllerSpecializationInput::MemorySelection(input)
+                if input.candidates.is_empty() && input.eligible_candidate_count == 0
+        )
     }
 
     fn validate_output(
@@ -782,6 +807,67 @@ pub enum ControllerSpecializationScenarioStatus {
     RuntimeFailure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerSpecializationFailureKind {
+    Parse,
+    Validation,
+    Runtime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "evidence", deny_unknown_fields)]
+pub enum ControllerSpecializationFailureEvidence {
+    Parse {
+        raw_output: String,
+        parse_error: String,
+    },
+    Validation {
+        error: String,
+    },
+    Runtime {
+        error: String,
+    },
+}
+
+impl ControllerSpecializationFailureEvidence {
+    pub fn kind(&self) -> ControllerSpecializationFailureKind {
+        match self {
+            Self::Parse { .. } => ControllerSpecializationFailureKind::Parse,
+            Self::Validation { .. } => ControllerSpecializationFailureKind::Validation,
+            Self::Runtime { .. } => ControllerSpecializationFailureKind::Runtime,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControllerSpecializationEvaluationError> {
+        let valid_text = |value: &str| {
+            !value.is_empty() && value.len() <= MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES
+        };
+        match self {
+            Self::Parse {
+                raw_output,
+                parse_error,
+            } => {
+                if raw_output.len() > MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES
+                    || !valid_text(parse_error)
+                {
+                    return Err(ControllerSpecializationEvaluationError::InvalidReport(
+                        "parse failure evidence is outside its bounds".into(),
+                    ));
+                }
+            }
+            Self::Validation { error } | Self::Runtime { error } => {
+                if !valid_text(error) {
+                    return Err(ControllerSpecializationEvaluationError::InvalidReport(
+                        "failure evidence is empty or oversized".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerSpecializationScenarioReport {
@@ -791,7 +877,7 @@ pub struct ControllerSpecializationScenarioReport {
     pub acceptable_alternatives: Vec<ControllerSpecializationSemanticResult>,
     pub observed: Option<ControllerSpecializationSemanticResult>,
     pub status: ControllerSpecializationScenarioStatus,
-    pub error: Option<String>,
+    pub failure: Option<ControllerSpecializationFailureEvidence>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,7 +938,8 @@ impl ControllerSpecializationEvaluationReport {
             BTreeMap::<String, ControllerSpecializationCapabilityAggregate>::new();
         let mut previous_id: Option<&str> = None;
         for scenario in &self.scenarios {
-            if scenario.scenario_id.is_empty() || scenario.scenario_id.len() > MAX_SCENARIO_ID_BYTES
+            if scenario.scenario_id.is_empty()
+                || scenario.scenario_id.len() > MAX_CONTROLLER_SPECIALIZATION_SCENARIO_ID_BYTES
             {
                 return Err(ControllerSpecializationEvaluationError::InvalidReport(
                     "scenario report ID is empty or oversized".into(),
@@ -886,19 +973,39 @@ impl ControllerSpecializationEvaluationReport {
             match scenario.status {
                 ControllerSpecializationScenarioStatus::Pass
                 | ControllerSpecializationScenarioStatus::IncorrectResult => {
-                    if scenario.observed.is_none() || scenario.error.is_some() {
+                    if scenario.observed.is_none() || scenario.failure.is_some() {
                         return Err(ControllerSpecializationEvaluationError::InvalidReport("successful or incorrect scenarios require observed semantics and no error".into()));
                     }
                 }
                 ControllerSpecializationScenarioStatus::ObservedValidationFailure
                 | ControllerSpecializationScenarioStatus::RuntimeFailure => {
-                    if scenario.observed.is_some()
-                        || scenario.error.as_deref().is_none_or(str::is_empty)
-                    {
+                    if scenario.observed.is_some() || scenario.failure.is_none() {
                         return Err(ControllerSpecializationEvaluationError::InvalidReport(
-                            "failed scenarios require one error and no observed semantics".into(),
+                            "failed scenarios require one failure and no observed semantics".into(),
                         ));
                     }
+                }
+            }
+            if let Some(failure) = &scenario.failure {
+                failure.validate()?;
+                let valid_kind = match scenario.status {
+                    ControllerSpecializationScenarioStatus::ObservedValidationFailure => {
+                        matches!(
+                            failure.kind(),
+                            ControllerSpecializationFailureKind::Parse
+                                | ControllerSpecializationFailureKind::Validation
+                        )
+                    }
+                    ControllerSpecializationScenarioStatus::RuntimeFailure => {
+                        failure.kind() == ControllerSpecializationFailureKind::Runtime
+                    }
+                    ControllerSpecializationScenarioStatus::Pass
+                    | ControllerSpecializationScenarioStatus::IncorrectResult => false,
+                };
+                if !valid_kind {
+                    return Err(ControllerSpecializationEvaluationError::InvalidReport(
+                        "failure kind does not match scenario status".into(),
+                    ));
                 }
             }
             aggregate.add(scenario.status);
@@ -981,6 +1088,10 @@ fn invalid_output(
 }
 
 enum ScenarioFailure {
+    Parse {
+        raw_output: String,
+        parse_error: String,
+    },
     Validation(String),
     Runtime(String),
 }
@@ -1014,7 +1125,7 @@ pub fn evaluate_controller_specialization(
                         } else {
                             ControllerSpecializationScenarioStatus::IncorrectResult
                         },
-                        error: None,
+                        failure: None,
                     });
                 }
                 Err(error) => reports.push(failed_report(
@@ -1075,14 +1186,28 @@ fn failed_report(
     alternatives: Vec<ControllerSpecializationSemanticResult>,
     failure: ScenarioFailure,
 ) -> ControllerSpecializationScenarioReport {
-    let (status, error) = match failure {
+    let (status, failure) = match failure {
+        ScenarioFailure::Parse {
+            raw_output,
+            parse_error,
+        } => (
+            ControllerSpecializationScenarioStatus::ObservedValidationFailure,
+            ControllerSpecializationFailureEvidence::Parse {
+                raw_output: bound_failure_text(&raw_output),
+                parse_error: bound_failure_text(&parse_error),
+            },
+        ),
         ScenarioFailure::Validation(error) => (
             ControllerSpecializationScenarioStatus::ObservedValidationFailure,
-            error,
+            ControllerSpecializationFailureEvidence::Validation {
+                error: bound_failure_text(&error),
+            },
         ),
         ScenarioFailure::Runtime(error) => (
             ControllerSpecializationScenarioStatus::RuntimeFailure,
-            error,
+            ControllerSpecializationFailureEvidence::Runtime {
+                error: bound_failure_text(&error),
+            },
         ),
     };
     ControllerSpecializationScenarioReport {
@@ -1092,7 +1217,7 @@ fn failed_report(
         acceptable_alternatives: alternatives,
         observed: None,
         status,
-        error: Some(error),
+        failure: Some(failure),
     }
 }
 
@@ -1100,104 +1225,202 @@ fn execute_scenario(
     input: &ControllerSpecializationInput,
     runtime: &mut dyn LocalInferenceRuntime,
 ) -> Result<ControllerSpecializationOutput, ScenarioFailure> {
+    let mut scenario_runtime = ScenarioRuntime {
+        inner: runtime,
+        last_response: None,
+    };
     match input {
         ControllerSpecializationInput::TaskRecommendation(input) => ControllerStateBuilder::new()
-            .recommend_packet_with_memory(&input.current_packet, input.memory.clone(), runtime)
+            .recommend_packet_with_memory(
+                &input.current_packet,
+                input.memory.clone(),
+                &mut scenario_runtime,
+            )
             .map(ControllerSpecializationOutput::TaskRecommendation)
-            .map_err(|error| classify(&error, matches!(&error, ControllerError::Inference(_)))),
+            .map_err(|error| {
+                let inference = match &error {
+                    ControllerError::Inference(inference) => Some(inference),
+                    _ => None,
+                };
+                classify(&error, inference, scenario_runtime.last_response.as_ref())
+            }),
         ControllerSpecializationInput::Recovery(input) => RecoveryRecommendationBuilder::new()
             .recommend_inspection_with_memory(
                 &recovery_inspection(input),
                 input.memory.clone(),
-                runtime,
+                &mut scenario_runtime,
             )
             .map(|result| ControllerSpecializationOutput::Recovery(result.recommendation))
             .map_err(|error| {
                 classify(
                     &error,
-                    matches!(&error, RecoveryControllerError::Inference(_)),
+                    match &error {
+                        RecoveryControllerError::Inference(inference) => Some(inference),
+                        _ => None,
+                    },
+                    scenario_runtime.last_response.as_ref(),
                 )
             }),
         ControllerSpecializationInput::PlanGeneration(input) => {
             crate::controller_planning::ControllerPlanningBuilder::new()
-                .propose_with_memory(input, runtime)
+                .propose_with_memory(input, &mut scenario_runtime)
                 .map(ControllerSpecializationOutput::PlanGeneration)
                 .map_err(|error| {
                     classify(
                         &error,
-                        matches!(&error, ControllerPlanningError::Inference(_)),
+                        match &error {
+                            ControllerPlanningError::Inference(inference) => Some(inference),
+                            _ => None,
+                        },
+                        scenario_runtime.last_response.as_ref(),
                     )
                 })
         }
         ControllerSpecializationInput::WorkflowIntake(input) => ControllerIntakeBuilder::new()
-            .classify_with_memory(&input.current_request, input.memory.clone(), runtime)
+            .classify_with_memory(
+                &input.current_request,
+                input.memory.clone(),
+                &mut scenario_runtime,
+            )
             .map(ControllerSpecializationOutput::WorkflowIntake)
             .map_err(|error| {
                 classify(
                     &error,
-                    matches!(&error, ControllerIntakeError::Inference(_)),
+                    match &error {
+                        ControllerIntakeError::Inference(inference) => Some(inference),
+                        _ => None,
+                    },
+                    scenario_runtime.last_response.as_ref(),
                 )
             }),
         ControllerSpecializationInput::PlanReview(input) => ControllerPlanReviewBuilder::new()
-            .review_with_memory(input, runtime)
+            .review_with_memory(input, &mut scenario_runtime)
             .map(ControllerSpecializationOutput::PlanReview)
             .map_err(|error| {
                 classify(
                     &error,
-                    matches!(&error, ControllerPlanReviewError::Inference(_)),
+                    match &error {
+                        ControllerPlanReviewError::Inference(inference) => Some(inference),
+                        _ => None,
+                    },
+                    scenario_runtime.last_response.as_ref(),
                 )
             }),
         ControllerSpecializationInput::PlanRevision(input) => ControllerPlanRevisionBuilder::new()
-            .revise_with_memory(input, runtime)
+            .revise_with_memory(input, &mut scenario_runtime)
             .map(ControllerSpecializationOutput::PlanRevision)
             .map_err(|error| {
                 classify(
                     &error,
-                    matches!(&error, ControllerPlanRevisionError::Inference(_)),
+                    match &error {
+                        ControllerPlanRevisionError::Inference(inference) => Some(inference),
+                        _ => None,
+                    },
+                    scenario_runtime.last_response.as_ref(),
                 )
             }),
         ControllerSpecializationInput::MemoryCapture(input) => {
             ControllerMemoryCaptureBuilder::new()
-                .capture_with_memory(input, runtime)
+                .capture_with_memory(input, &mut scenario_runtime)
                 .map(ControllerSpecializationOutput::MemoryCapture)
                 .map_err(|error| {
                     classify(
                         &error,
-                        matches!(&error, ControllerMemoryCaptureError::Inference(_)),
+                        match &error {
+                            ControllerMemoryCaptureError::Inference(inference) => Some(inference),
+                            _ => None,
+                        },
+                        scenario_runtime.last_response.as_ref(),
                     )
                 })
         }
         ControllerSpecializationInput::MemoryMaintenance(input) => {
             ControllerMemoryMaintenanceBuilder::new()
-                .maintain(input, runtime)
+                .maintain(input, &mut scenario_runtime)
                 .map(ControllerSpecializationOutput::MemoryMaintenance)
                 .map_err(|error| {
                     classify(
                         &error,
-                        matches!(&error, ControllerMemoryMaintenanceError::Inference(_)),
+                        match &error {
+                            ControllerMemoryMaintenanceError::Inference(inference) => {
+                                Some(inference)
+                            }
+                            _ => None,
+                        },
+                        scenario_runtime.last_response.as_ref(),
                     )
                 })
         }
         ControllerSpecializationInput::MemorySelection(input) => {
             ControllerMemorySelectionBuilder::new()
-                .select(input, runtime)
+                .select(input, &mut scenario_runtime)
                 .map(ControllerSpecializationOutput::MemorySelection)
                 .map_err(|error| {
                     classify(
                         &error,
-                        matches!(&error, ControllerMemorySelectionError::Inference(_)),
+                        match &error {
+                            ControllerMemorySelectionError::Inference(inference) => Some(inference),
+                            _ => None,
+                        },
+                        scenario_runtime.last_response.as_ref(),
                     )
                 })
         }
     }
 }
 
-fn classify(error: impl ToString, runtime: bool) -> ScenarioFailure {
-    if runtime {
-        ScenarioFailure::Runtime(error.to_string())
-    } else {
-        ScenarioFailure::Validation(error.to_string())
+struct ScenarioRuntime<'a> {
+    inner: &'a mut dyn LocalInferenceRuntime,
+    last_response: Option<LocalInferenceResponse>,
+}
+
+impl LocalInferenceRuntime for ScenarioRuntime<'_> {
+    fn infer(
+        &mut self,
+        request: &crate::local_runtime::LocalInferenceRequest,
+    ) -> Result<LocalInferenceResponse, LocalInferenceError> {
+        let result = self.inner.infer(request);
+        if let Ok(response) = &result {
+            self.last_response = Some(response.clone());
+        }
+        result
     }
+}
+
+fn classify(
+    error: impl ToString,
+    inference: Option<&LocalInferenceError>,
+    response: Option<&LocalInferenceResponse>,
+) -> ScenarioFailure {
+    match inference {
+        Some(LocalInferenceError::InvalidStructuredOutput {
+            raw_output,
+            parse_error,
+        }) => ScenarioFailure::Parse {
+            raw_output: raw_output.clone(),
+            parse_error: parse_error.clone(),
+        },
+        Some(_) => ScenarioFailure::Runtime(error.to_string()),
+        None if response.is_some_and(|response| response.structured_output.is_none()) => {
+            let response = response.expect("response was checked above");
+            ScenarioFailure::Parse {
+                raw_output: response.text.clone(),
+                parse_error: error.to_string(),
+            }
+        }
+        None => ScenarioFailure::Validation(error.to_string()),
+    }
+}
+
+fn bound_failure_text(value: &str) -> String {
+    if value.len() <= MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 fn recovery_inspection(input: &RecoveryInferenceInput) -> RecoveryInspection {
     RecoveryInspection {
@@ -1538,13 +1761,70 @@ mod tests {
             report.scenarios[0].status,
             ControllerSpecializationScenarioStatus::RuntimeFailure
         );
+        assert!(matches!(
+            report.scenarios[0].failure,
+            Some(ControllerSpecializationFailureEvidence::Runtime { .. })
+        ));
         assert_eq!(
             report.scenarios[1].status,
             ControllerSpecializationScenarioStatus::ObservedValidationFailure
         );
+        assert!(matches!(
+            report.scenarios[1].failure,
+            Some(ControllerSpecializationFailureEvidence::Validation { .. })
+        ));
         assert_eq!(report.aggregate.total, 17);
         assert_eq!(report.aggregate.runtime_failures, 1);
         assert_eq!(report.aggregate.validation_failures, 1);
+        assert_eq!(report.aggregate.passed, 15);
+    }
+
+    #[test]
+    fn parser_failures_are_distinct_bounded_and_non_aborting() {
+        let suite = ControllerSpecializationSuite::representative_suite().unwrap();
+        let raw_output = format!(
+            "{}tail",
+            "x".repeat(MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES)
+        );
+        let mut responses = vec![
+            Ok(LocalInferenceResponse::text(raw_output.clone())),
+            Ok(LocalInferenceResponse::structured(
+                "typed but invalid",
+                serde_json::json!({"decision": "invalid"}),
+            )),
+        ];
+        for scenario in suite.scenarios.iter().skip(2) {
+            if uses_runtime(&scenario.input) {
+                responses.push(Ok(scenario.expected.fake_runtime_response().unwrap()));
+            }
+        }
+        let mut runtime = FakeRuntime {
+            responses: responses.into(),
+        };
+        let report = evaluate_controller_specialization(&suite, &mut runtime).unwrap();
+        match report.scenarios[0].failure.as_ref() {
+            Some(ControllerSpecializationFailureEvidence::Parse {
+                raw_output: bounded,
+                parse_error,
+            }) => {
+                assert_eq!(bounded.len(), MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES);
+                assert_eq!(
+                    bounded,
+                    &raw_output[..MAX_CONTROLLER_SPECIALIZATION_FAILURE_BYTES]
+                );
+                assert_eq!(
+                    parse_error,
+                    "Controller memory capture output is malformed: structured output is required"
+                );
+            }
+            other => panic!("expected bounded parse evidence, got {other:?}"),
+        }
+        assert!(matches!(
+            report.scenarios[1].failure,
+            Some(ControllerSpecializationFailureEvidence::Validation { .. })
+        ));
+        assert_eq!(report.aggregate.runtime_failures, 0);
+        assert_eq!(report.aggregate.validation_failures, 2);
         assert_eq!(report.aggregate.passed, 15);
     }
     #[test]

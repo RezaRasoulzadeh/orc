@@ -381,7 +381,7 @@ pub enum ControllerSpecializationSemanticResult {
 }
 
 impl ControllerSpecializationSemanticResult {
-    fn capability(&self) -> &'static str {
+    pub(crate) fn capability(&self) -> &'static str {
         match self {
             Self::TaskRecommendation { .. } => CONTROLLER_SPECIALIZATION_CAPABILITIES[0],
             Self::Recovery { .. } => CONTROLLER_SPECIALIZATION_CAPABILITIES[1],

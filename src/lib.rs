@@ -37,6 +37,7 @@ pub mod controller_plan_revision;
 pub mod controller_plan_revision_persistence;
 pub mod controller_planning;
 pub mod controller_specialization_baseline;
+pub mod controller_specialization_comparison;
 pub mod controller_specialization_evaluation;
 pub mod desktop;
 pub mod discovery;

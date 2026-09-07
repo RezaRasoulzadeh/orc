@@ -63,7 +63,7 @@ impl ControllerSpecializationBaselineModelIdentity {
         Self::new(file_name)
     }
 
-    fn validate(&self) -> Result<(), ControllerSpecializationBaselineError> {
+    pub(crate) fn validate(&self) -> Result<(), ControllerSpecializationBaselineError> {
         if self.model_file_name.is_empty()
             || self.model_file_name.len() > MAX_CONTROLLER_SPECIALIZATION_BASELINE_MODEL_ID_BYTES
             || self.model_file_name == "."

@@ -64,7 +64,8 @@ Only current/near-term milestones are decomposed here.
 | [M09-002](M09-002.md) | Done | M09 | Establish full-surface Controller specialization evaluation suite |
 | [M09-003](M09-003.md) | Done | M09 | Capture reproducible full-surface Controller baseline |
 | [M09-004](M09-004.md) | Done | M09 | Define deterministic Controller candidate promotion gate |
-| [M09-005](M09-005.md) | Planned | M09 | Investigate native/offline Controller specialization backend |
+| [M09-005](M09-005.md) | Done | M09 | Investigate native/offline Controller specialization backend |
+| [M09-006](M09-006.md) | Planned | M09 | Provision and measure the canonical specialization source |
 
 ## Task format
 

@@ -50,9 +50,11 @@ M09-003 completed reproducible production-aligned baseline reporting at `5521441
 
 M09-004 completed the deterministic candidate-vs-baseline promotion gate at `8ddc47bc498d57d6729db2a85fcf1b3eeae2370f`. It requires fully comparable reports, strict global pass improvement, no execution/error increase, no capability pass-count regression, no baseline-pass regression, no newly introduced Parse/Validation/Runtime failure, and exact accounting. Typed transitions, signed deltas, and ordered reasons are validated. The gate is read-only and model-independent.
 
-M09-005 investigates native/offline specialization backends and the smallest justified training/export boundary. It must verify upstream support, Qwen3/GGUF/adapter compatibility, actual hardware/model/data readiness, and preserve canonical dataset and evaluation authority. No trainer is selected by assumption and no training occurs in this investigation.
+M09-005 completed the native/offline specialization investigation at `52a37429c8438e626106fd25fa23363df7496109`. Backend selection was deliberately deferred. Isolated ms-swift Qwen3-8B LoRA is the conditional first qualification path, followed by merged Hugging Face → GGUF conversion/quantization and the existing M09-003/M09-004 evaluation flow. Native llama.cpp training remains unsuitable for first selection based on current upstream WIP/limited evidence. No trainer or Python dependency was added to Orc runtime.
 
-Later M09 work should use the investigation to define narrow dataset preparation and controlled candidate training/evaluation tasks. A default-model change is considered only after actual comparable evidence satisfies the fixed gate and explicit operator authorization.
+M09-006 now provisions and measures the actual canonical specialization source through existing Orc authority, then captures M08-011 inventory and M09-001 Active snapshot evidence. It must establish exact dataset/capability facts before any export or trainer-specific transformation.
+
+If M09-006 establishes a usable canonical source, later M09 work should proceed in narrow independently reviewable steps: specify a versioned external snapshot-to-trainer transform; qualify one pinned Qwen3-8B LoRA toolchain on supplied hardware/model inputs; package and validate a candidate GGUF with full lineage; then execute M09-003/M09-004 candidate evaluation. A default-model change is considered only after actual comparable evidence satisfies the fixed gate and explicit operator authorization.
 
 ## M10 — Interface integration
 

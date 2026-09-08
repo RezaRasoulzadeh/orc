@@ -38,7 +38,7 @@ Finite routine grants and supervised continuation, including bounded memory capt
 
 M08 established the distinct canonical curated Controller experience dataset required by D-006. M08-001 established typed verified examples; M08-002 through M08-010 added capability-local curation across all nine inference-backed judgment boundaries; M08-011 added deterministic complete-dataset inventory. No automatic harvesting, runtime-memory coupling, embeddings, provider fallback, provider token hard cap, trainer-specific export, or continuous weight mutation.
 
-## M09 — Controller specialization — CURRENT
+## M09 — Controller specialization — BLOCKED / DEFERRED
 
 Fine-tune/evaluate the local Controller model. A new model becomes default only when evaluation demonstrates improvement without unacceptable regressions.
 
@@ -58,6 +58,14 @@ M09-007 is planned but blocked on genuine canonical source-data availability. It
 
 Later M09 work remains independently reviewable: qualify one pinned Qwen3-8B LoRA toolchain on supplied hardware/model inputs; package and validate a candidate GGUF with full lineage; then execute M09-003/M09-004 candidate evaluation. A default-model change is considered only after actual comparable evidence satisfies the fixed gate and explicit operator authorization. No backend is selected for execution.
 
-## M10 — Interface integration
+M09 specialization is therefore blocked/deferred while interface work that does not depend on training proceeds. This does not mark M09 complete and does not relax any source, evaluation, or promotion requirement.
+
+## M10 — Interface integration — CURRENT
 
 Expose the mature Controller consistently through CLI, TUI and GUI using shared core APIs.
+
+The repository-grounded `M10-interface-audit.md` found that the CLI has the broadest complete workflow coverage, the TUI is operationally narrow, and the Tauri bridge exposes more canonical capability than the Vue adapter currently wires. Existing application/read-model APIs are sufficient for the first interface slice; general post-creation task metadata editing is the only clear shared application API gap identified by the audit.
+
+M10-001 is the first planned implementation task: complete a normal task lifecycle in the TUI using existing canonical APIs. Its vertical slice covers task creation, queue/detail inspection, dispatch, execution refresh, validation/review evidence, revision with operator feedback through the canonical revision path, and explicit acceptance. It must not duplicate lifecycle/scheduler/validation/review logic, introduce Controller inference or automatic experience harvesting, or change M09 specialization state.
+
+Follow-on M10 work should remain independently reviewable and proceed from actual operator gaps: TUI run/history and worktree/diff/recovery controls; typed Controller authorization adapter exposure; supervised M08 curation surfaces; one shared general task-metadata update seam; and remaining desktop governance/economy/Plan/Lead parity gaps. Interface work must continue to preserve canonical Rust ownership of facts, legality, authorization, persistence, validation, and workflow transitions.

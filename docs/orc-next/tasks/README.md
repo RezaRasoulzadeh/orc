@@ -67,6 +67,7 @@ Only current/near-term milestones are decomposed here.
 | [M09-005](M09-005.md) | Done | M09 | Investigate native/offline Controller specialization backend |
 | [M09-006](M09-006.md) | Done | M09 | Provision and measure the canonical specialization source |
 | [M09-007](M09-007.md) | Planned — blocked | M09 | Specify the external snapshot-to-trainer transform |
+| [M10-001](M10-001.md) | Planned | M10 | Complete the TUI normal task lifecycle vertical slice |
 
 ## Task format
 

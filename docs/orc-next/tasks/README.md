@@ -68,6 +68,7 @@ Only current/near-term milestones are decomposed here.
 | [M09-006](M09-006.md) | Done | M09 | Provision and measure the canonical specialization source |
 | [M09-007](M09-007.md) | Planned — blocked | M09 | Specify the external snapshot-to-trainer transform |
 | [M10-001](M10-001.md) | Done | M10 | Complete the TUI normal task lifecycle vertical slice |
+| [M10-002](M10-002.md) | Planned | M10 | Add TUI run history and worktree/diff inspection |
 
 ## Task format
 

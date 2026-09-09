@@ -4,7 +4,7 @@
 
 **Current milestone:** M10 — Interface integration
 
-**Current task:** None — next M10 task not yet decomposed
+**Current task:** M10-002 — Add TUI run history and worktree/diff inspection
 
 **Last completed:** M10-001 — Complete the TUI normal task lifecycle vertical slice
 
@@ -25,6 +25,8 @@
 - M10 interface work may proceed independently where it does not depend on specialization. `M10-interface-audit.md` established the repository-grounded gap ordering.
 - M10-001 completed at `8106d75695da31dc5212b236eeeca60040e168b8`: the Rust TUI now covers normal task creation, canonical queue/detail inspection, non-blocking dispatch/review/revision/accept actions, manual execution refresh, validation/review evidence, previous-agent revision continuity, explicit acceptance, and illegal-action handling through existing application/read boundaries.
 - M10-001 required no shared application API addition and introduced no duplicate lifecycle/scheduler/validation/revision/recovery logic, M09 change, Controller inference, or automatic experience harvesting.
+- M10-002 is Planned. It is the next audited TUI adapter slice and is read-oriented: persisted run history/detail plus validated worktree and diff/change inspection through existing canonical run/read/Git/review boundaries.
+- M10-002 deliberately excludes reject/cancel/requeue/recovery execution, dependency mutation, explicit agent selection, Controller actions, M08 curation, and general task metadata editing so those remain independently reviewable follow-ons.
 - General post-creation task metadata editing remains a separate shared API seam identified by the M10 audit.
 - D-006 requires controlled learning and evaluation; training completion alone cannot justify promotion. M09-004 fixes acceptance semantics before candidate results exist.
 - D-007 keeps Orc runtime Rust/native, permits C/C++ inference/performance components, and treats training/export separately. A Python/PyTorch training/export environment may be isolated from Orc runtime but is not selected or added as a runtime dependency.
@@ -33,6 +35,6 @@
 
 ## Immediate next action
 
-Decompose the next independently reviewable M10 interface task from the audited operator gaps. Candidate follow-on areas remain TUI run/history and worktree/diff/recovery controls, typed Controller authorization adapter exposure, supervised M08 curation surfaces, one shared general task-metadata update seam, and remaining desktop governance/economy/Plan/Lead parity gaps. M09-007 remains blocked until supervised M08 curation produces genuine source data and fresh M08-011/M09-001 measurement confirms it.
+Implement M10-002 using existing canonical run/read, validated worktree, and Git/review evidence boundaries. Keep the task read-oriented and do not add lifecycle/recovery mutation or unsafe filesystem access. M09-007 remains blocked until supervised M08 curation produces genuine source data and fresh M08-011/M09-001 measurement confirms it.
 
 See `M00-REPOSITORY-MAP.md` for repository-grounded fact-versus-judgment classification and migration map.
